@@ -46,8 +46,9 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
 
 - ⬜ **Incremental search** — `C-s` / `C-r` isearch (the biggest missing daily
   feature); then `M-%` **query-replace**.
-- ⬜ **`M-x` run-command-by-name** — a command palette; pairs with a layers
-  `:commands` manifest so every command is reachable without a binding.
+- ✅ **`M-x` run-command-by-name** — `defcommand` marks a function interactive and
+  registers it (`src/command.blsp`); `M-x` (`M-x`/`:alt-x`) completes against and
+  runs the registry. Every `cmd-*` is interactive; reachable without a binding.
 - ⬜ **Comment / uncomment** — `M-;`, per-mode comment syntax (`;;` for brood,
   `#`/`//` for others) as a mode facet.
 - ⬜ **Indentation** — `TAB`; sexp-aware (indent by the CST) in brood-mode, simple
