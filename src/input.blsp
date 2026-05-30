@@ -1,30 +1,95 @@
 (defmodule input
-  "The editor's input layer: fold one key event into the next model. Today this
-is a plain `cond` mapping keys to commands; the planned next step is to replace
-it with a rebindable `std/keymap.blsp` keymap (with prefix-chord support, for
-Emacs binds like `C-x C-e`) so keys can be redefined live — the path to a
-self-editing editor."
-  (:use buffer)    ; the buffer ops keys map to
-  (:use model)     ; ed-scroll — keep the point on screen after each key
-  (:use commands)) ; ed-edit / ed-save
+  "The editor's input layer: fold one key event into the next model by dispatching
+through a keymap. Keys map to fully-qualified command **symbols**, resolved with
+`(eval sym)` at dispatch time — so redefining a command (or rebinding a key)
+hot-swaps behaviour on the next keystroke (late binding, the path to a
+self-editing editor). A key that maps to a nested keymap (a map, not a symbol) is
+a **prefix**: hitting it stashes the sub-keymap in the model's `:pending` so the
+next key resolves there — that's how Emacs chords like `C-x C-e` work.
+
+This mirrors `std/keymap.blsp` (the flat dispatcher behind the REPL/observer); the
+prefix-chord handling lives here for now and should migrate into `std/keymap.blsp`
+once it grows chord support — see CLAUDE.md (the language-improvement half of the
+plan)."
+  (:use buffer)
+  (:use model)     ; ed-scroll, message
+  (:use commands)) ; the commands the keymap names + cmd-self-insert fallback
+
+;; ---- the keymaps ------------------------------------------------------------
+;; Command values are quoted, fully-qualified symbols (`commands/…`) so `(eval
+;; sym)` resolves them at dispatch regardless of namespace (cf. *lineedit-keymap*).
+;; `*ctrl-x-keymap*` is referenced as a value below, so it's defined first.
+
+(def *ctrl-x-keymap*
+  {:ctrl-e 'commands/eval-last-sexp   ; eval the current line into *Messages*
+   :ctrl-s 'commands/cmd-save         ; save
+   :ctrl-c 'commands/cmd-quit})       ; quit
+
+(def *global-keymap*
+  {;; movement — the arrow keys and their Emacs C- equivalents
+   :left  'commands/cmd-backward-char     :ctrl-b 'commands/cmd-backward-char
+   :right 'commands/cmd-forward-char      :ctrl-f 'commands/cmd-forward-char
+   :up    'commands/cmd-previous-line     :ctrl-p 'commands/cmd-previous-line
+   :down  'commands/cmd-next-line         :ctrl-n 'commands/cmd-next-line
+   :home  'commands/cmd-beginning-of-line :ctrl-a 'commands/cmd-beginning-of-line
+   :end   'commands/cmd-end-of-line        :ctrl-e 'commands/cmd-end-of-line
+   ;; editing
+   :enter 'commands/cmd-newline
+   :backspace 'commands/cmd-delete-backward
+   :delete 'commands/cmd-delete-char       :ctrl-d 'commands/cmd-delete-char
+   ;; quit — the window close button is delivered as :escape
+   :escape 'commands/cmd-quit
+   ;; the C-x prefix
+   :ctrl-x *ctrl-x-keymap*})
+
+;; ---- key labels (for the echo area) -----------------------------------------
+
+(defn str-starts? (s p)
+  "Whether string `s` begins with prefix `p`."
+  (and (>= (string-length s) (string-length p))
+       (= (substring s 0 (string-length p)) p)))
+
+(defn key-label (k)
+  "A human label for key `k`: \"C-x\" for :ctrl-x, \"M-f\" for :alt-f, the keyword
+name otherwise, the string itself for a printable key."
+  (cond
+    (string? k) k
+    (keyword? k) (let (n (name k))
+                   (cond
+                     (str-starts? n "ctrl-") (str "C-" (substring n 5 (string-length n)))
+                     (str-starts? n "alt-")  (str "M-" (substring n 4 (string-length n)))
+                     else n))
+    else (pr-str k)))
+
+;; ---- dispatch ---------------------------------------------------------------
+
+(defn run-command (sym m key)
+  "Resolve command `sym` (a global `(fn (model key) -> model)`) and apply it; a
+throwing command is caught and reported, so a bad binding can't crash the loop."
+  (try ((eval sym) m key)
+       (catch e (message m (str "command error: " (if (string? e) e (pr-str e)))))))
+
+(defn ed-dispatch (m input)
+  "Fold one key `input` into the next model via the active keymap (the `:pending`
+prefix sub-keymap if mid-chord, else `*global-keymap*`):
+
+  - bound to a nested keymap → it's a PREFIX: stash it in `:pending`, echo it;
+  - bound to a command symbol → run it, clearing any prefix;
+  - unbound *after* a prefix → report it's undefined, clear the prefix;
+  - an unbound printable key → self-insert;
+  - any other unbound key → ignored."
+  (let (km (or (get m :pending) *global-keymap*)
+        entry (get km input))
+    (cond
+      (map? entry)     (assoc m :pending entry :echo (str (key-label input) "-"))
+      (symbol? entry)  (run-command entry (assoc m :pending nil :echo "") input)
+      (get m :pending) (assoc m :pending nil :echo (str (key-label input) " is undefined"))
+      (string? input)  (cmd-self-insert m input)
+      else m)))
 
 (defn ed-update (m input cols rows)
-  "ui-run update: fold one key into the next model, then keep the point on
-screen. Printable keys insert; the named keys move/edit; Esc / Ctrl-C / the
-window close button (delivered as `:escape`) quit. `:tick` is a no-op."
-  (ed-scroll (cond
-               (= input :tick) m
-               (or (= input :escape) (= input :ctrl-c)) (assoc m :done true)
-               (= input :ctrl-s) (ed-save m)
-               (= input :up) (ed-edit m (fn (b) (backward-line b)))
-               (= input :down) (ed-edit m (fn (b) (forward-line b)))
-               (= input :left) (ed-edit m (fn (b) (backward-char b)))
-               (= input :right) (ed-edit m (fn (b) (forward-char b)))
-               (= input :home) (ed-edit m (fn (b) (beginning-of-line b)))
-               (= input :end) (ed-edit m (fn (b) (end-of-line b)))
-               (= input :enter) (ed-edit m (fn (b) (insert b "\n")))
-               (= input :backspace) (ed-edit m (fn (b) (delete-backward-char b)))
-               (= input :delete) (ed-edit m (fn (b) (delete-char b)))
-               (string? input) (ed-edit m (fn (b) (insert b input)))
-               else m)
-    (dec rows)))
+  "ui-run update: fold one key into the next model, then keep the point on screen.
+`:tick` is a no-op and leaves any pending prefix intact."
+  (if (= input :tick)
+    m
+    (ed-scroll (ed-dispatch m input) (- rows 2))))

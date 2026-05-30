@@ -1,21 +1,85 @@
 (defmodule commands
-  "The editor's commands: each a pure `model -> model`. Editing commands apply a
-`buffer -> buffer` op through `ed-edit`; `ed-save` writes the buffer to its file.
-This is where new behaviour lands as the editor grows (eval-last-sexp, motion,
-kill/yank, …) — keep each one a small, testable `model -> model`."
-  (:use buffer))  ; the buffer ops the commands drive
+  "The editor's commands. Each is a global `(fn (model key) -> model)` resolved
+by symbol at dispatch time (see `input`), so redefining one hot-swaps the key's
+behaviour live — the late binding that makes a self-editing editor possible.
+`key` is the triggering key event; most commands ignore it, `cmd-self-insert`
+inserts it.
+
+Movement applies a `buffer -> buffer` op through `ed-apply` (no modified flag);
+edits go through `ed-edit` (marks the buffer modified). This is where new
+behaviour lands as the editor grows — keep each command small and testable."
+  (:use buffer)   ; the buffer ops the commands drive
+  (:use model))   ; message — the echo/`*Messages*` sink (eval output lands here)
+
+;; ---- applying buffer ops ----------------------------------------------------
+
+(defn ed-apply (m f)
+  "Apply a pure `buffer -> buffer` op `f` to the model's buffer (movement: no
+status change)."
+  (assoc m :buf (f (get m :buf))))
 
 (defn ed-edit (m f)
-  "Apply a pure buffer transform `f` (a `buffer -> buffer` op) to the model's
-buffer, marking it modified."
+  "Apply a pure `buffer -> buffer` op `f`, marking the buffer modified (edits)."
   (assoc m :buf (f (get m :buf)) :status "modified"))
 
-(defn ed-save (m)
-  "Write the buffer to its file (Ctrl-S); report the outcome in the status line.
+;; ---- movement (Emacs C-f/C-b/C-n/C-p/C-a/C-e + the arrow keys) ---------------
+
+(defn cmd-forward-char     (m key) (ed-apply m forward-char))
+(defn cmd-backward-char    (m key) (ed-apply m backward-char))
+(defn cmd-next-line        (m key) (ed-apply m forward-line))
+(defn cmd-previous-line    (m key) (ed-apply m backward-line))
+(defn cmd-beginning-of-line (m key) (ed-apply m beginning-of-line))
+(defn cmd-end-of-line      (m key) (ed-apply m end-of-line))
+
+;; ---- editing ----------------------------------------------------------------
+
+(defn cmd-self-insert (m key)
+  "Insert the typed character `key` (a 1-char string) at point."
+  (ed-edit m (fn (b) (insert b key))))
+
+(defn cmd-newline        (m key) (ed-edit m (fn (b) (insert b "\n"))))
+(defn cmd-delete-char    (m key) (ed-edit m delete-char))
+(defn cmd-delete-backward (m key) (ed-edit m delete-backward-char))
+
+;; ---- files + quit -----------------------------------------------------------
+
+(defn cmd-quit (m key)
+  "Quit the editor (C-x C-c, or the window close button → :escape)."
+  (assoc m :done true))
+
+(defn cmd-save (m key)
+  "Write the buffer to its file (C-x C-s); report the outcome in the echo area.
 A no-op-with-message if the buffer has no backing file."
   (let (buf (get m :buf))
     (if (nil? (buffer-file buf))
-      (assoc m :status "no file to save (run: nest run -- <path>)")
+      (message m "no file to save (run: nest run -- <path>)")
       (try
-        (do (save-buffer buf) (assoc m :status (str "saved " (buffer-file buf))))
-        (catch e (assoc m :status (str "save failed: " e)))))))
+        (do (save-buffer buf) (message m (str "saved " (buffer-file buf))))
+        (catch e (message m (str "save failed: " e)))))))
+
+;; ---- eval-in-buffer (the headline: Emacs `eval-last-sexp`) -------------------
+
+(defn current-line-text (buf)
+  "The text of the line the point is on, without its trailing newline."
+  (let (lt (buffer-line-at buf (buffer-current-line buf)))
+    (if (ends-with? lt "\n") (substring lt 0 (dec (string-length lt))) lt)))
+
+(defn eval-last-sexp (m key)
+  "C-x C-e — evaluate the current line as a Brood form in the running image, and
+show the result in `*Messages*`. Everything the form prints is captured via
+`with-out-str` (so `(println …)` output goes to `*Messages*`, never the
+console), followed by the form's value as `=> <value>`. A `def`/`defn` persists
+in the image, so you can define a fn on one line, then call it on the next.
+Errors are caught and reported, not raised — a bad form can't crash the loop.
+
+v1 evals the *current line*; multi-line / balanced-sexp extraction is a follow-up
+(and motivates sexp navigation in `std/buffer.blsp` — see CLAUDE.md)."
+  (let (src (trim (current-line-text (get m :buf))))
+    (if (blank? src)
+      (message m "(nothing to evaluate)")
+      (message m
+        (trimr
+          (with-out-str
+            (try
+              (print (str "=> " (pr-str (eval-string src))))
+              (catch e (print (str "error: " (if (string? e) e (pr-str e))))))))))))
