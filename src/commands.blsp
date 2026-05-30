@@ -12,8 +12,9 @@ region/kill commands maintain the model's `:kill-ring`; the buffer commands move
 between / open / kill buffers; `cmd-switch-buffer` / `cmd-find-file` open a
 minibuffer prompt (see `input`). This is editor *policy* — the reusable buffer
 model lives in `std/buffer.blsp`; keymaps in `input`."
-  (:use buffer)   ; the buffer ops the commands drive (incl. undo/redo, word motion)
-  (:use model))   ; current-buffer accessors, the kill ring, message
+  (:use buffer)        ; the buffer ops the commands drive (incl. undo/redo, word motion)
+  (:use eval-command)  ; eval-last-sexp / eval-region / eval-buffer (the C-x C-e family)
+  (:use model))        ; current-buffer accessors, the kill ring, message
 
 ;; ---- applying buffer ops to the current buffer ------------------------------
 
@@ -83,14 +84,18 @@ modified (edits)."
 
 ;; ---- multiple buffers -------------------------------------------------------
 
+;; Switching makes a buffer current; `:status` is per-model, so reset it (else a
+;; stale "modified" from the previous buffer would describe the new one).
+(defn ed-select (m i) (assoc m :current i :status ""))
+
 (defn cmd-next-buffer (m key)
   "Switch to the next buffer (wraps)."
-  (assoc m :current (mod (inc (get m :current)) (count (get m :buffers)))))
+  (ed-select m (mod (inc (get m :current)) (count (get m :buffers)))))
 
 (defn cmd-previous-buffer (m key)
   "Switch to the previous buffer (wraps)."
-  (assoc m :current (mod (+ (dec (get m :current)) (count (get m :buffers)))
-                         (count (get m :buffers)))))
+  (ed-select m (mod (+ (dec (get m :current)) (count (get m :buffers)))
+                    (count (get m :buffers)))))
 
 (defn ed-has-editable? (bufs)
   "Whether `bufs` holds a buffer other than `*Messages*`."
@@ -103,9 +108,13 @@ leave no editable buffer, opens a fresh `*scratch*`. Clamps `:current`."
     (if (= (buffer-name buf) "*Messages*")
       (message m "cannot kill *Messages*")
       (let (removed (ed-remove-nth (get m :buffers) (get m :current))
-            bufs (if (ed-has-editable? removed) removed (into removed [{:buf (make-buffer "") :top 0}]))
-            cur (min (get m :current) (dec (count bufs))))
-        (message (assoc m :buffers bufs :current cur) (str "killed " (buffer-name buf)))))))
+            killed (str "killed " (buffer-name buf)))
+        (if (ed-has-editable? removed)
+          ;; another editable buffer remains: keep the index (the "next" buffer), clamped
+          (message (assoc m :buffers removed :current (min (get m :current) (dec (count removed)))) killed)
+          ;; none left → open a fresh *scratch* and select IT (not *Messages*)
+          (let (bufs (into removed [{:buf (make-buffer "") :top 0}]))
+            (message (assoc m :buffers bufs :current (dec (count bufs))) killed)))))))
 
 (defn ed-open-buffer (m entry-buf)
   "Append a new entry holding `entry-buf` and switch to it."
@@ -115,7 +124,7 @@ leave no editable buffer, opens a fresh `*scratch*`. Clamps `:current`."
 (defn ed-switch-to-named (m nm)
   "Switch to the buffer named `nm`, or report there's no such buffer."
   (let (idx (ed-buffer-index-by-name m nm))
-    (if (nil? idx) (message m (str "no buffer named " nm)) (assoc m :current idx))))
+    (if (nil? idx) (message m (str "no buffer named " nm)) (ed-select m idx))))
 
 (defn ed-find-file (m path)
   "Open `path`: switch to it if already open, read it if it exists, else start a
@@ -124,7 +133,7 @@ fresh buffer backed by it (so Ctrl-S creates it)."
     (message m "(no file)")
     (let (idx (ed-buffer-index-by-name m path))
       (cond
-        (not (nil? idx)) (assoc m :current idx)
+        (not (nil? idx)) (ed-select m idx)
         (file-exists? path)
           (try (message (ed-open-buffer m (buffer-from-file path)) (str "opened " path))
                (catch e (message m (str "open failed: " (if (string? e) e (pr-str e))))))
@@ -215,30 +224,20 @@ area. A no-op-with-message if the buffer has no backing file."
         (do (save-buffer buf) (message m (str "saved " (buffer-file buf))))
         (catch e (message m (str "save failed: " (if (string? e) e (pr-str e)))))))))
 
-;; ---- eval-in-buffer (Emacs `eval-last-sexp`) --------------------------------
+;; ---- eval-in-buffer (the C-x C-e family, via std/eval-command) --------------
+;; Thin `(model key) -> model` wrappers over `std/eval-command.blsp`, which does
+;; the work (read + eval + value/output capture) as a pure `buffer -> message
+;; string` and is shared with any editor. We just route the result to `message`.
 
-(defn text-before-point (buf)
-  "The buffer's text from the start up to point."
-  (substring (buffer-text buf) 0 (buffer-point buf)))
+(defn cmd-eval-last-sexp (m key)
+  "C-x C-e — evaluate the last complete form ending at point (multi-line: reads
+every form up to point, evals the last) and show its value + any output."
+  (message m (eval-last-sexp (ed-current-buf m))))
 
-(defn eval-last-sexp (m key)
-  "C-x C-e — evaluate the last complete form ending at point and show the result
-in `*Messages*`. Reads *every* form before point and evals the last one, so a
-multi-line form (the whole `(defn …)` above point) is evaluated, not just the
-current line. Everything the form prints is captured via `with-out-str` (so
-`(println …)` goes to `*Messages*`, never the console), followed by the value as
-`=> <value>`. A `def`/`defn` persists in the image, so you can define a fn then
-call it. Errors (including an unbalanced form before point) are caught and
-reported, not raised."
-  (let (src (text-before-point (ed-current-buf m)))
-    (if (blank? src)
-      (message m "(nothing to evaluate)")
-      (message m
-        (trimr
-          (with-out-str
-            (try
-              (let (forms (read-all src))
-                (if (empty? forms)
-                  (print "(nothing to evaluate)")
-                  (print (str "=> " (pr-str (eval (last forms)))))))
-              (catch e (print (str "error: " (if (string? e) e (pr-str e))))))))))))
+(defn cmd-eval-region (m key)
+  "Evaluate the region (point↔mark) as Brood source, showing the last form's value."
+  (message m (eval-region (ed-current-buf m))))
+
+(defn cmd-eval-buffer (m key)
+  "Evaluate the whole buffer as Brood source, showing the last form's value."
+  (message m (eval-buffer (ed-current-buf m))))
