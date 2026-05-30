@@ -1,78 +1,38 @@
 (defmodule input
   "The editor's input layer: fold one key event into the next model.
 
-Dispatch is delegated to `std/keymap.blsp`: `keymap-step` runs one (possibly
-chorded) keystroke through `*global-keymap*`, threading the prefix-`:pending`
-state — so the chord state machine (prefix entry, mid-chord resolution, dead-end
-reset, self-insert fallback) lives in the language toolkit, not here (the
-prime directive — see CLAUDE.md). This module only declares the *bindings* (data,
-via `keymap-bind`), renders the echo-area label for a prefix / undefined chord,
-and gates the minibuffer. Keys map to fully-qualified command **symbols**
-resolved with `(eval sym)` at dispatch time, so redefining a command (or
-rebinding a key) hot-swaps behaviour on the next keystroke (late binding, the
-path to a self-editing editor)."
+Dispatch goes through **layers** (`std/layers.blsp`): the active buffer carries
+`:layers` (its mode — `text-mode` by default, see `modes`), and `active-keymap`
+composes them into one keymap. `keymap-step` then runs one (possibly chorded)
+keystroke through it, threading the prefix-`:pending` state — so the chord state
+machine (prefix entry, mid-chord resolution, dead-end reset, self-insert fallback)
+lives in the language toolkit, not here (the prime directive — see CLAUDE.md). The
+bindings are data, declared per-mode in `modes`; this module only resolves the
+active keymap, renders the echo-area label for a prefix / undefined chord, and
+gates the minibuffer. Keys map to fully-qualified command **symbols** resolved
+with `(eval sym)` at dispatch time, so redefining a command (or rebinding a key)
+hot-swaps behaviour on the next keystroke (late binding, the path to a
+self-editing editor)."
   (:use buffer)
-  (:use model)     ; ed-scroll, message, the minibuffer field
-  (:use commands)  ; the commands the keymap names + the self-insert fallback
+  (:use model)     ; ed-scroll, message, the minibuffer field, current-buffer accessors
+  (:use commands)  ; the self-insert fallback
   (:use complete)  ; the completion popup (Tab) + its modal key handling
-  (:use keymap))   ; keymap-step / keymap-bind — the std chord dispatcher
+  (:use keymap)    ; keymap-step — the std chord dispatcher
+  (:use layers))   ; active-keymap (compose a buffer's layers) + init-buffer-layers
 
-;; ---- the keymap (data: every binding declared here, none in the language) ----
-;; Command values are quoted, fully-qualified symbols (`commands/…`) so `(eval
-;; sym)` resolves them at dispatch regardless of namespace. Built with
-;; `keymap-bind`, which nests the prefix sub-keymaps for chords like `C-x C-e`.
+;; Loading `modes` defines the layers and registers the default (text-mode); the
+;; bindings live there, as data, not here.
+(require 'modes)
 
-(def *global-keymap*
-  (-> {}
-      ;; movement — arrows + the Emacs C-/M- equivalents
-      (keymap-bind [:left]  'commands/cmd-backward-char)
-      (keymap-bind [:ctrl-b] 'commands/cmd-backward-char)
-      (keymap-bind [:right] 'commands/cmd-forward-char)
-      (keymap-bind [:ctrl-f] 'commands/cmd-forward-char)
-      (keymap-bind [:up]    'commands/cmd-previous-line)
-      (keymap-bind [:ctrl-p] 'commands/cmd-previous-line)
-      (keymap-bind [:down]  'commands/cmd-next-line)
-      (keymap-bind [:ctrl-n] 'commands/cmd-next-line)
-      (keymap-bind [:home]  'commands/cmd-beginning-of-line)
-      (keymap-bind [:ctrl-a] 'commands/cmd-beginning-of-line)
-      (keymap-bind [:end]   'commands/cmd-end-of-line)
-      (keymap-bind [:ctrl-e] 'commands/cmd-end-of-line)
-      (keymap-bind [:alt-f] 'commands/cmd-forward-word)
-      (keymap-bind [:alt-b] 'commands/cmd-backward-word)
-      (keymap-bind [(keyword "alt-<")] 'commands/cmd-beginning-of-buffer)  ; M-<
-      (keymap-bind [(keyword "alt->")] 'commands/cmd-end-of-buffer)        ; M->
-      ;; screenful scrolling — C-v / M-v + the PageDown / PageUp keys
-      (keymap-bind [:ctrl-v]    'commands/cmd-scroll-up)
-      (keymap-bind [:page-down] 'commands/cmd-scroll-up)
-      (keymap-bind [:alt-v]     'commands/cmd-scroll-down)
-      (keymap-bind [:page-up]   'commands/cmd-scroll-down)
-      ;; completion-at-point
-      (keymap-bind [:tab] 'complete/cmd-complete)
-      ;; editing
-      (keymap-bind [:enter]     'commands/cmd-newline)
-      (keymap-bind [:backspace] 'commands/cmd-delete-backward)
-      (keymap-bind [:delete]    'commands/cmd-delete-char)
-      (keymap-bind [:ctrl-d]    'commands/cmd-delete-char)
-      ;; undo / redo
-      (keymap-bind [:ctrl-/] 'commands/cmd-undo)
-      (keymap-bind [:alt-/]  'commands/cmd-redo)
-      ;; region / kill ring — C-SPC arrives as the keyword named "ctrl- "
-      (keymap-bind [(keyword "ctrl- ")] 'commands/cmd-set-mark)
-      (keymap-bind [:ctrl-w] 'commands/cmd-kill-region)
-      (keymap-bind [:alt-w]  'commands/cmd-copy-region)
-      (keymap-bind [:ctrl-y] 'commands/cmd-yank)
-      ;; quit — the window close button is delivered as :escape
-      (keymap-bind [:escape] 'commands/cmd-quit)
-      ;; the C-x prefix
-      (keymap-bind [:ctrl-x :ctrl-c] 'commands/cmd-quit)
-      (keymap-bind [:ctrl-x :ctrl-s] 'commands/cmd-save)
-      (keymap-bind [:ctrl-x :ctrl-e] 'commands/cmd-eval-last-sexp)
-      (keymap-bind [:ctrl-x :ctrl-f] 'commands/cmd-find-file)
-      (keymap-bind [:ctrl-x "b"]     'commands/cmd-switch-buffer)
-      (keymap-bind [:ctrl-x "k"]     'commands/cmd-kill-buffer)
-      (keymap-bind [:ctrl-x "u"]     'commands/cmd-undo)
-      (keymap-bind [:ctrl-x :right]  'commands/cmd-next-buffer)
-      (keymap-bind [:ctrl-x :left]   'commands/cmd-previous-buffer)))
+;; ---- the active keymap comes from the buffer's layers -----------------------
+
+(defn ed--ensure-layers (m)
+  "Make sure the current buffer carries its mode layers, seeding them from its
+type (filename / `:type` → `text-mode` by default) on first use. Buffers created
+anywhere in the editor get their mode here, lazily, so dispatch always has a
+keymap and a `.blsp` buffer can later resolve to a richer mode automatically."
+  (let (b (ed-current-buf m))
+    (if (nil? (get b :layers)) (ed-set-buf m (init-buffer-layers b)) m)))
 
 ;; ---- key labels (for the echo area) -----------------------------------------
 
@@ -95,15 +55,18 @@ name otherwise, the string itself for a printable key."
 no-op (so a stray :f5 / :page-up never tries to insert a keyword)."
   (if (string? key) (cmd-self-insert m key) m))
 
-(defn ed-dispatch (m input)
-  "Fold one key `input` into the next model. `keymap-step` (std) does the chord
-work — resolve through the `:pending` prefix or `*global-keymap*`, enter a prefix,
+(defn ed-dispatch (m0 input)
+  "Fold one key `input` into the next model. The keymap is composed from the
+current buffer's active layers (`active-keymap`); `keymap-step` (std) does the
+chord work — resolve through the `:pending` prefix or that keymap, enter a prefix,
 reset a dead-end, or fall back to self-insert — returning `[model' pending']`. We
 add only the echo-area label: a prefix shows `\"C-x-\"`, an unbound chord
 `\"… is undefined\"`, and a fresh keystroke clears it (a command then sets its own
 message)."
-  (let (binding (get (or (get m :pending) *global-keymap*) input)
-        [m2 pending2] (keymap-step *global-keymap* (get m :pending)
+  (let (m (ed--ensure-layers m0)
+        km (active-keymap (ed-current-buf m))
+        binding (get (or (get m :pending) km) input)
+        [m2 pending2] (keymap-step km (get m :pending)
                                    (assoc m :echo "") input ed--self-insert)
         m3 (assoc m2 :pending pending2))
     (cond
