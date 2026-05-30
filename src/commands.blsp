@@ -84,16 +84,48 @@ line of context. (Emacs `scroll-down-command` — the view scrolls down.)"
 
 ;; ---- line / word editing (open-line, kill-line/word, transpose, case) -------
 
+;; ---- the kill ring (Emacs-style: coalesce consecutive kills; M-y yank-pops) --
+;; The model tracks `:last-command`/`:this-command` (set by the dispatch loop, see
+;; `input`) so a kill knows whether the *previous* command was also a kill (then it
+;; appends to the head entry rather than starting a new one), and so M-y
+;; (`cmd-yank-pop`) only fires right after a yank.
+
+;; Commands whose consecutive use coalesces into one kill-ring entry (like Emacs).
+(def ed--kill-commands
+  '(commands/cmd-kill-region commands/cmd-copy-region commands/cmd-kill-line
+    commands/cmd-kill-word commands/cmd-backward-kill-word commands/cmd-kill-whole-line))
+(def ed--yank-commands '(commands/cmd-yank commands/cmd-yank-pop))
+
+;; Cap the ring like Emacs's `kill-ring-max` (default 60) so it can't grow forever.
+(def ed-kill-ring-max 60)
+
+(defn ed--in? (sym syms) (some? (fn (s) (= s sym)) syms))
+(defn ed--kill-command? (sym) (ed--in? sym ed--kill-commands))
+(defn ed--yank-command? (sym) (ed--in? sym ed--yank-commands))
+
+(defn ed-push-kill (m text forward?)
+  "Push killed `text` onto the kill ring. If the previous command was also a kill,
+**append** to the current head entry instead of starting a new one — at the end for
+a forward kill, the front for a backward kill (Emacs's consecutive-kill coalescing).
+Otherwise cons a fresh entry."
+  (let (ring (get m :kill-ring))
+    (assoc m :kill-ring
+      (take ed-kill-ring-max
+        (if (and (ed--kill-command? (get m :last-command)) (not (empty? ring)))
+          (cons (if forward? (str (first ring) text) (str text (first ring))) (rest ring))
+          (cons text ring))))))
+
 (defn ed-kill-span (m move)
   "Kill from point to where `move` (a `buffer -> buffer` point move) lands: push
-the spanned text onto the kill ring (yankable with C-y) and delete it. An empty
-span is a no-op."
+the spanned text onto the kill ring (coalescing with an adjacent kill) and delete
+it. An empty span is a no-op."
   (let (b (ed-current-buf m)
+        p0 (buffer-point b)
         moved (move (set-mark b))            ; mark = point; point moves
         text (buffer-region moved))
     (if (or (nil? text) (= text ""))
       m
-      (assoc (ed-set-buf (assoc m :kill-ring (cons text (get m :kill-ring)))
+      (assoc (ed-set-buf (ed-push-kill m text (> (buffer-point moved) p0))
                          (clear-mark (delete-region moved)))
              :status "modified"))))
 
@@ -122,7 +154,7 @@ after it (M-u / M-l / M-c)."
   "Kill from point to end of line (C-k); at end of line, kill the newline."
   (let (b (ed-current-buf m))
     (if (= (buffer-char-after b) "\n")
-      (ed-edit (assoc m :kill-ring (cons "\n" (get m :kill-ring))) delete-char)
+      (ed-edit (ed-push-kill m "\n" true) delete-char)
       (ed-kill-span m end-of-line))))
 (defn cmd-kill-word (m key) "Kill the word after point (M-d)." (ed-kill-span m forward-word))
 (defn cmd-backward-kill-word (m key) "Kill the word before point (M-DEL)." (ed-kill-span m backward-word))
@@ -169,22 +201,46 @@ after it (M-u / M-l / M-c)."
   (let (text (buffer-region (ed-current-buf m)))
     (if (nil? text)
       (message m "no region (set the mark with C-SPC first)")
-      (ed-edit (assoc m :kill-ring (cons text (get m :kill-ring))) delete-region))))
+      (ed-edit (ed-push-kill m text true) delete-region))))
 
 (defn cmd-copy-region (m key)
   "Push the region's text onto the kill ring without deleting it (M-w)."
   (let (text (buffer-region (ed-current-buf m)))
     (if (nil? text)
       (message m "no region")
-      (message (ed-apply (assoc m :kill-ring (cons text (get m :kill-ring))) clear-mark)
-               "region copied"))))
+      (message (ed-apply (ed-push-kill m text true) clear-mark) "region copied"))))
 
 (defn cmd-yank (m key)
-  "Insert the most recently killed/copied text at point (C-y)."
+  "Insert the most recently killed/copied text at point (C-y), recording the
+inserted span + ring index in `:yank` so M-y (`cmd-yank-pop`) can replace it."
   (let (ring (get m :kill-ring))
     (if (empty? ring)
       (message m "kill ring is empty")
-      (ed-edit m (fn (b) (insert b (first ring)))))))
+      (let (b (ed-current-buf m)
+            start (buffer-point b)
+            b2 (insert b (first ring)))
+        (assoc (ed-set-buf m b2)
+               :status "modified"
+               :yank {:start start :end (buffer-point b2) :index 0})))))
+
+(defn cmd-yank-pop (m key)
+  "Replace the text of the immediately-preceding yank with the next-older kill,
+cycling the ring (M-y). Only valid right after a yank or yank-pop; otherwise it
+reports that the previous command was not a yank."
+  (let (y (get m :yank) ring (get m :kill-ring))
+    (if (or (nil? y) (not (ed--yank-command? (get m :last-command))) (empty? ring))
+      (message m "previous command was not a yank")
+      (let (n (count ring)
+            idx (let (i (inc (get y :index))) (if (>= i n) 0 i))
+            text (nth ring idx)
+            b (ed-current-buf m)
+            ;; delete the previous yank's span [start,end] (point lands at start),
+            ;; then insert the next entry there
+            cleared (delete-region (assoc b :mark (get y :start) :point (get y :end)))
+            b2 (insert cleared text))
+        (assoc (ed-set-buf m b2)
+               :status "modified"
+               :yank {:start (get y :start) :end (buffer-point b2) :index idx})))))
 
 ;; ---- multiple buffers -------------------------------------------------------
 
