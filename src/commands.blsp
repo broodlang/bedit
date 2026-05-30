@@ -16,6 +16,7 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
   (:use eval-command)  ; eval-last-sexp / eval-region / eval-buffer (the C-x C-e family)
   (:use sexp)          ; structural s-expression navigation (brood-mode commands)
   (:use command)       ; defcommand — define + register an interactive command (M-x)
+  (:use window)        ; the window-tree ops behind the split/other/delete commands
   (:use model))        ; current-buffer accessors, the kill ring, message
 
 ;; ---- applying buffer ops to the current buffer ------------------------------
@@ -245,42 +246,57 @@ reports that the previous command was not a yank."
 
 ;; ---- multiple buffers -------------------------------------------------------
 
-;; Switching makes a buffer current; `:status` is per-model, so reset it (else a
-;; stale "modified" from the previous buffer would describe the new one).
-(defn ed-select (m i) (assoc m :current i :status ""))
+;; Switching shows buffer `i` in the SELECTED window (other windows keep their
+;; buffers); `:status` is per-model, so reset it (else a stale "modified" from the
+;; previous buffer would describe the new one).
+(defn ed-select (m i)
+  (assoc (ed-show-index m i) :status ""))
 
 (defcommand cmd-next-buffer (m key)
-  "Switch to the next buffer (wraps)."
-  (ed-select m (mod (inc (get m :current)) (count (get m :buffers)))))
+  "Show the next buffer in the selected window (wraps)."
+  (ed-select m (mod (inc (ed-current-index m)) (count (get m :buffers)))))
 
 (defcommand cmd-previous-buffer (m key)
-  "Switch to the previous buffer (wraps)."
-  (ed-select m (mod (+ (dec (get m :current)) (count (get m :buffers)))
+  "Show the previous buffer in the selected window (wraps)."
+  (ed-select m (mod (+ (dec (ed-current-index m)) (count (get m :buffers)))
                     (count (get m :buffers)))))
 
 (defn ed-has-editable? (bufs)
-  "Whether `bufs` holds a buffer other than `*Messages*`."
-  (some? (fn (e) (not (= (buffer-name (get e :buf)) "*Messages*"))) bufs))
+  "Whether the pool `bufs` holds a buffer other than `*Messages*`."
+  (some? (fn (b) (not (= (buffer-name b) "*Messages*"))) bufs))
+
+(defn ed--remap (m killed target)
+  "Re-point every window after pool index `killed` was removed: a window on
+`killed` now shows `target`; windows above `killed` shift down one; below are
+unchanged. (Routes through `ed-map-windows` over all leaf payloads.)"
+  (ed-map-windows m
+    (fn (w) (let (b (get w :buffer))
+              (assoc w :buffer (cond (< b killed) b (> b killed) (dec b) else target))))))
 
 (defcommand cmd-kill-buffer (m key)
-  "Kill the current buffer (C-x k). Refuses to kill `*Messages*`; if it would
-leave no editable buffer, opens a fresh `*scratch*`. Clamps `:current`."
-  (let (buf (ed-current-buf m))
+  "Kill the current buffer (C-x k). Refuses to kill `*Messages*`; if it would leave
+no editable buffer, opens a fresh `*scratch*`. Windows showing the killed buffer are
+re-pointed; indices above it shift down."
+  (let (killed-idx (ed-current-index m)
+        buf (ed-current-buf m))
     (if (= (buffer-name buf) "*Messages*")
       (message m "cannot kill *Messages*")
-      (let (removed (ed-remove-nth (get m :buffers) (get m :current))
-            killed (str "killed " (buffer-name buf)))
+      (let (removed (ed-remove-nth (get m :buffers) killed-idx)
+            label (str "killed " (buffer-name buf)))
         (if (ed-has-editable? removed)
-          ;; another editable buffer remains: keep the index (the "next" buffer), clamped
-          (message (assoc m :buffers removed :current (min (get m :current) (dec (count removed)))) killed)
-          ;; none left → open a fresh *scratch* and select IT (not *Messages*)
-          (let (bufs (into removed [(ed-entry (make-buffer ""))]))
-            (message (assoc m :buffers bufs :current (dec (count bufs))) killed)))))))
+          ;; another editable buffer remains: the killed window shows the buffer
+          ;; that shifted into its slot (clamped to the last index).
+          (message (ed--remap (assoc m :buffers removed) killed-idx
+                     (min killed-idx (dec (count removed))))
+                   label)
+          ;; none left → append a fresh *scratch* and point the killed window at it.
+          (let (bufs (into removed [(ed-stamp (make-buffer ""))]))
+            (message (ed--remap (assoc m :buffers bufs) killed-idx (count removed)) label)))))))
 
-(defn ed-open-buffer (m entry-buf)
-  "Append a new entry holding `entry-buf` (with its mode attached) and switch to it."
-  (let (bufs (into (get m :buffers) [(ed-entry entry-buf)]))
-    (assoc m :buffers bufs :current (dec (count bufs)))))
+(defn ed-open-buffer (m buf)
+  "Add `buf` to the pool (mode-stamped) and show it in the selected window."
+  (let (bufs (into (get m :buffers) [(ed-stamp buf)]))
+    (ed-select (assoc m :buffers bufs) (dec (count bufs)))))
 
 (defn ed-switch-to-named (m nm)
   "Switch to the buffer named `nm`, or report there's no such buffer."
@@ -348,12 +364,37 @@ unchanged `text` when nothing matches. Tolerates a non-existent directory."
           (= (count matches) 1) (first matches)
           else (lcp matches))))
 
+;; ---- windows (tiled splits, Emacs C-x 2/3/0/1/o) ----------------------------
+;; Operate on the model's `:layout` window tree (std/window). A split shows the
+;; same buffer in the new window (point/scroll independent); selection/edits follow
+;; the selected window.
+
+(defcommand cmd-split-window-below (m key)
+  "Split the selected window top/bottom; the new window shows the same buffer (C-x 2)."
+  (assoc m :layout (window-split (get m :layout) :row (ed-window (ed-current-index m)))))
+
+(defcommand cmd-split-window-right (m key)
+  "Split the selected window left/right; the new window shows the same buffer (C-x 3)."
+  (assoc m :layout (window-split (get m :layout) :col (ed-window (ed-current-index m)))))
+
+(defcommand cmd-other-window (m key)
+  "Move selection to the next window, wrapping (C-x o)."
+  (assoc m :layout (window-other (get m :layout))))
+
+(defcommand cmd-delete-window (m key)
+  "Delete the selected window; its sibling fills the space (C-x 0)."
+  (assoc m :layout (window-delete (get m :layout))))
+
+(defcommand cmd-delete-other-windows (m key)
+  "Collapse the layout to just the selected window (C-x 1)."
+  (assoc m :layout (window-delete-others (get m :layout))))
+
 ;; ---- buffer/file prompts (open a minibuffer; see input/minibuffer-handle) ---
 
 (defcommand cmd-switch-buffer (m key)
   "Prompt (minibuffer) for a buffer name to switch to (C-x b), completing against
 the open buffers."
-  (let (names (map (fn (e) (buffer-name (get e :buf))) (get m :buffers)))
+  (let (names (map (fn (b) (buffer-name b)) (get m :buffers)))
     (assoc m :minibuffer
       {:prompt "Switch to buffer: "
        :input ""

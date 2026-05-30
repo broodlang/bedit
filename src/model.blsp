@@ -1,13 +1,17 @@
 (defmodule model
-  "The editor's `ui-run` model: a list of buffers, the active one, the kill ring,
+  "The editor's `ui-run` model: a buffer pool, the window layout, the kill ring,
 the minibuffer, and the `*Messages*` log + echo area.
 
 The model is a map threaded through the `ui-run` loop:
 
-  :buffers   a vector of ENTRIES `{:buf <buffer> :top <int>}` — each buffer with
-             its own scroll position (`:top`, the first visible line). One entry
-             is always the `*Messages*` buffer.
-  :current   the index into `:buffers` of the buffer being edited
+  :buffers   a vector of BUFFERS — the pool. Each is an immutable, mode-stamped
+             buffer value (its point/mark/undo travel with it). One is always the
+             `*Messages*` buffer. Windows reference a buffer by its pool index.
+  :layout    the WINDOW tree (`std/window.blsp`): Emacs-style tiled splits, each
+             leaf a window with payload `{:buffer <pool index> :top <scroll>}`.
+             Exactly one window is *selected* — the one being edited. Scroll is
+             per-window (`:top`); buffer TEXT is shared via the pool, so two windows
+             on the same buffer see each other's edits.
   :kill-ring a list of killed/copied strings, newest first (C-w / M-w / C-y)
   :minibuffer  nil, or `{:prompt :input :on-complete :complete-fn}` while a
              minibuffer prompt is active (C-x b switch-buffer, C-x C-f find-file)
@@ -16,14 +20,16 @@ The model is a map threaded through the `ui-run` loop:
   :status    the mode-line message
   :done      set to quit; :tick-ms the refresh beat (large — nothing animates)
 
-Buffers hold process-local ropes and the whole loop runs in one process, so they
-live in the model directly (a buffer is an immutable value — switching is just
-moving `:current`, and a buffer's point/mark/undo travel with it). `message` is
-the editor's echo primitive — like Emacs `message`, it writes to *both* the
-`*Messages*` buffer and the echo area; eval output reaches it via `with-out-str`,
-so it never hits the console."
+The whole loop runs in one process, so buffers live in the model directly. `message`
+is the editor's echo primitive — like Emacs `message`, it writes to *both* the
+`*Messages*` buffer and the echo area; eval output reaches it via `with-out-str`, so
+it never hits the console.
+
+\"The current buffer\" is the selected window's buffer; editing writes back to the
+pool (`ed-set-buf`), scrolling to the window (`ed-set-top`)."
   (:use buffer)   ; make-buffer / insert / end-of-buffer / buffer-name / accessors
-  (:use layers))  ; init-buffer-layers (stamp a buffer's mode) + layer-collect (its name)
+  (:use layers)   ; init-buffer-layers (stamp a buffer's mode) + active-layers (mode line)
+  (:use window))  ; the window-tree layout: window-single / selected payload / update / map
 
 ;; ---- immutable vector helpers (assoc is map-only) ---------------------------
 
@@ -44,20 +50,23 @@ degrade gracefully — the editor still runs, *Messages* just keeps an undo hist
   (let (b (make-buffer "" "*Messages*"))
     (try (disable-undo b) (catch e b))))
 
-(defn ed-entry (buf)
-  "A buffer-list entry `{:buf :top}` for `buf`, with its **mode** attached:
-`init-buffer-layers` resolves the buffer's type (filename / `:type` → `text-mode`
-by default, `brood-mode` for `.blsp`) and seeds its `:layers`. Use this at every
-buffer-creation site so the mode is set from the first frame (the mode line reads
-it, and dispatch composes its keymap)."
-  {:buf (init-buffer-layers buf) :top 0})
+(defn ed-stamp (buf)
+  "Mode-stamp `buf` for the pool: `init-buffer-layers` resolves its type (filename /
+`:type` → `text-mode` by default, `brood-mode` for `.blsp`) and seeds its `:layers`.
+Use at every buffer-creation site so the mode is set from the first frame (the mode
+line reads it, and dispatch composes its keymap)."
+  (init-buffer-layers buf))
+
+(defn ed-window (idx)
+  "A window payload showing pool buffer `idx`, scrolled to the top."
+  {:buffer idx :top 0})
 
 (defn ed-init (buf)
-  "The starting model: editing `buf` (entry 0) alongside an empty `*Messages*`
-buffer, scrolled to the top, with an empty kill ring and no minibuffer/prefix."
-  {:buffers [(ed-entry buf)
-             (ed-entry (ed--log-buffer))]
-   :current 0
+  "The starting model: a buffer pool of `buf` (index 0) and an empty `*Messages*`
+buffer (index 1), a single window showing `buf`, an empty kill ring, no
+minibuffer/prefix."
+  {:buffers [(ed-stamp buf) (ed-stamp (ed--log-buffer))]
+   :layout (window-single (ed-window 0))
    :kill-ring ()
    :minibuffer nil
    :pending nil
@@ -66,37 +75,66 @@ buffer, scrolled to the top, with an empty kill ring and no minibuffer/prefix."
    :done false
    :tick-ms 60000})
 
-;; ---- the current buffer / entry ---------------------------------------------
+;; ---- the selected window + its buffer ---------------------------------------
 
-(defn ed-current-entry (m) "The active buffer's entry `{:buf :top}`." (nth (get m :buffers) (get m :current)))
-(defn ed-current-buf (m) "The buffer being edited." (get (ed-current-entry m) :buf))
-(defn ed-current-top (m) "The active buffer's scroll offset (first visible line)." (get (ed-current-entry m) :top))
+(defn ed-current-window (m)
+  "The selected window's payload `{:buffer <pool index> :top <scroll>}`."
+  (window-selected-payload (get m :layout)))
 
-(defn ed-mode-name (m)
-  "The mode to show in the mode line: the name of the highest-precedence active
-layer that isn't a `:system` layer (so the always-on `global` layer is skipped —
-you see `brood` on a `.blsp` buffer, `text` otherwise). `\"\"` if there's no
-non-system layer."
-  (let (visible (filter (fn (l) (not (get l :system))) (active-layers (ed-current-buf m))))
+(defn ed-current-index (m)
+  "The pool index of the buffer shown in the selected window."
+  (get (ed-current-window m) :buffer))
+
+(defn ed-current-buf (m)
+  "The buffer being edited — the selected window's buffer, from the pool."
+  (nth (get m :buffers) (ed-current-index m)))
+
+(defn ed-current-top (m)
+  "The selected window's scroll offset (first visible line)."
+  (get (ed-current-window m) :top))
+
+(defn ed-buf-at (m i)
+  "The pool buffer at index `i` (what a window's `:buffer` payload references)."
+  (nth (get m :buffers) i))
+
+(defn ed-buf-mode-name (buf)
+  "The mode to show for `buf`: the name of its highest-precedence active layer that
+isn't a `:system` layer (so the always-on `global` layer is skipped — you see
+`brood` on a `.blsp` buffer, `text` otherwise). `\"\"` if there's no non-system layer."
+  (let (visible (filter (fn (l) (not (get l :system))) (active-layers buf)))
     (if (empty? visible) "" (name (get (first visible) :name)))))
 
+(defn ed-mode-name (m)
+  "The mode of the current (selected window's) buffer, for the mode line."
+  (ed-buf-mode-name (ed-current-buf m)))
+
 (defn ed-set-buf (m buf)
-  "The model with the active entry's buffer replaced by `buf`."
-  (let (i (get m :current))
-    (assoc m :buffers (ed-replace-nth (get m :buffers) i (assoc (ed-current-entry m) :buf buf)))))
+  "The model with the selected window's buffer replaced by `buf` in the POOL — so
+every window showing that buffer sees the edit. Scroll (per-window) is untouched."
+  (assoc m :buffers (ed-replace-nth (get m :buffers) (ed-current-index m) buf)))
 
 (defn ed-set-top (m n)
-  "The model with the active entry's scroll offset set to `n`."
-  (let (i (get m :current))
-    (assoc m :buffers (ed-replace-nth (get m :buffers) i (assoc (ed-current-entry m) :top n)))))
+  "The model with the *selected window's* scroll offset set to `n` (per-window, so
+another window on the same buffer keeps its own scroll)."
+  (assoc m :layout (window-update-selected (get m :layout) (fn (w) (assoc w :top n)))))
+
+(defn ed-show-index (m i)
+  "The model with the selected window showing pool buffer `i`, scrolled to the top
+(the window-layer primitive behind buffer switching)."
+  (assoc m :layout (window-update-selected (get m :layout) (fn (w) (assoc w :buffer i :top 0)))))
+
+(defn ed-map-windows (m f)
+  "The model with `f` applied to every window's payload — for re-pointing
+window→buffer references after the pool changes (e.g. after a kill). Pure."
+  (assoc m :layout (window-map (get m :layout) f)))
 
 (defn ed--index-by-name (bufs nm i n)
   (cond (>= i n) nil
-        (= (buffer-name (get (nth bufs i) :buf)) nm) i
+        (= (buffer-name (nth bufs i)) nm) i
         else (ed--index-by-name bufs nm (inc i) n)))
 
 (defn ed-buffer-index-by-name (m nm)
-  "The index into `:buffers` of the buffer named `nm`, or nil if there is none."
+  "The pool index of the buffer named `nm`, or nil if there is none."
   (ed--index-by-name (get m :buffers) nm 0 (count (get m :buffers))))
 
 ;; ---- the `*Messages*` log + echo area ---------------------------------------
@@ -107,25 +145,23 @@ full multi-line text is kept in the `*Messages*` buffer."
   (apply str (map (fn (c) (if (= c "\n") " " c)) (string->list s))))
 
 (defn message (m s)
-  "Log `s`: append it as a line to the `*Messages*` buffer (found by name, so it
-survives buffer switches/kills) and show it (flattened to one line) in the echo
-area. Never disturbs the current buffer's point. The editor's only output sink —
-commands print here, never to the console."
+  "Log `s`: append it as a line to the `*Messages*` buffer (found by name in the
+pool, so it survives buffer switches/kills) and show it (flattened to one line) in
+the echo area. Never disturbs the current buffer's point — *Messages* is a separate
+pool entry. The editor's only output sink — commands print here, never the console."
   (let (idx (ed-buffer-index-by-name m "*Messages*"))
     (if (nil? idx)
-      ;; defensive: *Messages* was somehow killed — recreate it
+      ;; defensive: *Messages* was somehow killed — recreate it in the pool
       (assoc m :echo (one-line s)
-               :buffers (into (get m :buffers)
-                          [{:buf (insert (ed--log-buffer) (str s "\n")) :top 0}]))
-      (let (entry (nth (get m :buffers) idx))
-        (assoc m :echo (one-line s)
-                 :buffers (ed-replace-nth (get m :buffers) idx
-                            (assoc entry :buf (insert (end-of-buffer (get entry :buf)) (str s "\n")))))))))
+               :buffers (into (get m :buffers) [(ed-stamp (insert (ed--log-buffer) (str s "\n")))]))
+      (assoc m :echo (one-line s)
+               :buffers (ed-replace-nth (get m :buffers) idx
+                          (insert (end-of-buffer (nth (get m :buffers) idx)) (str s "\n")))))))
 
 ;; ---- scrolling --------------------------------------------------------------
 
 (defn ed-scroll (m textrows)
-  "Adjust the active buffer's `:top` so the point's line stays inside a
+  "Adjust the selected window's `:top` so the point's line stays inside a
 `textrows`-tall viewport: scroll up if it's above the top, down if it's below the
 bottom. Pure."
   (let (line (buffer-current-line (ed-current-buf m))
@@ -133,4 +169,51 @@ bottom. Pure."
     (cond
       (< line top) (ed-set-top m line)
       (>= line (+ top textrows)) (ed-set-top m (inc (- line textrows)))
+      else m)))
+
+;; ---- window layout + mouse (shared geometry: view & hit-testing agree) ------
+;; The body rect is everything above the bottom echo row; both the view and mouse
+;; hit-testing lay the tree out over it, so screen coordinates line up.
+
+(defn ed-body-layout (m cols rows)
+  "The window layout (`{:panes :dividers}`) over the body rect `[0 0 cols (rows-1)]`
+— everything above the bottom echo/minibuffer row. Used by the view and by mouse
+hit-testing, so a click maps to the pane the view drew there."
+  (window-layout (get m :layout) [0 0 cols (dec rows)]))
+
+(defn ed-selected-text-rows (m cols rows)
+  "The text height of the *selected* pane (its rect height less the mode-line row),
+given the frame size — what scrolling and paging use, so they're correct inside a
+split, not just full-screen. At least 1."
+  (let (panes (get (ed-body-layout m cols rows) :panes)
+        sel (first (filter (fn (p) (get p :selected)) panes)))
+    (max 1 (dec (nth (get sel :rect) 3)))))   ; rect = [x y w h]; h-1 for the mode line
+
+(defn ed-mouse-press (m cols rows row col)
+  "Left-press at cell `[row col]`: if it lands on a divider, begin a resize drag
+(stash the divider on `:dragging` — it carries the split path + the rect to measure
+the new ratio against); otherwise select the window under the pointer."
+  (let (layout (ed-body-layout m cols rows)
+        d (divider-at layout [row col]))
+    (if (nil? d)
+      (assoc m :layout (window-select-at (get m :layout) layout [row col]))
+      (assoc m :dragging d))))
+
+(defn ed-mouse-drag (m row col)
+  "While dragging a divider, set its split's ratio so the boundary follows the
+pointer (clamped by `window-set-ratio` so no pane vanishes). A no-op if not dragging."
+  (let (d (get m :dragging))
+    (if (nil? d)
+      m
+      (assoc m :layout (window-set-ratio (get m :layout) (get d :path) (window-ratio-for d [row col]))))))
+
+(defn ed-mouse (m input cols rows)
+  "Fold a `[:mouse action button row col]` event into the model: left-press selects
+a window or begins a divider drag; `:drag` resizes the dragged divider; `:release`
+ends the drag. Other buttons / the wheel are ignored for now."
+  (let ([_ action button row col] input)
+    (cond
+      (and (= action :press) (= button :left)) (ed-mouse-press m cols rows row col)
+      (and (= action :drag) (= button :left)) (ed-mouse-drag m row col)
+      (= action :release) (dissoc m :dragging)
       else m)))

@@ -1,13 +1,19 @@
 (defmodule view
   "The editor's view: a pure `(model cols rows) -> render frame`, built from
-`std/display.blsp` ops. The bottom two rows are reserved, Emacs-style: a
-reverse-video **mode line** (buffer name · status · line:col · which buffer) at
-`rows-2`, and the **echo area / minibuffer** at `rows-1`. The text body fills the
-remaining `rows-2` rows, offset by the active buffer's `:top` scroll position, and
-the region (between point and mark) is drawn reverse-video. No window, no state:
-testable as plain data."
+`std/display.blsp` ops. The bottom row is the **echo area / minibuffer**; the rows
+above it are the **window layout** (`std/window.blsp`): the model's `:layout` tree
+is laid out into that body rect, giving one or more panes (each a buffer in its own
+sub-rect) separated by dividers. Each pane reserves its bottom row for a reverse-video
+**mode line** (buffer name · mode · line:col; the selected pane also shows the status
+and is bold). Within a pane the buffer is offset to the pane's origin, clipped to its
+width, scrolled by the window's `:top`, and the region (point↔mark) is reverse-video.
+No window IO, no state: testable as plain data.
+
+A single window fills the whole body, so the lone-pane layout is identical to the
+old full-screen one (mode line at `rows-2`, echo at `rows-1`)."
   (:use buffer)   ; line text / point + column / region bounds, read to lay out the frame
-  (:use model)    ; current-buffer accessors
+  (:use model)    ; current-buffer accessors, pane buffer + mode name
+  (:use window)   ; window-layout: the :layout tree -> pane rects + divider rects
   (:use complete) ; the completion popup overlay
   (:use display)) ; clear / text / cursor / frame render ops
 
@@ -18,8 +24,8 @@ testable as plain data."
 (defn ed-spaces (n) (apply str (map (fn (i) " ") (range (max 0 n)))))
 
 (defn ed-fit-pad (s w)
-  "Clip or space-pad `s` to *exactly* `w` columns — for a full-width bar (the mode
-line) that spans the window, so it visibly grows/shrinks on a horizontal resize."
+  "Clip or space-pad `s` to *exactly* `w` columns — for a full-width bar (a mode
+line) that spans its pane, so it visibly grows/shrinks on a horizontal resize."
   (if (> (string-length s) w)
     (substring s 0 w)
     (str s (ed-spaces (- w (string-length s))))))
@@ -29,47 +35,81 @@ line) that spans the window, so it visibly grows/shrinks on a horizontal resize.
   (let (lt (buffer-line-at buf line))
     (if (ends-with? lt "\n") (substring lt 0 (dec (string-length lt))) lt)))
 
-(defn ed-line-ops (buf line top cols bounds)
-  "Render op(s) for one buffer line at its screen row. With no active region
-(`bounds` nil) that's a single `text` op; when the region `[lo hi]` covers part of
-this line, the line is split into up to three ops — pre, the reverse-video region,
-post."
-  (let (row (- line top)
-        vis (ed-fit (ed-line-text buf line) cols))
+;; ---- one pane's body (a buffer clipped into a sub-rect at origin x,y) -------
+;; Render ops carry absolute screen coordinates, so a pane simply offsets every
+;; op by its rect's origin `(x, y)` and clips text to its width `w`.
+
+(defn ed-line-ops (buf line top x y w bounds)
+  "Render op(s) for buffer `line` at its screen row inside a pane whose text area
+starts at column `x`, row `y`, width `w`. With no active region (`bounds` nil) that's
+a single `text` op; when the region `[lo hi]` covers part of this line it splits into
+up to three — pre, the reverse-video region, post — all offset to the pane."
+  (let (row (+ y (- line top))
+        vis (ed-fit (ed-line-text buf line) w))
     (if (nil? bounds)
-      [(text row 0 vis)]
+      [(text row x vis)]
       (let (line-start (rope-line->char (buffer-rope buf) line)
             [lo hi] bounds
             n (string-length vis)
             rlo (max 0 (min n (- lo line-start)))
             rhi (max 0 (min n (- hi line-start))))
         (if (>= rlo rhi)
-          [(text row 0 vis)]
+          [(text row x vis)]
           (concat
-            (if (> rlo 0) [(text row 0 (substring vis 0 rlo))] [])
-            [(text row rlo (substring vis rlo rhi) {:reverse true})]
-            (if (< rhi n) [(text row rhi (substring vis rhi n))] [])))))))
+            (if (> rlo 0) [(text row x (substring vis 0 rlo))] [])
+            [(text row (+ x rlo) (substring vis rlo rhi) {:reverse true})]
+            (if (< rhi n) [(text row (+ x rhi) (substring vis rhi n))] [])))))))
 
-(defn ed-visible-lines (buf top textrows cols bounds)
-  "`text` render ops for the lines visible in a `textrows`-tall window starting at
-line `top`, each clipped to `cols` and positioned at its screen row, with the
-region (if `bounds` is set) highlighted."
+(defn ed-visible-lines (buf top textrows x y w bounds)
+  "`text` ops for the lines visible in a `textrows`-tall pane whose text area starts
+at `(x, y)` and is `w` wide, starting at line `top`, region highlighted if `bounds`."
   (let (last-line (min (dec (buffer-line-count buf)) (dec (+ top textrows))))
-    (mapcat (fn (line) (ed-line-ops buf line top cols bounds))
+    (mapcat (fn (line) (ed-line-ops buf line top x y w bounds))
       (range top (inc last-line)))))
 
-(defn ed-status-line (m cols rows)
-  "The reverse-video mode line (row `rows-2`): the buffer name, the status, the
-`line:col` at point, which buffer of how many, then the key hints."
-  (let (buf (ed-current-buf m)
-        pos (str (inc (buffer-current-line buf)) ":" (buffer-column buf)))
-    (text (- rows 2)
-      0
-      (ed-fit-pad (str " " (buffer-name buf) "  (" (ed-mode-name m) ")"
-                       "  —  " (get m :status) "  —  " pos
-                       "  —  buf " (inc (get m :current)) "/" (count (get m :buffers))
-                       "  —  C-x C-s save · C-x b switch · C-x C-c quit") cols)
-      {:reverse true})))
+;; ---- a pane: its buffer body + its mode line --------------------------------
+
+(defn ed-pane-buf (m pane)
+  "The buffer shown in `pane` (its payload's `:buffer` index into the pool)."
+  (ed-buf-at m (get (get pane :payload) :buffer)))
+
+(defn ed-pane-modeline (m pane buf)
+  "A pane's reverse-video mode line, on the bottom row of its rect: ` name (mode)  —
+line:col`; the selected pane also shows the model status. (Distinguishing the active
+pane visually — an inactive-mode-line face — lands with multi-pane splits.)"
+  (let ([x y w h] (get pane :rect)
+        sel (get pane :selected)
+        pos (str (inc (buffer-current-line buf)) ":" (buffer-column buf))
+        label (str " " (buffer-name buf) "  (" (ed-buf-mode-name buf) ")  —  " pos
+                   (if sel (str "  —  " (get m :status)) "")))
+    (text (+ y (dec h)) x (ed-fit-pad label w) {:reverse true})))
+
+(defn ed-pane-ops (m pane)
+  "All render ops for one pane: its visible buffer lines (region highlighted) inside
+the rect above its mode line, plus the mode line itself. The pane's text area is its
+rect minus the bottom mode-line row."
+  (let ([x y w h] (get pane :rect)
+        buf (ed-pane-buf m pane)
+        top (get (get pane :payload) :top))
+    (concat
+      (ed-visible-lines buf top (max 0 (dec h)) x y w (buffer-region-bounds buf))
+      [(ed-pane-modeline m pane buf)])))
+
+;; ---- dividers (the 1-cell lines between panes) ------------------------------
+
+(defn ed-divider-ops (d)
+  "Render ops drawing divider `d`: a vertical `│` column for a `:col` split, a
+horizontal `─` row for a `:row` split, plus a `cursor-zone` over it so the GUI shows
+a resize cursor on hover/drag (`:col-resize` ↔ / `:row-resize` ↕; the terminal
+ignores the zone). ADR-078."
+  (let ([x y w h] (get d :rect)
+        col? (= (get d :dir) :col)
+        line (if col?
+               (map (fn (r) (text (+ y r) x "│")) (range h))
+               [(text y x (apply str (map (fn (i) "─") (range w))))]))
+    (concat line [(cursor-zone x y w h (if col? :col-resize :row-resize))])))
+
+;; ---- the minibuffer / echo area + the cursor --------------------------------
 
 (defn ed--join-sp (xs)
   "Space-join a list of strings."
@@ -95,32 +135,40 @@ completion candidates, if the prompt offers them) if one is open, else the lates
                 (get m :echo)
                 (str (get mb :prompt) (get mb :input) (ed-mb-candidates mb))) cols))))
 
-(defn ed-cursor (m cols rows)
+(defn ed-selected-pane (panes)
+  "The pane flagged `:selected` (where the cursor goes), or the first as a fallback."
+  (let (sel (filter (fn (p) (get p :selected)) panes))
+    (if (empty? sel) (first panes) (first sel))))
+
+(defn ed-cursor (m panes cols rows)
   "Place the cursor: at the minibuffer's point (prompt + `:point`) when one is open,
-else at the active buffer's point (screen coords, offset by its `:top`)."
+else at the selected pane's buffer point, in that pane's screen coords (offset by the
+pane origin and the window's `:top`, column clamped to the pane width)."
   (let (mb (get m :minibuffer))
     (if (nil? mb)
-      (let (buf (ed-current-buf m))
-        ;; clamp the column to the window — a long line clips, so the cursor
-        ;; must stay on-screen rather than running off the right edge.
-        (cursor (- (buffer-current-line buf) (ed-current-top m))
-                (min (dec cols) (buffer-column buf))))
+      (let (pane (ed-selected-pane panes)
+            [x y w h] (get pane :rect)
+            buf (ed-pane-buf m pane)
+            top (get (get pane :payload) :top))
+        (cursor (+ y (- (buffer-current-line buf) top))
+                (+ x (min (dec w) (buffer-column buf)))))
       (cursor (dec rows)
         ;; prompt width + cursor index into the input (defaults to end)
         (min (dec cols) (+ (string-length (get mb :prompt))
                            (or (get mb :point) (string-length (get mb :input)))))))))
 
 (defn ed-view (m cols rows)
-  "ui-run view (pure): clear, draw the visible buffer lines (region highlighted),
-the mode line, the echo area / minibuffer, and place the cursor. The text body is
-`rows-2` tall — the bottom two rows are the mode line and echo area."
-  (let (buf (ed-current-buf m)
-        top (ed-current-top m)
-        textrows (- rows 2))
+  "ui-run view (pure): lay the window tree into the body (everything above the echo
+row), paint each pane (buffer body + its mode line) and the dividers between them,
+then the echo area / minibuffer, the completion popup (if open), and the cursor at
+the selected pane. A single window fills the body — identical to the old full-screen
+layout."
+  (let (layout (ed-body-layout m cols rows)
+        panes (get layout :panes))
     (apply frame
       (concat [(clear)]
-        (ed-visible-lines buf top textrows cols (buffer-region-bounds buf))
-        [(ed-status-line m cols rows)
-         (ed-echo-line m cols rows)]
+        (mapcat (fn (p) (ed-pane-ops m p)) panes)
+        (mapcat (fn (d) (ed-divider-ops d)) (get layout :dividers))
+        [(ed-echo-line m cols rows)]
         (complete-popup-ops m cols rows)   ; overlays the buffer body when open
-        [(ed-cursor m cols rows)]))))
+        [(ed-cursor m panes cols rows)]))))
