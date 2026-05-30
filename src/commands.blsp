@@ -5,24 +5,29 @@ behaviour live — the late binding that makes a self-editing editor possible.
 `key` is the triggering key event; most commands ignore it, `cmd-self-insert`
 inserts it.
 
-Movement applies a `buffer -> buffer` op through `ed-apply` (no modified flag);
-edits go through `ed-edit` (marks the buffer modified). This is where new
-behaviour lands as the editor grows — keep each command small and testable."
-  (:use buffer)   ; the buffer ops the commands drive
-  (:use model))   ; message — the echo/`*Messages*` sink (eval output lands here)
+All editing/movement runs on the *current* buffer (the active entry in the
+model's `:buffers`): movement applies a `buffer -> buffer` op through `ed-apply`
+(no modified flag); edits go through `ed-edit` (marks the buffer modified). The
+region/kill commands maintain the model's `:kill-ring`; the buffer commands move
+between / open / kill buffers; `cmd-switch-buffer` / `cmd-find-file` open a
+minibuffer prompt (see `input`). This is editor *policy* — the reusable buffer
+model lives in `std/buffer.blsp`; keymaps in `input`."
+  (:use buffer)   ; the buffer ops the commands drive (incl. undo/redo, word motion)
+  (:use model))   ; current-buffer accessors, the kill ring, message
 
-;; ---- applying buffer ops ----------------------------------------------------
+;; ---- applying buffer ops to the current buffer ------------------------------
 
 (defn ed-apply (m f)
-  "Apply a pure `buffer -> buffer` op `f` to the model's buffer (movement: no
-status change)."
-  (assoc m :buf (f (get m :buf))))
+  "Apply a pure `buffer -> buffer` op `f` to the current buffer (movement/undo:
+no status change)."
+  (ed-set-buf m (f (ed-current-buf m))))
 
 (defn ed-edit (m f)
-  "Apply a pure `buffer -> buffer` op `f`, marking the buffer modified (edits)."
-  (assoc m :buf (f (get m :buf)) :status "modified"))
+  "Apply a pure `buffer -> buffer` op `f` to the current buffer, marking it
+modified (edits)."
+  (assoc (ed-set-buf m (f (ed-current-buf m))) :status "modified"))
 
-;; ---- movement (Emacs C-f/C-b/C-n/C-p/C-a/C-e + the arrow keys) ---------------
+;; ---- movement (Emacs C-f/C-b/C-n/C-p/C-a/C-e/M-f/M-b + the arrow keys) -------
 
 (defn cmd-forward-char     (m key) (ed-apply m forward-char))
 (defn cmd-backward-char    (m key) (ed-apply m backward-char))
@@ -30,6 +35,8 @@ status change)."
 (defn cmd-previous-line    (m key) (ed-apply m backward-line))
 (defn cmd-beginning-of-line (m key) (ed-apply m beginning-of-line))
 (defn cmd-end-of-line      (m key) (ed-apply m end-of-line))
+(defn cmd-forward-word     (m key) (ed-apply m forward-word))
+(defn cmd-backward-word    (m key) (ed-apply m backward-word))
 
 ;; ---- editing ----------------------------------------------------------------
 
@@ -41,6 +48,157 @@ status change)."
 (defn cmd-delete-char    (m key) (ed-edit m delete-char))
 (defn cmd-delete-backward (m key) (ed-edit m delete-backward-char))
 
+;; ---- undo / redo ------------------------------------------------------------
+
+(defn cmd-undo (m key) (assoc (ed-apply m undo) :status "undo"))
+(defn cmd-redo (m key) (assoc (ed-apply m redo) :status "redo"))
+
+;; ---- region / kill ring (C-SPC set mark · C-w kill · M-w copy · C-y yank) ----
+
+(defn cmd-set-mark (m key)
+  "Set the mark at point — point and mark delimit the region."
+  (message (ed-apply m set-mark) "mark set"))
+
+(defn cmd-kill-region (m key)
+  "Delete the region and push its text onto the kill ring (C-w)."
+  (let (text (buffer-region (ed-current-buf m)))
+    (if (nil? text)
+      (message m "no region (set the mark with C-SPC first)")
+      (ed-edit (assoc m :kill-ring (cons text (get m :kill-ring))) delete-region))))
+
+(defn cmd-copy-region (m key)
+  "Push the region's text onto the kill ring without deleting it (M-w)."
+  (let (text (buffer-region (ed-current-buf m)))
+    (if (nil? text)
+      (message m "no region")
+      (message (ed-apply (assoc m :kill-ring (cons text (get m :kill-ring))) clear-mark)
+               "region copied"))))
+
+(defn cmd-yank (m key)
+  "Insert the most recently killed/copied text at point (C-y)."
+  (let (ring (get m :kill-ring))
+    (if (empty? ring)
+      (message m "kill ring is empty")
+      (ed-edit m (fn (b) (insert b (first ring)))))))
+
+;; ---- multiple buffers -------------------------------------------------------
+
+(defn cmd-next-buffer (m key)
+  "Switch to the next buffer (wraps)."
+  (assoc m :current (mod (inc (get m :current)) (count (get m :buffers)))))
+
+(defn cmd-previous-buffer (m key)
+  "Switch to the previous buffer (wraps)."
+  (assoc m :current (mod (+ (dec (get m :current)) (count (get m :buffers)))
+                         (count (get m :buffers)))))
+
+(defn ed-has-editable? (bufs)
+  "Whether `bufs` holds a buffer other than `*Messages*`."
+  (some? (fn (e) (not (= (buffer-name (get e :buf)) "*Messages*"))) bufs))
+
+(defn cmd-kill-buffer (m key)
+  "Kill the current buffer (C-x k). Refuses to kill `*Messages*`; if it would
+leave no editable buffer, opens a fresh `*scratch*`. Clamps `:current`."
+  (let (buf (ed-current-buf m))
+    (if (= (buffer-name buf) "*Messages*")
+      (message m "cannot kill *Messages*")
+      (let (removed (ed-remove-nth (get m :buffers) (get m :current))
+            bufs (if (ed-has-editable? removed) removed (into removed [{:buf (make-buffer "") :top 0}]))
+            cur (min (get m :current) (dec (count bufs))))
+        (message (assoc m :buffers bufs :current cur) (str "killed " (buffer-name buf)))))))
+
+(defn ed-open-buffer (m entry-buf)
+  "Append a new entry holding `entry-buf` and switch to it."
+  (let (bufs (into (get m :buffers) [{:buf entry-buf :top 0}]))
+    (assoc m :buffers bufs :current (dec (count bufs)))))
+
+(defn ed-switch-to-named (m nm)
+  "Switch to the buffer named `nm`, or report there's no such buffer."
+  (let (idx (ed-buffer-index-by-name m nm))
+    (if (nil? idx) (message m (str "no buffer named " nm)) (assoc m :current idx))))
+
+(defn ed-find-file (m path)
+  "Open `path`: switch to it if already open, read it if it exists, else start a
+fresh buffer backed by it (so Ctrl-S creates it)."
+  (if (blank? path)
+    (message m "(no file)")
+    (let (idx (ed-buffer-index-by-name m path))
+      (cond
+        (not (nil? idx)) (assoc m :current idx)
+        (file-exists? path)
+          (try (message (ed-open-buffer m (buffer-from-file path)) (str "opened " path))
+               (catch e (message m (str "open failed: " (if (string? e) e (pr-str e))))))
+        else (message (ed-open-buffer m (make-buffer "" path path)) (str "new file " path))))))
+
+;; ---- minibuffer completion (pure helpers the prompts close over) ------------
+
+(defn lcp--len (a b i n)
+  (if (or (>= i n) (not (= (char-at a i) (char-at b i)))) i (lcp--len a b (inc i) n)))
+(defn lcp--2 (a b)
+  (substring a 0 (lcp--len a b 0 (min (string-length a) (string-length b)))))
+(defn lcp (strs)
+  "The longest common prefix of a non-empty sequence of strings."
+  (if (empty? strs) "" (fold lcp--2 (first strs) (rest strs))))
+
+(defn ed--last-slash (s i)
+  (cond (< i 0) -1 (= (char-at s i) "/") i else (ed--last-slash s (dec i))))
+
+(defn ed--split-path (text)
+  "Split `text` into the directory to list, the literal prefix to reattach, and
+the fragment being completed. With no `/`, the directory is `.` and there's
+nothing to reattach (relative to cwd)."
+  (let (i (ed--last-slash text (dec (string-length text))))
+    (if (< i 0)
+      {:dir "." :prefix "" :frag text}
+      {:dir (if (= i 0) "/" (substring text 0 i))
+       :prefix (substring text 0 (inc i))
+       :frag (substring text (inc i) (string-length text))})))
+
+(defn ed--join (dir name)
+  (cond (= dir "/") (str "/" name) (= dir ".") name else (str dir "/" name)))
+
+(defn ed-complete-path (text)
+  "Complete a filesystem `path` against the entries of its directory: the sole
+match (a trailing `/` for a directory), else the longest common prefix; the
+unchanged `text` when nothing matches. Tolerates a non-existent directory."
+  (let (p (ed--split-path text)
+        names (try (list-dir (get p :dir)) (catch e ()))
+        matches (filter (fn (nm) (starts-with? nm (get p :frag))) names))
+    (cond
+      (empty? matches) text
+      (= (count matches) 1)
+        (let (full (str (get p :prefix) (first matches)))
+          (if (dir? (ed--join (get p :dir) (first matches))) (str full "/") full))
+      else (str (get p :prefix) (lcp matches)))))
+
+(defn ed-complete-name (text names)
+  "Complete `text` against `names` (the sole match, else their common prefix)."
+  (let (matches (filter (fn (nm) (starts-with? nm text)) names))
+    (cond (empty? matches) text
+          (= (count matches) 1) (first matches)
+          else (lcp matches))))
+
+;; ---- buffer/file prompts (open a minibuffer; see input/minibuffer-handle) ---
+
+(defn cmd-switch-buffer (m key)
+  "Prompt (minibuffer) for a buffer name to switch to (C-x b), completing against
+the open buffers."
+  (let (names (map (fn (e) (buffer-name (get e :buf))) (get m :buffers)))
+    (assoc m :minibuffer
+      {:prompt "Switch to buffer: "
+       :input ""
+       :on-complete (fn (mm t) (ed-switch-to-named mm t))
+       :complete-fn (fn (t) (ed-complete-name t names))})))
+
+(defn cmd-find-file (m key)
+  "Prompt (minibuffer) for a file path to open (C-x C-f), completing against the
+filesystem; prefilled with the working directory."
+  (assoc m :minibuffer
+    {:prompt "Find file: "
+     :input (str (cwd) "/")
+     :on-complete (fn (mm t) (ed-find-file mm t))
+     :complete-fn (fn (t) (ed-complete-path t))}))
+
 ;; ---- files + quit -----------------------------------------------------------
 
 (defn cmd-quit (m key)
@@ -48,38 +206,39 @@ status change)."
   (assoc m :done true))
 
 (defn cmd-save (m key)
-  "Write the buffer to its file (C-x C-s); report the outcome in the echo area.
-A no-op-with-message if the buffer has no backing file."
-  (let (buf (get m :buf))
+  "Write the current buffer to its file (C-x C-s); report the outcome in the echo
+area. A no-op-with-message if the buffer has no backing file."
+  (let (buf (ed-current-buf m))
     (if (nil? (buffer-file buf))
-      (message m "no file to save (run: nest run -- <path>)")
+      (message m "no file to save (C-x C-f to open one, or run: nest run -- <path>)")
       (try
         (do (save-buffer buf) (message m (str "saved " (buffer-file buf))))
-        (catch e (message m (str "save failed: " e)))))))
+        (catch e (message m (str "save failed: " (if (string? e) e (pr-str e)))))))))
 
-;; ---- eval-in-buffer (the headline: Emacs `eval-last-sexp`) -------------------
+;; ---- eval-in-buffer (Emacs `eval-last-sexp`) --------------------------------
 
-(defn current-line-text (buf)
-  "The text of the line the point is on, without its trailing newline."
-  (let (lt (buffer-line-at buf (buffer-current-line buf)))
-    (if (ends-with? lt "\n") (substring lt 0 (dec (string-length lt))) lt)))
+(defn text-before-point (buf)
+  "The buffer's text from the start up to point."
+  (substring (buffer-text buf) 0 (buffer-point buf)))
 
 (defn eval-last-sexp (m key)
-  "C-x C-e — evaluate the current line as a Brood form in the running image, and
-show the result in `*Messages*`. Everything the form prints is captured via
-`with-out-str` (so `(println …)` output goes to `*Messages*`, never the
-console), followed by the form's value as `=> <value>`. A `def`/`defn` persists
-in the image, so you can define a fn on one line, then call it on the next.
-Errors are caught and reported, not raised — a bad form can't crash the loop.
-
-v1 evals the *current line*; multi-line / balanced-sexp extraction is a follow-up
-(and motivates sexp navigation in `std/buffer.blsp` — see CLAUDE.md)."
-  (let (src (trim (current-line-text (get m :buf))))
+  "C-x C-e — evaluate the last complete form ending at point and show the result
+in `*Messages*`. Reads *every* form before point and evals the last one, so a
+multi-line form (the whole `(defn …)` above point) is evaluated, not just the
+current line. Everything the form prints is captured via `with-out-str` (so
+`(println …)` goes to `*Messages*`, never the console), followed by the value as
+`=> <value>`. A `def`/`defn` persists in the image, so you can define a fn then
+call it. Errors (including an unbalanced form before point) are caught and
+reported, not raised."
+  (let (src (text-before-point (ed-current-buf m)))
     (if (blank? src)
       (message m "(nothing to evaluate)")
       (message m
         (trimr
           (with-out-str
             (try
-              (print (str "=> " (pr-str (eval-string src))))
+              (let (forms (read-all src))
+                (if (empty? forms)
+                  (print "(nothing to evaluate)")
+                  (print (str "=> " (pr-str (eval (last forms)))))))
               (catch e (print (str "error: " (if (string? e) e (pr-str e))))))))))))

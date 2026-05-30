@@ -1,34 +1,81 @@
 (defmodule model
-  "The editor's `ui-run` model, the `*Messages*` log + echo area, and the
-scrolling that keeps the point on screen.
+  "The editor's `ui-run` model: a list of buffers, the active one, the kill ring,
+the minibuffer, and the `*Messages*` log + echo area.
 
 The model is a map threaded through the `ui-run` loop:
 
-  :buf      the buffer being edited
-  :top      the first visible line (scroll offset)
-  :status   the mode-line message
-  :msgs      a `*Messages*` buffer — the scrollback of everything `message` logs
-  :echo     the one-line echo area (the latest message, newlines flattened)
-  :pending  the active prefix sub-keymap mid-chord (e.g. after C-x), else nil
-  :done     set to quit; :tick-ms the refresh beat (large — nothing animates)
+  :buffers   a vector of ENTRIES `{:buf <buffer> :top <int>}` — each buffer with
+             its own scroll position (`:top`, the first visible line). One entry
+             is always the `*Messages*` buffer.
+  :current   the index into `:buffers` of the buffer being edited
+  :kill-ring a list of killed/copied strings, newest first (C-w / M-w / C-y)
+  :minibuffer  nil, or `{:prompt :input :on-complete :complete-fn}` while a
+             minibuffer prompt is active (C-x b switch-buffer, C-x C-f find-file)
+  :pending   the active prefix sub-keymap mid-chord (e.g. after C-x), else nil
+  :echo      the one-line echo area (the latest message, newlines flattened)
+  :status    the mode-line message
+  :done      set to quit; :tick-ms the refresh beat (large — nothing animates)
 
-The buffers hold process-local ropes and the whole loop runs in one process, so
-they live in the model directly. `message` is the editor's echo primitive —
-like Emacs `message`, it writes to *both* the `*Messages*` buffer and the echo
-area; eval output reaches it via `with-out-str`, so it never hits the console."
-  (:use buffer))  ; make-buffer / insert / end-of-buffer / accessors
+Buffers hold process-local ropes and the whole loop runs in one process, so they
+live in the model directly (a buffer is an immutable value — switching is just
+moving `:current`, and a buffer's point/mark/undo travel with it). `message` is
+the editor's echo primitive — like Emacs `message`, it writes to *both* the
+`*Messages*` buffer and the echo area; eval output reaches it via `with-out-str`,
+so it never hits the console."
+  (:use buffer))  ; make-buffer / insert / end-of-buffer / buffer-name / accessors
+
+;; ---- immutable vector helpers (assoc is map-only) ---------------------------
+
+(defn ed-replace-nth (xs i v)
+  "A fresh vector like `xs` with index `i` replaced by `v`."
+  (apply vector (map (fn (j) (if (= j i) v (nth xs j))) (range (count xs)))))
+
+(defn ed-remove-nth (xs i)
+  "A fresh vector like `xs` with index `i` removed."
+  (apply vector (concat (take i xs) (drop (inc i) xs))))
+
+;; ---- construction -----------------------------------------------------------
 
 (defn ed-init (buf)
-  "The starting model: editing `buf`, scrolled to the top, with an empty
-`*Messages*` buffer and echo area and no prefix pending."
-  {:buf buf
-   :top 0
-   :status (str "editing " (buffer-name buf))
-   :msgs (make-buffer "" "*Messages*")
-   :echo ""
+  "The starting model: editing `buf` (entry 0) alongside an empty `*Messages*`
+buffer, scrolled to the top, with an empty kill ring and no minibuffer/prefix."
+  {:buffers [{:buf buf :top 0}
+             {:buf (make-buffer "" "*Messages*") :top 0}]
+   :current 0
+   :kill-ring ()
+   :minibuffer nil
    :pending nil
+   :echo ""
+   :status (str "editing " (buffer-name buf))
    :done false
    :tick-ms 60000})
+
+;; ---- the current buffer / entry ---------------------------------------------
+
+(defn ed-current-entry (m) "The active buffer's entry `{:buf :top}`." (nth (get m :buffers) (get m :current)))
+(defn ed-current-buf (m) "The buffer being edited." (get (ed-current-entry m) :buf))
+(defn ed-current-top (m) "The active buffer's scroll offset (first visible line)." (get (ed-current-entry m) :top))
+
+(defn ed-set-buf (m buf)
+  "The model with the active entry's buffer replaced by `buf`."
+  (let (i (get m :current))
+    (assoc m :buffers (ed-replace-nth (get m :buffers) i (assoc (ed-current-entry m) :buf buf)))))
+
+(defn ed-set-top (m n)
+  "The model with the active entry's scroll offset set to `n`."
+  (let (i (get m :current))
+    (assoc m :buffers (ed-replace-nth (get m :buffers) i (assoc (ed-current-entry m) :top n)))))
+
+(defn ed--index-by-name (bufs nm i n)
+  (cond (>= i n) nil
+        (= (buffer-name (get (nth bufs i) :buf)) nm) i
+        else (ed--index-by-name bufs nm (inc i) n)))
+
+(defn ed-buffer-index-by-name (m nm)
+  "The index into `:buffers` of the buffer named `nm`, or nil if there is none."
+  (ed--index-by-name (get m :buffers) nm 0 (count (get m :buffers))))
+
+;; ---- the `*Messages*` log + echo area ---------------------------------------
 
 (defn one-line (s)
   "Collapse newlines in `s` to spaces — the echo area is a single row, while the
@@ -36,20 +83,30 @@ full multi-line text is kept in the `*Messages*` buffer."
   (apply str (map (fn (c) (if (= c "\n") " " c)) (string->list s))))
 
 (defn message (m s)
-  "Log `s`: append it as a line to the `*Messages*` buffer and show it (flattened
-to one line) in the echo area. The editor's only output sink — commands print
-here, never to the console."
-  (let (msgs (get m :msgs))
-    (assoc m
-      :echo (one-line s)
-      :msgs (insert (end-of-buffer msgs) (str s "\n")))))
+  "Log `s`: append it as a line to the `*Messages*` buffer (found by name, so it
+survives buffer switches/kills) and show it (flattened to one line) in the echo
+area. Never disturbs the current buffer's point. The editor's only output sink —
+commands print here, never to the console."
+  (let (idx (ed-buffer-index-by-name m "*Messages*"))
+    (if (nil? idx)
+      ;; defensive: *Messages* was somehow killed — recreate it
+      (assoc m :echo (one-line s)
+               :buffers (into (get m :buffers)
+                          [{:buf (insert (make-buffer "" "*Messages*") (str s "\n")) :top 0}]))
+      (let (entry (nth (get m :buffers) idx))
+        (assoc m :echo (one-line s)
+                 :buffers (ed-replace-nth (get m :buffers) idx
+                            (assoc entry :buf (insert (end-of-buffer (get entry :buf)) (str s "\n")))))))))
+
+;; ---- scrolling --------------------------------------------------------------
 
 (defn ed-scroll (m textrows)
-  "Adjust `:top` so the point's line stays inside a `textrows`-tall viewport:
-scroll up if it's above the top, down if it's below the bottom. Pure."
-  (let (line (buffer-current-line (get m :buf))
-        top (get m :top))
+  "Adjust the active buffer's `:top` so the point's line stays inside a
+`textrows`-tall viewport: scroll up if it's above the top, down if it's below the
+bottom. Pure."
+  (let (line (buffer-current-line (ed-current-buf m))
+        top (ed-current-top m))
     (cond
-      (< line top) (assoc m :top line)
-      (>= line (+ top textrows)) (assoc m :top (inc (- line textrows)))
+      (< line top) (ed-set-top m line)
+      (>= line (+ top textrows)) (ed-set-top m (inc (- line textrows)))
       else m)))
