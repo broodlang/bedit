@@ -21,6 +21,7 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
   (:use complete)  ; cmd-complete / complete-word-char? — TAB indent-or-complete
   (:use mincomplete)  ; ed-complete-name / ed-complete-path — minibuffer prompt completion
   (:use projects)  ; project-root / project-files — find-file-in-project (C-x p f)
+  (:use task)  ; task / cancel-task — the off-loop, cancellable, timeout-bounded async eval
   (:use model))  ; current-buffer accessors, the kill ring, message
 
 ;; ---- applying buffer ops to the current buffer ------------------------------
@@ -416,7 +417,7 @@ re-pointed; indices above it shift down."
         buf (ed-current-buf m))
     (if (= (buffer-name buf) "*Messages*")
       (message m "cannot kill *Messages*")
-      (let (removed (ed-remove-nth (get m :buffers) killed-idx)
+      (let (removed (remove-nth (get m :buffers) killed-idx)
             label (str "killed " (buffer-name buf)))
         (if (ed-has-editable? removed)
           ;; another editable buffer remains: the killed pane shows the buffer
@@ -451,7 +452,7 @@ fresh buffer backed by it (so Ctrl-S creates it)."
                               (message (ed-open-buffer m (buffer-from-file path))
                                 (str "opened " path))
                               (catch e
-                                (message m (str "open failed: " (if (string? e) e (pr-str e))))))
+                                (message m (str "open failed: " (error-message e)))))
         else (message (ed-open-buffer m (make-buffer "" path path)) (str "new file " path))))))
 
 ;; ---- panes (tiled splits, Emacs C-x 2/3/0/1/o) ----------------------------
@@ -572,7 +573,7 @@ area. A no-op-with-message if the buffer has no backing file."
       (message m "no file to save (C-x C-f to open one, or run: nest run -- <path>)")
       (try
         (do (save-buffer buf) (message m (str "saved " (buffer-file buf))))
-        (catch e (message m (str "save failed: " (if (string? e) e (pr-str e)))))))))
+        (catch e (message m (str "save failed: " (error-message e))))))))
 
 ;; ---- eval-in-buffer (the C-x C-e family, via std/eval-command) --------------
 ;; Thin `(model key) -> model` wrappers over `std/eval-command.blsp`, which does
@@ -584,44 +585,35 @@ area. A no-op-with-message if the buffer has no backing file."
   ;; Redefine to arm it — e.g. `(def *eval-timeout-ms* 5000)` via C-x C-e.
   nil)
 
-(defn ed--spawn-watchdog (me job timeout)
-  "Spawn a watchdog that, after `timeout` ms, hard-kills the eval `job` and reports a
-timeout to the editor `me` (tagged with `job`'s pid, so a stale report is ignored)."
-  (spawn (do
-           (receive (after timeout nil))
-           (exit job :kill)
-           (send me [:eval-done job (str "eval timed out after " timeout "ms")]))))
-
 (defn ed-eval-async (m src timeout)
-  "Evaluate Brood source string `src` in a **spawned process**, so a long-running or
-looping form never freezes the editor (`ui-run` is single-process — a synchronous
-eval would block the loop). Safeguards: a still-running prior eval is cancelled
-first; the worker tags its result with its own pid — `[:eval-done <pid> <message>]` —
-so a stale watchdog (from a cancelled/finished eval) can't clobber a newer one
-(`ed-update` shows it only when the pid matches `:eval-proc`); and with `timeout`
-(ms, else nil) a watchdog kills the eval after that long. Manual interrupt is C-g
-(`cmd-keyboard-quit`). Returns the model with the job on `:eval-proc` and an
+  "Evaluate Brood source string `src` off the editor's loop via `std/task`, so a
+long-running or looping form never freezes the editor (`ui-run` is single-process —
+a synchronous eval would block the loop). A still-running prior eval is cancelled
+first; `task` returns a *handle* that tags its reply — `[:task-done <handle>
+<message>]`, or `[:task-timeout <handle>]` past `timeout` (ms; nil = no limit) — so a
+stale reply from a finished/cancelled eval can't clobber a newer one (`ed-update`
+shows it only when the handle matches `:eval-proc`). Manual interrupt is C-g
+(`cmd-keyboard-quit`). Returns the model with the handle on `:eval-proc` and an
 `evaluating…` note. (Async delivery relies on the GUI display's mailbox-`receive`
-poll; a runaway form runs in its own process while the editor stays live.)"
+poll; the eval runs in its own process while the editor stays live.)"
   (let (prev (get m :eval-proc)
          _
-         (when (not (nil? prev)) (exit prev :kill))  ; cancel a still-running eval
-         me
-         (self)
+         (when (not (nil? prev)) (cancel-task prev))  ; cancel a still-running eval
+         opts
+         (if (and (not (nil? timeout)) (> timeout 0)) {:timeout timeout} {})
          job
-         (spawn (send me [:eval-done (self) (eval-source src)])))
-    (when (and (not (nil? timeout)) (> timeout 0)) (ed--spawn-watchdog me job timeout))
+         (task (fn () (eval-source src)) opts))
     (message (assoc m :eval-proc job) "evaluating…")))
 
 (defcommand cmd-keyboard-quit
   (m key)
-  "C-g: interrupt a running evaluation (hard-kill its process) if one is in flight,
-else the usual no-op quit. The kill is `(exit pid :kill)` — a runaway loop dies even
-parked; if it had already finished, this is a harmless no-op."
+  "C-g: interrupt a running evaluation if one is in flight, else the usual no-op quit.
+`cancel-task` hard-kills the eval's worker — a runaway loop dies even parked; if it
+had already finished, this is a harmless no-op (and no reply is delivered)."
   (let (p (get m :eval-proc))
     (if (nil? p)
       (message m "quit")
-      (do (exit p :kill) (message (dissoc m :eval-proc) "eval interrupted")))))
+      (do (cancel-task p) (message (dissoc m :eval-proc) "eval interrupted")))))
 
 (defcommand cmd-eval-last-sexp
   (m key)
