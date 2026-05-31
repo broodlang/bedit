@@ -119,5 +119,11 @@ counterpart — it won't reflect the windowed build.
   keymap to command *symbols* resolved at dispatch time, so a command redefined
   at runtime hot-swaps live — that late binding is the road to a self-editing
   editor. Keep `view` pure; thread all state through the `ui-run` model.
+- **Refactor as you go.** After each step (a command, a service, a feature), pause
+  and look for refactoring opportunities in what you just touched *and* what it
+  builds on: duplication to fold into a helper, a one-off that wants to be a shared
+  primitive, a clearer name, dead code to delete. Prefer pulling the shared shape up
+  (often into a `std/` module — the prime directive) over copy-paste. Make the
+  cleanup a small, separate step; don't let it balloon the feature.
 - **No Claude/AI co-author trailer on commits** (matches the Brood repo).
 - Commit/push only when asked.
