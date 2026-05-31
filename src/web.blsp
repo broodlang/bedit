@@ -33,43 +33,63 @@ folded in by the loop's event registry (see `input`)."
 
 ;; ---- the snapshot (plain data — what crosses the process boundary) ----------
 
-(defn web--gutter-snapshot (buf)
-  "A plain-data snapshot of the buffer's left gutter: `{:width w :cells ([text face]…)}`
-materialised by calling the mode's `:gutter-width` / `:gutter-cell` services for every
-line, or nil when the mode offers no gutter. The services are functions (they can't
-cross to the worker process), so the gutter content is rendered to data here, in the
-editor process — exactly like `:spans`."
+(defn web--gutter-window (buf top last-line)
+  "A plain-data snapshot of the gutter for just the visible lines `top`..`last-line`:
+`{:width w :cells ([text face]…)}` (cells indexed from 0, matching the windowed text),
+or nil when the mode offers no gutter. The services are functions (they can't cross to
+the worker process), so the gutter is materialised to data here — like `:spans`. Only
+the visible cells, so a huge buffer doesn't render every line every publish."
   (let (gwfn (ed-mode-service buf :gutter-width)
         cell (ed-mode-service buf :gutter-cell)
         gw (if (nil? gwfn) 0 (gwfn buf)))
     (if (or (= gw 0) (nil? cell))
       nil
       {:width gw
-       :cells (map (fn (i) (cell buf i gw)) (range (buffer-line-count buf)))})))
+       :cells (map (fn (i) (cell buf i gw)) (range top (inc last-line)))})))
+
+(defn web--shift-region (region delta len)
+  "The `[lo hi]` selection shifted by `-delta` into window-local coordinates and clamped
+to `[0, len]`, or nil when unset or outside the window."
+  (if (nil? region)
+    nil
+    (let ([lo hi] region
+          lo2 (- lo delta)
+          hi2 (- hi delta))
+      (if (or (>= lo2 len) (<= hi2 0)) nil [(max 0 lo2) (min len hi2)]))))
 
 (defn web-snapshot (m)
-  "A plain-data snapshot of the selected pane's buffer for the browser: name, mode,
-full text, point (0-based `:line` / `:col` — the modeline convention), backing
-`:file`, total `:lines`, the `:region` selection `[lo hi]` (or nil), the modeline
-`:status`, `:spans` — the buffer mode's syntax-highlight spans (`[start end face]`,
-reusing its `:fontify` service; empty when the mode offers none) — and `:gutter`, the
-materialised line-number gutter (`web--gutter-snapshot`, nil when the mode offers
-none). Plain data throughout (vectors / maps / scalars), so it copies cleanly to the
-publisher."
+  "A plain-data snapshot of the selected pane's **visible window** for the browser —
+only the on-screen lines, never the whole buffer (so a large file doesn't lock the
+editor on every publish). Carries name, mode, the windowed `:text`, the cursor as an
+absolute `:line` (for the header) plus a window-local `:cur-row` (for the cursor-line
+highlight) and `:col`, backing `:file`, total `:lines`, the window-local `:region`
+selection, the modeline `:status`, `:spans` — the mode's `:fontify` over the visible
+slice (window-local offsets) — and `:gutter`, the visible line-number cells. Plain data
+throughout, so it copies cleanly to the publisher."
   (let (buf (ed-current-buf m)
-        text (buffer-text buf)
+        rope (buffer-rope buf)
+        nlines (buffer-line-count buf)
+        vrows (max 1 (or (get m :view-rows) 40))
+        top (min (max 0 (or (ed-current-top m) 0)) (max 0 (dec nlines)))
+        last-line (min (dec nlines) (dec (+ top vrows)))
+        win-start (rope-line->char rope top)
+        win-end (if (>= (inc last-line) nlines)
+                  (buffer-length buf)
+                  (dec (rope-line->char rope (inc last-line))))  ; drop the trailing newline
+        text (rope-slice rope win-start (max win-start win-end))
         fontify (ed-mode-service buf :fontify))  ; the buffer mode's syntax lexer, or nil
     {:name (buffer-name buf)
      :mode (ed-buf-mode-name buf)
      :text text
-     :line (buffer-current-line buf)
+     :line (buffer-current-line buf)         ; absolute cursor line (header pos)
+     :cur-row (- (buffer-current-line buf) top)  ; window-local row (cursor-line highlight)
      :col (buffer-column buf)
      :file (buffer-file buf)                 ; backing path, or nil
-     :lines (buffer-line-count buf)          ; total line count
-     :region (buffer-region-bounds buf)      ; [lo hi] selection, or nil
+     :lines nlines                           ; total line count
+     :region (web--shift-region (buffer-region-bounds buf) win-start (string-length text))
      :status (get m :status)                 ; the modeline status (e.g. "modified")
-     :spans (if (nil? fontify) '() (fontify text))  ; [start end face] syntax spans
-     :gutter (web--gutter-snapshot buf)}))   ; {:width :cells} line-number gutter, or nil
+     :spans (if (nil? fontify) '() (fontify text))  ; window-local [start end face] spans
+     :gutter (web--gutter-window buf top last-line)}))
 
 ;; ---- rendering a snapshot to HTML -------------------------------------------
 
@@ -181,7 +201,7 @@ region still paint on both sides."
 optional line-number `:gutter`, the mode's `:spans` syntax-coloured, the active
 `:region` shaded, the cursor line marked."
   (web--lines (string-split (get snap :text) "\n") 0 0
-    (get snap :spans) (get snap :region) (get snap :line) (get snap :col)
+    (get snap :spans) (get snap :region) (get snap :cur-row) (get snap :col)
     (get snap :gutter) '()))
 
 (defn web-render-app (snap)
