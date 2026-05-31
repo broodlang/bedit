@@ -27,8 +27,8 @@ it never hits the console.
 
 \"The current buffer\" is the selected window's buffer; editing writes back to the
 pool (`ed-set-buf`), scrolling to the window (`ed-set-top`)."
-  (:use buffer)   ; make-buffer / insert / end-of-buffer / buffer-name / accessors
-  (:use layers)   ; init-buffer-layers (stamp a buffer's mode) + active-layers (mode line)
+  (:use buffer)  ; make-buffer / insert / end-of-buffer / buffer-name / accessors
+  (:use layers)  ; init-buffer-layers (stamp a buffer's mode) + active-layers (mode line)
   (:use window))  ; the window-tree layout: window-single / selected payload / update / map
 
 ;; ---- immutable vector helpers (assoc is map-only) ---------------------------
@@ -58,8 +58,9 @@ line reads it, and dispatch composes its keymap)."
   (init-buffer-layers buf))
 
 (defn ed-window (idx)
-  "A window payload showing pool buffer `idx`, scrolled to the top."
-  {:buffer idx :top 0})
+  "A window payload showing pool buffer `idx`, scrolled to the top, at font scale 1
+(`:scale` is the per-pane zoom level Ctrl+wheel changes — see `ed-zoom`)."
+  {:buffer idx :top 0 :scale 1})
 
 (defn ed-init (buf)
   "The starting model: a buffer pool of `buf` (index 0) and an empty `*Messages*`
@@ -108,6 +109,33 @@ isn't a `:system` layer (so the always-on `global` layer is skipped — you see
   "The mode of the current (selected window's) buffer, for the mode line."
   (ed-buf-mode-name (ed-current-buf m)))
 
+(defn ed-mode-service (buf facet)
+  "The value the buffer's active mode provides for `facet` — from the
+highest-precedence active layer that defines it (`layer-collect`), resolved late
+(`eval`) if stored as a fn *symbol*, else nil when no layer offers it. The generic
+per-language services hook: the view and completion ask the buffer's mode for
+`:fontify` / `:bracket-match` / `:eldoc` / `:complete-at` *without naming any
+language*, so a new mode (json, python, …) is the same registration with its own
+functions. `brood-mode` is the first to supply these (see `modes`)."
+  (let (v (first (layer-collect buf facet)))
+    (cond (nil? v) nil (symbol? v) (eval v) :else v)))
+
+;; ---- pure text geometry (offset → line/column) ------------------------------
+;; Shared by the indenter mode-service adapters (src/modes.blsp) and the indent
+;; command (src/commands.blsp): a char offset's line start and column, computed
+;; from the text alone so they're testable without a buffer/rope.
+
+(defn ed-line-start-offset (text off)
+  "The offset of the start of the line containing char offset `off` — just after
+the previous newline (0 at the first line). Tail-recursive."
+  (if (or (<= off 0) (= (char-at text (dec off)) "\n"))
+    off
+    (ed-line-start-offset text (dec off))))
+
+(defn ed-column-at (text off)
+  "The 0-based column of char offset `off` in `text` (chars since the line start)."
+  (- off (ed-line-start-offset text off)))
+
 (defn ed-set-buf (m buf)
   "The model with the selected window's buffer replaced by `buf` in the POOL — so
 every window showing that buffer sees the edit. Scroll (per-window) is untouched."
@@ -129,9 +157,10 @@ window→buffer references after the pool changes (e.g. after a kill). Pure."
   (assoc m :layout (window-map (get m :layout) f)))
 
 (defn ed--index-by-name (bufs nm i n)
-  (cond (>= i n) nil
-        (= (buffer-name (nth bufs i)) nm) i
-        else (ed--index-by-name bufs nm (inc i) n)))
+  (cond
+    (>= i n) nil
+    (= (buffer-name (nth bufs i)) nm) i
+    else (ed--index-by-name bufs nm (inc i) n)))
 
 (defn ed-buffer-index-by-name (m nm)
   "The pool index of the buffer named `nm`, or nil if there is none."
@@ -152,11 +181,18 @@ pool entry. The editor's only output sink — commands print here, never the con
   (let (idx (ed-buffer-index-by-name m "*Messages*"))
     (if (nil? idx)
       ;; defensive: *Messages* was somehow killed — recreate it in the pool
-      (assoc m :echo (one-line s)
-               :buffers (into (get m :buffers) [(ed-stamp (insert (ed--log-buffer) (str s "\n")))]))
-      (assoc m :echo (one-line s)
-               :buffers (ed-replace-nth (get m :buffers) idx
-                          (insert (end-of-buffer (nth (get m :buffers) idx)) (str s "\n")))))))
+      (assoc m
+        :echo
+        (one-line s)
+        :buffers
+        (into (get m :buffers) [(ed-stamp (insert (ed--log-buffer) (str s "\n")))]))
+      (assoc m
+        :echo
+        (one-line s)
+        :buffers
+        (ed-replace-nth (get m :buffers)
+          idx
+          (insert (end-of-buffer (nth (get m :buffers) idx)) (str s "\n")))))))
 
 ;; ---- scrolling --------------------------------------------------------------
 
@@ -182,12 +218,18 @@ hit-testing, so a click maps to the pane the view drew there."
   (window-layout (get m :layout) [0 0 cols (dec rows)]))
 
 (defn ed-selected-text-rows (m cols rows)
-  "The text height of the *selected* pane (its rect height less the mode-line row),
-given the frame size — what scrolling and paging use, so they're correct inside a
-split, not just full-screen. At least 1."
+  "The text height of the *selected* pane in BUFFER lines — its rect height less the
+mode-line row, divided by the pane's font scale (a zoomed pane shows fewer lines).
+What scrolling and paging use, so they're correct inside a split and when zoomed.
+At least 1."
   (let (panes (get (ed-body-layout m cols rows) :panes)
-        sel (first (filter (fn (p) (get p :selected)) panes)))
-    (max 1 (dec (nth (get sel :rect) 3)))))   ; rect = [x y w h]; h-1 for the mode line
+         sel
+         (first (filter (fn (p) (get p :selected)) panes))
+         cells
+         (dec (nth (get sel :rect) 3))  ; rect = [x y w h]; h-1 for the mode line
+         s
+         (max 1 (or (get (get sel :payload) :scale) 1)))
+    (max 1 (quot cells s))))
 
 (defn ed-mouse-press (m cols rows row col)
   "Left-press at cell `[row col]`: if it lands on a divider, begin a resize drag
@@ -205,15 +247,52 @@ pointer (clamped by `window-set-ratio` so no pane vanishes). A no-op if not drag
   (let (d (get m :dragging))
     (if (nil? d)
       m
-      (assoc m :layout (window-set-ratio (get m :layout) (get d :path) (window-ratio-for d [row col]))))))
+      (assoc m
+        :layout
+        (window-set-ratio (get m :layout) (get d :path) (window-ratio-for d [row col]))))))
+
+(def *max-zoom* 6)  ; integer font-scale cap (1 = base; the GUI :scale matches the kernel's gui-font! cap)
+(def *wheel-lines* 3)  ; lines a plain wheel notch scrolls
+
+(defn ed-current-scale (m)
+  "The selected window's integer font scale (≥1), the per-pane zoom level."
+  (max 1 (or (get (ed-current-window m) :scale) 1)))
+
+(defn ed-zoom (m delta)
+  "Ctrl+mouse-wheel: change the *selected window's* font scale by `delta` levels,
+clamped to 1..*max-zoom*. Per-pane (it sets `:scale` on the selected window's
+payload, which the view renders via the kernel's per-op `:scale` face attribute —
+ADR-079), so only that pane resizes; a split's other panes and any other window keep
+their own scale. Pure (the GUI applies `:scale`; the terminal renders 1×). The
+*decision* to zoom on Ctrl+wheel is editor policy here; the kernel only supplies the
+mechanism (ADR-006)."
+  (let (s (max 1 (min *max-zoom* (+ (ed-current-scale m) delta))))
+    (assoc m :layout (window-update-selected (get m :layout) (fn (w) (assoc w :scale s))))))
+
+(defn ed-wheel-scroll (m delta)
+  "Plain mouse-wheel: scroll the selected window by moving point `delta` lines
+(`forward-line` clamps at the buffer ends); the view then follows via the
+scroll-to-point clamp in `ed-update`. Negative scrolls toward the top."
+  (ed-set-buf m (forward-line (ed-current-buf m) delta)))
 
 (defn ed-mouse (m input cols rows)
-  "Fold a `[:mouse action button row col]` event into the model: left-press selects
-a window or begins a divider drag; `:drag` resizes the dragged divider; `:release`
-ends the drag. Other buttons / the wheel are ignored for now."
-  (let ([_ action button row col] input)
+  "Fold a `[:mouse action button row col mods]` event into the model: left-press
+selects a window or begins a divider drag; `:drag` resizes the dragged divider;
+`:release` ends the drag; **Ctrl+wheel zooms the selected pane** (`ed-zoom`, one
+level per notch); a **plain wheel scrolls** the selected window (`ed-wheel-scroll`).
+Fields are read positionally (`nth`), not by a fixed-length vector pattern, so the
+trailing `mods` element (and any future addition) can't silently break the match."
+  (let (action (nth input 1)
+        button (nth input 2)
+        row (nth input 3)
+        col (nth input 4)
+        mods (nth input 5 []))
     (cond
       (and (= action :press) (= button :left)) (ed-mouse-press m cols rows row col)
       (and (= action :drag) (= button :left)) (ed-mouse-drag m row col)
       (= action :release) (dissoc m :dragging)
+      (and (= action :scroll-up) (includes? mods :ctrl)) (ed-zoom m 1)
+      (and (= action :scroll-down) (includes? mods :ctrl)) (ed-zoom m -1)
+      (= action :scroll-up) (ed-wheel-scroll m (- *wheel-lines*))
+      (= action :scroll-down) (ed-wheel-scroll m *wheel-lines*)
       else m)))
