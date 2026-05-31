@@ -33,13 +33,29 @@ folded in by the loop's event registry (see `input`)."
 
 ;; ---- the snapshot (plain data — what crosses the process boundary) ----------
 
+(defn web--gutter-snapshot (buf)
+  "A plain-data snapshot of the buffer's left gutter: `{:width w :cells ([text face]…)}`
+materialised by calling the mode's `:gutter-width` / `:gutter-cell` services for every
+line, or nil when the mode offers no gutter. The services are functions (they can't
+cross to the worker process), so the gutter content is rendered to data here, in the
+editor process — exactly like `:spans`."
+  (let (gwfn (ed-mode-service buf :gutter-width)
+        cell (ed-mode-service buf :gutter-cell)
+        gw (if (nil? gwfn) 0 (gwfn buf)))
+    (if (or (= gw 0) (nil? cell))
+      nil
+      {:width gw
+       :cells (map (fn (i) (cell buf i gw)) (range (buffer-line-count buf)))})))
+
 (defn web-snapshot (m)
   "A plain-data snapshot of the selected pane's buffer for the browser: name, mode,
 full text, point (0-based `:line` / `:col` — the modeline convention), backing
 `:file`, total `:lines`, the `:region` selection `[lo hi]` (or nil), the modeline
-`:status`, and `:spans` — the buffer mode's syntax-highlight spans (`[start end
-face]`, reusing its `:fontify` service; empty when the mode offers none). Plain
-data throughout (vectors / maps / scalars), so it copies cleanly to the publisher."
+`:status`, `:spans` — the buffer mode's syntax-highlight spans (`[start end face]`,
+reusing its `:fontify` service; empty when the mode offers none) — and `:gutter`, the
+materialised line-number gutter (`web--gutter-snapshot`, nil when the mode offers
+none). Plain data throughout (vectors / maps / scalars), so it copies cleanly to the
+publisher."
   (let (buf (ed-current-buf m)
         text (buffer-text buf)
         fontify (ed-mode-service buf :fontify))  ; the buffer mode's syntax lexer, or nil
@@ -52,7 +68,8 @@ data throughout (vectors / maps / scalars), so it copies cleanly to the publishe
      :lines (buffer-line-count buf)          ; total line count
      :region (buffer-region-bounds buf)      ; [lo hi] selection, or nil
      :status (get m :status)                 ; the modeline status (e.g. "modified")
-     :spans (if (nil? fontify) '() (fontify text))}))  ; [start end face] syntax spans
+     :spans (if (nil? fontify) '() (fontify text))  ; [start end face] syntax spans
+     :gutter (web--gutter-snapshot buf)}))   ; {:width :cells} line-number gutter, or nil
 
 ;; ---- rendering a snapshot to HTML -------------------------------------------
 
@@ -64,6 +81,7 @@ header .mode{color:#89b4fa}
 header .status{color:#f9e2af}
 header .pos{float:right;color:#6c7086}
 pre{margin:0;padding:.5rem 1rem;white-space:pre;tab-size:4}
+.gutter{color:#6c7086;user-select:none}
 .cur-line{background:#2a2b3c;display:inline-block;min-width:100%}
 .cursor{display:inline-block;width:0;border-left:2px solid #f38ba8;height:1.2em;vertical-align:text-bottom;animation:blink 1s step-end infinite}
 @keyframes blink{50%{opacity:0}}")
@@ -120,35 +138,51 @@ to CSS, plain escaped text otherwise."
 `highlight/fontify-runs`; this only emits each resulting run's `<span>`."
   (join "" (map web--chunk-html (fontify-runs s base spans (web--region-ranges region)))))
 
-(defn web--line-html (line base idx spans region cur-line cur-col)
-  "One buffer line (first char at offset `base`, line number `idx`) as faced HTML. The
-cursor's line is wrapped in `.cur-line` with a `.cursor` caret spliced in at `cur-col`
-— splitting the line there so faces and the region still paint on both sides."
-  (if (= idx cur-line)
-    (let (n (min cur-col (string-length line))
-          before (substring line 0 n)
-          after (substring line n (string-length line)))
-      (str "<span class=\"cur-line\">"
-        (web--run-html before base spans region)
-        "<span class=\"cursor\"></span>"
-        (web--run-html after (+ base n) spans region)
-        "</span>"))
-    (web--run-html line base spans region)))
+(defn web--gutter-html (gutter idx)
+  "The materialised `:gutter` cell for 0-based line `idx` as a non-selectable `<span>`
+(its `[text face]` from the snapshot), or \"\" when there's no gutter. The cell text is
+already padded to the gutter width, so it tiles fixed-width inside the `<pre>`."
+  (if (nil? gutter)
+    ""
+    (let ([txt face] (nth (get gutter :cells) idx)
+          style (web--face-style face))
+      (str "<span class=\"gutter\""
+        (if (= "" style) "" (str " style=\"" style "\""))
+        ">" (web--escape txt) "</span>"))))
 
-(defn web--lines (lines idx base spans region cur-line cur-col acc)
+(defn web--line-html (line base idx spans region cur-line cur-col gutter)
+  "One buffer line (first char at offset `base`, line number `idx`) as faced HTML: the
+optional `gutter` cell, then the text. The cursor's line is wrapped in `.cur-line` with
+a `.cursor` caret spliced in at `cur-col` — splitting the line there so faces and the
+region still paint on both sides."
+  (str (web--gutter-html gutter idx)
+    (if (= idx cur-line)
+      (let (n (min cur-col (string-length line))
+            before (substring line 0 n)
+            after (substring line n (string-length line)))
+        (str "<span class=\"cur-line\">"
+          (web--run-html before base spans region)
+          "<span class=\"cursor\"></span>"
+          (web--run-html after (+ base n) spans region)
+          "</span>"))
+      (web--run-html line base spans region))))
+
+(defn web--lines (lines idx base spans region cur-line cur-col gutter acc)
   "Tail-recursive walk over `lines`, threading each line's buffer start-offset `base`
 (+1 per stripped newline) and accumulating its `web--line-html`."
   (if (empty? lines)
     (join "\n" (reverse acc))
     (web--lines (rest lines) (inc idx) (+ base (string-length (first lines)) 1)
-      spans region cur-line cur-col
-      (cons (web--line-html (first lines) base idx spans region cur-line cur-col) acc))))
+      spans region cur-line cur-col gutter
+      (cons (web--line-html (first lines) base idx spans region cur-line cur-col gutter) acc))))
 
 (defn web--lines-html (snap)
   "The buffer's lines as faced HTML joined by real newlines (the `<pre>` body): the
-mode's `:spans` syntax-coloured, the active `:region` shaded, the cursor line marked."
+optional line-number `:gutter`, the mode's `:spans` syntax-coloured, the active
+`:region` shaded, the cursor line marked."
   (web--lines (string-split (get snap :text) "\n") 0 0
-    (get snap :spans) (get snap :region) (get snap :line) (get snap :col) '()))
+    (get snap :spans) (get snap :region) (get snap :line) (get snap :col)
+    (get snap :gutter) '()))
 
 (defn web-render-app (snap)
   "The **live region** the browser swaps in on each update: the sticky header
