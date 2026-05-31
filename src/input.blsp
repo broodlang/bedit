@@ -167,6 +167,58 @@ on `:cancel` close. Movement, kill-ring, yank, and history all come from lineedi
                (nil? done) (assoc m :minibuffer (assoc mb :edit edit))
                else (assoc m :minibuffer nil :echo "quit"))))))
 
+;; ---- transient input overlays (one registry; the dispatch fallthrough policy) ----
+;; The minibuffer, the completion popup, incremental search, and query-replace are
+;; all *transient* modes that sit beside the keymap: while open, one of them captures
+;; input. Each is a handler — `{:active? :owns? :handle :exit}` — and `ed-route-transient`
+;; routes one key to whichever is open: the handler that *owns* the key handles it; any
+;; other key exits the overlay (`:exit`) and dispatches normally. `:owns?` nil means
+;; capture-all (the minibuffer); `:exit` nil means no fallthrough. A new modal feature
+;; registers a handler here instead of growing `ed-update`. (The pattern generalises —
+;; `std/observer`'s REPL has the same minibuffer+completion shape — so this could move
+;; to std once a second app wants it.)
+
+(def ed--transient-handlers
+  (list
+    {:name :query-replace
+     :active? (fn (m) (get m :query-replace))
+     :owns? (fn (m input) (qr-control-key? input))
+     :handle (fn (m input) (qr-handle m input))
+     :exit (fn (m) (qr-finish m))}
+    {:name :isearch
+     :active? (fn (m) (get m :isearch))
+     :owns? (fn (m input) (isearch-control-key? input))
+     :handle (fn (m input) (isearch-handle m input))
+     :exit (fn (m) (isearch-exit m))}
+    {:name :minibuffer
+     :active? (fn (m) (get m :minibuffer))
+     :owns? nil  ; capture-all — every key is the minibuffer's
+     :handle (fn (m input) (minibuffer-handle m input))
+     :exit nil}
+    {:name :completion
+     :active? (fn (m) (get m :completion))
+     :owns? (fn (m input) (complete-control-key? input))
+     :handle (fn (m input) (complete-handle m input))
+     :exit (fn (m) (complete-cancel m))}))
+
+(defn ed--transient-active (m)
+  "The first open transient handler (registry order = precedence), or nil."
+  (find (fn (h) ((get h :active?) m)) ed--transient-handlers))
+
+(defn ed--transient-owns? (h m input)
+  "Whether handler `h` consumes `input` (a nil `:owns?` is capture-all → always)."
+  (let (o (get h :owns?)) (or (nil? o) (o m input))))
+
+(defn ed-route-transient (m input)
+  "Fold `input` into the active transient overlay, or through normal dispatch when
+none is open. The owning handler consumes the key; otherwise the overlay exits
+(`:exit`) and the key is dispatched normally (Emacs' dismiss-and-process)."
+  (let (h (ed--transient-active m))
+    (cond
+      (nil? h) (ed-dispatch m input)
+      (ed--transient-owns? h m input) ((get h :handle) m input)
+      else (ed-dispatch ((get h :exit) m) input))))
+
 ;; ---- the ui-run update ------------------------------------------------------
 
 (defn ed-update (m input cols rows)
@@ -177,9 +229,9 @@ the loop re-render (it isn't a command, so it doesn't touch the keymap or echo);
 `[:mouse …]` event is handled by `ed-mouse` (left-click selects the window under it,
 a press on a divider begins a drag, `:drag` resizes it, `:release` ends it). Scroll
 clamping uses the *selected pane's* height (`ed-selected-text-rows`), so it's correct
-inside a split. While a minibuffer is open, every key goes to it; while the completion
-popup is open, its control keys (C-n/C-p/Enter/…) go to it and any other key dismisses
-it and is then dispatched normally; otherwise the key is dispatched through the keymap."
+inside a split. Any non-system input is a key, routed by `ed-route-transient`: to the
+open transient overlay (minibuffer / completion / isearch / query-replace) if one
+owns it, else through the keymap (`ed-dispatch`)."
   (let (textrows (ed-selected-text-rows m cols rows)
          ; selected pane height (split-aware)
          m0
@@ -222,20 +274,7 @@ it and is then dispatched normally; otherwise the key is dispatched through the 
                                                                  (= (nth input 1) :scroll-down))
                                                              mm
                                                              (ed-scroll mm textrows)))
-          ;; an active query-replace consumes its answer keys; any other key finishes
-          ;; the replace and is dispatched normally.
-          (get m0 :query-replace) (if (qr-control-key? input)
-                                    (ed-scroll (qr-handle m0 input) textrows)
-                                    (ed-scroll (ed-dispatch (qr-finish m0) input) textrows))
-          ;; an active incremental search consumes its control keys (and printable
-          ;; chars, which extend it); any other key exits the search and is then
-          ;; dispatched normally (Emacs isearch). Mirrors the completion popup below.
-          (get m0 :isearch) (if (isearch-control-key? input)
-                              (ed-scroll (isearch-handle m0 input) textrows)
-                              (ed-scroll (ed-dispatch (isearch-exit m0) input) textrows))
-          (get m0 :minibuffer) (ed-scroll (minibuffer-handle m0 input) textrows)
-          (get m0 :completion) (if (complete-control-key? input)
-                                 (ed-scroll (complete-handle m0 input) textrows)
-                                 (ed-scroll (ed-dispatch (complete-cancel m0) input) textrows))
-          else (ed-scroll (ed-dispatch m0 input) textrows)))
+          ;; any other input is a key: route it through the active transient overlay
+          ;; (minibuffer / completion / isearch / query-replace) or normal dispatch.
+          else (ed-scroll (ed-route-transient m0 input) textrows)))
       (catch e (message m0 (str "error: " (error-message e)))))))
