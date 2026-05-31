@@ -58,16 +58,39 @@ name otherwise, the string itself for a printable key."
 no-op (so a stray :f5 / :page-up never tries to insert a keyword)."
   (if (string? key) (cmd-self-insert m key) m))
 
-(defn ed-dispatch (m0 input)
-  "Fold one key `input` into the next model. The keymap is composed from the
-current buffer's active layers (`active-keymap`); `keymap-step` (std) does the
-chord work — resolve through the `:pending` prefix or that keymap, enter a prefix,
-reset a dead-end, or fall back to self-insert — returning `[model' pending']`. We
-add only the echo-area label: a prefix shows `\"C-x-\"`, an unbound chord
-`\"… is undefined\"`, and a fresh keystroke clears it (a command then sets its own
-message)."
-  (let (m (ed--ensure-layers m0)
-         km
+;; ---- prefix arguments (C-u N) -----------------------------------------------
+;; `:prefix-arg` is `{:count N :raw bool}` while a numeric argument is being built:
+;; C-u seeds 4 (`:raw` — not yet explicit digits); a further C-u multiplies by 4; a
+;; digit switches to explicit accumulation. The next *complete* command runs `:count`
+;; times (the common-case Emacs mechanism; per-command interactive specs are the
+;; deferred std/layers improvement). `cmd-set-mark` reads the arg itself (C-u C-SPC →
+;; pop-mark) and so is listed in `ed--prefix-consuming` to run once, not repeat.
+
+(def ed--prefix-consuming '(commands/cmd-set-mark))
+
+(defn ed--digit? (input)
+  "True if `input` is a single decimal-digit key."
+  (and (string? input) (= (string-length input) 1) (>= (index-of "0123456789" input) 0)))
+
+(defn ed--prefix-continues? (input)
+  "Keys that extend a pending prefix arg rather than ending it: another C-u or a digit."
+  (or (= input :ctrl-u) (ed--digit? input)))
+
+(defn ed--prefix-read (m input)
+  "Fold a C-u / digit into the active prefix-arg accumulator."
+  (let (pa (get m :prefix-arg))
+    (cond
+      (= input :ctrl-u) (assoc m :prefix-arg {:count (* 4 (get pa :count)) :raw true})
+      else (let (d (string->number input))
+             (assoc m :prefix-arg
+               (if (get pa :raw) {:count d :raw false} {:count (+ (* 10 (get pa :count)) d) :raw false}))))))
+
+(defn ed--dispatch-key (m input)
+  "Resolve and run `input` through the active keymap (the chord work is `keymap-step`),
+repeating the command `:prefix-arg` times when one is set. A prefix key mid-chord just
+steps (the prefix arg carries until the chord completes); a prefix-consuming command
+(set-mark) runs once and reads the arg itself."
+  (let (km
          (active-keymap (ed-current-buf m))
          binding
          (get (or (get m :pending) km) input)
@@ -75,22 +98,45 @@ message)."
          ;; unbound (the fallback), nil for a prefix key (mid-chord — no command).
          this-cmd
          (cond (map? binding) nil (nil? binding) :self-insert :else binding)
+         pa
+         (get m :prefix-arg)
+         n
+         (if (nil? pa) 1 (max 1 (get pa :count)))
          ;; record this/last command (the Emacs mechanism) so kills coalesce and
          ;; M-y yank-pop knows it follows a yank; a prefix key leaves them untouched.
          m1
          (if (nil? this-cmd) m (assoc m :last-command (get m :this-command) :this-command this-cmd))
-         [m2 pending2]
-         (keymap-step km
-           (get m1 :pending)
-           (assoc m1 :echo "")
-           input
-           ed--self-insert)
-         m3
-         (assoc m2 :pending pending2))
+         ;; one keymap step (resolve through :pending / the keymap, threading :pending)
+         step
+         (fn (mm)
+           (let ([m2 p2] (keymap-step km (get mm :pending) (assoc mm :echo "") input ed--self-insert))
+             (assoc m2 :pending p2)))
+         result
+         (cond
+           ;; a prefix key mid-chord: step, keep the prefix arg for the resolving key
+           (nil? this-cmd) (step m1)
+           ;; a command that consumes the arg itself (set-mark → pop-mark): run once
+           (and pa (includes? ed--prefix-consuming this-cmd)) (dissoc (step m1) :prefix-arg)
+           ;; a normal command under a prefix arg: run it N times (set last-command on
+           ;; the repeats so consecutive kills/inserts coalesce), then clear the arg
+           pa (dissoc (fold (fn (mm i) (step (if (= i 0) mm (assoc mm :last-command this-cmd))))
+                        m1 (range n))
+                :prefix-arg)
+           else (step m1)))
     (cond
-      (map? binding) (assoc m3 :echo (str (key-label input) "-"))
-      (and (nil? binding) (get m :pending)) (assoc m3 :echo (str (key-label input) " is undefined"))
-      else m3)))
+      (map? binding) (assoc result :echo (str (key-label input) "-"))
+      (and (nil? binding) (get m :pending)) (assoc result :echo (str (key-label input) " is undefined"))
+      else result)))
+
+(defn ed-dispatch (m0 input)
+  "Fold one key `input` into the next model. While a numeric prefix argument is being
+built (`:prefix-arg` set and `input` a C-u/digit), accumulate it and run nothing yet;
+otherwise resolve and run the key through the active keymap (`ed--dispatch-key`)."
+  (let (m (ed--ensure-layers m0))
+    (if (and (get m :prefix-arg) (ed--prefix-continues? input))
+      (let (m2 (ed--prefix-read m input))
+        (assoc m2 :echo (str "C-u " (get (get m2 :prefix-arg) :count) "-")))
+      (ed--dispatch-key m input))))
 
 ;; ---- the minibuffer (modal: when active, all input is the minibuffer's) ------
 ;; A one-line prompt that REUSES the REPL line editor: `:minibuffer :edit` is a
