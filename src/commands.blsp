@@ -763,16 +763,22 @@ the common prefix; Enter opens the first match. Reports when not in a project."
 
 (defcommand cmd-execute-extended-command
   (m key)
-  "Prompt for an interactive command name and run it (M-x). Completes against, and
-shows, the registered commands (`defcommand`s); an unknown name is reported."
-  (assoc m
-    :minibuffer
-    {:edit (ed-mb-edit "M-x " "")
-     :on-complete (fn (mm t)
-                    (interactive/run-command mm t (fn (mmm nm) (message mmm (str "no command: " nm)))))
-     :complete-fn (fn (t) (ed-complete-name t (interactive/command-names)))
-     :candidates-fn (fn (t) (take 15 (completion-rank t (interactive/command-names))))
-     :accept-selection true}))
+  "Prompt for an interactive command name and run it (M-x). Completes against the
+commands relevant to the current buffer's active layers: global commands plus any
+mode-specific ones the active layers expose via their `:commands` facet."
+  (let (buf (ed-current-buf m)
+        active-cmds (apply concat (ed-active-mode-commands buf))
+        owned (ed-all-layer-commands)
+        names (sort (concat (filter (fn (n) (not (includes? owned n))) (interactive/command-names))
+                            active-cmds)))
+    (assoc m
+      :minibuffer
+      {:edit (ed-mb-edit "M-x " "")
+       :on-complete (fn (mm t)
+                      (interactive/run-command mm t (fn (mmm nm) (message mmm (str "no command: " nm)))))
+       :complete-fn (fn (t) (ed-complete-name t names))
+       :candidates-fn (fn (t) (take 15 (completion-rank t names)))
+       :accept-selection true})))
 
 ;; ---- process list (M-x list-processes) — a read-only, killable menu ----------
 ;; The runtime's live processes in a read-only `*Process List*` buffer, from the
@@ -790,25 +796,64 @@ column-aligned). `:depth` is absent (→ 0, no indent) in the flat view."
         s (if (> depth 0) (str (string-repeat "  " depth) nm) nm))
     (if (> (string-length s) 14) (substring s 0 14) s)))
 
+(defn ed--opt (v f)
+  "Render optional `process-info` field `v` with `f`, or \"-\" when absent (nil) —
+observer parity (`observe--opt`)."
+  (if (nil? v) "-" (f v)))
+
+(defn ed--bytes->human (n)
+  "A compact human byte count: B / KB / MB (integer-rounded) — matches the observer's
+`observe--bytes->human` so the *Process List* MEM column reads the same."
+  (cond
+    (< n 1024) (str n " B")
+    (< n 1048576) (str (quot n 1024) " KB")
+    else (str (quot n 1048576) " MB")))
+
+(defn ed--reds-rate (prev-reds prev-at reds at)
+  "Reductions/second between two `process-info` samples, or nil when it can't be
+computed — no prior sample for this id, missing counters, or no elapsed time. Clamps a
+negative delta (a recycled id) to 0. Mirrors `observe--reds-rate`."
+  (if (or (nil? prev-reds) (nil? prev-at) (nil? reds) (nil? at) (<= (- at prev-at) 0))
+    nil
+    (quot (* 1000 (max 0 (- reds prev-reds))) (- at prev-at))))
+
+(defn ed--rate-procs (prev-reds prev-at infos at)
+  "Tag each `process-info` map in `infos` with `:reds-rate` — its reductions/second
+since the matching id in the previous snapshot (`prev-reds` an id→reductions map,
+`prev-at` its wall-clock ms). A process new this tick gets nil. Pure; O(n)."
+  (map (fn (p)
+         (assoc p :reds-rate
+           (ed--reds-rate (get prev-reds (get p :id)) prev-at (get p :reductions) at)))
+    infos))
+
 (defn ed--proc-row (p)
   "One `*Process List*` row from a `process-info` map. The ID stays flush-left (so
-`ed--line-id` and the kill keys parse it); the tree shape shows in the NAME cell."
+`ed--line-id` and the kill keys parse it); the tree shape shows in the NAME cell.
+Columns mirror the observer: id · name · status · mailbox · mem · reds · reds/s · mon
+(`:reds-rate` is tagged on by `ed--rate-procs`; `-` until the first refresh diff)."
   (str (pad-right (str (get p :id)) 5) " "
     (pad-right (ed--proc-name p) 14) " "
     (pad-right (name (get p :status)) 8) " "
     (pad-left (str (get p :mailbox)) 7) " "
-    (pad-left (str (get p :reductions)) 12)))
+    (pad-left (ed--opt (get p :memory) ed--bytes->human) 8) " "
+    (pad-left (str (get p :reductions)) 12) " "
+    (pad-left (ed--opt (get p :reds-rate) str) 8) " "
+    (pad-left (str (get p :monitored-by)) 4)))
 
-(defn ed-process-list-text (view)
+(defn ed-process-list-text (view &optional rated-infos)
   "The `*Process List*` buffer text: a header row plus one `ed--proc-row` per live
-process (a fresh `process-info` snapshot, so re-showing after a kill reflects the
-change). `view` is `:tree` (a parent→child forest, indented by depth — `proctree`)
-or `:flat` (ascending by id)."
-  (let (infos (filter (fn (p) (not (nil? p))) (map process-info (list-processes)))
+process. `rated-infos` is the snapshot already tagged with `:reds-rate` (passed by
+`ed-show-process-list`); when omitted, a fresh untagged snapshot is taken (so the
+REDS/S column reads `-`). `view` is `:tree` (a parent→child forest, indented by
+depth — `proctree`) or `:flat` (ascending by id). Re-showing after a kill reflects
+the change (the snapshot is fresh)."
+  (let (infos (or rated-infos
+                (filter (fn (p) (not (nil? p))) (map process-info (list-processes))))
         ordered (if (= view :flat) (proctree/by-id infos) (proctree/tree-order infos))
         rows (map ed--proc-row ordered))
-    (str (pad-right "ID" 5) " " (pad-right "NAME" 14) " " (pad-right "STATUS" 8)
-      " " (pad-left "MAILBOX" 7) " " (pad-left "REDUCTIONS" 12) "\n"
+    (str (pad-right "ID" 5) " " (pad-right "NAME" 14) " " (pad-right "STATUS" 8) " "
+      (pad-left "MAILBOX" 7) " " (pad-left "MEM" 8) " " (pad-left "REDS" 12) " "
+      (pad-left "REDS/S" 8) " " (pad-left "MON" 4) "\n"
       (join "\n" rows) "\n")))
 
 (defn ed-proc-view (m)
@@ -818,9 +863,19 @@ or `:flat` (ascending by id)."
 (defn ed-show-process-list (m)
   "Build/refresh the read-only `*Process List*` in the selected pane and show it,
 stamped `:process-menu` so its kill/refresh keys and read-only mode apply, in the
-model's current `:proc-view` (tree by default). The seam the list / refresh / kill /
-toggle commands all route through."
-  (ed-show-named m "*Process List*" (ed-process-list-text (ed-proc-view m)) :process-menu))
+model's current `:proc-view` (tree by default). Computes each process's reductions/
+second against the previous snapshot stashed in `:proc-snapshot` — so the REDS/S
+column shows who's busy *now* (`-` on the first show, a real rate on the next refresh
+`g`) — then records a fresh snapshot for next time. The seam the list / refresh /
+kill / toggle commands all route through."
+  (let (at (now)
+        infos (filter (fn (p) (not (nil? p))) (map process-info (list-processes)))
+        snap (get m :proc-snapshot)
+        rated (ed--rate-procs (get snap :reds) (get snap :at) infos at)
+        m1 (ed-show-named m "*Process List*"
+             (ed-process-list-text (ed-proc-view m) rated) :process-menu)
+        reds (reduce (fn (acc p) (assoc acc (get p :id) (get p :reductions))) {} infos))
+    (assoc m1 :proc-snapshot {:at at :reds reds})))
 
 (defcommand cmd-list-processes
   (m key)
