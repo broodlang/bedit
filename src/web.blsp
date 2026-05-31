@@ -1,27 +1,34 @@
 (defmodule web
-  "Serve the selected pane's buffer over HTTP — a live, auto-refreshing mirror of
-what you're editing, viewable in a browser (M-x serve-buffer, C-x w).
+  "Serve the selected pane's buffer over HTTP — a **live** mirror of what you're
+editing, viewable in a browser (M-x serve-buffer, C-x w). The page opens an
+`EventSource('/events')` and the editor *pushes* every edit and cursor move down
+that stream (Server-Sent Events); a few lines of JavaScript swap the updated region
+into the DOM. No polling, no flicker.
 
-Nothing here is a Brood gap: the whole server stack already ships in `std` —
-`http` (`serve-loop` / `http-listen` / `ok`) over `tcp` over green processes. The
-one real constraint is that a buffer's rope is **process-local**: a spawned HTTP
-worker can't read the editor's live buffer. So the editor *pushes* plain-data
-snapshots (`web-snapshot` — strings/ints, freely copied between processes) and the
-server only ever renders those. Two long-lived processes back a running server:
+Nothing here is a Brood gap: the server stack ships in `std` — `http`
+(`serve-loop` / `stream-response` / `router`) and `sse` (`sse-headers` /
+`sse-send`) over `tcp` over green processes. The one real constraint is that a
+buffer's rope is **process-local**: a spawned HTTP worker can't read the editor's
+live buffer. So the editor pushes plain-data snapshots (`web-snapshot` — strings/
+ints, freely copied between processes) and the server only ever renders those.
 
-  - a **publisher** (`web-pub-loop`): holds the latest snapshot; `[:put snap]`
-    replaces it, `[:get pid]` replies `[:snap snap]`. The bridge across the
-    process-local-rope boundary.
-  - a **server** (`web-serve-proc`): owns the listening socket and runs the
-    `serve-loop`; each connection's worker pulls the current snapshot from the
-    publisher and renders it.
+Three kinds of process back a running server:
 
-`ed-update` calls `web-publish!` once per event while a server is running (the
-hook that makes it *live*); the OS-assigned port comes back as a `[:web-port n]`
-message folded in by the loop's event registry (see `input`)."
+  - the **publisher / fan-out hub** (`web-pub-loop`): holds the latest snapshot and
+    the set of open SSE connections; `[:put snap]` updates and broadcasts a frame,
+    `[:subscribe]`/`[:unsubscribe]` manage connections, `[:get]` serves the initial
+    page. The bridge across the process-local-rope boundary.
+  - the **accept loop** (`web-serve-proc`): owns the listening socket, `serve-loop`s.
+  - one **SSE worker** per open browser tab (`web--sse-serve`): the sole writer to
+    its own socket — the publisher hands it frames as messages, it writes them out.
+
+`ed-update` calls `web-publish!` once per event while a server is running (the hook
+that makes it live); the OS-assigned port comes back as a `[:web-port n]` message
+folded in by the loop's event registry (see `input`)."
   (:use model)  ; ed-current-buf / ed-buf-mode-name — the selected pane's buffer
   (:use buffer)  ; buffer-text / buffer-name / buffer-current-line / buffer-column
-  (:use http))  ; http-listen / serve-loop / ok — the std HTTP server
+  (:use sse)  ; sse-headers / sse-send — server-side event-stream framing
+  (:use http))  ; http-listen / serve-loop / router / stream-response / ok
 
 ;; ---- the snapshot (plain data — what crosses the process boundary) ----------
 
@@ -49,6 +56,11 @@ pre{margin:0;padding:.5rem 1rem;white-space:pre;tab-size:4}
 .cursor{display:inline-block;width:0;border-left:2px solid #f38ba8;height:1.2em;vertical-align:text-bottom;animation:blink 1s step-end infinite}
 @keyframes blink{50%{opacity:0}}")
 
+;; The page script: subscribe to the push stream and swap the live region in on
+;; each frame. EventSource reconnects on its own if the connection drops.
+(def *web-js*
+  "const es=new EventSource('/events');es.onmessage=e=>{document.getElementById('app').innerHTML=e.data};")
+
 (defn web--escape (s)
   "HTML-escape the three markup-significant characters in `s`."
   (replace (replace (replace s "&" "&amp;") "<" "&lt;") ">" "&gt;"))
@@ -67,51 +79,106 @@ pre{margin:0;padding:.5rem 1rem;white-space:pre;tab-size:4}
         "</span>"))
     (web--escape line)))
 
-(defn web-render-html (snap)
-  "A full HTML page mirroring `snap`: a sticky header (`name (mode)  line:col`) over
-a `<pre>` of the text with the cursor's line highlighted and a caret at point. A
-`<meta http-equiv=refresh>` makes it poll once a second — the live update without a
-socket on the page (SSE can replace this later; the std module is already there)."
+(defn web--lines-html (snap)
+  "The buffer's lines as HTML, joined by real newlines (the `<pre>` body)."
   (let (lines (string-split (get snap :text) "\n")
         cur-line (get snap :line)
-        cur-col (get snap :col)
-        body (join "\n"
-               (map (fn (i) (web--line-html (nth lines i) i cur-line cur-col))
-                 (range (count lines)))))
-    (str "<!doctype html><html><head><meta charset=\"utf-8\">"
-      "<meta http-equiv=\"refresh\" content=\"1\">"
-      "<title>" (web--escape (get snap :name)) " — myedit</title>"
-      "<style>" *web-css* "</style></head><body>"
-      "<header>" (web--escape (get snap :name))
-      " <span class=\"mode\">(" (web--escape (get snap :mode)) ")</span>"
-      "<span class=\"pos\">" (inc cur-line) ":" cur-col "</span></header>"
-      "<pre>" body "</pre></body></html>")))
+        cur-col (get snap :col))
+    (join "\n"
+      (map (fn (i) (web--line-html (nth lines i) i cur-line cur-col))
+        (range (count lines))))))
 
-;; ---- the two server processes -----------------------------------------------
+(defn web-render-app (snap)
+  "The **live region** the browser swaps in on each update: the sticky header
+(`name (mode)  line:col`) over a `<pre>` of the text with the cursor line
+highlighted and a caret at point. Rendered into the initial page (inside `#app`)
+*and* pushed verbatim down the SSE stream. It keeps real newlines (the `<pre>`);
+`sse-send`/`sse-frame` `data:`-prefix every line so they round-trip to the browser."
+  (str "<header>" (web--escape (get snap :name))
+    " <span class=\"mode\">(" (web--escape (get snap :mode)) ")</span>"
+    "<span class=\"pos\">" (inc (get snap :line)) ":" (get snap :col) "</span></header>"
+    "<pre>" (web--lines-html snap) "</pre>"))
 
-(defn web-pub-loop (snap)
-  "The publisher process: hold the latest snapshot. `[:put s]` replaces it; `[:get
-pid]` replies `[:snap snap]`. Started by `web-start`, fed by `web-publish!`, read
-by each connection's worker (`web-handler`)."
+(defn web-render-page (snap)
+  "The full HTML document: the CSS, the live region inside `#app`, and the script
+that opens an `EventSource` to `/events` and replaces `#app` on every pushed frame.
+No meta-refresh — updates arrive over SSE."
+  (str "<!doctype html><html><head><meta charset=\"utf-8\">"
+    "<title>" (web--escape (get snap :name)) " — myedit</title>"
+    "<style>" *web-css* "</style></head><body>"
+    "<div id=\"app\">" (web-render-app snap) "</div>"
+    "<script>" *web-js* "</script></body></html>"))
+
+;; ---- the publisher / fan-out hub --------------------------------------------
+
+(defn web-pub-loop (snap subs)
+  "The publisher: holds the latest snapshot and `subs`, the list of open SSE-worker
+pids. `[:put s]` updates the snapshot and broadcasts a `[:frame s]` to every
+subscriber; `[:subscribe pid]` adds one (seeding it with the current frame so a new
+tab paints immediately); `[:unsubscribe pid]` drops one; `[:get pid]` replies
+`[:snap snap]` (the initial full-page render); `[:shutdown]` tells every worker to
+close, then ends. Workers — never the publisher — write their own sockets, so
+frames travel as messages: one writer per socket, no interleaved bytes."
   (receive
-    ([:put s] (web-pub-loop s))
-    ([:get pid] (do (send pid [:snap snap]) (web-pub-loop snap)))))
+    ([:put s] (do (doseq (pid subs) (send pid [:frame s])) (web-pub-loop s subs)))
+    ([:subscribe pid] (do (send pid [:frame snap]) (web-pub-loop snap (cons pid subs))))
+    ([:unsubscribe pid] (web-pub-loop snap (remove (fn (p) (= p pid)) subs)))
+    ([:get pid] (do (send pid [:snap snap]) (web-pub-loop snap subs)))
+    ([:shutdown] (doseq (pid subs) (send pid [:close])))))
+
+;; ---- one SSE worker per open browser tab ------------------------------------
+
+(def *web-sse-keepalive-ms* 25000)
+
+(defn web--sse-loop (c pub)
+  "An open SSE connection's pump. Writes each `[:frame snap]` the publisher fans out
+(this worker is the sole writer to its socket `c`); drops out on `[:tcp-closed]`
+(the browser left) or `[:close]` (the server is shutting down), unsubscribing first;
+sends a comment line when idle to hold the connection open. A failed write means a
+dead socket — unsubscribe and end the worker."
+  (receive
+    ([:frame s]
+      (if (try (do (sse-send c (web-render-app s)) true) (catch e false))
+        (web--sse-loop c pub)
+        (send pub [:unsubscribe (self)])))
+    ([:tcp-closed ~c] (send pub [:unsubscribe (self)]))
+    ([:tcp ~c d] (web--sse-loop c pub))
+    ([:close] (tcp-close c))
+    (after *web-sse-keepalive-ms*
+      (if (try (do (tcp-send c ": keep\n\n") true) (catch e false))
+        (web--sse-loop c pub)
+        (send pub [:unsubscribe (self)])))))
+
+(defn web--sse-serve (c pub)
+  "Serve `/events`: the connection's worker (it already owns `c` — `stream-response`
+has sent the head) subscribes itself to the publisher and pumps frames until the
+browser disconnects. Owning `c`'s reader, its `web--sse-loop` sees `[:tcp-closed]`."
+  (send pub [:subscribe (self)])
+  (web--sse-loop c pub))
+
+;; ---- the HTTP handler (routes the page + the event stream) ------------------
 
 (defn web-handler (pub)
-  "An HTTP handler `(request -> response)`: pull the current snapshot from `pub`
-and render it. Runs in the per-connection worker `serve-loop` spawns, so `(self)`
-is that worker — the `[:snap …]` reply lands in its own mailbox."
-  (fn (req)
-    (send pub [:get (self)])
-    (receive
-      ([:snap s] (ok (web-render-html s)))
-      (after 1000 (text-response "myedit: no snapshot")))))
+  "The server's handler: `/` renders the current snapshot as the full page;
+`/events` is the long-lived SSE stream the page subscribes to (a `stream-response`,
+so the socket stays open and `web--sse-serve` pumps it). Both close over `pub`."
+  (router
+    {"/" (fn (req)
+           (send pub [:get (self)])
+           (receive
+             ([:snap s] (ok (web-render-page s)))
+             (after 1000 (text-response "myedit: no snapshot"))))
+     "/events" (fn (req)
+                 (stream-response 200 (sse-headers)
+                   (fn (c) (web--sse-serve c pub))))}))
+
+;; ---- the server process -----------------------------------------------------
 
 (defn web-serve-proc (port pub reply-to)
-  "The server process: bind a listener (falling back to an OS-assigned port if
-`port` is taken), tell `reply-to` the bound port (`[:web-port n]`), then run the
-accept loop forever. Must own the listener it serves, so the `http-listen` happens
-here — not in the editor process — which is why the port comes back as a message."
+  "The accept loop: bind a listener (falling back to an OS-assigned port if `port`
+is taken), tell `reply-to` the bound port (`[:web-port n]`), then `serve-loop`
+forever. Must own the listener it serves, so the `http-listen` happens here — not in
+the editor process — which is why the port comes back as a message."
   (let (ls (try (http-listen port) (catch e (http-listen 0)))
         bound (tcp-local-port ls))
     (send reply-to [:web-port bound])
@@ -120,22 +187,23 @@ here — not in the editor process — which is why the port comes back as a mes
 ;; ---- lifecycle (called from the commands, in the editor process) ------------
 
 (defn web-start (m port)
-  "Spawn the publisher (seeded with the current snapshot) and the server, trying
-`port` first. Returns `{:pub :proc :port}` for the model's `:server` field; `:port`
-is nil until the `[:web-port n]` reply arrives. `(self)` is captured here (the
-editor process) so the server knows where to report its bound port."
+  "Spawn the publisher (seeded with the current snapshot, no subscribers yet) and the
+accept loop, trying `port` first. Returns `{:pub :proc :port}` for the model's
+`:server` field; `:port` is nil until the `[:web-port n]` reply arrives. `(self)` is
+captured here (the editor process) so the server can report its bound port back."
   (let (me (self)
         seed (web-snapshot m)
-        pub (spawn (web-pub-loop seed))
+        pub (spawn (web-pub-loop seed '()))
         proc (spawn (web-serve-proc port pub me)))
     {:pub pub :proc proc :port nil}))
 
 (defn web-stop! (srv)
-  "Hard-kill a running server's processes (idempotent — `exit` no-ops on a dead
-pid). Killing the server process drops its listener; the publisher just stops."
+  "Stop a running server: ask the publisher to close every open SSE connection and
+exit (`[:shutdown]`), then kill the accept loop (which drops the listener).
+Idempotent — `send`/`exit` no-op on dead pids."
   (when srv
-    (exit (get srv :proc) :kill)
-    (exit (get srv :pub) :kill))
+    (send (get srv :pub) [:shutdown])
+    (exit (get srv :proc) :kill))
   nil)
 
 (defn web-publish! (m)
