@@ -68,7 +68,8 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
   align under the first arg, vectors/maps under the first element); buffers with no
   `:indent` fall back to matching the previous line.
 - ✅ **Projects — find-file-in-project** (`C-x p f`) — `src/projects.blsp` finds the
-  root (nearest ancestor with `project.blsp`) and walks it for files (recursive,
+  root (nearest ancestor holding a `*project-markers*` entry — `project.blsp` or
+  `.git`, so any repo opens as a project) and walks it for files (recursive,
   skipping `.git`/`target`/…); a minibuffer completes over the root-relative paths.
   The current project shows on the mode line. (Follow-ups under the `C-x p` prefix:
   project-wide grep, a multi-project switcher.)
