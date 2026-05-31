@@ -44,6 +44,7 @@ Clip first (`ed-fit`), then prelude `pad-right` brings it up to width."
 
 (def ed-face-bracket-match {:reverse true})  ; the matched bracket pair
 (def ed-face-bracket-error {:fg :red :bold true})  ; a lone unmatched bracket
+(def ed-face-region {:reverse true})  ; the active region (point↔mark)
 
 (defn ed--face-at (spans pos)
   "The lexer face of the `[start end face]` span covering offset `pos`, or nil."
@@ -59,29 +60,38 @@ Clip first (`ed-fit`), then prelude `pad-right` brings it up to width."
     :else (let ([p f] (first overrides))
             (if (= p pos) f (ed--override-at (rest overrides) pos)))))
 
-(defn ed--line-face (spans bounds overrides base k)
+(defn ed--ranges-face (hl-ranges pos)
+  "Merge the faces of every highlight range `[lo hi face]` in `hl-ranges` that covers
+`pos` (later ranges win on a key conflict), or nil when none cover it. The active
+region and any transient overlay (isearch/query-replace match) are such ranges."
+  (fold (fn (acc r)
+          (let ([lo hi f] r)
+            (if (and (>= pos lo) (< pos hi)) (into (or acc {}) f) acc)))
+    nil hl-ranges))
+
+(defn ed--line-face (spans hl-ranges overrides base k)
   "The face for visible-line char `k` (buffer offset `base+k`): the lexer span face
 with any `override` (bracket-match, diagnostic underline) merged ON TOP — so an
-underline/reverse keeps the token's syntax colour — and then the active region
-`bounds` `[lo hi]`'s `:reverse` on top of that."
+underline/reverse keeps the token's syntax colour — and then any highlight-range
+face (the region's `:reverse`, an isearch overlay's colours) on top of that."
   (let (pos (+ base k)
         span-f (ed--face-at spans pos)
         ov (ed--override-at overrides pos)
         f (if (nil? ov) span-f (into (or span-f {}) ov))
-        in-region (and bounds (>= pos (first bounds)) (< pos (second bounds))))
-    (if in-region (assoc (or f {}) :reverse true) f)))
+        hl (ed--ranges-face hl-ranges pos))
+    (if (nil? hl) f (into (or f {}) hl))))
 
-(defn ed--coalesce (vis spans bounds overrides base len i start cur acc)
+(defn ed--coalesce (vis spans hl-ranges overrides base len i start cur acc)
   "Run-length coalescer (tail-recursive over `vis`): emit a `[substring face]` chunk
 whenever the per-char face changes."
   (if (>= i len)
     (reverse (cons [(substring vis start len) cur] acc))
-    (let (f (ed--line-face spans bounds overrides base i))
+    (let (f (ed--line-face spans hl-ranges overrides base i))
       (if (= f cur)
-        (ed--coalesce vis spans bounds overrides base len (inc i) start cur acc)
+        (ed--coalesce vis spans hl-ranges overrides base len (inc i) start cur acc)
         (ed--coalesce vis
           spans
-          bounds
+          hl-ranges
           overrides
           base
           len
@@ -90,21 +100,22 @@ whenever the per-char face changes."
           f
           (cons [(substring vis start i) cur] acc))))))
 
-(defn ed--line-chunks (vis base spans bounds overrides)
+(defn ed--line-chunks (vis base spans hl-ranges overrides)
   "`[substring face]` chunks tiling visible substring `vis` (its first char at buffer
-offset `base`), coloured by `spans`, with region + bracket `overrides` merged in."
+offset `base`), coloured by `spans`, with highlight-range faces (region, overlays)
+and bracket `overrides` merged in."
   (let (len (string-length vis))
     (if (= len 0)
       '()
       (ed--coalesce vis
         spans
-        bounds
+        hl-ranges
         overrides
         base
         len
         1
         0
-        (ed--line-face spans bounds overrides base 0)
+        (ed--line-face spans hl-ranges overrides base 0)
         '()))))
 
 (defn ed--chunks->ops (row x chunks acc)
@@ -160,45 +171,49 @@ Out-of-range positions (stale before the next recheck) simply match no visible c
                 (map (fn (p) [p ed-face-diagnostic]) (range off (ed--diag-span-end text off)))))
       (filter (fn (d) (and (get d :line) (get d :col))) (or (get m :diagnostics) '())))))
 
+;; ---- highlight ranges: the region + transient overlays ----------------------
+
+(defn ed-hl-ranges (m buf selected?)
+  "The highlight ranges `[lo hi face]` to paint over `buf` in a pane: the active
+region (point↔mark, `:reverse`), plus — on the selected pane only — the model's
+transient `:overlays` (isearch / query-replace matches, each `{:start :end :face}`).
+Overlays are gated to the selected pane so a split showing another buffer never
+highlights stray offsets."
+  (let (region (let (b (buffer-region-bounds buf))
+                 (if (nil? b) '() (list [(first b) (second b) ed-face-region])))
+        overlays (if selected?
+                   (map (fn (o) [(get o :start) (get o :end) (get o :face)]) (or (get m :overlays) '()))
+                   '()))
+    (concat region overlays)))
+
 ;; ---- one pane's body (a buffer clipped into a sub-rect at origin x,y) -------
 ;; Render ops carry absolute screen coordinates, so a pane simply offsets every
 ;; op by its rect's origin `(x, y)` and clips text to its width `w`.
 
-(defn ed-line-ops (buf line top x y w bounds spans overrides)
+(defn ed-line-ops (buf line top x y w hl-ranges spans overrides)
   "Render op(s) for buffer `line` at its screen row inside a pane whose text area
-starts at column `x`, row `y`, width `w`. Without `:fontify` `spans` it's a single
-`text` op (or, with active region `bounds` `[lo hi]`, the up-to-three pre /
-reverse-video region / post split). With `spans` the line is painted as coloured
-chunks, with region `:reverse` and bracket `overrides` merged into the per-char face."
+starts at column `x`, row `y`, width `w`. With neither `:fontify` `spans` nor any
+highlight range it's a single plain `text` op; otherwise the line is painted as
+coloured `[substring face]` chunks (coalesced), with the syntax spans, the highlight
+ranges (region/overlays), and bracket `overrides` merged into the per-char face."
   (let (row (+ y (- line top))
         vis (ed-fit (ed-line-text buf line) w))
-    (if (nil? spans)
-      (if (nil? bounds)
-        [(text row x vis)]
-        (let (line-start (rope-line->char (buffer-rope buf) line)
-              [lo hi] bounds
-              n (string-length vis)
-              rlo (max 0 (min n (- lo line-start)))
-              rhi (max 0 (min n (- hi line-start))))
-          (if (>= rlo rhi)
-            [(text row x vis)]
-            (concat (if (> rlo 0) [(text row x (substring vis 0 rlo))] [])
-              [(text row (+ x rlo) (substring vis rlo rhi) {:reverse true})]
-              (if (< rhi n) [(text row (+ x rhi) (substring vis rhi n))] [])))))
+    (if (and (nil? spans) (empty? hl-ranges))
+      [(text row x vis)]
       (ed-chunks->ops row
         x
         (ed--line-chunks vis
           (rope-line->char (buffer-rope buf) line)
-          spans
-          bounds
+          (or spans '())
+          hl-ranges
           overrides)))))
 
-(defn ed-visible-lines (buf top textrows x y w bounds spans overrides)
+(defn ed-visible-lines (buf top textrows x y w hl-ranges spans overrides)
   "`text` ops for the lines visible in a `textrows`-tall pane whose text area starts
-at `(x, y)` and is `w` wide, from line `top`; region highlighted if `bounds`,
-syntax-coloured if `spans` (with bracket `overrides`)."
+at `(x, y)` and is `w` wide, from line `top`; `hl-ranges` `[lo hi face]` highlight
+the region/overlays, `spans` syntax-colour (with bracket `overrides`)."
   (let (last-line (min (dec (buffer-line-count buf)) (dec (+ top textrows))))
-    (mapcat (fn (line) (ed-line-ops buf line top x y w bounds spans overrides))
+    (mapcat (fn (line) (ed-line-ops buf line top x y w hl-ranges spans overrides))
       (range top (inc last-line)))))
 
 ;; ---- a pane: its buffer body + its mode line --------------------------------
@@ -291,16 +306,16 @@ re-anchors it — so the gutter magnifies in lock-step; the mode line stays base
         overrides (if (get pane :selected)
                     (concat (ed-bracket-overrides buf) (ed-diagnostic-overrides m buf))
                     '())
-        bounds (buffer-region-bounds buf)
+        hl-ranges (ed-hl-ranges m buf (get pane :selected))
         text-h (max 0 (dec h)))
     (if (= s 1)
       (concat (ed-gutter-ops buf top text-h x y gw)
-        (ed-visible-lines buf top text-h (+ x gw) y (max 1 (- w gw)) bounds spans overrides)
+        (ed-visible-lines buf top text-h (+ x gw) y (max 1 (- w gw)) hl-ranges spans overrides)
         [(ed-pane-modeline m pane buf)])
       (let (vh (max 1 (quot text-h s))
             vw (max 1 (quot w s))
             body (concat (ed-gutter-ops buf top vh 0 0 gw)
-                   (ed-visible-lines buf top vh gw 0 (max 1 (- vw gw)) bounds spans overrides)))
+                   (ed-visible-lines buf top vh gw 0 (max 1 (- vw gw)) hl-ranges spans overrides)))
         (concat (map (fn (op) (ed--scale-op op x y s)) body)
           [(ed-pane-modeline m pane buf)])))))
 
