@@ -33,11 +33,22 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
   find-file, `C-x →/←` cycle, `C-x k` kill; a persistent `*Messages*` buffer.
 - ✅ **Minibuffer** — a real editable field (`C-f/b/a/e`, arrows, `Backspace`/
   `C-d`, `C-k`, insert at point, `Tab` complete, `Enter`/`C-g`).
-- ✅ **Completion-at-point** — `Tab` popup of buffer words.
+- ✅ **Completion-at-point** — `Tab` popup; buffer words by default, **live global
+  symbols in brood-mode** (the `:complete-at` mode service).
 - ✅ **Evaluate Brood in the buffer** — `C-x C-e` (last sexp), region, whole buffer
   (`std/eval-command`); result + captured output to the echo area / `*Messages*`.
 - ✅ **Structural navigation (brood-mode)** — `C-M-f/b/u/d/a` over the parse-source
   CST (`std/sexp`).
+- ✅ **Syntax highlighting (brood-mode)** — live lexical colouring via the
+  `:fontify` mode service over `std/highlight`; spans lexed once per frame, region
+  `:reverse` merged into the lexer face.
+- ✅ **Bracket matching + eldoc (brood-mode)** — the `:bracket-match` service marks
+  the pair at point; the `:eldoc` service shows the enclosing call's signature in
+  the echo area as point moves (both reuse `std/highlight`).
+- ✅ **Generic mode-services host** — the view/completion ask the buffer's mode for
+  `:fontify` / `:bracket-match` / `:eldoc` / `:complete-at` facets
+  (`ed-mode-service`) without naming any language; brood-mode is the first to
+  supply them. A `json`/`ruby`/`elixir` mode is the same registration (see §C).
 - ✅ **Files** — `C-x C-s` save, `C-x C-c` / `Esc` quit.
 
 ---
@@ -51,8 +62,11 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
   runs the registry. Every `cmd-*` is interactive; reachable without a binding.
 - ⬜ **Comment / uncomment** — `M-;`, per-mode comment syntax (`;;` for brood,
   `#`/`//` for others) as a mode facet.
-- ⬜ **Indentation** — `TAB`; sexp-aware (indent by the CST) in brood-mode, simple
-  elsewhere.
+- ✅ **Indentation** — `TAB` indents-or-completes (Emacs `tab-always-indent` =
+  `'complete`), `C-M-i` always completes; in brood-mode `RET` is newline-and-indent.
+  Sexp-aware via the `:indent` mode service over `std/sexp` (body forms +2, calls
+  align under the first arg, vectors/maps under the first element); buffers with no
+  `:indent` fall back to matching the previous line.
 - ⬜ **Prefix args & mark ring** — numeric `C-u N`; `C-u C-SPC` to pop the mark.
 - ⬜ **find-file live candidates** — switch-buffer has them; give find-file the
   same (directory listing as you type).
@@ -79,8 +93,9 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
 
 ## D. Polish & deferred
 
-- ⬜ **Syntax highlighting** — CST → faces in brood-mode (`std/highlight` +
-  `std/face`); tree-sitter queries for other languages later.
+- ✅ **Syntax highlighting** — lexical colouring in brood-mode via the `:fontify`
+  mode service over `std/highlight` (see the core list above). CST-/tree-sitter-query
+  driven highlighting for other languages comes with §C.
 - ⬜ **Windows / splits** — one window, many buffers today.
 - ⬜ **Browsable `*Kill Ring*`** view and a **which-key**-style popup for prefixes.
 - ⬜ **regex** ranges `[a-z]` / captures / `{m,n}` (`std/regex`, brood repo).

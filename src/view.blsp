@@ -4,18 +4,18 @@
 above it are the **window layout** (`std/window.blsp`): the model's `:layout` tree
 is laid out into that body rect, giving one or more panes (each a buffer in its own
 sub-rect) separated by dividers. Each pane reserves its bottom row for a reverse-video
-**mode line** (buffer name · mode · line:col; the selected pane also shows the status
-and is bold). Within a pane the buffer is offset to the pane's origin, clipped to its
+**mode line** (buffer name · mode · line:col; the selected pane also shows the status).
+Within a pane the buffer is offset to the pane's origin, clipped to its
 width, scrolled by the window's `:top`, and the region (point↔mark) is reverse-video.
 No window IO, no state: testable as plain data.
 
 A single window fills the whole body, so the lone-pane layout is identical to the
 old full-screen one (mode line at `rows-2`, echo at `rows-1`)."
-  (:use buffer)   ; line text / point + column / region bounds, read to lay out the frame
-  (:use model)    ; current-buffer accessors, pane buffer + mode name
-  (:use window)   ; window-layout: the :layout tree -> pane rects + divider rects
-  (:use complete) ; the completion popup overlay
-  (:use display)) ; clear / text / cursor / frame render ops
+  (:use buffer)  ; line text / point + column / region bounds, read to lay out the frame
+  (:use model)  ; current-buffer accessors, pane buffer + mode name
+  (:use window)  ; window-layout: the :layout tree -> pane rects + divider rects
+  (:use complete)  ; the completion popup overlay
+  (:use display))  ; clear / text / cursor / frame render ops
 
 (defn ed-fit (s w)
   "Clip string `s` to `w` columns (long lines don't wrap — v1 has no h-scroll)."
@@ -35,36 +35,145 @@ line) that spans its pane, so it visibly grows/shrinks on a horizontal resize."
   (let (lt (buffer-line-at buf line))
     (if (ends-with? lt "\n") (substring lt 0 (dec (string-length lt))) lt)))
 
+;; ---- syntax highlighting: tile precomputed spans onto a visible line --------
+;; A language mode may supply a `:fontify` service (`text -> [start end face]`
+;; spans, the `highlight-spans` shape). When it does, each visible line is painted
+;; as coloured `[substring face]` chunks — with the active region's `:reverse` and
+;; any bracket-match `overrides` merged into the per-char face — instead of plain
+;; text. Spans are lexed ONCE per frame (in `ed-pane-ops`) and tiled here, so the
+;; buffer isn't re-lexed per visible line. The view never names a language: it asks
+;; the buffer's mode for these services (`ed-mode-service`, src/model.blsp).
+
+(def ed-face-bracket-match {:reverse true})  ; the matched bracket pair
+(def ed-face-bracket-error {:fg :red :bold true})  ; a lone unmatched bracket
+
+(defn ed--face-at (spans pos)
+  "The lexer face of the `[start end face]` span covering offset `pos`, or nil."
+  (cond
+    (empty? spans) nil
+    :else (let ([s e f] (first spans))
+            (if (and (>= pos s) (< pos e)) f (ed--face-at (rest spans) pos)))))
+
+(defn ed--override-at (overrides pos)
+  "The override face for offset `pos` in the `[pos face]` list `overrides`, or nil."
+  (cond
+    (empty? overrides) nil
+    :else (let ([p f] (first overrides))
+            (if (= p pos) f (ed--override-at (rest overrides) pos)))))
+
+(defn ed--line-face (spans bounds overrides base k)
+  "The face for visible-line char `k` (buffer offset `base+k`): a bracket `override`
+wins, else the lexer span face; the active region `bounds` `[lo hi]` merges its
+`:reverse` on top."
+  (let (pos (+ base k)
+        f (or (ed--override-at overrides pos) (ed--face-at spans pos))
+        in-region (and bounds (>= pos (first bounds)) (< pos (second bounds))))
+    (if in-region (assoc (or f {}) :reverse true) f)))
+
+(defn ed--coalesce (vis spans bounds overrides base len i start cur acc)
+  "Run-length coalescer (tail-recursive over `vis`): emit a `[substring face]` chunk
+whenever the per-char face changes."
+  (if (>= i len)
+    (reverse (cons [(substring vis start len) cur] acc))
+    (let (f (ed--line-face spans bounds overrides base i))
+      (if (= f cur)
+        (ed--coalesce vis spans bounds overrides base len (inc i) start cur acc)
+        (ed--coalesce vis
+          spans
+          bounds
+          overrides
+          base
+          len
+          (inc i)
+          i
+          f
+          (cons [(substring vis start i) cur] acc))))))
+
+(defn ed--line-chunks (vis base spans bounds overrides)
+  "`[substring face]` chunks tiling visible substring `vis` (its first char at buffer
+offset `base`), coloured by `spans`, with region + bracket `overrides` merged in."
+  (let (len (string-length vis))
+    (if (= len 0)
+      '()
+      (ed--coalesce vis
+        spans
+        bounds
+        overrides
+        base
+        len
+        1
+        0
+        (ed--line-face spans bounds overrides base 0)
+        '()))))
+
+(defn ed--chunks->ops (row x chunks acc)
+  "Tail-recursive: `text` ops for `[substring face]` `chunks` laid left-to-right from
+column `x` at screen `row`."
+  (if (empty? chunks)
+    (reverse acc)
+    (let ([s f] (first chunks))
+      (ed--chunks->ops row
+        (+ x (string-length s))
+        (rest chunks)
+        (cons (if (nil? f) (text row x s) (text row x s f)) acc)))))
+
+(defn ed-chunks->ops (row x chunks)
+  "`text` ops for `[substring face]` `chunks`, starting at column `x` on screen `row`."
+  (ed--chunks->ops row x chunks '()))
+
+(defn ed-bracket-overrides (buf)
+  "`[pos face]` overrides for the bracket pair adjacent to point, via `buf`'s mode
+`:bracket-match` service: the matched pair in the match face, a lone unmatched
+bracket in the error face, or `()` when there's no service or no bracket at point."
+  (let (bm (ed-mode-service buf :bracket-match))
+    (if (nil? bm)
+      '()
+      (let (r (bm (buffer-text buf) (buffer-point buf)))
+        (cond
+          (nil? r) '()
+          (= (second r) :unmatched) (list [(first r) ed-face-bracket-error])
+          :else (list [(first r) ed-face-bracket-match]
+                  [(second r) ed-face-bracket-match]))))))
+
 ;; ---- one pane's body (a buffer clipped into a sub-rect at origin x,y) -------
 ;; Render ops carry absolute screen coordinates, so a pane simply offsets every
 ;; op by its rect's origin `(x, y)` and clips text to its width `w`.
 
-(defn ed-line-ops (buf line top x y w bounds)
+(defn ed-line-ops (buf line top x y w bounds spans overrides)
   "Render op(s) for buffer `line` at its screen row inside a pane whose text area
-starts at column `x`, row `y`, width `w`. With no active region (`bounds` nil) that's
-a single `text` op; when the region `[lo hi]` covers part of this line it splits into
-up to three — pre, the reverse-video region, post — all offset to the pane."
+starts at column `x`, row `y`, width `w`. Without `:fontify` `spans` it's a single
+`text` op (or, with active region `bounds` `[lo hi]`, the up-to-three pre /
+reverse-video region / post split). With `spans` the line is painted as coloured
+chunks, with region `:reverse` and bracket `overrides` merged into the per-char face."
   (let (row (+ y (- line top))
         vis (ed-fit (ed-line-text buf line) w))
-    (if (nil? bounds)
-      [(text row x vis)]
-      (let (line-start (rope-line->char (buffer-rope buf) line)
-            [lo hi] bounds
-            n (string-length vis)
-            rlo (max 0 (min n (- lo line-start)))
-            rhi (max 0 (min n (- hi line-start))))
-        (if (>= rlo rhi)
-          [(text row x vis)]
-          (concat
-            (if (> rlo 0) [(text row x (substring vis 0 rlo))] [])
-            [(text row (+ x rlo) (substring vis rlo rhi) {:reverse true})]
-            (if (< rhi n) [(text row (+ x rhi) (substring vis rhi n))] [])))))))
+    (if (nil? spans)
+      (if (nil? bounds)
+        [(text row x vis)]
+        (let (line-start (rope-line->char (buffer-rope buf) line)
+              [lo hi] bounds
+              n (string-length vis)
+              rlo (max 0 (min n (- lo line-start)))
+              rhi (max 0 (min n (- hi line-start))))
+          (if (>= rlo rhi)
+            [(text row x vis)]
+            (concat (if (> rlo 0) [(text row x (substring vis 0 rlo))] [])
+              [(text row (+ x rlo) (substring vis rlo rhi) {:reverse true})]
+              (if (< rhi n) [(text row (+ x rhi) (substring vis rhi n))] [])))))
+      (ed-chunks->ops row
+        x
+        (ed--line-chunks vis
+          (rope-line->char (buffer-rope buf) line)
+          spans
+          bounds
+          overrides)))))
 
-(defn ed-visible-lines (buf top textrows x y w bounds)
+(defn ed-visible-lines (buf top textrows x y w bounds spans overrides)
   "`text` ops for the lines visible in a `textrows`-tall pane whose text area starts
-at `(x, y)` and is `w` wide, starting at line `top`, region highlighted if `bounds`."
+at `(x, y)` and is `w` wide, from line `top`; region highlighted if `bounds`,
+syntax-coloured if `spans` (with bracket `overrides`)."
   (let (last-line (min (dec (buffer-line-count buf)) (dec (+ top textrows))))
-    (mapcat (fn (line) (ed-line-ops buf line top x y w bounds))
+    (mapcat (fn (line) (ed-line-ops buf line top x y w bounds spans overrides))
       (range top (inc last-line)))))
 
 ;; ---- a pane: its buffer body + its mode line --------------------------------
@@ -80,20 +189,52 @@ pane visually — an inactive-mode-line face — lands with multi-pane splits.)"
   (let ([x y w h] (get pane :rect)
         sel (get pane :selected)
         pos (str (inc (buffer-current-line buf)) ":" (buffer-column buf))
-        label (str " " (buffer-name buf) "  (" (ed-buf-mode-name buf) ")  —  " pos
-                   (if sel (str "  —  " (get m :status)) "")))
+        label (str " "
+                (buffer-name buf)
+                "  ("
+                (ed-buf-mode-name buf)
+                ")  —  "
+                pos
+                (if sel (str "  —  " (get m :status)) "")))
     (text (+ y (dec h)) x (ed-fit-pad label w) {:reverse true})))
 
+(defn ed--scale-op (op x y s)
+  "Re-anchor a virtual-coords (origin 0,0) `text` op into a pane at screen `(x, y)`,
+scaled by `s`: it lands `s` cells apart and the glyphs draw `s`× larger via the
+kernel's `:scale` face attribute (ADR-079; the terminal renders it 1×). Non-text ops
+pass through unchanged."
+  (if (= (first op) :text)
+    (text (+ y (* (nth op 1) s))
+      (+ x (* (nth op 2) s))
+      (nth op 3)
+      (assoc (or (nth op 4 nil) {}) :scale s))
+    op))
+
 (defn ed-pane-ops (m pane)
-  "All render ops for one pane: its visible buffer lines (region highlighted) inside
-the rect above its mode line, plus the mode line itself. The pane's text area is its
-rect minus the bottom mode-line row."
+  "All render ops for one pane: its visible buffer lines inside the rect above its
+mode line, plus the mode line. Lines are syntax-coloured when the buffer's mode
+offers a `:fontify` service (lexed once per frame here), region-highlighted, and —
+in the selected pane — the bracket pair at point is marked. The pane's text area is
+its rect minus the bottom mode-line row. A pane with font scale `s>1` (Ctrl+wheel
+zoom) renders its body into a virtual `vw×vh` area, then scales every op `s`× and
+re-anchors it — so only this pane is magnified; the mode line stays base-size chrome."
   (let ([x y w h] (get pane :rect)
         buf (ed-pane-buf m pane)
-        top (get (get pane :payload) :top))
-    (concat
-      (ed-visible-lines buf top (max 0 (dec h)) x y w (buffer-region-bounds buf))
-      [(ed-pane-modeline m pane buf)])))
+        top (get (get pane :payload) :top)
+        s (max 1 (or (get (get pane :payload) :scale) 1))
+        fontify (ed-mode-service buf :fontify)
+        spans (if (nil? fontify) nil (fontify (buffer-text buf)))
+        overrides (if (get pane :selected) (ed-bracket-overrides buf) '())
+        bounds (buffer-region-bounds buf)
+        text-h (max 0 (dec h)))
+    (if (= s 1)
+      (concat (ed-visible-lines buf top text-h x y w bounds spans overrides)
+        [(ed-pane-modeline m pane buf)])
+      (let (vh (max 1 (quot text-h s))
+            vw (max 1 (quot w s))
+            body (ed-visible-lines buf top vh 0 0 vw bounds spans overrides))
+        (concat (map (fn (op) (ed--scale-op op x y s)) body)
+          [(ed-pane-modeline m pane buf)])))))
 
 ;; ---- dividers (the 1-cell lines between panes) ------------------------------
 
@@ -101,7 +242,7 @@ rect minus the bottom mode-line row."
   "Render ops drawing divider `d`: a vertical `│` column for a `:col` split, a
 horizontal `─` row for a `:row` split, plus a `cursor-zone` over it so the GUI shows
 a resize cursor on hover/drag (`:col-resize` ↔ / `:row-resize` ↕; the terminal
-ignores the zone). ADR-078."
+ignores the zone). ADR-080."
   (let ([x y w h] (get d :rect)
         col? (= (get d :dir) :col)
         line (if col?
@@ -125,15 +266,30 @@ prompt without one. Shown after the input so you see what completion will offer.
       (let (cs (f (get mb :input)))
         (if (empty? cs) "   {no match}" (str "   {" (ed--join-sp cs) "}"))))))
 
+(defn ed-echo-or-eldoc (m)
+  "The echo-row text when no minibuffer is open: the latest `message` if there is
+one, else — when the row is idle and the current buffer's mode offers an `:eldoc`
+service — that mode's signature hint for point (e.g. `(map f coll)`), else `\"\"`. An
+explicit message thus always wins over eldoc for that frame; eldoc only fills the
+otherwise-empty row."
+  (let (echo (get m :echo))
+    (if (not (= echo ""))
+      echo
+      (let (buf (ed-current-buf m)
+            eldoc (ed-mode-service buf :eldoc))
+        (if (nil? eldoc) "" (or (eldoc (buffer-text buf) (buffer-point buf)) ""))))))
+
 (defn ed-echo-line (m cols rows)
   "The bottom row (`rows-1`): the active minibuffer prompt + input (+ live
 completion candidates, if the prompt offers them) if one is open, else the latest
-`message`."
+`message` — or, when idle, the current mode's eldoc signature hint."
   (let (mb (get m :minibuffer))
-    (text (dec rows) 0
+    (text (dec rows)
+      0
       (ed-fit (if (nil? mb)
-                (get m :echo)
-                (str (get mb :prompt) (get mb :input) (ed-mb-candidates mb))) cols))))
+                (ed-echo-or-eldoc m)
+                (str (get mb :prompt) (get mb :input) (ed-mb-candidates mb)))
+        cols))))
 
 (defn ed-selected-pane (panes)
   "The pane flagged `:selected` (where the cursor goes), or the first as a fallback."
@@ -149,13 +305,18 @@ pane origin and the window's `:top`, column clamped to the pane width)."
       (let (pane (ed-selected-pane panes)
             [x y w h] (get pane :rect)
             buf (ed-pane-buf m pane)
-            top (get (get pane :payload) :top))
-        (cursor (+ y (- (buffer-current-line buf) top))
-                (+ x (min (dec w) (buffer-column buf)))))
+            top (get (get pane :payload) :top)
+            s (max 1 (or (get (get pane :payload) :scale) 1))
+            vw (max 1 (quot w s)))
+        ;; In a zoomed pane each char is s×s cells, so the cursor lands at the
+        ;; scaled top-left of its cell (column clamped to the pane's scaled width).
+        (cursor (+ y (* (- (buffer-current-line buf) top) s))
+          (+ x (* (min (dec vw) (buffer-column buf)) s))))
       (cursor (dec rows)
         ;; prompt width + cursor index into the input (defaults to end)
-        (min (dec cols) (+ (string-length (get mb :prompt))
-                           (or (get mb :point) (string-length (get mb :input)))))))))
+        (min (dec cols)
+          (+ (string-length (get mb :prompt))
+            (or (get mb :point) (string-length (get mb :input)))))))))
 
 (defn ed-view (m cols rows)
   "ui-run view (pure): lay the window tree into the body (everything above the echo
@@ -170,5 +331,5 @@ layout."
         (mapcat (fn (p) (ed-pane-ops m p)) panes)
         (mapcat (fn (d) (ed-divider-ops d)) (get layout :dividers))
         [(ed-echo-line m cols rows)]
-        (complete-popup-ops m cols rows)   ; overlays the buffer body when open
+        (complete-popup-ops m cols rows)  ; overlays the buffer body when open
         [(ed-cursor m panes cols rows)]))))

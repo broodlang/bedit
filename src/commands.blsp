@@ -12,12 +12,13 @@ region/kill commands maintain the model's `:kill-ring`; the buffer commands move
 between / open / kill buffers; `cmd-switch-buffer` / `cmd-find-file` open a
 minibuffer prompt (see `input`). This is editor *policy* — the reusable buffer
 model lives in `std/buffer.blsp`; keymaps in `input`."
-  (:use buffer)        ; the buffer ops the commands drive (incl. undo/redo, word motion)
+  (:use buffer)  ; the buffer ops the commands drive (incl. undo/redo, word motion)
   (:use eval-command)  ; eval-last-sexp / eval-region / eval-buffer (the C-x C-e family)
-  (:use sexp)          ; structural s-expression navigation (brood-mode commands)
-  (:use command)       ; defcommand — define + register an interactive command (M-x)
-  (:use window)        ; the window-tree ops behind the split/other/delete commands
-  (:use model))        ; current-buffer accessors, the kill ring, message
+  (:use sexp)  ; structural s-expression navigation (brood-mode commands)
+  (:use command)  ; defcommand — define + register an interactive command (M-x)
+  (:use window)  ; the window-tree ops behind the split/other/delete commands
+  (:use complete)  ; cmd-complete / complete-word-char? — TAB indent-or-complete
+  (:use model))  ; current-buffer accessors, the kill ring, message
 
 ;; ---- applying buffer ops to the current buffer ------------------------------
 
@@ -33,26 +34,112 @@ modified (edits)."
 
 ;; ---- movement (Emacs C-f/C-b/C-n/C-p/C-a/C-e/M-f/M-b + the arrow keys) -------
 
-(defcommand cmd-forward-char     (m key) (ed-apply m forward-char))
-(defcommand cmd-backward-char    (m key) (ed-apply m backward-char))
-(defcommand cmd-next-line        (m key) (ed-apply m forward-line))
-(defcommand cmd-previous-line    (m key) (ed-apply m backward-line))
+(defcommand cmd-forward-char (m key) (ed-apply m forward-char))
+(defcommand cmd-backward-char (m key) (ed-apply m backward-char))
+(defcommand cmd-next-line (m key) (ed-apply m forward-line))
+(defcommand cmd-previous-line (m key) (ed-apply m backward-line))
 (defcommand cmd-beginning-of-line (m key) (ed-apply m beginning-of-line))
-(defcommand cmd-end-of-line      (m key) (ed-apply m end-of-line))
-(defcommand cmd-forward-word     (m key) (ed-apply m forward-word))
-(defcommand cmd-backward-word    (m key) (ed-apply m backward-word))
+(defcommand cmd-end-of-line (m key) (ed-apply m end-of-line))
+(defcommand cmd-forward-word (m key) (ed-apply m forward-word))
+(defcommand cmd-backward-word (m key) (ed-apply m backward-word))
 (defcommand cmd-beginning-of-buffer (m key) (ed-apply m beginning-of-buffer))  ; M-<
-(defcommand cmd-end-of-buffer       (m key) (ed-apply m end-of-buffer))        ; M->
+(defcommand cmd-end-of-buffer (m key) (ed-apply m end-of-buffer))  ; M->
 
 ;; ---- structural s-expression motion (brood-mode: C-M-f/b/u/d/a) -------------
 ;; Each runs a `std/sexp` buffer command over the current buffer — navigation by
 ;; the parse-source CST, not characters. Bound only in `brood-mode` (see `modes`).
 
-(defcommand cmd-forward-sexp       (m key) (ed-apply m (fn (b) (sexp/forward b key))))
-(defcommand cmd-backward-sexp      (m key) (ed-apply m (fn (b) (sexp/backward b key))))
-(defcommand cmd-up-list            (m key) (ed-apply m (fn (b) (sexp/up b key))))
-(defcommand cmd-down-list          (m key) (ed-apply m (fn (b) (sexp/down b key))))
+(defcommand cmd-forward-sexp (m key) (ed-apply m (fn (b) (sexp/forward b key))))
+(defcommand cmd-backward-sexp (m key) (ed-apply m (fn (b) (sexp/backward b key))))
+(defcommand cmd-up-list (m key) (ed-apply m (fn (b) (sexp/up b key))))
+(defcommand cmd-down-list (m key) (ed-apply m (fn (b) (sexp/down b key))))
 (defcommand cmd-beginning-of-defun (m key) (ed-apply m (fn (b) (sexp/beginning-of-defun b key))))
+
+;; ---- indentation (TAB / RET; sexp-aware via the mode's :indent service) -----
+;; The mechanism is language-neutral: `ed-indent-target` asks the buffer's mode for
+;; an `:indent` service (brood-mode supplies a sexp-aware one — see `modes`), and
+;; falls back to matching the previous line. `ed-reindent-line` rewrites the line's
+;; leading whitespace, preserving point. Emacs feel: TAB indents-or-completes, and
+;; (in brood-mode) RET indents the new line.
+
+(defn ed--ws-char? (c) "True for an indentation char (space or tab)." (or (= c " ") (= c "\t")))
+
+(defn ed--leading-ws* (text i n)
+  (if (and (< i (string-length text)) (ed--ws-char? (char-at text i)))
+    (ed--leading-ws* text (inc i) (inc n))
+    n))
+(defn ed--leading-ws (text bol)
+  "The count of leading spaces/tabs on the line starting at offset `bol`."
+  (ed--leading-ws* text bol 0))
+
+(defn cmd--spaces (n)
+  "A string of `n` spaces (n<0 → empty)."
+  (apply str (map (fn (i) " ") (range (max 0 n)))))
+
+(defn ed--fallback-indent (text bol)
+  "The simple, mode-less indent for the line at `bol`: the leading-whitespace width
+of the previous non-blank line, or 0 at the top. Tail-recursive over blank lines."
+  (if (<= bol 0)
+    0
+    (let (prev-bol (ed-line-start-offset text (dec bol))
+          content-len (- (dec bol) prev-bol)
+          ws (ed--leading-ws text prev-bol))
+      (if (>= ws content-len)
+        ; previous line is empty / all whitespace — skip it
+        (ed--fallback-indent text prev-bol)
+        ws))))
+
+(defn ed-indent-target (buf)
+  "The column the current line should indent to: the buffer mode's `:indent` service
+applied to the line start, else the previous-line fallback."
+  (let (text (buffer-text buf)
+        bol (buffer-point (beginning-of-line buf))
+        svc (ed-mode-service buf :indent))
+    (if (nil? svc) (ed--fallback-indent text bol) (svc text bol))))
+
+(defn ed-reindent-line (buf target)
+  "Reindent the current line of `buf` to `target` columns of leading spaces,
+preserving point: from inside the old indentation point moves to the first non-blank
+char; from the body it shifts by the indent delta."
+  (let (text (buffer-text buf)
+        p (buffer-point buf)
+        bol (buffer-point (beginning-of-line buf))
+        cur (ed--leading-ws text bol)
+        within (<= (- p bol) cur)
+        b1 (insert (delete-char (goto-char buf bol) cur) (cmd--spaces target))
+        newp (if within (+ bol target) (+ p (- target cur))))
+    (goto-char b1 newp)))
+
+(defcommand cmd-indent-line
+  (m key)
+  "Reindent the current line to the column its mode dictates — sexp-aware in
+brood-mode, the previous line elsewhere (`M-x indent-line`)."
+  (ed-edit m (fn (b) (ed-reindent-line b (ed-indent-target b)))))
+
+(defcommand cmd-newline-and-indent
+  (m key)
+  "Enter in a structured mode: insert a newline, then indent the new line to its
+mode's column (Emacs `newline-and-indent`)."
+  (ed-edit m
+    (fn (b)
+      (let (nb (insert b "\n"))
+        (ed-reindent-line nb (ed-indent-target nb))))))
+
+(defcommand cmd-indent-or-complete
+  (m key)
+  "TAB: reindent the current line; if it's already at the right indent and point
+sits on a symbol, complete instead (Emacs `tab-always-indent` = `'complete`)."
+  (let (buf (ed-current-buf m)
+        text (buffer-text buf)
+        bol (buffer-point (beginning-of-line buf))
+        cur (ed--leading-ws text bol)
+        p (buffer-point buf)
+        target (ed-indent-target buf))
+    (if (and (= cur target)
+          (> p (+ bol cur))
+          (complete-word-char? (char-at text (dec p))))
+      (cmd-complete m key)
+      (ed-edit m (fn (b) (ed-reindent-line b target))))))
 
 ;; ---- screenful scrolling (C-v / M-v, PageDown / PageUp) ---------------------
 ;; A "page" is the viewport height less one line of overlap. `ed-update` stashes
@@ -64,24 +151,27 @@ modified (edits)."
 line of overlap; at least 1."
   (max 1 (dec (or (get m :view-rows) 10))))
 
-(defcommand cmd-scroll-up (m key)
+(defcommand cmd-scroll-up
+  (m key)
   "Scroll forward a screenful (C-v / PageDown): move point down ~one viewport,
 keeping a line of context. (Emacs `scroll-up-command` — the view scrolls up.)"
   (ed-apply m (fn (b) (forward-line b (ed-page-step m)))))
 
-(defcommand cmd-scroll-down (m key)
+(defcommand cmd-scroll-down
+  (m key)
   "Scroll back a screenful (M-v / PageUp): move point up ~one viewport, keeping a
 line of context. (Emacs `scroll-down-command` — the view scrolls down.)"
   (ed-apply m (fn (b) (backward-line b (ed-page-step m)))))
 
 ;; ---- editing ----------------------------------------------------------------
 
-(defcommand cmd-self-insert (m key)
+(defcommand cmd-self-insert
+  (m key)
   "Insert the typed character `key` (a 1-char string) at point."
   (ed-edit m (fn (b) (insert b key))))
 
-(defcommand cmd-newline        (m key) (ed-edit m (fn (b) (insert b "\n"))))
-(defcommand cmd-delete-char    (m key) (ed-edit m delete-char))
+(defcommand cmd-newline (m key) (ed-edit m (fn (b) (insert b "\n"))))
+(defcommand cmd-delete-char (m key) (ed-edit m delete-char))
 (defcommand cmd-delete-backward (m key) (ed-edit m delete-backward-char))
 
 ;; ---- line / word editing (open-line, kill-line/word, transpose, case) -------
@@ -94,8 +184,11 @@ line of context. (Emacs `scroll-down-command` — the view scrolls down.)"
 
 ;; Commands whose consecutive use coalesces into one kill-ring entry (like Emacs).
 (def ed--kill-commands
-  '(commands/cmd-kill-region commands/cmd-copy-region commands/cmd-kill-line
-    commands/cmd-kill-word commands/cmd-backward-kill-word commands/cmd-kill-whole-line))
+  '(commands/cmd-kill-region commands/cmd-copy-region
+     commands/cmd-kill-line
+     commands/cmd-kill-word
+     commands/cmd-backward-kill-word
+     commands/cmd-kill-whole-line))
 (def ed--yank-commands '(commands/cmd-yank commands/cmd-yank-pop))
 
 ;; Cap the ring like Emacs's `kill-ring-max` (default 60) so it can't grow forever.
@@ -111,7 +204,8 @@ line of context. (Emacs `scroll-down-command` — the view scrolls down.)"
 a forward kill, the front for a backward kill (Emacs's consecutive-kill coalescing).
 Otherwise cons a fresh entry."
   (let (ring (get m :kill-ring))
-    (assoc m :kill-ring
+    (assoc m
+      :kill-ring
       (take ed-kill-ring-max
         (if (and (ed--kill-command? (get m :last-command)) (not (empty? ring)))
           (cons (if forward? (str (first ring) text) (str text (first ring))) (rest ring))
@@ -122,14 +216,18 @@ Otherwise cons a fresh entry."
 the spanned text onto the kill ring (coalescing with an adjacent kill) and delete
 it. An empty span is a no-op."
   (let (b (ed-current-buf m)
-        p0 (buffer-point b)
-        moved (move (set-mark b))            ; mark = point; point moves
-        text (buffer-region moved))
+         p0
+         (buffer-point b)
+         moved
+         (move (set-mark b))  ; mark = point; point moves
+         text
+         (buffer-region moved))
     (if (or (nil? text) (= text ""))
       m
       (assoc (ed-set-buf (ed-push-kill m text (> (buffer-point moved) p0))
-                         (clear-mark (delete-region moved)))
-             :status "modified"))))
+               (clear-mark (delete-region moved)))
+        :status
+        "modified"))))
 
 (defn ed-capitalize (s)
   "`s` with its first character upper-cased and the rest lower-cased."
@@ -147,44 +245,63 @@ after it (M-u / M-l / M-c)."
       (ed-edit m (fn (bb) (insert (delete-region (assoc bb :mark p :point e)) (f word)))))))
 
 ;; open lines — C-o keeps point, M-o opens below, M-O opens above
-(defcommand cmd-open-line       (m key) "Insert a newline after point, leaving point (C-o)." (ed-edit m (fn (b) (backward-char (insert b "\n")))))
-(defcommand cmd-open-line-below (m key) "Open a new line below and move there (M-o)." (ed-edit m (fn (b) (insert (end-of-line b) "\n"))))
-(defcommand cmd-open-line-above (m key) "Open a new line above and move there (M-O)." (ed-edit m (fn (b) (backward-line (insert (beginning-of-line b) "\n")))))
+(defcommand cmd-open-line
+  (m key)
+  "Insert a newline after point, leaving point (C-o)."
+  (ed-edit m (fn (b) (backward-char (insert b "\n")))))
+(defcommand cmd-open-line-below
+  (m key)
+  "Open a new line below and move there (M-o)."
+  (ed-edit m (fn (b) (insert (end-of-line b) "\n"))))
+(defcommand cmd-open-line-above
+  (m key)
+  "Open a new line above and move there (M-O)."
+  (ed-edit m (fn (b) (backward-line (insert (beginning-of-line b) "\n")))))
 
 ;; kill (into the kill ring)
-(defcommand cmd-kill-line (m key)
+(defcommand cmd-kill-line
+  (m key)
   "Kill from point to end of line (C-k); at end of line, kill the newline."
   (let (b (ed-current-buf m))
     (if (= (buffer-char-after b) "\n")
       (ed-edit (ed-push-kill m "\n" true) delete-char)
       (ed-kill-span m end-of-line))))
 (defcommand cmd-kill-word (m key) "Kill the word after point (M-d)." (ed-kill-span m forward-word))
-(defcommand cmd-backward-kill-word (m key) "Kill the word before point (M-DEL)." (ed-kill-span m backward-word))
-(defcommand cmd-kill-whole-line (m key)
+(defcommand cmd-backward-kill-word
+  (m key)
+  "Kill the word before point (M-DEL)."
+  (ed-kill-span m backward-word))
+(defcommand cmd-kill-whole-line
+  (m key)
   "Kill the whole current line, newline included."
   (ed-kill-span (ed-apply m beginning-of-line) (fn (b) (forward-char (end-of-line b)))))
 
 ;; transpose / duplicate / join
-(defcommand cmd-transpose-chars (m key)
+(defcommand cmd-transpose-chars
+  (m key)
   "Swap the two characters around point and move forward (C-t)."
-  (ed-edit m (fn (b)
-    (let (p (buffer-point b))
-      (if (and (>= p 1) (< p (buffer-length b)))
-        (insert (delete-char (goto-char b (dec p)) 2)
-                (str (buffer-char-after b) (buffer-char-before b)))
-        b)))))
-(defcommand cmd-duplicate-line (m key)
+  (ed-edit m
+    (fn (b)
+      (let (p (buffer-point b))
+        (if (and (>= p 1) (< p (buffer-length b)))
+          (insert (delete-char (goto-char b (dec p)) 2)
+            (str (buffer-char-after b) (buffer-char-before b)))
+          b)))))
+(defcommand cmd-duplicate-line
+  (m key)
   "Duplicate the current line below it (C-x d)."
-  (ed-edit m (fn (b)
-    (let (lt (buffer-line-at b (buffer-current-line b)))
-      (insert (beginning-of-line b) (if (ends-with? lt "\n") lt (str lt "\n")))))))
-(defcommand cmd-join-line (m key)
+  (ed-edit m
+    (fn (b)
+      (let (lt (buffer-line-at b (buffer-current-line b)))
+        (insert (beginning-of-line b) (if (ends-with? lt "\n") lt (str lt "\n")))))))
+(defcommand cmd-join-line
+  (m key)
   "Join the next line onto this one — delete the newline at end of line (M-^)."
   (ed-edit m (fn (b) (delete-char (end-of-line b)))))
 
 ;; case
-(defcommand cmd-upcase-word     (m key) (ed-xform-word m upper))
-(defcommand cmd-downcase-word   (m key) (ed-xform-word m lower))
+(defcommand cmd-upcase-word (m key) (ed-xform-word m upper))
+(defcommand cmd-downcase-word (m key) (ed-xform-word m lower))
 (defcommand cmd-capitalize-word (m key) (ed-xform-word m ed-capitalize))
 
 ;; ---- undo / redo ------------------------------------------------------------
@@ -194,25 +311,29 @@ after it (M-u / M-l / M-c)."
 
 ;; ---- region / kill ring (C-SPC set mark · C-w kill · M-w copy · C-y yank) ----
 
-(defcommand cmd-set-mark (m key)
+(defcommand cmd-set-mark
+  (m key)
   "Set the mark at point — point and mark delimit the region."
   (message (ed-apply m set-mark) "mark set"))
 
-(defcommand cmd-kill-region (m key)
+(defcommand cmd-kill-region
+  (m key)
   "Delete the region and push its text onto the kill ring (C-w)."
   (let (text (buffer-region (ed-current-buf m)))
     (if (nil? text)
       (message m "no region (set the mark with C-SPC first)")
       (ed-edit (ed-push-kill m text true) delete-region))))
 
-(defcommand cmd-copy-region (m key)
+(defcommand cmd-copy-region
+  (m key)
   "Push the region's text onto the kill ring without deleting it (M-w)."
   (let (text (buffer-region (ed-current-buf m)))
     (if (nil? text)
       (message m "no region")
       (message (ed-apply (ed-push-kill m text true) clear-mark) "region copied"))))
 
-(defcommand cmd-yank (m key)
+(defcommand cmd-yank
+  (m key)
   "Insert the most recently killed/copied text at point (C-y), recording the
 inserted span + ring index in `:yank` so M-y (`cmd-yank-pop`) can replace it."
   (let (ring (get m :kill-ring))
@@ -222,10 +343,13 @@ inserted span + ring index in `:yank` so M-y (`cmd-yank-pop`) can replace it."
             start (buffer-point b)
             b2 (insert b (first ring)))
         (assoc (ed-set-buf m b2)
-               :status "modified"
-               :yank {:start start :end (buffer-point b2) :index 0})))))
+          :status
+          "modified"
+          :yank
+          {:start start :end (buffer-point b2) :index 0})))))
 
-(defcommand cmd-yank-pop (m key)
+(defcommand cmd-yank-pop
+  (m key)
   "Replace the text of the immediately-preceding yank with the next-older kill,
 cycling the ring (M-y). Only valid right after a yank or yank-pop; otherwise it
 reports that the previous command was not a yank."
@@ -233,16 +357,23 @@ reports that the previous command was not a yank."
     (if (or (nil? y) (not (ed--yank-command? (get m :last-command))) (empty? ring))
       (message m "previous command was not a yank")
       (let (n (count ring)
-            idx (let (i (inc (get y :index))) (if (>= i n) 0 i))
-            text (nth ring idx)
-            b (ed-current-buf m)
-            ;; delete the previous yank's span [start,end] (point lands at start),
-            ;; then insert the next entry there
-            cleared (delete-region (assoc b :mark (get y :start) :point (get y :end)))
-            b2 (insert cleared text))
+             idx
+             (let (i (inc (get y :index))) (if (>= i n) 0 i))
+             text
+             (nth ring idx)
+             b
+             (ed-current-buf m)
+             ;; delete the previous yank's span [start,end] (point lands at start),
+             ;; then insert the next entry there
+             cleared
+             (delete-region (assoc b :mark (get y :start) :point (get y :end)))
+             b2
+             (insert cleared text))
         (assoc (ed-set-buf m b2)
-               :status "modified"
-               :yank {:start (get y :start) :end (buffer-point b2) :index idx})))))
+          :status
+          "modified"
+          :yank
+          {:start (get y :start) :end (buffer-point b2) :index idx})))))
 
 ;; ---- multiple buffers -------------------------------------------------------
 
@@ -252,14 +383,17 @@ reports that the previous command was not a yank."
 (defn ed-select (m i)
   (assoc (ed-show-index m i) :status ""))
 
-(defcommand cmd-next-buffer (m key)
+(defcommand cmd-next-buffer
+  (m key)
   "Show the next buffer in the selected window (wraps)."
   (ed-select m (mod (inc (ed-current-index m)) (count (get m :buffers)))))
 
-(defcommand cmd-previous-buffer (m key)
+(defcommand cmd-previous-buffer
+  (m key)
   "Show the previous buffer in the selected window (wraps)."
-  (ed-select m (mod (+ (dec (ed-current-index m)) (count (get m :buffers)))
-                    (count (get m :buffers)))))
+  (ed-select m
+    (mod (+ (dec (ed-current-index m)) (count (get m :buffers)))
+      (count (get m :buffers)))))
 
 (defn ed-has-editable? (bufs)
   "Whether the pool `bufs` holds a buffer other than `*Messages*`."
@@ -270,10 +404,12 @@ reports that the previous command was not a yank."
 `killed` now shows `target`; windows above `killed` shift down one; below are
 unchanged. (Routes through `ed-map-windows` over all leaf payloads.)"
   (ed-map-windows m
-    (fn (w) (let (b (get w :buffer))
-              (assoc w :buffer (cond (< b killed) b (> b killed) (dec b) else target))))))
+    (fn (w)
+      (let (b (get w :buffer))
+        (assoc w :buffer (cond (< b killed) b (> b killed) (dec b) else target))))))
 
-(defcommand cmd-kill-buffer (m key)
+(defcommand cmd-kill-buffer
+  (m key)
   "Kill the current buffer (C-x k). Refuses to kill `*Messages*`; if it would leave
 no editable buffer, opens a fresh `*scratch*`. Windows showing the killed buffer are
 re-pointed; indices above it shift down."
@@ -286,9 +422,10 @@ re-pointed; indices above it shift down."
         (if (ed-has-editable? removed)
           ;; another editable buffer remains: the killed window shows the buffer
           ;; that shifted into its slot (clamped to the last index).
-          (message (ed--remap (assoc m :buffers removed) killed-idx
+          (message (ed--remap (assoc m :buffers removed)
+                     killed-idx
                      (min killed-idx (dec (count removed))))
-                   label)
+            label)
           ;; none left → append a fresh *scratch* and point the killed window at it.
           (let (bufs (into removed [(ed-stamp (make-buffer ""))]))
             (message (ed--remap (assoc m :buffers bufs) killed-idx (count removed)) label)))))))
@@ -311,9 +448,11 @@ fresh buffer backed by it (so Ctrl-S creates it)."
     (let (idx (ed-buffer-index-by-name m path))
       (cond
         (not (nil? idx)) (ed-select m idx)
-        (file-exists? path)
-          (try (message (ed-open-buffer m (buffer-from-file path)) (str "opened " path))
-               (catch e (message m (str "open failed: " (if (string? e) e (pr-str e))))))
+        (file-exists? path) (try
+                              (message (ed-open-buffer m (buffer-from-file path))
+                                (str "opened " path))
+                              (catch e
+                                (message m (str "open failed: " (if (string? e) e (pr-str e))))))
         else (message (ed-open-buffer m (make-buffer "" path path)) (str "new file " path))))))
 
 ;; ---- minibuffer completion (pure helpers the prompts close over) ------------
@@ -352,60 +491,71 @@ unchanged `text` when nothing matches. Tolerates a non-existent directory."
         matches (filter (fn (nm) (starts-with? nm (get p :frag))) names))
     (cond
       (empty? matches) text
-      (= (count matches) 1)
-        (let (full (str (get p :prefix) (first matches)))
-          (if (dir? (ed--join (get p :dir) (first matches))) (str full "/") full))
+      (= (count matches) 1) (let (full (str (get p :prefix) (first matches)))
+                              (if (dir? (ed--join (get p :dir) (first matches)))
+                                (str full "/")
+                                full))
       else (str (get p :prefix) (lcp matches)))))
 
 (defn ed-complete-name (text names)
   "Complete `text` against `names` (the sole match, else their common prefix)."
   (let (matches (filter (fn (nm) (starts-with? nm text)) names))
-    (cond (empty? matches) text
-          (= (count matches) 1) (first matches)
-          else (lcp matches))))
+    (cond
+      (empty? matches) text
+      (= (count matches) 1) (first matches)
+      else (lcp matches))))
 
 ;; ---- windows (tiled splits, Emacs C-x 2/3/0/1/o) ----------------------------
 ;; Operate on the model's `:layout` window tree (std/window). A split shows the
 ;; same buffer in the new window (point/scroll independent); selection/edits follow
 ;; the selected window.
 
-(defcommand cmd-split-window-below (m key)
+(defcommand cmd-split-window-below
+  (m key)
   "Split the selected window top/bottom; the new window shows the same buffer (C-x 2)."
   (assoc m :layout (window-split (get m :layout) :row (ed-window (ed-current-index m)))))
 
-(defcommand cmd-split-window-right (m key)
+(defcommand cmd-split-window-right
+  (m key)
   "Split the selected window left/right; the new window shows the same buffer (C-x 3)."
   (assoc m :layout (window-split (get m :layout) :col (ed-window (ed-current-index m)))))
 
-(defcommand cmd-other-window (m key)
+(defcommand cmd-other-window
+  (m key)
   "Move selection to the next window, wrapping (C-x o)."
   (assoc m :layout (window-other (get m :layout))))
 
-(defcommand cmd-delete-window (m key)
+(defcommand cmd-delete-window
+  (m key)
   "Delete the selected window; its sibling fills the space (C-x 0)."
   (assoc m :layout (window-delete (get m :layout))))
 
-(defcommand cmd-delete-other-windows (m key)
+(defcommand cmd-delete-other-windows
+  (m key)
   "Collapse the layout to just the selected window (C-x 1)."
   (assoc m :layout (window-delete-others (get m :layout))))
 
 ;; ---- buffer/file prompts (open a minibuffer; see input/minibuffer-handle) ---
 
-(defcommand cmd-switch-buffer (m key)
+(defcommand cmd-switch-buffer
+  (m key)
   "Prompt (minibuffer) for a buffer name to switch to (C-x b), completing against
 the open buffers."
   (let (names (map (fn (b) (buffer-name b)) (get m :buffers)))
-    (assoc m :minibuffer
+    (assoc m
+      :minibuffer
       {:prompt "Switch to buffer: "
        :input ""
        :on-complete (fn (mm t) (ed-switch-to-named mm t))
        :complete-fn (fn (t) (ed-complete-name t names))
        :candidates-fn (fn (t) (filter (fn (nm) (starts-with? nm t)) names))})))
 
-(defcommand cmd-find-file (m key)
+(defcommand cmd-find-file
+  (m key)
   "Prompt (minibuffer) for a file path to open (C-x C-f), completing against the
 filesystem; prefilled with the working directory."
-  (assoc m :minibuffer
+  (assoc m
+    :minibuffer
     {:prompt "Find file: "
      :input (str (cwd) "/")
      :on-complete (fn (mm t) (ed-find-file mm t))
@@ -413,23 +563,29 @@ filesystem; prefilled with the working directory."
 
 ;; ---- M-x: run any interactive command by name -------------------------------
 
-(defcommand cmd-execute-extended-command (m key)
+(defcommand cmd-execute-extended-command
+  (m key)
   "Prompt for an interactive command name and run it (M-x). Completes against, and
 shows, the registered commands (`defcommand`s); an unknown name is reported."
-  (assoc m :minibuffer
+  (assoc m
+    :minibuffer
     {:prompt "M-x "
      :input ""
-     :on-complete (fn (mm t) (command/run-command mm t (fn (mmm nm) (message mmm (str "no command: " nm)))))
+     :on-complete (fn (mm t)
+                    (command/run-command mm t (fn (mmm nm) (message mmm (str "no command: " nm)))))
      :complete-fn (fn (t) (ed-complete-name t (command/command-names)))
-     :candidates-fn (fn (t) (take 12 (filter (fn (nm) (starts-with? nm t)) (command/command-names))))}))
+     :candidates-fn (fn (t)
+                      (take 12 (filter (fn (nm) (starts-with? nm t)) (command/command-names))))}))
 
 ;; ---- files + quit -----------------------------------------------------------
 
-(defcommand cmd-quit (m key)
+(defcommand cmd-quit
+  (m key)
   "Quit the editor (C-x C-c, or the window close button → :escape)."
   (assoc m :done true))
 
-(defcommand cmd-save (m key)
+(defcommand cmd-save
+  (m key)
   "Write the current buffer to its file (C-x C-s); report the outcome in the echo
 area. A no-op-with-message if the buffer has no backing file."
   (let (buf (ed-current-buf m))
@@ -444,15 +600,18 @@ area. A no-op-with-message if the buffer has no backing file."
 ;; the work (read + eval + value/output capture) as a pure `buffer -> message
 ;; string` and is shared with any editor. We just route the result to `message`.
 
-(defcommand cmd-eval-last-sexp (m key)
+(defcommand cmd-eval-last-sexp
+  (m key)
   "C-x C-e — evaluate the last complete form ending at point (multi-line: reads
 every form up to point, evals the last) and show its value + any output."
   (message m (eval-last-sexp (ed-current-buf m))))
 
-(defcommand cmd-eval-region (m key)
+(defcommand cmd-eval-region
+  (m key)
   "Evaluate the region (point↔mark) as Brood source, showing the last form's value."
   (message m (eval-region (ed-current-buf m))))
 
-(defcommand cmd-eval-buffer (m key)
+(defcommand cmd-eval-buffer
+  (m key)
   "Evaluate the whole buffer as Brood source, showing the last form's value."
   (message m (eval-buffer (ed-current-buf m))))
