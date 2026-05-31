@@ -72,7 +72,18 @@ feature work — surfacing it is half the point of this project.
 ## Layout
 
 ```
-src/main.blsp          the editor — module/view/update glue over the toolkit
+src/main.blsp          entry point — opens the window, runs the ui-run loop
+src/model.blsp         the ui-run model: buffer pool, kill ring, minibuffer, *Messages*, scrolling
+src/panes.blsp         pane-layout geometry + mouse-event folding (model -> model)
+src/view.blsp          pure view: model -> render frame (std/display ops)
+src/input.blsp         dispatch: fold a key/mouse/tick event into the next model
+src/commands.blsp      the editing commands, each a (model key) -> model
+src/interactive.blsp   the `defcommand` macro + the M-x command registry
+src/modes.blsp         modes as layers: the keymaps (data) + brood-mode services
+src/complete.blsp      completion-at-point (the in-buffer Tab popup)
+src/mincomplete.blsp   minibuffer prompt completion (path / name)
+src/eval-command.blsp  eval Brood source from a buffer (the C-x C-e core)
+src/projects.blsp      project root + file walk (find-file-in-project)
 tests/main_test.blsp   pure update/view tests (no window needed)
 project.blsp           the nest manifest (:name "myedit")
 ```
