@@ -23,6 +23,7 @@ self-editing editor)."
 ;; Loading `modes` defines the layers and registers the default (text-mode); the
 ;; bindings live there, as data, not here.
 (require 'modes)
+(require 'lineedit)  ; the minibuffer drives lineedit's pure one-line editor core
 
 ;; ---- the active keymap comes from the buffer's layers -----------------------
 
@@ -90,52 +91,33 @@ message)."
       else m3)))
 
 ;; ---- the minibuffer (modal: when active, all input is the minibuffer's) ------
-;; The prompt is a one-line editable field — `:input` (a string) plus `:point` (the
-;; cursor's char index into it). It supports Emacs line editing: C-f/C-b/C-a/C-e
-;; (and the arrows / Home / End) move point, Backspace / C-d / Delete remove, C-k
-;; kills to end, a printable key inserts *at point*, Tab completes, Enter accepts,
-;; Esc / C-g abort. `:point` defaults to the end of `:input` (so a freshly-opened or
-;; programmatically-set prompt starts with the cursor after the text).
-
-(defn mb-point (mb)
-  "The minibuffer cursor index, defaulting to the end of its input."
-  (or (get mb :point) (string-length (get mb :input))))
-
-(defn mb-set (m s p)
-  "The model with the active minibuffer's input set to `s` and point clamped to
-`p` within it."
-  (assoc m
-    :minibuffer
-    (assoc (get m :minibuffer) :input s :point (max 0 (min (string-length s) p)))))
+;; A one-line prompt that REUSES the REPL line editor: `:minibuffer :edit` is a
+;; `std/lineedit` state (the same pure core std/observer's minibuffer drives), so
+;; the prompt gets emacs editing for free — C-a/C-e, C-f/C-b, M-f/M-b, C-k/C-u/C-w/
+;; M-d, C-y yank, C-t, ↑/↓ history, C-r reverse-search. Keys are fed to
+;; `lineedit--handle`; we intercept only **Tab** (per-prompt completion via the
+;; minibuffer's `:complete-fn`, not lineedit's symbol completion) and **Esc / C-g**
+;; (abort). Enter makes lineedit set `:done :submit`, and we run `:on-complete` with
+;; the text; C-c (`:cancel`) closes. (The text/point/prompt accessors live in `model`.)
 
 (defn minibuffer-handle (m input)
-  "Fold one key into an active minibuffer prompt — a one-line Emacs editor over
-`:input`/`:point`. Enter runs `:on-complete` with the text (and closes it); Esc /
-C-g abort; movement / deletion edit at point; Tab completes via `:complete-fn`
-(point to end); a printable key inserts at point; everything else is ignored."
-  (let (mb (get m :minibuffer)
-        s (get mb :input)
-        p (mb-point mb)
-        n (string-length s))
+  "Fold one key into the active minibuffer. Tab replaces the text with the
+`:complete-fn` of the input; Esc / C-g abort; every other key drives lineedit's pure
+editor (`lineedit--handle`) — on `:submit` (Enter) run `:on-complete` with the text,
+on `:cancel` close. Movement, kill-ring, yank, and history all come from lineedit."
+  (let (mb (get m :minibuffer))
     (cond
-      (= input :enter) ((get mb :on-complete) (assoc m :minibuffer nil) s)
+      (= input :tab) (let (completed ((get mb :complete-fn) (mb-text mb)))
+                       (assoc m
+                         :minibuffer
+                         (assoc mb :edit (ed-mb-set-text (get mb :edit) completed))))
       (or (= input :escape) (= input :ctrl-g)) (assoc m :minibuffer nil :echo "quit")
-      (or (= input :left) (= input :ctrl-b)) (mb-set m s (dec p))
-      (or (= input :right) (= input :ctrl-f)) (mb-set m s (inc p))
-      (or (= input :home) (= input :ctrl-a)) (mb-set m s 0)
-      (or (= input :end) (= input :ctrl-e)) (mb-set m s n)
-      (= input :backspace) (if (> p 0)
-                             (mb-set m (str (substring s 0 (dec p)) (substring s p n)) (dec p))
-                             m)
-      (or (= input :delete) (= input :ctrl-d)) (if (< p n)
-                                                 (mb-set m
-                                                   (str (substring s 0 p) (substring s (inc p) n))
-                                                   p)
-                                                 m)
-      (= input :ctrl-k) (mb-set m (substring s 0 p) p)
-      (= input :tab) (let (c ((get mb :complete-fn) s)) (mb-set m c (string-length c)))
-      (string? input) (mb-set m (str (substring s 0 p) input (substring s p n)) (inc p))
-      else m)))
+      else (let (edit (lineedit/lineedit--handle (get mb :edit) input)
+                 done (get edit :done))
+             (cond
+               (= done :submit) ((get mb :on-complete) (assoc m :minibuffer nil) (get edit :text))
+               (nil? done) (assoc m :minibuffer (assoc mb :edit edit))
+               else (assoc m :minibuffer nil :echo "quit"))))))
 
 ;; ---- the ui-run update ------------------------------------------------------
 
@@ -151,31 +133,31 @@ inside a split. While a minibuffer is open, every key goes to it; while the comp
 popup is open, its control keys (C-n/C-p/Enter/…) go to it and any other key dismisses
 it and is then dispatched normally; otherwise the key is dispatched through the keymap."
   (let (textrows (ed-selected-text-rows m cols rows)
-         ; the SELECTED pane's text height (split-aware)
-         m
+         ; selected pane height (split-aware)
+         m0
          (assoc m :view-rows textrows))
-    ; so page commands (C-v/M-v) know the viewport
-    ;; Refresh diagnostics after folding the key in — a no-op (cache hit on
-    ;; `:diag-text`) unless the current buffer's text changed, so movement is free
-    ;; and only edits pay for a recheck.
-    (ed-refresh-diagnostics
-      (cond
-        (= input :tick) m
-        (and (vector? input) (= (first input) :resize)) (ed-scroll m textrows)
-        (and (vector? input) (= (first input) :mouse))
-        ;; A wheel notch scrolls/zooms the HOVERED pane's own
-        ;; payload (:top/:scale), so it must bypass the
-        ;; selected-pane point-clamp (`ed-scroll`) that would
-        ;; otherwise snap its viewport back to point.
-        (let (mm (ed-mouse m input cols rows))
-          (if (or (= (nth input 1) :scroll-up) (= (nth input 1) :scroll-down))
-            mm
-            (ed-scroll mm textrows))) (get m
-                                                                                                                                                                                     :minibuffer)
-        (ed-scroll (minibuffer-handle m input) textrows) (get m :completion)
-        (if (complete-control-key? input)
-          (ed-scroll (complete-handle m input) textrows)
-          (ed-scroll (ed-dispatch (complete-cancel m)
-                       input)
-            textrows)) else
-        (ed-scroll (ed-dispatch m input) textrows)))))
+    ; so page commands know the viewport
+    ;; A thrown error — from a command, the minibuffer, completion, or a re-check —
+    ;; surfaces in the echo area and the editor keeps running: a crash must never take
+    ;; down the whole editor (ui-run would otherwise restore the screen and re-raise,
+    ;; exiting). The model `m0` (pre-dispatch) is kept so editing can continue.
+    (try
+      ;; Refresh diagnostics after folding the key in — a no-op (cache hit on
+      ;; `:diag-text`) unless the current buffer's text changed.
+      (ed-refresh-diagnostics
+        (cond
+          (= input :tick) m0
+          (and (vector? input) (= (first input) :resize)) (ed-scroll m0 textrows)
+          ;; A wheel notch scrolls/zooms the HOVERED pane (:top/:scale), so it bypasses
+          ;; the selected-pane point-clamp (ed-scroll) that would snap it back to point.
+          (and (vector? input) (= (first input) :mouse)) (let (mm (ed-mouse m0 input cols rows))
+                                                           (if (or (= (nth input 1) :scroll-up)
+                                                                 (= (nth input 1) :scroll-down))
+                                                             mm
+                                                             (ed-scroll mm textrows)))
+          (get m0 :minibuffer) (ed-scroll (minibuffer-handle m0 input) textrows)
+          (get m0 :completion) (if (complete-control-key? input)
+                                 (ed-scroll (complete-handle m0 input) textrows)
+                                 (ed-scroll (ed-dispatch (complete-cancel m0) input) textrows))
+          else (ed-scroll (ed-dispatch m0 input) textrows)))
+      (catch e (message m0 (str "error: " (ed-error-message e)))))))
