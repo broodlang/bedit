@@ -25,23 +25,34 @@ Three kinds of process back a running server:
 `ed-update` calls `web-publish!` once per event while a server is running (the hook
 that makes it live); the OS-assigned port comes back as a `[:web-port n]` message
 folded in by the loop's event registry (see `input`)."
-  (:use model)  ; ed-current-buf / ed-buf-mode-name — the selected pane's buffer
-  (:use buffer)  ; buffer-text / buffer-name / buffer-current-line / buffer-column
+  (:use model)  ; ed-current-buf / ed-buf-mode-name / ed-mode-service (the mode's :fontify)
+  (:use buffer)  ; buffer-text / -name / -current-line / -column / -file / -line-count / -region-bounds
+  (:use highlight)  ; fontify-runs — the shared span+overlay -> [substring face] tiler
   (:use sse)  ; sse-headers / sse-send — server-side event-stream framing
   (:use http))  ; http-listen / serve-loop / router / stream-response / ok
 
 ;; ---- the snapshot (plain data — what crosses the process boundary) ----------
 
 (defn web-snapshot (m)
-  "A plain-data snapshot of the selected pane's buffer: name, mode, full text, and
-point as 0-based `:line` / `:col` (the modeline convention — line shown 1-based,
-column 0-based). Only primitives, so it copies cleanly to the publisher process."
-  (let (buf (ed-current-buf m))
+  "A plain-data snapshot of the selected pane's buffer for the browser: name, mode,
+full text, point (0-based `:line` / `:col` — the modeline convention), backing
+`:file`, total `:lines`, the `:region` selection `[lo hi]` (or nil), the modeline
+`:status`, and `:spans` — the buffer mode's syntax-highlight spans (`[start end
+face]`, reusing its `:fontify` service; empty when the mode offers none). Plain
+data throughout (vectors / maps / scalars), so it copies cleanly to the publisher."
+  (let (buf (ed-current-buf m)
+        text (buffer-text buf)
+        fontify (ed-mode-service buf :fontify))  ; the buffer mode's syntax lexer, or nil
     {:name (buffer-name buf)
      :mode (ed-buf-mode-name buf)
-     :text (buffer-text buf)
+     :text text
      :line (buffer-current-line buf)
-     :col (buffer-column buf)}))
+     :col (buffer-column buf)
+     :file (buffer-file buf)                 ; backing path, or nil
+     :lines (buffer-line-count buf)          ; total line count
+     :region (buffer-region-bounds buf)      ; [lo hi] selection, or nil
+     :status (get m :status)                 ; the modeline status (e.g. "modified")
+     :spans (if (nil? fontify) '() (fontify text))}))  ; [start end face] syntax spans
 
 ;; ---- rendering a snapshot to HTML -------------------------------------------
 
@@ -50,6 +61,7 @@ column 0-based). Only primitives, so it copies cleanly to the publisher process.
 body{margin:0}
 header{position:sticky;top:0;background:#181825;padding:.5rem 1rem;border-bottom:1px solid #313244;color:#a6adc8}
 header .mode{color:#89b4fa}
+header .status{color:#f9e2af}
 header .pos{float:right;color:#6c7086}
 pre{margin:0;padding:.5rem 1rem;white-space:pre;tab-size:4}
 .cur-line{background:#2a2b3c;display:inline-block;min-width:100%}
@@ -65,28 +77,78 @@ pre{margin:0;padding:.5rem 1rem;white-space:pre;tab-size:4}
   "HTML-escape the three markup-significant characters in `s`."
   (replace (replace (replace s "&" "&amp;") "<" "&lt;") ">" "&gt;"))
 
-(defn web--line-html (line idx cur-line cur-col)
-  "One buffer line as HTML. The cursor's line is wrapped in `.cur-line` with a
-`.cursor` caret spliced in at `cur-col`; other lines are just escaped text."
+;; ---- faces -> inline CSS (mirror the native view's syntax colours) ----------
+
+;; Named lexer-face colours (highlight.blsp's `:fg` keywords) -> catppuccin hex,
+;; so the browser mirror matches the editor's own palette.
+(def *web-colors*
+  {:dark-grey "#6c7086" :grey "#9399b2" :green "#a6e3a1" :yellow "#f9e2af"
+   :magenta "#f5c2e7" :blue "#89b4fa" :cyan "#94e2d5" :red "#f38ba8"
+   :white "#cdd6f4"})
+
+(defn web--face-style (face)
+  "Inline CSS for a `display.blsp`-style face map (`{:fg :green :bold true}` …): its
+`:fg` mapped through `*web-colors*`, plus `:bold`/`:italic`, and `:reverse` rendered
+as a selection background (what the active region carries). \"\" when nothing renders."
+  (str
+    (let (col (get *web-colors* (get face :fg))) (if (nil? col) "" (str "color:" col ";")))
+    (if (get face :bold) "font-weight:bold;" "")
+    (if (get face :italic) "font-style:italic;" "")
+    (if (get face :reverse) "background:#45475a;" "")))
+
+;; ---- [substring face] runs (from the shared tiler) -> HTML -------------------
+;; `highlight/fontify-runs` does the offset/merge/coalesce — the same primitive the
+;; native view renders. Web only turns each `[substring face]` run into an inline-
+;; styled `<span>`; the region is just one `[lo hi face]` overlay range.
+
+(defn web--region-ranges (region)
+  "The active selection as a `fontify-runs` overlay channel: a single `[lo hi
+{:reverse true}]` range, or `()` when nothing is marked."
+  (if (nil? region) '() (let ([lo hi] region) (list [lo hi {:reverse true}]))))
+
+(defn web--chunk-html (run)
+  "One `[substring face]` run as escaped HTML: a styled `<span>` when the face renders
+to CSS, plain escaped text otherwise."
+  (let ([s f] run
+        txt (web--escape s)
+        style (if (nil? f) "" (web--face-style f)))
+    (if (= "" style) txt (str "<span style=\"" style "\">" txt "</span>"))))
+
+(defn web--run-html (s base spans region)
+  "A run of buffer text `s` (its first char at offset `base`) as faced HTML: the mode's
+`spans` syntax-coloured, the active `region` shaded. The offset/merge/coalesce is
+`highlight/fontify-runs`; this only emits each resulting run's `<span>`."
+  (join "" (map web--chunk-html (fontify-runs s base spans (web--region-ranges region)))))
+
+(defn web--line-html (line base idx spans region cur-line cur-col)
+  "One buffer line (first char at offset `base`, line number `idx`) as faced HTML. The
+cursor's line is wrapped in `.cur-line` with a `.cursor` caret spliced in at `cur-col`
+— splitting the line there so faces and the region still paint on both sides."
   (if (= idx cur-line)
     (let (n (min cur-col (string-length line))
           before (substring line 0 n)
           after (substring line n (string-length line)))
       (str "<span class=\"cur-line\">"
-        (web--escape before)
+        (web--run-html before base spans region)
         "<span class=\"cursor\"></span>"
-        (web--escape after)
+        (web--run-html after (+ base n) spans region)
         "</span>"))
-    (web--escape line)))
+    (web--run-html line base spans region)))
+
+(defn web--lines (lines idx base spans region cur-line cur-col acc)
+  "Tail-recursive walk over `lines`, threading each line's buffer start-offset `base`
+(+1 per stripped newline) and accumulating its `web--line-html`."
+  (if (empty? lines)
+    (join "\n" (reverse acc))
+    (web--lines (rest lines) (inc idx) (+ base (string-length (first lines)) 1)
+      spans region cur-line cur-col
+      (cons (web--line-html (first lines) base idx spans region cur-line cur-col) acc))))
 
 (defn web--lines-html (snap)
-  "The buffer's lines as HTML, joined by real newlines (the `<pre>` body)."
-  (let (lines (string-split (get snap :text) "\n")
-        cur-line (get snap :line)
-        cur-col (get snap :col))
-    (join "\n"
-      (map (fn (i) (web--line-html (nth lines i) i cur-line cur-col))
-        (range (count lines))))))
+  "The buffer's lines as faced HTML joined by real newlines (the `<pre>` body): the
+mode's `:spans` syntax-coloured, the active `:region` shaded, the cursor line marked."
+  (web--lines (string-split (get snap :text) "\n") 0 0
+    (get snap :spans) (get snap :region) (get snap :line) (get snap :col) '()))
 
 (defn web-render-app (snap)
   "The **live region** the browser swaps in on each update: the sticky header
@@ -96,7 +158,10 @@ highlighted and a caret at point. Rendered into the initial page (inside `#app`)
 `sse-send`/`sse-frame` `data:`-prefix every line so they round-trip to the browser."
   (str "<header>" (web--escape (get snap :name))
     " <span class=\"mode\">(" (web--escape (get snap :mode)) ")</span>"
-    "<span class=\"pos\">" (inc (get snap :line)) ":" (get snap :col) "</span></header>"
+    (let (st (get snap :status))
+      (if (or (nil? st) (= "" st)) "" (str " <span class=\"status\">" (web--escape st) "</span>")))
+    "<span class=\"pos\">" (inc (get snap :line)) ":" (get snap :col)
+    " · " (get snap :lines) "L</span></header>"
     "<pre>" (web--lines-html snap) "</pre>"))
 
 (defn web-render-page (snap)
