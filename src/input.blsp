@@ -73,24 +73,47 @@ no-op (so a stray :f5 / :page-up never tries to insert a keyword)."
   "True if `input` is a single decimal-digit key."
   (and (string? input) (= (string-length input) 1) (>= (index-of "0123456789" input) 0)))
 
-(defn ed--prefix-continues? (input)
-  "Keys that extend a pending prefix arg rather than ending it: another C-u or a digit."
-  (or (= input :ctrl-u) (ed--digit? input)))
+(defn ed--prefix-continues? (m input)
+  "Keys that extend a pending prefix arg rather than ending it: another C-u, a digit, or
+a `-` **only while the argument is still raw** (no digits yet) — `C-u -` negates, but a
+`-` after digits terminates the arg and self-inserts (so `C-u 5 -` types five dashes)."
+  (or (= input :ctrl-u)
+    (ed--digit? input)
+    (and (= input "-") (get (get m :prefix-arg) :raw))))
 
 (defn ed--prefix-read (m input)
-  "Fold a C-u / digit into the active prefix-arg accumulator."
-  (let (pa (get m :prefix-arg))
+  "Fold a C-u / digit / `-` into the active prefix-arg accumulator. The count carries its
+sign, so digits after a negative seed (from `M--`/`C--` or `-`) accumulate negative."
+  (let (pa (get m :prefix-arg)
+        c (get pa :count)
+        neg (< c 0))
     (cond
-      (= input :ctrl-u) (assoc m :prefix-arg {:count (* 4 (get pa :count)) :raw true})
-      else (let (d (string->number input))
+      (= input :ctrl-u) (assoc m :prefix-arg {:count (* 4 c) :raw true})
+      ;; `-`: raw → seed a negative argument (-1); mid-number → flip the sign.
+      (= input "-") (assoc m :prefix-arg {:count (if (get pa :raw) -1 (- c)) :raw (get pa :raw)})
+      else (let (d (string->number input)
+                 sd (if neg (- d) d))
              (assoc m :prefix-arg
-               (if (get pa :raw) {:count d :raw false} {:count (+ (* 10 (get pa :count)) d) :raw false}))))))
+               (if (get pa :raw) {:count sd :raw false} {:count (+ (* 10 c) sd) :raw false}))))))
+
+(defn ed--run-arg (m1 step this-cmd input n)
+  "Run `this-cmd` under numeric prefix argument `n`: `|n|` repetitions, swapping to its
+registered inverse command when `n` is negative (Emacs negative-argument — `C-- C-f`
+goes backward). Repeats thread `:last-command`/`:this-command` so consecutive kills /
+inserts coalesce. With no registered inverse a negative arg just repeats `|n|` times."
+  (let (an (abs n)
+        inv (command-inverse this-cmd))
+    (if (and (< n 0) (not (nil? inv)))
+      (fold (fn (mm i)
+              ((eval inv) (assoc mm :last-command (if (= i 0) (get mm :last-command) inv) :this-command inv) input))
+        m1 (range an))
+      (fold (fn (mm i) (step (if (= i 0) mm (assoc mm :last-command this-cmd)))) m1 (range an)))))
 
 (defn ed--dispatch-key (m input)
   "Resolve and run `input` through the active keymap (the chord work is `keymap-step`),
-repeating the command `:prefix-arg` times when one is set. A prefix key mid-chord just
-steps (the prefix arg carries until the chord completes); a prefix-consuming command
-(set-mark) runs once and reads the arg itself."
+repeating the command `:prefix-arg` times when one is set (negative runs the inverse —
+see `ed--run-arg`). A prefix key mid-chord just steps (the prefix arg carries until the
+chord completes); a prefix-consuming command (set-mark) runs once and reads the arg."
   (let (km
          (active-keymap (ed-current-buf m))
          binding
@@ -118,11 +141,9 @@ steps (the prefix arg carries until the chord completes); a prefix-consuming com
            (nil? this-cmd) (step m1)
            ;; a command that consumes the arg itself (set-mark → pop-mark): run once
            (and pa (prefix-consuming? this-cmd)) (dissoc (step m1) :prefix-arg)
-           ;; a normal command under a prefix arg: run it N times (set last-command on
-           ;; the repeats so consecutive kills/inserts coalesce), then clear the arg
-           pa (dissoc (fold (fn (mm i) (step (if (= i 0) mm (assoc mm :last-command this-cmd))))
-                        m1 (range n))
-                :prefix-arg)
+           ;; a normal command under a prefix arg: run |N| times — the inverse when N is
+           ;; negative (`ed--run-arg`) — then clear the arg
+           pa (dissoc (ed--run-arg m1 step this-cmd input n) :prefix-arg)
            else (step m1)))
     (cond
       (map? binding) (assoc result :echo (str (key-label input) "-"))
@@ -134,7 +155,7 @@ steps (the prefix arg carries until the chord completes); a prefix-consuming com
 built (`:prefix-arg` set and `input` a C-u/digit), accumulate it and run nothing yet;
 otherwise resolve and run the key through the active keymap (`ed--dispatch-key`)."
   (let (m (ed--ensure-layers m0))
-    (if (and (get m :prefix-arg) (ed--prefix-continues? input))
+    (if (and (get m :prefix-arg) (ed--prefix-continues? m input))
       (let (m2 (ed--prefix-read m input))
         (assoc m2 :echo (str "C-u " (get (get m2 :prefix-arg) :count) "-")))
       (ed--dispatch-key m input))))
@@ -237,6 +258,77 @@ none is open. The owning handler consumes the key; otherwise the overlay exits
       (ed--transient-owns? h m input) ((get h :handle) m input)
       else (ed-dispatch ((get h :exit) m) input))))
 
+;; ---- key repeat (consumer-paced, off the GUI's down/up pair) ----------------
+;; The GUI backend no longer relays the OS auto-repeat (it floods the mailbox, so a
+;; release left a backlog that kept "playing" — the cursor scrolling on past the
+;; key-up). Instead it sends one key-down and, on release, a `[:key-up k]`. We track
+;; the held key (`:held-key`) and re-issue it on the refresh `:tick`, shortening the
+;; tick to a repeat beat so the cadence is paced by *our* render loop — it can't
+;; outrun the screen and stops the instant the key lifts. The terminal frontend sends
+;; no releases, so repeat is gated on `:gui-keys` (set once a `[:key-up]` is seen):
+;; there the terminal's own key repeat still applies, and we never engage (and so
+;; never run away with no release to stop us).
+
+(def *repeat-delay-ms* 300)  ; initial pause before a held key starts repeating (typematic)
+(def *repeat-rate-ms* 35)    ; interval between repeats once it has started
+
+(def *repeat-keys*
+  ;; The non-self-inserting keys that auto-repeat while held: motion and deletion.
+  ;; (Any printable key — a 1-char string — repeats too; see `ed-repeat-key?`.) Prefix
+  ;; chords, overlay keys, and one-shot commands deliberately aren't here.
+  [:ctrl-n :ctrl-p :ctrl-f :ctrl-b :alt-f :alt-b
+   :up :down :left :right
+   :backspace :delete :ctrl-d
+   :ctrl-v :alt-v :page-up :page-down])
+
+(defn ed-repeat-key? (input)
+  "Whether `input` is a key that may auto-repeat while held: a self-inserting
+character (a 1-char string) or one of the known motion/deletion keys."
+  (or (and (string? input) (= (string-length input) 1))
+    (member? input *repeat-keys*)))
+
+(defn ed--base-key (k)
+  "The modifier-stripped base of key `k` — `:ctrl-n`/`:alt-n` → \"n\", a printable key →
+itself, any other keyword → its name. Lets a release match the held key regardless of
+whether the modifier or the key itself came up first (`C-n` held, then either `n` or
+`C-n` released → same base \"n\")."
+  (cond
+    (string? k) k
+    (keyword? k) (let (n (name k))
+                   (cond
+                     (starts-with? n "ctrl-") (substring n 5 (string-length n))
+                     (starts-with? n "alt-") (substring n 4 (string-length n))
+                     else n))
+    else (pr-str k)))
+
+(defn ed--repeatable? (m input)
+  "Whether, after dispatching `input`, key-repeat should be armed: `input` is a
+repeatable key, it landed in the plain editing context (no prefix chord mid-flight, no
+transient overlay), and this frontend reports key releases (`:gui-keys`) so a hold can
+be stopped. Re-checked each repeat, so a key whose context changed stops cleanly."
+  (and (get m :gui-keys)
+    (ed-repeat-key? input)
+    (nil? (get m :pending))
+    (nil? (ed--transient-active m))))
+
+(defn ed--repeat-clear (m)
+  "Stop any in-progress key repeat: drop `:held-key` and restore the idle tick beat."
+  (assoc (dissoc m :held-key) :tick-ms *idle-tick-ms*))
+
+(defn ed--arm-repeat (m input beat)
+  "After dispatching `input`, arm repeat if it's a repeatable key still in the plain
+editing context — hold it and set the tick to `beat` (the initial delay on a fresh
+press, the faster rate on a repeat tick); otherwise stop any repeat."
+  (if (ed--repeatable? m input)
+    (assoc m :held-key input :tick-ms beat)
+    (ed--repeat-clear m)))
+
+(defn ed-repeat-key-step (m input textrows beat)
+  "Route one key through normal dispatch, re-clamp scroll, then (re)arm repeat at
+`beat`. The shared core of a fresh keystroke (`beat` = the initial delay) and a
+held-key repeat tick (`beat` = the faster rate)."
+  (ed--arm-repeat (ed-scroll (ed-route-transient m input) textrows) input beat))
+
 ;; ---- inbound system / async events (the loop's event bus) -------------------
 ;; Besides keys, the ui-run loop receives async `[:tag …]` messages on its mailbox:
 ;; redirected output (`:io-write` — std/io / std/log), a spawned eval's reply
@@ -249,8 +341,16 @@ none is open. The owning handler consumes the key; otherwise the overlay exits
 ;; mailbox messages into update" is a candidate std/ui capability — kept here for now.)
 
 (defn ed--ev-io-write (m input textrows cols rows)
-  "Redirected output (`[:io-write s]`) → *Messages*, trimming the writer's newline."
+  "Redirected output (`[:io-write s]`) → *Messages* + the echo area (the default
+output sink: eval stdout, the uncategorised logger backend)."
   (message m (trimr (nth input 1))))
+
+(defn ed--ev-buffer-log (m input textrows cols rows)
+  "A routed log line (`[:buffer-log <name> <s>]`, from a category log backend — see
+`model/ed-buffer-backend`) → append to that buffer (`ed-append-named`, created if
+absent). Unlike `:io-write` it sets *no* echo, so a category's stream (e.g. *LSP*)
+never floods the echo area."
+  (ed-append-named m (nth input 1) (nth input 2)))
 
 (defn ed--ev-eval-reply (m input textrows cols rows)
   "A spawned eval's reply (`:task-done` / `:task-error` / `:task-timeout`): show it only
@@ -284,8 +384,22 @@ so it bypasses the selected-pane point-clamp; other mouse actions re-clamp."
       mm
       (ed-scroll mm textrows))))
 
+(defn ed--ev-key-up (m input textrows cols rows)
+  "A `[:key-up k]` (GUI only — the terminal frontend sends no releases): note that
+this frontend reports releases (`:gui-keys`, which gates held-key repeat so a
+release-less terminal never engages it), and if `k` ends the held key (matched
+modifier-insensitively, so releasing the modifier or the key first both count), stop
+the repeat. Other releases just keep the flag set."
+  (let (m1 (assoc m :gui-keys true)
+        held (get m :held-key))
+    (if (and held (= (ed--base-key (nth input 1)) (ed--base-key held)))
+      (ed--repeat-clear m1)
+      m1)))
+
 (def ed--event-handlers
   {:io-write ed--ev-io-write
+   :buffer-log ed--ev-buffer-log
+   :key-up ed--ev-key-up
    :task-done ed--ev-eval-reply
    :task-error ed--ev-eval-reply
    :task-timeout ed--ev-eval-reply
@@ -301,7 +415,8 @@ so it bypasses the selected-pane point-clamp; other mouse actions re-clamp."
 
 (defn ed-update (m input cols rows)
   "ui-run update: fold one key into the next model, then keep point on screen.
-`:tick` is a no-op (and leaves a pending prefix / open minibuffer intact); a
+`:tick` re-issues the currently held key (consumer-paced key repeat — see the key-repeat
+section) when one is held, else a no-op (leaving a pending prefix / open minibuffer intact); a
 `[:resize cols rows]` event just re-clamps the scroll to the new viewport and lets
 the loop re-render (it isn't a command, so it doesn't touch the keymap or echo); a
 `[:mouse …]` event is handled by `ed-mouse` (left-click selects the window under it,
@@ -327,11 +442,19 @@ owns it, else through the keymap (`ed-dispatch`)."
       (web-publish!
        (ed-refresh-diagnostics
         (cond
-          ;; a tick leaves a pending prefix / open overlay intact (don't route it).
-          (= input :tick) m0
+          ;; a tick re-issues the held key at the fast repeat rate (consumer-paced
+          ;; key repeat); with nothing held it's a no-op, leaving any pending prefix /
+          ;; open overlay intact.
+          (= input :tick) (if (get m0 :held-key)
+                            (ed-repeat-key-step m0 (get m0 :held-key) textrows *repeat-rate-ms*)
+                            m0)
+          ;; the window lost focus (`:blur`): the key-up may now never arrive (the
+          ;; release lands in another window), so stop any repeat now — the safety net
+          ;; for a missed key-up.
+          (= input :blur) (ed--repeat-clear m0)
           ;; an inbound async/system event (`[:tag …]`) → its registered handler.
           (ed-system-event? input) ((get ed--event-handlers (first input)) m0 input textrows cols rows)
-          ;; otherwise a key: the active transient overlay (minibuffer / completion /
-          ;; isearch / query-replace) or normal dispatch.
-          else (ed-scroll (ed-route-transient m0 input) textrows))))
+          ;; otherwise a key: route through the transient overlay / keymap, then arm
+          ;; held-key repeat (initial delay before it starts) if it's repeatable.
+          else (ed-repeat-key-step m0 input textrows *repeat-delay-ms*))))
       (catch e (message m0 (str "error: " (error-message e)))))))

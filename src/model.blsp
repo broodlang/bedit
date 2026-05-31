@@ -29,17 +29,25 @@ it never hits the console.
 pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
   (:use buffer)  ; make-buffer / insert / end-of-buffer / buffer-name / accessors
   (:use layers)  ; init-buffer-layers (stamp a buffer's mode) + active-layers (mode line)
-  (:use pane))  ; the pane-tree layout: pane-single / selected payload / update / map
+  (:use pane)  ; the pane-tree layout: pane-single / selected payload / update / map
+  (:use log)  ; backend — the log-routing backends (one filtered backend per buffer)
+  (:use io))  ; fn-port — the editor-targeting log sink ([:buffer-log name line])
 
 (require 'lineedit)  ; the minibuffer reuses the REPL line editor's pure core
 
+(def *idle-tick-ms* 60000)
+  ;; The poll/refresh beat when nothing is animating — large, since the editor only
+  ;; redraws on input. While a key is held, `input` shortens it to the key-repeat
+  ;; beat (see *repeat-delay-ms* / *repeat-rate-ms*) and restores this on release.
+
 ;; ---- construction -----------------------------------------------------------
 
-(defn ed--log-buffer ()
-  "A fresh `*Messages*` buffer with undo turned off. `disable-undo` is a recent
-std/buffer addition; if the running `nest` predates it the call throws, so we
-degrade gracefully — the editor still runs, *Messages* just keeps an undo history."
-  (let (b (make-buffer "" "*Messages*"))
+(defn ed--log-buffer (&optional (name "*Messages*"))
+  "A fresh log/output buffer named `name` (default `*Messages*`) with undo turned off
+— append-only sinks don't want an undo history. `disable-undo` is a recent std/buffer
+addition; if the running `nest` predates it the call throws, so we degrade gracefully
+(the buffer just keeps an undo history)."
+  (let (b (make-buffer "" name))
     (try (disable-undo b) (catch e b))))
 
 (defn ed-stamp (buf)
@@ -66,7 +74,7 @@ minibuffer/prefix."
    :echo ""
    :status (str "editing " (buffer-name buf))
    :done false
-   :tick-ms 60000})
+   :tick-ms *idle-tick-ms*})
 
 ;; ---- the selected pane + its buffer ---------------------------------------
 
@@ -208,26 +216,76 @@ pane→buffer references after the pool changes (e.g. after a kill). Pure."
 full multi-line text is kept in the `*Messages*` buffer."
   (replace s "\n" " "))
 
-(defn message (m s)
-  "Log `s`: append it as a line to the `*Messages*` buffer (found by name in the
-pool, so it survives buffer switches/kills) and show it (flattened to one line) in
-the echo area. Never disturbs the current buffer's point — *Messages* is a separate
-pool entry. The editor's only output sink — commands print here, never the console."
-  (let (idx (ed-buffer-index-by-name m "*Messages*"))
+(defn ed--ensure-newline (s)
+  "`s` with exactly one trailing newline (logger lines already end in one; echo
+strings don't) — so a log buffer keeps one line per record."
+  (if (ends-with? s "\n") s (str s "\n")))
+
+(defn ed-append-named (m nm s)
+  "Append `s` as a line to the buffer named `nm`, creating a fresh undo-less log
+buffer for it in the pool if none exists (so *Messages* / *LSP* / … survive buffer
+switches and kills). Appends at that buffer's end without disturbing the *current*
+buffer's point — the target is a separate pool entry. Sets no echo: this is the raw
+sink shared by `message` (which adds the echo) and routed log buffers (which must not
+flood the echo area). Returns the model."
+  (let (idx (ed-buffer-index-by-name m nm)
+        line (ed--ensure-newline s))
     (if (nil? idx)
-      ;; defensive: *Messages* was somehow killed — recreate it in the pool
-      (assoc m
-        :echo
-        (one-line s)
-        :buffers
-        (into (get m :buffers) [(ed-stamp (insert (ed--log-buffer) (str s "\n")))]))
-      (assoc m
-        :echo
-        (one-line s)
-        :buffers
-        (assoc (get m :buffers)
-          idx
-          (insert (end-of-buffer (nth (get m :buffers) idx)) (str s "\n")))))))
+      (update m :buffers into [(ed-stamp (insert (ed--log-buffer nm) line))])
+      (update m :buffers assoc idx (insert (end-of-buffer (nth (get m :buffers) idx)) line)))))
+
+(defn message (m s)
+  "Log `s` to the editor's default sink: append it as a line to `*Messages*`
+(`ed-append-named`, creating it if needed) *and* show it (flattened to one line) in
+the echo area. Never disturbs the current buffer's point. The editor's primary output
+— commands print here, never the console; categorised logs route elsewhere (see
+`ed-append-named` + the log routes)."
+  (assoc (ed-append-named m "*Messages*" s) :echo (one-line s)))
+
+;; ---- log routing: one logger, a filtered backend per destination buffer ------
+;; stdout (a raw `*out*` stream) and logging (structured, levelled records) are
+;; different pipes that converge only here — text appended to a named buffer. The
+;; logger (std/log) fans each record to its backends; we give it one backend per
+;; destination buffer, each a `:filter` on the record's `:meta :category`, so a
+;; component's logs land in its own buffer: uncategorised → *Messages* (the default),
+;; `{:category :lsp}` → *LSP*, etc. A backend's sink is a `process-port`-style `io`
+;; port that sends `[:buffer-log <name> <line>]` to the editor, which `input` folds
+;; into that buffer (`ed-append-named`) — the same share-nothing path `print` uses.
+
+(def *log-routes* ()
+  "Registered category→buffer log routes — a list of `{:category :buffer}`. A `def`
+registry (rebound by `register-log-route`, like `layers/*type-layers*`), so it's
+reload-stable *and* read afresh whenever the supervised logger (re)starts, so routes
+survive a logger restart. Uncategorised records always go to *Messages*.")
+
+(defn register-log-route (category buffer)
+  "Route log records tagged `{:category <category>}` to the buffer named `buffer`
+(its own *LSP*-style log buffer). Idempotent-ish: prepended, newest wins. A mode
+declares its destination by calling this (its `:log-category` / `:log-buffer`)."
+  (def *log-routes* (cons {:category category :buffer buffer} *log-routes*)))
+
+(defn ed--record-category (rec)
+  "The `:category` a log record carries in its `:meta`, or nil (uncategorised)."
+  (get (get rec :meta) :category))
+
+(defn ed-buffer-backend (nm &optional (opts {}))
+  "A std/log backend whose sink sends each formatted line to the editor as
+`[:buffer-log nm line]` (the editor appends it to buffer `nm`). `opts` is the usual
+`backend` map (`:filter` / `:min-level` / `:format`). The log-side counterpart of
+`message`: a component points its logger here to stream into its own buffer."
+  (log/backend (io/fn-port (fn (s) (send (whereis :editor) [:buffer-log nm s]) nil)) opts))
+
+(defn ed-log-backends ()
+  "The logger's full backend list, built from `*log-routes*`: one filtered backend
+per route (records of that `:category` → its buffer) plus the default backend for
+*uncategorised* records → *Messages*. Disjoint filters, so a record lands in exactly
+one buffer and the table needs no shared state. Rebuilt at every (re)start of the
+supervised logger, so routes survive a restart."
+  (cons (ed-buffer-backend "*Messages*" {:filter (fn (r) (nil? (ed--record-category r)))})
+    (map (fn (rt)
+           (ed-buffer-backend (get rt :buffer)
+             {:filter (fn (r) (= (ed--record-category r) (get rt :category)))}))
+      *log-routes*)))
 
 ;; ---- scrolling --------------------------------------------------------------
 
