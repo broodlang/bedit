@@ -23,6 +23,8 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
   (:use mincomplete)  ; ed-complete-name / ed-complete-path — minibuffer prompt completion
   (:use projects)  ; project-root / project-files — find-file-in-project (C-x p f)
   (:use task)  ; task / cancel-task — the off-loop, cancellable, timeout-bounded async eval
+  (:use io)  ; process-port — stream a spawned eval's output back to the editor
+  (:use web)  ; web-start / web-stop! — serve the selected buffer over HTTP (C-x w)
   (:use model))  ; current-buffer accessors, the kill ring, message
 
 ;; ---- applying buffer ops to the current buffer ------------------------------
@@ -539,6 +541,15 @@ re-pointed; indices above it shift down."
   (let (bufs (into (get m :buffers) [(ed-stamp buf)]))
     (ed-select (assoc m :buffers bufs) (dec (count bufs)))))
 
+(defn ed-show-named (m nm text)
+  "Show a report buffer named `nm` holding `text` in the selected pane — replacing its
+contents if a buffer of that name already exists, else opening a fresh one. The reuse
+seam for generated/refreshable buffers (*Process List*, and later *Kill Ring* etc.)."
+  (let (idx (ed-buffer-index-by-name m nm))
+    (if (nil? idx)
+      (ed-open-buffer m (make-buffer text nm))
+      (ed-select (assoc m :buffers (assoc (get m :buffers) idx (ed-stamp (make-buffer text nm)))) idx))))
+
 (defn ed-switch-to-named (m nm)
   "Switch to the buffer named `nm`, or report there's no such buffer."
   (let (idx (ed-buffer-index-by-name m nm))
@@ -662,6 +673,32 @@ shows, the registered commands (`defcommand`s); an unknown name is reported."
      :candidates-fn (fn (t)
                       (take 12 (filter (fn (nm) (starts-with? nm t)) (interactive/command-names))))}))
 
+;; ---- process list (M-x list-processes) --------------------------------------
+;; The runtime's live processes in a buffer, from the kernel snapshots
+;; `list-processes` + `process-info` — to spot a runaway eval (high mailbox /
+;; reductions) and read its pid. C-g cancels a running C-x C-e eval.
+
+(defn ed--proc-row (p)
+  "One `*Process List*` row from a `process-info` map."
+  (str (pad-right (str (get p :id)) 5) " "
+    (pad-right (if (get p :name) (name (get p :name)) "-") 14) " "
+    (pad-right (name (get p :status)) 8) " "
+    (pad-left (str (get p :mailbox)) 7) " "
+    (pad-left (str (get p :reductions)) 12)))
+
+(defcommand cmd-list-processes
+  (m key)
+  "List the runtime's live processes in a *Process List* buffer (M-x list-processes):
+id, registered name, status, mailbox backlog, and reductions — the kernel's
+`process-info` snapshot. Spot a runaway eval by its growing mailbox/reductions; C-g
+cancels a running `C-x C-e` eval."
+  (let (infos (filter (fn (p) (not (nil? p))) (map process-info (list-processes)))
+        rows (map ed--proc-row (sort-by (fn (p) (get p :id)) infos))
+        text (str (pad-right "ID" 5) " " (pad-right "NAME" 14) " " (pad-right "STATUS" 8)
+               " " (pad-left "MAILBOX" 7) " " (pad-left "REDUCTIONS" 12) "\n"
+               (join "\n" rows) "\n"))
+    (ed-show-named m "*Process List*" text)))
+
 ;; ---- files + quit -----------------------------------------------------------
 
 (defcommand cmd-quit
@@ -704,10 +741,22 @@ poll; the eval runs in its own process while the editor stays live.)"
   (let (prev (get m :eval-proc)
          _
          (when (not (nil? prev)) (cancel-task prev))  ; cancel a still-running eval
+         sink
+         (whereis :editor)  ; the editor process, if running (nil in tests / headless)
          opts
          (if (and (not (nil? timeout)) (> timeout 0)) {:timeout timeout} {})
+         ;; With a live editor, bind the eval's *out*/*err* to a process-port back to it,
+         ;; so the form's output STREAMS into *Messages* as it's produced — a long or
+         ;; looping form's prints appear immediately, not trapped in a capture buffer
+         ;; until (if ever) it returns; the reply carries just the value. Without an
+         ;; editor (tests / headless) capture + bundle output into the reply as before.
+         thunk
+         (if (nil? sink)
+           (fn () (eval-source src))
+           (fn () (binding (*out* (io/process-port sink) *err* (io/process-port sink))
+                    (eval-source-value src))))
          job
-         (task (fn () (eval-source src)) opts))
+         (task thunk opts))
     (message (assoc m :eval-proc job) "evaluating…")))
 
 (defcommand cmd-keyboard-quit
@@ -744,3 +793,29 @@ the editor."
   (m key)
   "Evaluate the whole buffer as Brood source in a separate process."
   (ed-eval-async m (buffer-text (ed-current-buf m)) *eval-timeout-ms*))
+
+;; ---- serve the selected buffer over HTTP (the live web mirror, C-x w) -------
+
+(defcommand cmd-serve-buffer
+  (m key)
+  "Serve the selected pane's buffer over HTTP — a browser-viewable mirror that
+auto-refreshes as you type (C-x w · M-x serve-buffer). Tries port 5000, falling
+back to an OS-assigned one; the URL appears in the echo area once the socket is
+bound. Re-running reports the running server's URL rather than starting a second.
+M-x stop-serving tears it down. (The push/render lives in `web`.)"
+  (let (srv (get m :server))
+    (if (nil? srv)
+      (message (assoc m :server (web-start m 5000)) "starting web server…")
+      (let (p (get srv :port))
+        (message m
+          (if (nil? p)
+            "web server starting…"
+            (str "already serving on http://localhost:" p)))))))
+
+(defcommand cmd-stop-serving
+  (m key)
+  "Stop the buffer web server started by `serve-buffer` (M-x stop-serving)."
+  (let (srv (get m :server))
+    (if (nil? srv)
+      (message m "no web server running")
+      (do (web-stop! srv) (message (dissoc m :server) "web server stopped")))))
