@@ -1,4 +1,4 @@
-;; Tests for the editor. The window loop (`ui-run`) needs a display, so it's not
+;; Tests for the editor. The pane loop (`ui-run`) needs a display, so it's not
 ;; tested here; we test the pure pieces exactly as they run in the loop:
 ;; `ed-update` (key + model -> model, via the keymap / minibuffer), the model
 ;; accessors, `message`, `eval-last-sexp`, the region/undo/buffer commands, and
@@ -70,7 +70,7 @@
       (assert= (buffer-current-line (cur pgdn)) 21))))  ; PageDown == C-v
 
 (describe "editor quit + save (Emacs C-x chords)"
-  (test "Esc quits (it's also the window close button)"
+  (test "Esc quits (it's also the pane close button)"
     (is (get (ed-update (m-of "x") :escape 80 24) :done)))
   (test "C-x C-c quits"
     (is (get (press (m-of "x") [:ctrl-x :ctrl-c]) :done)))
@@ -271,8 +271,8 @@
     (let (ops (complete-popup-ops (cmd-complete (cm "alpha alps al" 13) nil) 80 24))
       (is (> (count ops) 0))
       (is (= (first (first ops)) :text))))
-  (test "the popup never overruns a short window (caps to the text area)"
-    ;; 10 candidates for prefix \"a\", in a 5-row window (text area = 3 rows)
+  (test "the popup never overruns a short pane (caps to the text area)"
+    ;; 10 candidates for prefix \"a\", in a 5-row pane (text area = 3 rows)
     (let (m (cmd-complete (cm "aa ab ac ad ae af ag ah ai aj a" 31) nil)
           ops (complete-popup-ops m 80 5))
       (is (<= (count ops) 3))
@@ -479,6 +479,64 @@
     (let (m (cmd-indent-line (ed-set-buf (m-of "") (goto-char (make-buffer "    foo\nbar") 8)) nil))
       (assert= (buffer-text (cur m)) "    foo\n    bar"))))
 
+;; ---- in-process diagnostics (the :diagnostics service) ----------------------
+;; brood-mode calls the advisory type checker directly (same image) via
+;; check-string-structured; the warning is cached on edit and rendered inline /
+;; in the echo / on the mode line. `(map cons …)` is a reliable warner: cons is
+;; 2-ary, map calls it with 1 (ADR-078 callback-arity), flagged on line 1.
+(def bad-src "(map cons (list 1 2 3))")
+
+(describe "editor brood-mode: diagnostics service"
+  (test "brood-diagnostics returns positioned warnings for a bad form"
+    (let (ds (modes/brood-diagnostics bad-src))
+      (is (> (count ds) 0))
+      (assert= (get (first ds) :line) 1)
+      (is (string? (get (first ds) :message)))))
+  (test "brood-diagnostics is empty for clean or unparsable source"
+    (is (empty? (modes/brood-diagnostics "(def x 1)")))
+    (is (empty? (modes/brood-diagnostics "(")))))  ; incomplete input mid-edit
+
+(describe "editor diagnostics cache (recompute only on text change)"
+  (test "ed-refresh-diagnostics populates :diagnostics + :diag-text for a brood buffer"
+    (let (m (ed-refresh-diagnostics (blsp-cm bad-src 1)))
+      (is (> (count (get m :diagnostics)) 0))
+      (assert= (get m :diag-text) bad-src)))
+  (test "it is a no-op when the text is unchanged (cache hit on :diag-text)"
+    ;; seed the cache, then re-run with the text unchanged but a sentinel in place —
+    ;; an unchanged sentinel proves it didn't recompute.
+    (let (m1 (ed-refresh-diagnostics (blsp-cm bad-src 1))
+          m2 (ed-refresh-diagnostics (assoc m1 :diagnostics :sentinel)))
+      (assert= (get m2 :diagnostics) :sentinel)))
+  (test "a plain (non-brood) buffer has no :diagnostics service → left untouched"
+    (is (nil? (get (ed-refresh-diagnostics (m-of "(map cons (list))")) :diagnostics))))
+  (test "typing through ed-update surfaces a warning live — empty while incomplete"
+    ;; drive the real keystroke path: an unbalanced prefix nags nothing; the
+    ;; completed (ill-typed) form yields a cached diagnostic.
+    (let (blank (ed-init (make-buffer "" "x.blsp" "x.blsp"))
+          type (fn (m s) (fold (fn (acc c) (ed-update acc c 80 24)) m (string->list s))))
+      (is (empty? (get (type blank "(map cons (list 1 2 3") :diagnostics)))  ; mid-type
+      (is (> (count (get (type blank "(map cons (list 1 2 3))") :diagnostics)) 0)))))  ; complete
+
+(describe "editor diagnostics rendering"
+  (test "a diagnostic on the current line shows in the echo area (over eldoc)"
+    (is (string-contains? (ed-echo-or-eldoc (ed-refresh-diagnostics (blsp-cm bad-src 1))) "warning")))
+  (test "an explicit message still wins over a diagnostic"
+    (assert= (ed-echo-or-eldoc (message (ed-refresh-diagnostics (blsp-cm bad-src 1)) "hi")) "hi"))
+  (test "ed-diagnostic-overrides underlines each diagnostic token"
+    (let (m (ed-refresh-diagnostics (blsp-cm bad-src 1))
+          ovs (ed-diagnostic-overrides m (cur m)))
+      (is (> (count ovs) 0))
+      (assert= (second (first ovs)) {:underline true})))
+  (test "ed-view underlines the diagnostic token (point off any bracket)"
+    ;; point at 5 (inside `cons`) sits next to no bracket, so the diagnostic
+    ;; underline at the call isn't shadowed by bracket-match.
+    (let (m (ed-refresh-diagnostics (blsp-cm bad-src 5))
+          underlined (filter (fn (op) (and (= (first op) :text) (get (nth op 4 {}) :underline)))
+                       (ed-view m 80 24)))
+      (is (> (count underlined) 0))))
+  (test "the mode line shows the diagnostic count"
+    (is (string-contains? (mode-line-text (ed-refresh-diagnostics (blsp-cm bad-src 1))) "⚠"))))
+
 ;; ---- genericity: the view honours ANY mode's services, not just brood's -----
 ;; A throwaway "stub" mode proves the editor is a language-agnostic services host:
 ;; register a layer with its own :fontify / :eldoc and the view uses them. This is
@@ -487,11 +545,13 @@
 (defn stub-fontify (text) (list [0 (string-length text) {:fg :magenta}]))
 (defn stub-eldoc (text pos) "STUB-HINT")
 (defn stub-indent (text bol) 7)
+(defn stub-diagnostics (text) (list {:line 1 :col 1 :message "stub-warning"}))
 (def stub-layer
   {:name 'stub
    :fontify 'main-test/stub-fontify
    :eldoc 'main-test/stub-eldoc
-   :indent 'main-test/stub-indent})
+   :indent 'main-test/stub-indent
+   :diagnostics 'main-test/stub-diagnostics})
 (defn stub-model (text)
   (ed-set-buf (m-of "") (layers/push-layer (make-buffer text) 'main-test/stub-layer)))
 
@@ -503,7 +563,11 @@
   (test "the view honours any mode's :eldoc"
     (assert= (ed-echo-or-eldoc (stub-model "hello")) "STUB-HINT"))
   (test "cmd-indent-line honours any mode's :indent"
-    (assert= (buffer-text (cur (cmd-indent-line (stub-model "ab") nil))) "       ab")))
+    (assert= (buffer-text (cur (cmd-indent-line (stub-model "ab") nil))) "       ab"))
+  (test "the editor honours any mode's :diagnostics"
+    (let (m (ed-refresh-diagnostics (stub-model "hello")))
+      (assert= (count (get m :diagnostics)) 1)
+      (is (string-contains? (ed-echo-or-eldoc m) "stub-warning")))))
 
 (describe "editor brood-mode services across processes"
   :isolated
@@ -515,7 +579,15 @@
           m (blsp-cm "(defn f ())" 0)
           _ (spawn (let (ops (text-ops-where (ed-view m 80 24) (fn (s) (= s "defn"))))
                      (send me [:result (count ops) (not (nil? (nth (first ops) 4 nil)))]))))
-      (receive ([:result n faced] (is (> n 0)) (is faced))))))
+      (receive ([:result n faced] (is (> n 0)) (is faced)))))
+
+  (test "diagnostics re-check correctly in a spawned process (in-process checker)"
+    ;; the worker runs the advisory checker on a deep-copied model and reports the
+    ;; warning count — proves check-string-structured works off the main process too.
+    (let (me (self)
+          m (blsp-cm "(map cons (list 1 2 3))" 1)
+          _ (spawn (send me [:n (count (get (ed-refresh-diagnostics m) :diagnostics))])))
+      (receive ([:n n] (is (> n 0)))))))
 
 ;; ---- the mode in the mode line ----------------------------------------------
 (defn mode-line-text (m)
@@ -710,34 +782,34 @@
   (test "global bindings still dispatch (e.g. C-k) on a plain buffer"
     (assert= (buffer-text (cur (ed-update (m-of "abc") :ctrl-k 80 24))) "")))  ; kill-line via global
 
-;; ---- windows (splits / other-window / delete) -------------------------------
-(describe "editor windows"
-  (test "C-x 2 / C-x 3 split into two windows"
-    (assert= (window/window-count (get (press (m-of "x") [:ctrl-x "2"]) :layout)) 2)
-    (assert= (window/window-count (get (press (m-of "x") [:ctrl-x "3"]) :layout)) 2))
-  (test "C-x 1 collapses back to one window"
-    (assert= (window/window-count (get (press (m-of "x") [:ctrl-x "2" :ctrl-x "1"]) :layout)) 1))
-  (test "C-x 0 deletes the selected window"
-    (assert= (window/window-count (get (press (m-of "x") [:ctrl-x "2" :ctrl-x "0"]) :layout)) 1))
-  (test "C-x o moves selection to the other window"
+;; ---- panes (splits / other-pane / delete) -------------------------------
+(describe "editor panes"
+  (test "C-x 2 / C-x 3 split into two panes"
+    (assert= (pane/pane-count (get (press (m-of "x") [:ctrl-x "2"]) :layout)) 2)
+    (assert= (pane/pane-count (get (press (m-of "x") [:ctrl-x "3"]) :layout)) 2))
+  (test "C-x 1 collapses back to one pane"
+    (assert= (pane/pane-count (get (press (m-of "x") [:ctrl-x "2" :ctrl-x "1"]) :layout)) 1))
+  (test "C-x 0 deletes the selected pane"
+    (assert= (pane/pane-count (get (press (m-of "x") [:ctrl-x "2" :ctrl-x "0"]) :layout)) 1))
+  (test "C-x o moves selection to the other pane"
     (let (split (press (m-of "x") [:ctrl-x "2"])
           moved (press split [:ctrl-x "o"]))
-      (is (not (= (window/window-selected-path (get moved :layout))
-                 (window/window-selected-path (get split :layout)))))))
-  (test "M-x runs a window command by name (split-window-right)"
-    (let (done (ed-update (type-str (press (m-of "x") [:alt-x]) "split-window-right") :enter 80 24))
-      (assert= (window/window-count (get done :layout)) 2))))
+      (is (not (= (pane/pane-selected-path (get moved :layout))
+                 (pane/pane-selected-path (get split :layout)))))))
+  (test "M-x runs a pane command by name (split-pane-right)"
+    (let (done (ed-update (type-str (press (m-of "x") [:alt-x]) "split-pane-right") :enter 80 24))
+      (assert= (pane/pane-count (get done :layout)) 2))))
 
-;; ---- windows: mouse (click-select + divider drag-resize, over :drag events) --
+;; ---- panes: mouse (click-select + divider drag-resize, over :drag events) --
 ;; On an 80x24 frame the body is [0 0 80 23]; C-x 3 makes left [0 0 40 23] | a
 ;; divider at col 40 | right [41 0 39 23], the left pane selected.
-(describe "editor windows — mouse"
+(describe "editor panes — mouse"
   (defn pane-w0 (m) (nth (get (first (get (ed-body-layout m 80 24) :panes)) :rect) 2))
   (test "a click in the other pane selects it"
     (let (split (press (m-of "x") [:ctrl-x "3"])
           clicked (ed-update split [:mouse :press :left 5 60] 80 24))
-      (is (not (= (window/window-selected-path (get split :layout))
-                 (window/window-selected-path (get clicked :layout)))))))
+      (is (not (= (pane/pane-selected-path (get split :layout))
+                 (pane/pane-selected-path (get clicked :layout)))))))
   (test "press on a divider starts a drag; release ends it"
     (let (split (press (m-of "x") [:ctrl-x "3"])
           pressed (ed-update split [:mouse :press :left 5 40] 80 24)
@@ -751,31 +823,68 @@
                     80
                     24))
       (assert= (pane-w0 dragged) 20)))
-  (test "Ctrl+wheel zooms the SELECTED window's font scale (per-pane), clamped"
-    ;; Pure: ed-zoom sets :scale on the selected window's payload; the view renders
-    ;; it via the kernel :scale face attr. Only the selected pane is affected.
+  (defn pane-scale-at (m sel?)
+    ;; the :scale of the (non-)selected pane in `m`'s layout
+    (let (p (first (filter (fn (p) (= sel? (= true (get p :selected))))
+                     (get (ed-body-layout m 80 24) :panes))))
+      (max 1 (or (get (get p :payload) :scale) 1))))
+  (defn pane-top-at (m sel?)
+    (let (p (first (filter (fn (p) (= sel? (= true (get p :selected))))
+                     (get (ed-body-layout m 80 24) :panes))))
+      (or (get (get p :payload) :top) 0)))
+
+  (test "Ctrl+wheel zooms the pane UNDER THE POINTER, not the active pane"
     (let (base (m-of "x"))
+      ;; a lone pane (which is the hovered one): zoom up, then clamp at 1
       (assert= (ed-current-scale (ed-update base [:mouse :scroll-up nil 5 5 [:ctrl]] 80 24)) 2)
-      ;; clamped at 1 from the bottom
       (assert= (ed-current-scale (ed-update base [:mouse :scroll-down nil 5 5 [:ctrl]] 80 24)) 1)
-      ;; in a split, zooming the selected pane leaves the OTHER pane at scale 1
+      ;; split (left selected, right at col 60): hovering the RIGHT pane zooms IT,
+      ;; while the active (left) pane stays at scale 1.
       (let (split (press (m-of "x") [:ctrl-x "3"])
-            zoomed (ed-update split [:mouse :scroll-up nil 5 5 [:ctrl]] 80 24)
-            other (first (filter (fn (p) (not (get p :selected)))
-                           (get (ed-body-layout zoomed 80 24) :panes))))
-        (assert= (ed-current-scale zoomed) 2)
-        (assert= (max 1 (or (get (get other :payload) :scale) 1)) 1))))
-  (test "a plain wheel scrolls the buffer (moves point by lines); no zoom"
+            zoomed (ed-update split [:mouse :scroll-up nil 5 60 [:ctrl]] 80 24))
+        (assert= (pane-scale-at zoomed true) 1)  ; active pane untouched
+        (assert= (pane-scale-at zoomed false) 2))))  ; hovered pane zoomed
+  (test "a plain wheel scrolls the hovered pane's viewport (:top), leaving point + zoom"
     (let (text (apply str (map (fn (i) (str "L" i "\n")) (range 30)))
           down (ed-update (m-of text) [:mouse :scroll-down nil 5 5 []] 80 24))
-      (assert= (buffer-current-line (cur down)) 3)  ; *wheel-lines* = 3
+      (assert= (ed-current-top down) 3)  ; *wheel-lines* = 3 — the viewport moved
+      (assert= (buffer-current-line (cur down)) 0)  ; ...but point did not
       (assert= (ed-current-scale down) 1)  ; plain wheel doesn't zoom
-      ;; scrolling up from the top clamps at line 0
-      (assert= (buffer-current-line (cur (ed-update (m-of text)
-                                           [:mouse :scroll-up nil 5 5 []]
-                                           80
-                                           24)))
-        0)))
+      ;; scrolling up from the top clamps at 0
+      (assert= (ed-current-top (ed-update (m-of text) [:mouse :scroll-up nil 5 5 []] 80 24)) 0)))
+  (test "a plain wheel scrolls the pane under the pointer, not the active pane"
+    (let (text (apply str (map (fn (i) (str "L" i "\n")) (range 30)))
+          split (press (m-of text) [:ctrl-x "3"])
+          scrolled (ed-update split [:mouse :scroll-down nil 5 60 []] 80 24))
+      ; hover RIGHT
+      (assert= (pane-top-at scrolled true) 0)  ; active (left) pane not scrolled
+      (assert= (pane-top-at scrolled false) 3)))  ; hovered (right) pane scrolled
+  (test "C-x l toggles the per-pane line-number gutter"
+    (let (on (press (m-of "a\nb\nc") [:ctrl-x "l"]))
+      (is (get (ed-current-pane on) :line-numbers))
+      (is (not (get (ed-current-pane (press on [:ctrl-x "l"])) :line-numbers)))
+      ;; in a split, the gutter is pane-local — only the selected pane gets it
+      (let (split (press (m-of "a\nb\nc") [:ctrl-x "3"])
+            ln-on (press split [:ctrl-x "l"])
+            other (first (filter (fn (p) (not (get p :selected)))
+                           (get (ed-body-layout ln-on 80 24) :panes))))
+        (is (get (ed-current-pane ln-on) :line-numbers))
+        (is (not (get (get other :payload) :line-numbers))))))
+  (test "ed-gutter-width = digit-count + 1 when on, 0 when off"
+    (let (buf (make-buffer "a\nb\nc"))
+      ; 3 lines → 1 digit + 1 space
+      (assert= (ed-gutter-width buf true) 2)
+      (assert= (ed-gutter-width buf false) 0)))
+  (test "with the gutter on, the view draws right-aligned line numbers at col 0"
+    (let (on (press (m-of "a\nb\nc") [:ctrl-x "l"])
+           ops
+           (ed-view on 80 24)
+           ;; the gutter cell for the top line: a text op at row 0, col 0
+           gut
+           (first (filter (fn (op) (and (= (first op) :text) (= (nth op 1) 0) (= (nth op 2) 0)))
+                    ops)))
+      (is (not (nil? gut)))
+      (is (string-contains? (nth gut 3) "1"))))  ; line 1's number
   (test "the view emits a resize cursor-zone over each divider (GUI hover/drag affordance)"
     ;; C-x 3 → a :col-resize zone; C-x 2 → a :row-resize zone. (The terminal ignores
     ;; the op; the GUI shows the resize cursor over it — ADR-080.)
@@ -785,4 +894,4 @@
                          (and z (last z)))))
       (assert= (zone-shape [:ctrl-x "3"]) :col-resize)
       (assert= (zone-shape [:ctrl-x "2"]) :row-resize)
-      (is (nil? (zone-shape []))))))  ; a lone window has no divider, so no zone
+      (is (nil? (zone-shape []))))))  ; a lone pane has no divider, so no zone

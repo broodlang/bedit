@@ -1,16 +1,16 @@
 (defmodule model
-  "The editor's `ui-run` model: a buffer pool, the window layout, the kill ring,
+  "The editor's `ui-run` model: a buffer pool, the pane layout, the kill ring,
 the minibuffer, and the `*Messages*` log + echo area.
 
 The model is a map threaded through the `ui-run` loop:
 
   :buffers   a vector of BUFFERS — the pool. Each is an immutable, mode-stamped
              buffer value (its point/mark/undo travel with it). One is always the
-             `*Messages*` buffer. Windows reference a buffer by its pool index.
-  :layout    the WINDOW tree (`std/window.blsp`): Emacs-style tiled splits, each
-             leaf a window with payload `{:buffer <pool index> :top <scroll>}`.
-             Exactly one window is *selected* — the one being edited. Scroll is
-             per-window (`:top`); buffer TEXT is shared via the pool, so two windows
+             `*Messages*` buffer. Panes reference a buffer by its pool index.
+  :layout    the PANE tree (`std/pane.blsp`): Emacs-style tiled splits, each
+             leaf a pane with payload `{:buffer <pool index> :top <scroll>}`.
+             Exactly one pane is *selected* — the one being edited. Scroll is
+             per-pane (`:top`); buffer TEXT is shared via the pool, so two panes
              on the same buffer see each other's edits.
   :kill-ring a list of killed/copied strings, newest first (C-w / M-w / C-y)
   :minibuffer  nil, or `{:prompt :input :on-complete :complete-fn}` while a
@@ -25,11 +25,11 @@ is the editor's echo primitive — like Emacs `message`, it writes to *both* the
 `*Messages*` buffer and the echo area; eval output reaches it via `with-out-str`, so
 it never hits the console.
 
-\"The current buffer\" is the selected window's buffer; editing writes back to the
-pool (`ed-set-buf`), scrolling to the window (`ed-set-top`)."
+\"The current buffer\" is the selected pane's buffer; editing writes back to the
+pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
   (:use buffer)  ; make-buffer / insert / end-of-buffer / buffer-name / accessors
   (:use layers)  ; init-buffer-layers (stamp a buffer's mode) + active-layers (mode line)
-  (:use window))  ; the window-tree layout: window-single / selected payload / update / map
+  (:use pane))  ; the pane-tree layout: pane-single / selected payload / update / map
 
 ;; ---- immutable vector helpers (assoc is map-only) ---------------------------
 
@@ -57,17 +57,17 @@ Use at every buffer-creation site so the mode is set from the first frame (the m
 line reads it, and dispatch composes its keymap)."
   (init-buffer-layers buf))
 
-(defn ed-window (idx)
-  "A window payload showing pool buffer `idx`, scrolled to the top, at font scale 1
+(defn ed-pane (idx)
+  "A pane payload showing pool buffer `idx`, scrolled to the top, at font scale 1
 (`:scale` is the per-pane zoom level Ctrl+wheel changes — see `ed-zoom`)."
   {:buffer idx :top 0 :scale 1})
 
 (defn ed-init (buf)
   "The starting model: a buffer pool of `buf` (index 0) and an empty `*Messages*`
-buffer (index 1), a single window showing `buf`, an empty kill ring, no
+buffer (index 1), a single pane showing `buf`, an empty kill ring, no
 minibuffer/prefix."
   {:buffers [(ed-stamp buf) (ed-stamp (ed--log-buffer))]
-   :layout (window-single (ed-window 0))
+   :layout (pane-single (ed-pane 0))
    :kill-ring ()
    :minibuffer nil
    :pending nil
@@ -76,26 +76,26 @@ minibuffer/prefix."
    :done false
    :tick-ms 60000})
 
-;; ---- the selected window + its buffer ---------------------------------------
+;; ---- the selected pane + its buffer ---------------------------------------
 
-(defn ed-current-window (m)
-  "The selected window's payload `{:buffer <pool index> :top <scroll>}`."
-  (window-selected-payload (get m :layout)))
+(defn ed-current-pane (m)
+  "The selected pane's payload `{:buffer <pool index> :top <scroll>}`."
+  (pane-selected-payload (get m :layout)))
 
 (defn ed-current-index (m)
-  "The pool index of the buffer shown in the selected window."
-  (get (ed-current-window m) :buffer))
+  "The pool index of the buffer shown in the selected pane."
+  (get (ed-current-pane m) :buffer))
 
 (defn ed-current-buf (m)
-  "The buffer being edited — the selected window's buffer, from the pool."
+  "The buffer being edited — the selected pane's buffer, from the pool."
   (nth (get m :buffers) (ed-current-index m)))
 
 (defn ed-current-top (m)
-  "The selected window's scroll offset (first visible line)."
-  (get (ed-current-window m) :top))
+  "The selected pane's scroll offset (first visible line)."
+  (get (ed-current-pane m) :top))
 
 (defn ed-buf-at (m i)
-  "The pool buffer at index `i` (what a window's `:buffer` payload references)."
+  "The pool buffer at index `i` (what a pane's `:buffer` payload references)."
   (nth (get m :buffers) i))
 
 (defn ed-buf-mode-name (buf)
@@ -106,7 +106,7 @@ isn't a `:system` layer (so the always-on `global` layer is skipped — you see
     (if (empty? visible) "" (name (get (first visible) :name)))))
 
 (defn ed-mode-name (m)
-  "The mode of the current (selected window's) buffer, for the mode line."
+  "The mode of the current (selected pane's) buffer, for the mode line."
   (ed-buf-mode-name (ed-current-buf m)))
 
 (defn ed-mode-service (buf facet)
@@ -136,25 +136,51 @@ the previous newline (0 at the first line). Tail-recursive."
   "The 0-based column of char offset `off` in `text` (chars since the line start)."
   (- off (ed-line-start-offset text off)))
 
+(defn ed-diag-offset (buf line col)
+  "The char offset in `buf` of a 1-based diagnostic position `line`:`col` (as the
+checker reports them) — `rope-line->char` of the line plus the column."
+  (+ (rope-line->char (buffer-rope buf) (dec line)) (dec col)))
+
+;; ---- diagnostics cache (live, recomputed only when the text changes) --------
+;; A full advisory type-check is far heavier than per-frame highlighting, so it's
+;; kept off the render path: `ed-update` runs this after each key, but it recomputes
+;; only when the current buffer's text differs from `:diag-text` (the text the cached
+;; `:diagnostics` were computed from). Movement is therefore a no-op; an edit
+;; refreshes. The check is the buffer mode's `:diagnostics` service (brood-mode →
+;; the in-process type checker); buffers whose mode offers none never pay for it.
+
+(defn ed-refresh-diagnostics (m)
+  "The model with `:diagnostics` (a list of `{:line :col :message}`) + `:diag-text`
+refreshed iff the current buffer has a `:diagnostics` service and its text changed
+since the last check; otherwise `m` unchanged."
+  (let (buf (ed-current-buf m)
+        svc (ed-mode-service buf :diagnostics))
+    (if (nil? svc)
+      m
+      (let (text (buffer-text buf))
+        (if (= text (get m :diag-text))
+          m
+          (assoc m :diagnostics (svc text) :diag-text text))))))
+
 (defn ed-set-buf (m buf)
-  "The model with the selected window's buffer replaced by `buf` in the POOL — so
-every window showing that buffer sees the edit. Scroll (per-window) is untouched."
+  "The model with the selected pane's buffer replaced by `buf` in the POOL — so
+every pane showing that buffer sees the edit. Scroll (per-pane) is untouched."
   (assoc m :buffers (ed-replace-nth (get m :buffers) (ed-current-index m) buf)))
 
 (defn ed-set-top (m n)
-  "The model with the *selected window's* scroll offset set to `n` (per-window, so
-another window on the same buffer keeps its own scroll)."
-  (assoc m :layout (window-update-selected (get m :layout) (fn (w) (assoc w :top n)))))
+  "The model with the *selected pane's* scroll offset set to `n` (per-pane, so
+another pane on the same buffer keeps its own scroll)."
+  (assoc m :layout (pane-update-selected (get m :layout) (fn (w) (assoc w :top n)))))
 
 (defn ed-show-index (m i)
-  "The model with the selected window showing pool buffer `i`, scrolled to the top
-(the window-layer primitive behind buffer switching)."
-  (assoc m :layout (window-update-selected (get m :layout) (fn (w) (assoc w :buffer i :top 0)))))
+  "The model with the selected pane showing pool buffer `i`, scrolled to the top
+(the pane-layer primitive behind buffer switching)."
+  (assoc m :layout (pane-update-selected (get m :layout) (fn (w) (assoc w :buffer i :top 0)))))
 
-(defn ed-map-windows (m f)
-  "The model with `f` applied to every window's payload — for re-pointing
-window→buffer references after the pool changes (e.g. after a kill). Pure."
-  (assoc m :layout (window-map (get m :layout) f)))
+(defn ed-map-panes (m f)
+  "The model with `f` applied to every pane's payload — for re-pointing
+pane→buffer references after the pool changes (e.g. after a kill). Pure."
+  (assoc m :layout (pane-map (get m :layout) f)))
 
 (defn ed--index-by-name (bufs nm i n)
   (cond
@@ -197,7 +223,7 @@ pool entry. The editor's only output sink — commands print here, never the con
 ;; ---- scrolling --------------------------------------------------------------
 
 (defn ed-scroll (m textrows)
-  "Adjust the selected window's `:top` so the point's line stays inside a
+  "Adjust the selected pane's `:top` so the point's line stays inside a
 `textrows`-tall viewport: scroll up if it's above the top, down if it's below the
 bottom. Pure."
   (let (line (buffer-current-line (ed-current-buf m))
@@ -207,15 +233,15 @@ bottom. Pure."
       (>= line (+ top textrows)) (ed-set-top m (inc (- line textrows)))
       else m)))
 
-;; ---- window layout + mouse (shared geometry: view & hit-testing agree) ------
+;; ---- pane layout + mouse (shared geometry: view & hit-testing agree) ------
 ;; The body rect is everything above the bottom echo row; both the view and mouse
 ;; hit-testing lay the tree out over it, so screen coordinates line up.
 
 (defn ed-body-layout (m cols rows)
-  "The window layout (`{:panes :dividers}`) over the body rect `[0 0 cols (rows-1)]`
+  "The pane layout (`{:panes :dividers}`) over the body rect `[0 0 cols (rows-1)]`
 — everything above the bottom echo/minibuffer row. Used by the view and by mouse
 hit-testing, so a click maps to the pane the view drew there."
-  (window-layout (get m :layout) [0 0 cols (dec rows)]))
+  (pane-layout (get m :layout) [0 0 cols (dec rows)]))
 
 (defn ed-selected-text-rows (m cols rows)
   "The text height of the *selected* pane in BUFFER lines — its rect height less the
@@ -234,65 +260,94 @@ At least 1."
 (defn ed-mouse-press (m cols rows row col)
   "Left-press at cell `[row col]`: if it lands on a divider, begin a resize drag
 (stash the divider on `:dragging` — it carries the split path + the rect to measure
-the new ratio against); otherwise select the window under the pointer."
+the new ratio against); otherwise select the pane under the pointer."
   (let (layout (ed-body-layout m cols rows)
         d (divider-at layout [row col]))
     (if (nil? d)
-      (assoc m :layout (window-select-at (get m :layout) layout [row col]))
+      (assoc m :layout (pane-select-at (get m :layout) layout [row col]))
       (assoc m :dragging d))))
 
 (defn ed-mouse-drag (m row col)
   "While dragging a divider, set its split's ratio so the boundary follows the
-pointer (clamped by `window-set-ratio` so no pane vanishes). A no-op if not dragging."
+pointer (clamped by `pane-set-ratio` so no pane vanishes). A no-op if not dragging."
   (let (d (get m :dragging))
     (if (nil? d)
       m
       (assoc m
         :layout
-        (window-set-ratio (get m :layout) (get d :path) (window-ratio-for d [row col]))))))
+        (pane-set-ratio (get m :layout) (get d :path) (pane-ratio-for d [row col]))))))
 
 (def *max-zoom* 6)  ; integer font-scale cap (1 = base; the GUI :scale matches the kernel's gui-font! cap)
 (def *wheel-lines* 3)  ; lines a plain wheel notch scrolls
 
 (defn ed-current-scale (m)
-  "The selected window's integer font scale (≥1), the per-pane zoom level."
-  (max 1 (or (get (ed-current-window m) :scale) 1)))
+  "The selected pane's integer font scale (≥1), the per-pane zoom level."
+  (max 1 (or (get (ed-current-pane m) :scale) 1)))
 
-(defn ed-zoom (m delta)
-  "Ctrl+mouse-wheel: change the *selected window's* font scale by `delta` levels,
-clamped to 1..*max-zoom*. Per-pane (it sets `:scale` on the selected window's
-payload, which the view renders via the kernel's per-op `:scale` face attribute —
-ADR-079), so only that pane resizes; a split's other panes and any other window keep
-their own scale. Pure (the GUI applies `:scale`; the terminal renders 1×). The
-*decision* to zoom on Ctrl+wheel is editor policy here; the kernel only supplies the
-mechanism (ADR-006)."
-  (let (s (max 1 (min *max-zoom* (+ (ed-current-scale m) delta))))
-    (assoc m :layout (window-update-selected (get m :layout) (fn (w) (assoc w :scale s))))))
+;; ---- mouse wheel acts on the pane UNDER THE POINTER (not the active one) -----
+;; A wheel notch zooms / scrolls the pane the cursor is over, like every editor —
+;; so it never disturbs which pane is selected. `pane-at` resolves the hovered
+;; pane (carrying its `:path`); `pane-update-path` edits exactly that pane's
+;; payload. (Divider drag-resize is already hover-targeted in `ed-mouse-press`.)
 
-(defn ed-wheel-scroll (m delta)
-  "Plain mouse-wheel: scroll the selected window by moving point `delta` lines
-(`forward-line` clamps at the buffer ends); the view then follows via the
-scroll-to-point clamp in `ed-update`. Negative scrolls toward the top."
-  (ed-set-buf m (forward-line (ed-current-buf m) delta)))
+(defn ed-pane-at (m cols rows row col)
+  "The pane under screen cell `[row col]` (`{:path :payload :selected :rect}`), or nil."
+  (pane-at (ed-body-layout m cols rows) [row col]))
+
+(defn ed-zoom-pane (m pane delta)
+  "Ctrl+mouse-wheel: change the font scale of `pane` (the one under the pointer) by
+`delta` levels, clamped to 1..*max-zoom*. Per-pane `:scale` (the view renders it via
+the kernel's per-op `:scale` face attr, ADR-079) — only the hovered pane resizes;
+selection and every other pane are untouched. The *decision* to zoom on Ctrl+wheel
+is editor policy; the kernel supplies only the mechanism (ADR-006)."
+  (let (cur (max 1 (or (get (get pane :payload) :scale) 1))
+        s (max 1 (min *max-zoom* (+ cur delta))))
+    (assoc m
+      :layout
+      (pane-update-path (get m :layout) (get pane :path) (fn (w) (assoc w :scale s))))))
+
+(defn ed-scroll-pane (m pane delta)
+  "Plain mouse-wheel: scroll the *hovered* `pane`'s viewport by `delta` buffer lines,
+moving its `:top` (clamped to the buffer) — point and the active pane are left alone.
+Negative scrolls toward the top."
+  (let (buf (ed-buf-at m (get (get pane :payload) :buffer))
+        top (or (get (get pane :payload) :top) 0)
+        last (max 0 (dec (buffer-line-count buf)))
+        new-top (max 0 (min last (+ top delta))))
+    (assoc m
+      :layout
+      (pane-update-path (get m :layout) (get pane :path) (fn (w) (assoc w :top new-top))))))
+
+(defn ed-toggle-line-numbers (m)
+  "Toggle the left line-number gutter on the *selected pane* (per-pane, like Emacs
+`display-line-numbers-mode` but pane-local — the view reads the pane payload's
+`:line-numbers`). Pure."
+  (assoc m
+    :layout
+    (pane-update-selected (get m :layout)
+      (fn (p) (assoc p :line-numbers (not (get p :line-numbers)))))))
 
 (defn ed-mouse (m input cols rows)
   "Fold a `[:mouse action button row col mods]` event into the model: left-press
-selects a window or begins a divider drag; `:drag` resizes the dragged divider;
-`:release` ends the drag; **Ctrl+wheel zooms the selected pane** (`ed-zoom`, one
-level per notch); a **plain wheel scrolls** the selected window (`ed-wheel-scroll`).
-Fields are read positionally (`nth`), not by a fixed-length vector pattern, so the
-trailing `mods` element (and any future addition) can't silently break the match."
+selects a pane or begins a divider drag; `:drag` resizes the dragged divider;
+`:release` ends the drag; **Ctrl+wheel zooms** and a **plain wheel scrolls** the pane
+**under the pointer** (`ed-zoom-pane` / `ed-scroll-pane`, one notch each), never the
+active pane. Fields are read positionally (`nth`), not by a fixed-length vector
+pattern, so the trailing `mods` element (and any future addition) can't silently
+break the match. A wheel notch off every pane is ignored."
   (let (action (nth input 1)
         button (nth input 2)
         row (nth input 3)
         col (nth input 4)
-        mods (nth input 5 []))
+        mods (nth input 5 [])
+        hovered (ed-pane-at m cols rows row col))
     (cond
       (and (= action :press) (= button :left)) (ed-mouse-press m cols rows row col)
       (and (= action :drag) (= button :left)) (ed-mouse-drag m row col)
       (= action :release) (dissoc m :dragging)
-      (and (= action :scroll-up) (includes? mods :ctrl)) (ed-zoom m 1)
-      (and (= action :scroll-down) (includes? mods :ctrl)) (ed-zoom m -1)
-      (= action :scroll-up) (ed-wheel-scroll m (- *wheel-lines*))
-      (= action :scroll-down) (ed-wheel-scroll m *wheel-lines*)
+      (nil? hovered) m
+      (and (= action :scroll-up) (includes? mods :ctrl)) (ed-zoom-pane m hovered 1)
+      (and (= action :scroll-down) (includes? mods :ctrl)) (ed-zoom-pane m hovered -1)
+      (= action :scroll-up) (ed-scroll-pane m hovered (- *wheel-lines*))
+      (= action :scroll-down) (ed-scroll-pane m hovered *wheel-lines*)
       else m)))
