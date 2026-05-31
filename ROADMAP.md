@@ -67,6 +67,11 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
   Sexp-aware via the `:indent` mode service over `std/sexp` (body forms +2, calls
   align under the first arg, vectors/maps under the first element); buffers with no
   `:indent` fall back to matching the previous line.
+- ✅ **Projects — find-file-in-project** (`C-x p f`) — `src/projects.blsp` finds the
+  root (nearest ancestor with `project.blsp`) and walks it for files (recursive,
+  skipping `.git`/`target`/…); a minibuffer completes over the root-relative paths.
+  The current project shows on the mode line. (Follow-ups under the `C-x p` prefix:
+  project-wide grep, a multi-project switcher.)
 - ⬜ **Prefix args & mark ring** — numeric `C-u N`; `C-u C-SPC` to pop the mark.
 - ⬜ **find-file live candidates** — switch-buffer has them; give find-file the
   same (directory listing as you type).
