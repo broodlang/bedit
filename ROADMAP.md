@@ -121,6 +121,17 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
 - ⬜ Complements (not replaces) LSP: tree-sitter = fast local syntax/structure;
   `brood-lsp` & others = semantics.
 
+## E. The actor-model editor (deferred — design note)
+
+- ⬜ **Buffers (and services) as processes**, with **push-projection rendering** — the
+  loop becomes a view aggregator over buffer processes that publish versioned
+  viewport projections; point/scroll move to the pane, text+markers to the buffer
+  process; kill-ring / fontify / LSP become supervised services. Unlocks concurrency,
+  supervision/restart, and near-free collaboration (a buffer process on another node).
+  Decided direction, **not building yet** — the single-process pure model serves us
+  well today. Full reasoning, decomposition, hard-parts-and-answers, and a staged
+  (non-big-bang) path: **`docs/actor-architecture.md`**.
+
 ## D. Polish & deferred
 
 - ✅ **Syntax highlighting** — lexical colouring in brood-mode via the `:fontify`
