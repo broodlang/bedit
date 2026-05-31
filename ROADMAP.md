@@ -68,13 +68,19 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
 
 ## A. Round out the everyday Emacs feel (next)
 
-- ⬜ **Incremental search** — `C-s` / `C-r` isearch (the biggest missing daily
-  feature); then `M-%` **query-replace**.
+- ✅ **Incremental search** — `C-s` / `C-r` isearch + `M-%` **query-replace**
+  (`src/isearch.blsp`): modal mini-loops beside the keymap, matches highlighted via
+  point+mark over the region face, wrap-around, the search origin pushed to the mark
+  ring on exit. Built on new `std/buffer` `buffer-search-forward`/`-backward` (over
+  `string-index-of`/`string-last-index-of` in the prelude). Regex isearch waits on the
+  `std/regex` gaps (§D).
 - ✅ **`M-x` run-command-by-name** — `defcommand` marks a function interactive and
   registers it (`src/command.blsp`); `M-x` (`M-x`/`:alt-x`) completes against and
   runs the registry. Every `cmd-*` is interactive; reachable without a binding.
-- ⬜ **Comment / uncomment** — `M-;`, per-mode comment syntax (`;;` for brood,
-  `#`/`//` for others) as a mode facet.
+- ✅ **Comment / uncomment** — `M-;` (`cmd-comment-dwim`): toggles the region's lines
+  (or the current line) — uncomments when every non-blank line is already commented,
+  else comments. The token is a `:comment-syntax` mode facet (brood-mode → `";; "`);
+  a mode without one reports it can't comment. (`#`/`//` modes are the same facet.)
 - ✅ **Indentation** — `TAB` indents-or-completes (Emacs `tab-always-indent` =
   `'complete`), `C-M-i` always completes; in brood-mode `RET` is newline-and-indent.
   Sexp-aware via the `:indent` mode service over `std/sexp` (body forms +2, calls
@@ -86,10 +92,15 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
   skipping `.git`/`target`/…); a minibuffer completes over the root-relative paths.
   The current project shows on the mode line. (Follow-ups under the `C-x p` prefix:
   project-wide grep, a multi-project switcher.)
-- ⬜ **Prefix args & mark ring** — numeric `C-u N`; `C-u C-SPC` to pop the mark.
-- ⬜ **find-file live candidates** — switch-buffer has them; give find-file the
-  same (directory listing as you type).
-- ⬜ **Bind `cmd-kill-whole-line`** (defined, currently unbound).
+- ✅ **Prefix args & mark ring** — numeric `C-u N` (default 4; further `C-u` ×4,
+  digits set it) repeats the next command N times (the common-case mechanism;
+  per-command interactive specs are a deferred `std/layers` improvement); `C-u C-SPC`
+  pops the mark. `C-SPC` now `push-mark`s, filling a per-buffer mark ring
+  (`std/buffer` `push-mark`/`pop-mark`).
+- ✅ **find-file live candidates** — `C-x C-f` shows the directory's entries as you
+  type (the same `view/ed-mb-candidates` path `C-x b` uses), via a shared
+  `mincomplete/ed--dir-matches`.
+- ✅ **Bind `cmd-kill-whole-line`** — `C-S-backspace` (best-guess encoding; rebindable).
 
 ## B. Structural editing for brood-mode
 
