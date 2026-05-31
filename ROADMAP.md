@@ -2,7 +2,8 @@
 
 A small, Emacs-style GUI text editor written in Brood, on the standard editor
 framework (`std/buffer`, `std/keymap`, `std/layers`, `std/sexp`, `std/regex`,
-`std/eval-command`, `std/display`, `std/ui`). Nothing custom in any kernel — the
+`std/display`, `std/ui`) plus the editor's own `src/eval-command.blsp` (the
+C-x C-e policy, moved out of `std/`). Nothing custom in any kernel — the
 editor is *policy* (commands, modes, keymaps) over that framework. The model is a
 single `ui-run` loop; modes are **layers** carried by each buffer (see the layers
 design-of-record in the brood repo: `docs/layers.md`).
@@ -36,7 +37,10 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
 - ✅ **Completion-at-point** — `Tab` popup; buffer words by default, **live global
   symbols in brood-mode** (the `:complete-at` mode service).
 - ✅ **Evaluate Brood in the buffer** — `C-x C-e` (last sexp), region, whole buffer
-  (`std/eval-command`); result + captured output to the echo area / `*Messages*`.
+  (`src/eval-command.blsp`); result + captured output to the echo area / `*Messages*`.
+  Eval runs in a **spawned process** so a long/looping form never freezes the loop;
+  `C-g` interrupts a running eval, and an optional `*eval-timeout-ms*` watchdog can
+  auto-kill a runaway one.
 - ✅ **Structural navigation (brood-mode)** — `C-M-f/b/u/d/a` over the parse-source
   CST (`std/sexp`).
 - ✅ **Syntax highlighting (brood-mode)** — live lexical colouring via the
@@ -49,6 +53,14 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
   `:fontify` / `:bracket-match` / `:eldoc` / `:complete-at` facets
   (`ed-mode-service`) without naming any language; brood-mode is the first to
   supply them. A `json`/`ruby`/`elixir` mode is the same registration (see §C).
+- ✅ **Windows / splits** — tiled panes over a `std/pane` layout tree: `C-x 2/3`
+  split, `C-x o` other, `C-x 0/1` close; each pane has independent scroll/zoom and
+  shares buffer text via the pool. **Mouse**: click selects a pane, divider drag
+  resizes, Ctrl+wheel zooms / plain wheel scrolls the pane *under the pointer*.
+  Per-pane line-number gutter (`C-x l`).
+- ✅ **Live diagnostics (brood-mode)** — the advisory type-checker runs off the
+  render path (recomputed only when buffer text changes), underlining flagged
+  tokens, a `⚠N` count on the mode line, and the message on the echo row at point.
 - ✅ **Files** — `C-x C-s` save, `C-x C-c` / `Esc` quit.
 
 ---
@@ -102,7 +114,6 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
 - ✅ **Syntax highlighting** — lexical colouring in brood-mode via the `:fontify`
   mode service over `std/highlight` (see the core list above). CST-/tree-sitter-query
   driven highlighting for other languages comes with §C.
-- ⬜ **Windows / splits** — one window, many buffers today.
 - ⬜ **Browsable `*Kill Ring*`** view and a **which-key**-style popup for prefixes.
 - ⬜ **regex** ranges `[a-z]` / captures / `{m,n}` (`std/regex`, brood repo).
 - ⬜ **layers** extras (brood repo): `:commands` manifest, per-binding `when`-guards,
@@ -121,4 +132,3 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
   live via `C-x C-e` on a `keymap-bind`.
 - Bindings live in `src/modes.blsp`; commands in `src/commands.blsp`; dispatch +
   minibuffer in `src/input.blsp`; model in `src/model.blsp`; view in `src/view.blsp`.
-- A stray `somefile.blsp` is untracked at the project root (delete if junk).
