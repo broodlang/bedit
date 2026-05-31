@@ -273,6 +273,63 @@
     (let (m (eval-result (ed-eval-async (m-of "x") "(receive (after 100000 nil))" 50)))
       (is (string-contains? (get m :echo) "timed out")))))
 
+;; ---- read-only buffers (the std/buffer flag, enforced editor-wide) ----------
+(describe "editor read-only buffers"
+  ;; a model whose current buffer is read-only
+  (defn ro-model (text) (ed-set-buf (m-of text) (set-read-only (cur (m-of text)) true)))
+  (test "a printable key into a read-only buffer is refused and reported"
+    (let (m (ed-update (ro-model "abc") "x" 80 24))
+      (assert= (buffer-text (cur m)) "abc")  ; unchanged
+      (is (string-contains? (get m :echo) "read-only"))))
+  (test "Backspace / Delete into a read-only buffer are refused"
+    (assert= (buffer-text (cur (ed-update (ro-model "abc") :backspace 80 24))) "abc")
+    (assert= (buffer-text (cur (ed-update (ro-model "abc") :delete 80 24))) "abc"))
+  (test "movement still works in a read-only buffer (navigable, just not editable)"
+    (assert= (buffer-point (cur (press (ro-model "foo bar") [:alt-f]))) 3)  ; end of "foo"
+    (assert= (buffer-point (cur (ed-update (ro-model "ab\ncd") :down 80 24))) 3))  ; next line
+  (test "the mode line shows an RO marker for a read-only buffer"
+    (let (frame (ed-view (ro-model "abc") 80 24))
+      (is (string-contains? (pr-str frame) "RO ")))))
+
+;; ---- the *Process List* (M-x list-processes) + the process-menu mode ---------
+(describe "editor process list + process-menu mode"
+  (test "list-processes opens a read-only *Process List* in process-menu mode"
+    (let (m (cmd-list-processes (m-of "x") nil)
+          buf (cur m))
+      (assert= (buffer-name buf) "*Process List*")
+      (is (read-only? buf))                       ; the :activate hook flipped it
+      (assert= (ed-buf-mode-name buf) "process-menu")
+      (is (string-contains? (buffer-text buf) "ID"))))   ; the header row
+  (test "ed--line-id parses a row's id and skips the header"
+    (assert= (commands/ed--line-id "7    worker  running  0  42") 7)
+    (assert= (commands/ed--line-id "ID   NAME    STATUS") nil)
+    (assert= (commands/ed--line-id "") nil))
+  (test "ed--pid-for-id resolves a live process's id to its pid (nil when none)"
+    (let (pid (spawn (receive (after 100000 nil)))
+          id (get (process-info pid) :id))
+      (assert= (commands/ed--pid-for-id id) pid)
+      (assert= (commands/ed--pid-for-id 999999999) nil)
+      (exit pid :kill)))
+  (test "kill (d) on a process row kills that process and reports it"
+    (let (pid (spawn (receive (after 100000 nil)))
+          mref (monitor pid)                          ; to confirm death deterministically
+          id (get (process-info pid) :id)
+          m (cmd-list-processes (m-of "x") nil)
+          buf (cur m)
+          ;; put point on the spawned process's row, then press the kill command
+          ln (find (fn (l) (= (commands/ed--line-id (buffer-line-at buf l)) id))
+               (range (buffer-line-count buf)))
+          on-row (ed-set-buf m (goto-char buf (rope-line->char (buffer-rope buf) ln)))
+          killed (cmd-process-menu-kill on-row nil))
+      (is (not (nil? ln)))                                  ; the row was found
+      (is (string-contains? (get killed :echo) (str "killed process " id)))
+      ;; the monitor fires only because the process actually died from the kill
+      (assert= (receive ([:down ~mref _ _] :killed) (after 2000 :timeout)) :killed)))
+  (test "kill off a process row (the header) is a no-op with a message"
+    (let (m (cmd-list-processes (m-of "x") nil)   ; point at 0 = the header row
+          r (cmd-process-menu-kill m nil))
+      (is (string-contains? (get r :echo) "not on a process line")))))
+
 (describe "editor completion-at-point"
   ;; a model whose current buffer is `text` with point at `p`
   (defn cm (text p) (ed-set-buf (m-of "") (goto-char (make-buffer text) p)))
@@ -981,30 +1038,29 @@
       ; hover RIGHT
       (assert= (pane-top-at scrolled true) 0)  ; active (left) pane not scrolled
       (assert= (pane-top-at scrolled false) 3)))  ; hovered (right) pane scrolled
-  (test "C-x l toggles the per-pane line-number gutter"
-    (let (on (press (m-of "a\nb\nc") [:ctrl-x "l"]))
-      (is (get (ed-current-pane on) :line-numbers))
-      (is (not (get (ed-current-pane (press on [:ctrl-x "l"])) :line-numbers)))
-      ;; in a split, the gutter is pane-local — only the selected pane gets it
+  (test "C-x l toggles the per-pane line-number gutter (default on for text-mode)"
+    ;; text-mode carries the :gutter-* service, so the gutter is shown by default; C-x l
+    ;; flips the *effective* state — first press hides it, the second shows it again.
+    (let (off (press (m-of "a\nb\nc") [:ctrl-x "l"]))
+      (assert= (get (ed-current-pane off) :line-numbers) false)  ; hidden
+      (is (not (= false (get (ed-current-pane (press off [:ctrl-x "l"])) :line-numbers))))  ; shown again
+      ;; in a split, the override is pane-local — only the selected pane is touched
       (let (split (press (m-of "a\nb\nc") [:ctrl-x "3"])
-            ln-on (press split [:ctrl-x "l"])
+            ln-off (press split [:ctrl-x "l"])
             other (first (filter (fn (p) (not (get p :selected)))
-                           (get (ed-body-layout ln-on 80 24) :panes))))
-        (is (get (ed-current-pane ln-on) :line-numbers))
-        (is (not (get (get other :payload) :line-numbers))))))
-  (test "ed-gutter-width = digit-count + 1 when on, 0 when off"
-    (let (buf (make-buffer "a\nb\nc"))
-      ; 3 lines → 1 digit + 1 space
-      (assert= (ed-gutter-width buf true) 2)
+                           (get (ed-body-layout ln-off 80 24) :panes))))
+        (assert= (get (ed-current-pane ln-off) :line-numbers) false)
+        (is (nil? (get (get other :payload) :line-numbers))))))  ; untouched → still default-on
+  (test "ed-gutter-width = digit-count + 1 when shown, 0 when hidden"
+    ;; a pooled buffer carries the text-mode layer, so the :gutter-width service resolves
+    (let (buf (ed-current-buf (m-of "a\nb\nc")))
+      (assert= (ed-gutter-width buf true) 2)    ; 3 lines → 1 digit + 1 space
       (assert= (ed-gutter-width buf false) 0)))
-  (test "with the gutter on, the view draws right-aligned line numbers at col 0"
-    (let (on (press (m-of "a\nb\nc") [:ctrl-x "l"])
-           ops
-           (ed-view on 80 24)
-           ;; the gutter cell for the top line: a text op at row 0, col 0
-           gut
-           (first (filter (fn (op) (and (= (first op) :text) (= (nth op 1) 0) (= (nth op 2) 0)))
-                    ops)))
+  (test "with the gutter shown (default), the view draws right-aligned line numbers at col 0"
+    (let (ops (ed-view (m-of "a\nb\nc") 80 24)
+          ;; the gutter cell for the top line: a text op at row 0, col 0
+          gut (first (filter (fn (op) (and (= (first op) :text) (= (nth op 1) 0) (= (nth op 2) 0)))
+                       ops)))
       (is (not (nil? gut)))
       (is (string-contains? (nth gut 3) "1"))))  ; line 1's number
   (test "the view emits a resize cursor-zone over each divider (GUI hover/drag affordance)"
@@ -1295,6 +1351,16 @@
       (assert= (get s :line) 1)
       (assert= (get s :col) 1)
       (is (string-contains? (get s :name) "scratch"))))
+  (test "web-snapshot materialises the line-number gutter, web-render-app draws it"
+    ;; the scratch buffer is text-mode, which carries the :gutter-* service, so the
+    ;; snapshot renders the per-line numbers to plain data and the page shows them
+    (let (s (web-snapshot (m-at-cd))
+          g (get s :gutter)
+          html (web-render-app s))
+      (assert= (get g :width) 2)                     ; 2 lines → 1 digit + 1 space
+      (assert= (first (nth (get g :cells) 0)) "1 ")  ; row 0's cell: "1" right-aligned + space
+      (is (string-contains? html "class=\"gutter\""))  ; non-selectable gutter span
+      (is (string-contains? html ">1 </span>"))))      ; line 1's number, in the gutter
   (test "web-render-app embeds the buffer text and the cursor caret"
     (let (html (web-render-app (web-snapshot (m-at-cd))))
       (is (string-contains? html "<pre>"))

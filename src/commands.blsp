@@ -37,8 +37,13 @@ no status change)."
 
 (defn ed-edit (m f)
   "Apply a pure `buffer -> buffer` op `f` to the current buffer, marking it
-modified (edits)."
-  (assoc (ed-set-buf m (f (ed-current-buf m))) :status "modified"))
+modified (edits). Refuses on a read-only buffer (a process list, etc.): the edit is
+skipped and the echo area says so, rather than letting the model's `insert`/`delete`
+guard surface as a raw `error:`. Movement (`ed-apply`) is never blocked — a read-only
+buffer stays navigable."
+  (if (read-only? (ed-current-buf m))
+    (message m "buffer is read-only")
+    (assoc (ed-set-buf m (f (ed-current-buf m))) :status "modified")))
 
 ;; ---- movement (Emacs C-f/C-b/C-n/C-p/C-a/C-e/M-f/M-b + the arrow keys) -------
 
@@ -542,14 +547,19 @@ re-pointed; indices above it shift down."
   (let (bufs (into (get m :buffers) [(ed-stamp buf)]))
     (ed-select (assoc m :buffers bufs) (dec (count bufs)))))
 
-(defn ed-show-named (m nm text)
+(defn ed-show-named (m nm text &optional (type nil))
   "Show a report buffer named `nm` holding `text` in the selected pane — replacing its
-contents if a buffer of that name already exists, else opening a fresh one. The reuse
-seam for generated/refreshable buffers (*Process List*, and later *Kill Ring* etc.)."
-  (let (idx (ed-buffer-index-by-name m nm))
+contents if a buffer of that name already exists, else opening a fresh one. With a
+`type` (e.g. `:process-menu`), the buffer is stamped that type before its layers seed,
+so a special mode (and its read-only `:activate` hook) applies — so a refresh
+(re-show) re-stamps and re-applies it. The reuse seam for generated/refreshable
+buffers (*Process List*, and later *Kill Ring* etc.)."
+  (let (idx (ed-buffer-index-by-name m nm)
+        raw (make-buffer text nm)
+        buf (if (nil? type) raw (layers/set-buffer-type raw type)))
     (if (nil? idx)
-      (ed-open-buffer m (make-buffer text nm))
-      (ed-select (assoc m :buffers (assoc (get m :buffers) idx (ed-stamp (make-buffer text nm)))) idx))))
+      (ed-open-buffer m buf)
+      (ed-select (assoc m :buffers (assoc (get m :buffers) idx (ed-stamp buf))) idx))))
 
 (defn ed-switch-to-named (m nm)
   "Switch to the buffer named `nm`, or report there's no such buffer."
@@ -680,10 +690,12 @@ shows, the registered commands (`defcommand`s); an unknown name is reported."
      :candidates-fn (fn (t) (take 15 (completion-rank t (interactive/command-names))))
      :accept-selection true}))
 
-;; ---- process list (M-x list-processes) --------------------------------------
-;; The runtime's live processes in a buffer, from the kernel snapshots
-;; `list-processes` + `process-info` — to spot a runaway eval (high mailbox /
-;; reductions) and read its pid. C-g cancels a running C-x C-e eval.
+;; ---- process list (M-x list-processes) — a read-only, killable menu ----------
+;; The runtime's live processes in a read-only `*Process List*` buffer, from the
+;; kernel snapshots `list-processes` + `process-info` — to spot a runaway eval (high
+;; mailbox / reductions) and read its id. The buffer is stamped `:process-menu` (see
+;; `modes`): read-only, with `d`/`x`/`k` to kill the process on the current line and
+;; `g` to refresh (Emacs `process-menu-mode`). C-g still cancels a running C-x C-e.
 
 (defn ed--proc-row (p)
   "One `*Process List*` row from a `process-info` map."
@@ -693,18 +705,75 @@ shows, the registered commands (`defcommand`s); an unknown name is reported."
     (pad-left (str (get p :mailbox)) 7) " "
     (pad-left (str (get p :reductions)) 12)))
 
+(defn ed-process-list-text ()
+  "The `*Process List*` buffer text: a header row plus one `ed--proc-row` per live
+process (`process-info` snapshot, sorted by id). A fresh snapshot each call, so
+re-showing it after a kill reflects the change."
+  (let (infos (filter (fn (p) (not (nil? p))) (map process-info (list-processes)))
+        rows (map ed--proc-row (sort-by (fn (p) (get p :id)) infos)))
+    (str (pad-right "ID" 5) " " (pad-right "NAME" 14) " " (pad-right "STATUS" 8)
+      " " (pad-left "MAILBOX" 7) " " (pad-left "REDUCTIONS" 12) "\n"
+      (join "\n" rows) "\n")))
+
+(defn ed-show-process-list (m)
+  "Build/refresh the read-only `*Process List*` in the selected pane and show it,
+stamped `:process-menu` so its kill/refresh keys and read-only mode apply. The seam
+the list / refresh / kill commands all route through."
+  (ed-show-named m "*Process List*" (ed-process-list-text) :process-menu))
+
 (defcommand cmd-list-processes
   (m key)
-  "List the runtime's live processes in a *Process List* buffer (M-x list-processes):
-id, registered name, status, mailbox backlog, and reductions — the kernel's
-`process-info` snapshot. Spot a runaway eval by its growing mailbox/reductions; C-g
-cancels a running `C-x C-e` eval."
-  (let (infos (filter (fn (p) (not (nil? p))) (map process-info (list-processes)))
-        rows (map ed--proc-row (sort-by (fn (p) (get p :id)) infos))
-        text (str (pad-right "ID" 5) " " (pad-right "NAME" 14) " " (pad-right "STATUS" 8)
-               " " (pad-left "MAILBOX" 7) " " (pad-left "REDUCTIONS" 12) "\n"
-               (join "\n" rows) "\n"))
-    (ed-show-named m "*Process List*" text)))
+  "List the runtime's live processes in a read-only *Process List* buffer (M-x
+list-processes): id, registered name, status, mailbox backlog, and reductions — the
+kernel's `process-info` snapshot. Spot a runaway eval by its growing mailbox/
+reductions; press `d`/`x`/`k` on a row to kill it, `g` to refresh."
+  (ed-show-process-list m))
+
+;; ---- process-menu actions (the :process-menu layer's keys: d/x/k kill · g refresh) --
+
+(defn ed--digits-prefix (s i)
+  "The index of the first non-digit in `s` at or after `i` — the length of the
+leading decimal run when `i` is 0."
+  (if (and (< i (string-length s)) (>= (index-of "0123456789" (char-at s i)) 0))
+    (ed--digits-prefix s (inc i))
+    i))
+
+(defn ed--line-id (line)
+  "Parse the leading process id from a `*Process List*` row, or nil for the header
+row / a line that doesn't start with digits."
+  (let (t (triml line)
+        n (ed--digits-prefix t 0))
+    (if (= n 0) nil (string->number (substring t 0 n)))))
+
+(defn ed--pid-for-id (id)
+  "The live pid whose process id is `id` (re-snapshotting `list-processes`), or nil
+when no such process exists — so the kill command resolves id→pid statelessly rather
+than caching a side table that could go stale."
+  (let (hit (find (fn (p) (and (not (nil? p)) (= (get p :id) id)))
+              (map process-info (list-processes))))
+    (if (nil? hit) nil (get hit :pid))))
+
+(defcommand cmd-process-menu-kill
+  (m key)
+  "Kill the process named on the current *Process List* line (`d` / `x` / `k`): parse
+its id, resolve the live pid, `exit … :kill`, then refresh the list. Refuses to kill
+the editor's own loop process (that would freeze the editor); reports when the cursor
+isn't on a process row, or the process is already gone."
+  (let (buf (ed-current-buf m)
+        id (ed--line-id (buffer-line-at buf (buffer-current-line buf))))
+    (if (nil? id)
+      (message m "not on a process line")
+      (let (pid (ed--pid-for-id id))
+        (cond
+          (nil? pid) (ed-show-process-list (message m (str "process " id " is already gone")))
+          (= pid (whereis :editor)) (message m "refusing to kill the editor")
+          else (do (exit pid :kill)
+                 (message (ed-show-process-list m) (str "killed process " id))))))))
+
+(defcommand cmd-process-menu-refresh
+  (m key)
+  "Re-snapshot the live processes into the *Process List* (`g`)."
+  (ed-show-process-list m))
 
 ;; ---- files + quit -----------------------------------------------------------
 

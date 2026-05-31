@@ -73,19 +73,30 @@ column `x` at screen `row`."
   "`text` ops for `[substring face]` `chunks`, starting at column `x` on screen `row`."
   (ed--chunks->ops row x chunks '()))
 
+(def ed-bracket-scan 4000)  ; max chars each side of point the bracket matcher scans
+
 (defn ed-bracket-overrides (buf)
   "`[pos face]` overrides for the bracket pair adjacent to point, via `buf`'s mode
-`:bracket-match` service: the matched pair in the match face, a lone unmatched
-bracket in the error face, or `()` when there's no service or no bracket at point."
+`:bracket-match` service: the matched pair in the match face, a lone unmatched bracket
+in the error face, or `()` when there's no service or no bracket at point. The match is
+sought within a `ed-bracket-scan`-char window each side of point (not the whole
+buffer), so a deep point in a large file costs O(window), not O(point); a partner
+beyond the window is treated as not found, and a window-clipped `:unmatched` is
+suppressed (no false red) rather than scanning the rest of the buffer."
   (let (bm (ed-mode-service buf :bracket-match))
     (if (nil? bm)
       '()
-      (let (r (bm (buffer-text buf) (buffer-point buf)))
+      (let (n (buffer-length buf)
+            pt (buffer-point buf)
+            lo (max 0 (- pt ed-bracket-scan))
+            hi (min n (+ pt ed-bracket-scan))
+            clipped (or (> lo 0) (< hi n))
+            r (bm (rope-slice (buffer-rope buf) lo hi) (- pt lo)))
         (cond
           (nil? r) '()
-          (= (second r) :unmatched) (list [(first r) ed-face-bracket-error])
-          :else (list [(first r) ed-face-bracket-match]
-                  [(second r) ed-face-bracket-match]))))))
+          (= (second r) :unmatched) (if clipped '() (list [(+ lo (first r)) ed-face-bracket-error]))
+          :else (list [(+ lo (first r)) ed-face-bracket-match]
+                  [(+ lo (second r)) ed-face-bracket-match]))))))
 
 (def ed-face-diagnostic {:underline true})  ; merged onto the token's syntax face
 
@@ -183,6 +194,7 @@ multi-pane splits.)"
         sel (get pane :selected)
         pos (str (inc (buffer-current-line buf)) ":" (buffer-column buf))
         label (str " "
+                (if (read-only? buf) "RO " "")
                 (buffer-name buf)
                 "  ("
                 (ed-buf-mode-name buf)
@@ -205,26 +217,32 @@ pass through unchanged."
       (assoc (or (nth op 4 nil) {}) :scale s))
     op))
 
-(def ed-face-line-number {:fg :dark-grey})  ; the left line-number gutter
+(defn ed-gutter-shown? (buf pane)
+  "Whether the left gutter shows for `pane`: an explicit per-pane `:line-numbers`
+(set by C-x l) wins; otherwise it defaults **on** whenever the buffer's mode offers a
+`:gutter-width` service (so a text/brood buffer shows line numbers without a toggle)."
+  (let (ln (get (get pane :payload) :line-numbers))
+    (if (nil? ln) (not (nil? (ed-mode-service buf :gutter-width))) ln)))
 
-(defn ed-gutter-width (buf show?)
-  "Columns the left line-number gutter reserves when `show?`: the last line number's
-digit count + 1 trailing space; 0 when off (so the body fills the pane as before)."
-  (if show? (+ 1 (string-length (str (buffer-line-count buf)))) 0))
+(defn ed-gutter-width (buf shown?)
+  "Columns the left gutter reserves: the mode's `:gutter-width` service (e.g. the line-
+number digit count + a trailing space) when `shown?` and a service exists, else 0 (so
+the body fills the pane)."
+  (let (gwfn (ed-mode-service buf :gutter-width))
+    (if (and shown? (not (nil? gwfn))) (gwfn buf) 0)))
 
 (defn ed-gutter-ops (buf top vh bx by gw)
-  "Right-aligned 1-based line numbers for the up-to-`vh` visible lines from `top`, in
-the gutter at column `bx` (rows from `by`, total width `gw` incl. a trailing space).
-`()` when `gw` is 0 (gutter off)."
-  (if (<= gw 0)
-    '()
-    (let (last-line (min (dec (buffer-line-count buf)) (dec (+ top vh))))
-      (map (fn (line)
-             (text (+ by (- line top))
-               bx
-               (str (pad-left (str (inc line)) (dec gw)) " ")
-               ed-face-line-number))
-        (range top (inc last-line))))))
+  "Gutter cells for the up-to-`vh` visible lines from `top`, via the buffer mode's
+`:gutter-cell` service (`[text face]` per 0-based line), placed at column `bx` (rows
+from `by`, total width `gw`). `()` when `gw` is 0 or the mode offers no gutter."
+  (let (cell (ed-mode-service buf :gutter-cell))
+    (if (or (<= gw 0) (nil? cell))
+      '()
+      (let (last-line (min (dec (buffer-line-count buf)) (dec (+ top vh))))
+        (map (fn (line)
+               (let ([txt face] (cell buf line gw))
+                 (text (+ by (- line top)) bx txt face)))
+          (range top (inc last-line)))))))
 
 ;; ---- windowed fontification (highlight only the visible part) ---------------
 ;; Lexing the whole buffer every frame is what makes a large file crawl. Instead we
@@ -275,7 +293,7 @@ re-anchors it — so the gutter magnifies in lock-step; the mode line stays base
         buf (ed-pane-buf m pane)
         top (get (get pane :payload) :top)
         s (max 1 (or (get (get pane :payload) :scale) 1))
-        gw (ed-gutter-width buf (get (get pane :payload) :line-numbers))
+        gw (ed-gutter-width buf (ed-gutter-shown? buf pane))
         text-h (max 0 (dec h))
         vrows (if (= s 1) text-h (max 1 (quot text-h s)))
         fontify (ed-mode-service buf :fontify)
@@ -401,7 +419,7 @@ pane origin and the pane's `:top`, column clamped to the pane width)."
             buf (ed-pane-buf m pane)
             top (get (get pane :payload) :top)
             s (max 1 (or (get (get pane :payload) :scale) 1))
-            gw (ed-gutter-width buf (get (get pane :payload) :line-numbers))
+            gw (ed-gutter-width buf (ed-gutter-shown? buf pane))
             vw (max 1 (quot w s))
             tw (max 1 (- vw gw)))
         ; text columns after the gutter
