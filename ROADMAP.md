@@ -130,5 +130,8 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
   haven't been confirmed on a live window — verify on a run and rebind in
   `src/modes.blsp` (`text-keymap`) if they differ. Bindings are data, rebindable
   live via `C-x C-e` on a `keymap-bind`.
-- Bindings live in `src/modes.blsp`; commands in `src/commands.blsp`; dispatch +
-  minibuffer in `src/input.blsp`; model in `src/model.blsp`; view in `src/view.blsp`.
+- Bindings live in `src/modes.blsp`; commands in `src/commands.blsp` (the
+  `defcommand` macro + M-x registry in `src/interactive.blsp`); dispatch + minibuffer
+  in `src/input.blsp`; model in `src/model.blsp`; pane geometry + mouse in
+  `src/panes.blsp`; view in `src/view.blsp`. Completion: `src/complete.blsp`
+  (in-buffer) and `src/mincomplete.blsp` (minibuffer prompts).
