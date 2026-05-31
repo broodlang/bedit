@@ -1,14 +1,15 @@
 ;; Tests for the editor. The pane loop (`ui-run`) needs a display, so it's not
 ;; tested here; we test the pure pieces exactly as they run in the loop:
 ;; `ed-update` (key + model -> model, via the keymap / minibuffer), the model
-;; accessors, `message`, `eval-last-sexp`, the region/undo/buffer commands, and
-;; `ed-view` (model -> render frame). These run under plain `nest test` — no GUI
+;; accessors, `message`, the C-x C-e eval command, the region/undo/buffer commands,
+;; and `ed-view` (model -> render frame). These run under plain `nest test` — no GUI
 ;; build needed (but the eval tests need a `nest` whose prelude has `with-out-str`).
 (defmodule main-test
   (:use model)  ; ed-init / ed-scroll / message / current-buffer accessors
   (:use input)  ; ed-update
   (:use view)  ; ed-view
-  (:use commands)  ; ed-complete-name / ed-complete-path / ed-has-editable?
+  (:use commands)  ; ed-has-editable? / the editor commands
+  (:use mincomplete)  ; ed-complete-name / ed-complete-path (minibuffer completion)
   (:use complete)  ; completion-at-point
   (:use buffer)
   (:use test))
@@ -251,7 +252,23 @@
     ;; form can't block the ui-run loop; it leaves an 'evaluating…' note and spawns.
     (let (m (eval-spawn "(+ 1 2)"))
       (is (string-contains? (get m :echo) "evaluating"))
-      (is (not (get m :done))))))
+      (is (not (get m :done)))
+      (is (not (nil? (get m :eval-proc))))))  ; the eval process is tracked for interrupt
+
+  ;; ---- safeguards: C-g interrupt + optional timeout ----
+  (test "C-g interrupts a running eval — kills its process and clears :eval-proc"
+    ;; eval a form that parks ~100s; C-g must kill it instantly (not wait).
+    (let (running (eval-spawn "(receive (after 100000 nil))")
+          done (cmd-keyboard-quit running nil))
+      (is (string-contains? (get done :echo) "interrupted"))
+      (is (nil? (get done :eval-proc)))))
+  (test "C-g with no eval in flight is a plain quit"
+    (is (string-contains? (get (cmd-keyboard-quit (m-of "x") nil) :echo) "quit")))
+  (test "an optional timeout kills a runaway eval and reports it"
+    ;; arm a 50ms timeout on a form that would otherwise park ~100s; the watchdog
+    ;; fires, kills the eval, and reports the timeout (received via eval-result).
+    (let (m (eval-result (ed-eval-async (m-of "x") "(receive (after 100000 nil))" 50)))
+      (is (string-contains? (get m :echo) "timed out")))))
 
 (describe "editor completion-at-point"
   ;; a model whose current buffer is `text` with point at `p`
@@ -786,9 +803,9 @@
 ;; ---- M-x: run interactive commands by name ----------------------------------
 (describe "editor M-x"
   (test "defcommand registered the editing commands (interactive)"
-    (is (> (count (command/command-names)) 20))
-    (is (some? (fn (n) (= n "kill-line")) (command/command-names)))
-    (is (some? (fn (n) (= n "newline")) (command/command-names))))
+    (is (> (count (interactive/command-names)) 20))
+    (is (some? (fn (n) (= n "kill-line")) (interactive/command-names)))
+    (is (some? (fn (n) (= n "newline")) (interactive/command-names))))
   (test "M-x runs a command by name"
     (let (m (press (m-of "ab") [:alt-x])
           done (ed-update (type-str m "open-line-below") :enter 80 24))
@@ -807,7 +824,7 @@
   (test "the global layer is active (its keys work) but not shown as the mode"
     (let (m (m-of "x"))
       (is (some? (fn (l) (= (get l :name) 'global)) (layers/active-layers (cur m))))
-      (assert= (ed-mode-name m) "text")))  ; global is :system → hidden; text shows
+      (assert= (ed-buf-mode-name (cur m)) "text")))  ; global is :system → hidden; text shows
   (test "global bindings still dispatch (e.g. C-k) on a plain buffer"
     (assert= (buffer-text (cur (ed-update (m-of "abc") :ctrl-k 80 24))) "")))  ; kill-line via global
 
@@ -865,8 +882,8 @@
   (test "Ctrl+wheel zooms the pane UNDER THE POINTER, not the active pane"
     (let (base (m-of "x"))
       ;; a lone pane (which is the hovered one): zoom up, then clamp at 1
-      (assert= (ed-current-scale (ed-update base [:mouse :scroll-up nil 5 5 [:ctrl]] 80 24)) 2)
-      (assert= (ed-current-scale (ed-update base [:mouse :scroll-down nil 5 5 [:ctrl]] 80 24)) 1)
+      (assert= (pane-scale-at (ed-update base [:mouse :scroll-up nil 5 5 [:ctrl]] 80 24) true) 2)
+      (assert= (pane-scale-at (ed-update base [:mouse :scroll-down nil 5 5 [:ctrl]] 80 24) true) 1)
       ;; split (left selected, right at col 60): hovering the RIGHT pane zooms IT,
       ;; while the active (left) pane stays at scale 1.
       (let (split (press (m-of "x") [:ctrl-x "3"])
@@ -878,7 +895,7 @@
           down (ed-update (m-of text) [:mouse :scroll-down nil 5 5 []] 80 24))
       (assert= (ed-current-top down) 3)  ; *wheel-lines* = 3 — the viewport moved
       (assert= (buffer-current-line (cur down)) 0)  ; ...but point did not
-      (assert= (ed-current-scale down) 1)  ; plain wheel doesn't zoom
+      (assert= (pane-scale-at down true) 1)  ; plain wheel doesn't zoom
       ;; scrolling up from the top clamps at 0
       (assert= (ed-current-top (ed-update (m-of text) [:mouse :scroll-up nil 5 5 []] 80 24)) 0)))
   (test "a plain wheel scrolls the pane under the pointer, not the active pane"
@@ -971,7 +988,7 @@
   (test "a command that throws is caught — the editor survives with the error echoed"
     ;; register a throwing interactive command, run it via M-x, and confirm the model
     ;; comes back (not raised), not quit, with the message in the echo area.
-    (command/register-command 'cmd-test-boom (fn (m key) (throw "kaboom")))
+    (interactive/register-command 'cmd-test-boom (fn (m key) (throw "kaboom")))
     (let (opened (press (m-of "x") [:alt-x])
           done (press (type-str opened "test-boom") [:enter]))
       (is (not (get done :done)))  ; the editor did NOT quit

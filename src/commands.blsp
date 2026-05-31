@@ -13,11 +13,12 @@ between / open / kill buffers; `cmd-switch-buffer` / `cmd-find-file` open a
 minibuffer prompt (see `input`). This is editor *policy* — the reusable buffer
 model lives in `std/buffer.blsp`; keymaps in `input`."
   (:use buffer)  ; the buffer ops the commands drive (incl. undo/redo, word motion)
-  (:use eval-command)  ; eval-last-sexp / eval-region / eval-buffer (the C-x C-e family)
+  (:use eval-command)  ; last-sexp-source + eval-source — the async C-x C-e family
   (:use sexp)  ; structural s-expression navigation (brood-mode commands)
-  (:use command)  ; defcommand — define + register an interactive command (M-x)
+  (:use interactive)  ; defcommand — define + register an interactive command (M-x)
   (:use pane)  ; the pane-tree ops behind the split/other/delete commands
   (:use complete)  ; cmd-complete / complete-word-char? — TAB indent-or-complete
+  (:use mincomplete)  ; ed-complete-name / ed-complete-path — minibuffer prompt completion
   (:use projects)  ; project-root / project-files — find-file-in-project (C-x p f)
   (:use model))  ; current-buffer accessors, the kill ring, message
 
@@ -73,10 +74,6 @@ modified (edits)."
   "The count of leading spaces/tabs on the line starting at offset `bol`."
   (ed--leading-ws* text bol 0))
 
-(defn cmd--spaces (n)
-  "A string of `n` spaces (n<0 → empty)."
-  (apply str (map (fn (i) " ") (range (max 0 n)))))
-
 (defn ed--fallback-indent (text bol)
   "The simple, mode-less indent for the line at `bol`: the leading-whitespace width
 of the previous non-blank line, or 0 at the top. Tail-recursive over blank lines."
@@ -107,7 +104,7 @@ char; from the body it shifts by the indent delta."
         bol (buffer-point (beginning-of-line buf))
         cur (ed--leading-ws text bol)
         within (<= (- p bol) cur)
-        b1 (insert (delete-char (goto-char buf bol) cur) (cmd--spaces target))
+        b1 (insert (delete-char (goto-char buf bol) cur) (string-repeat " " target))
         newp (if within (+ bol target) (+ p (- target cur))))
     (goto-char b1 newp)))
 
@@ -456,56 +453,6 @@ fresh buffer backed by it (so Ctrl-S creates it)."
                                 (message m (str "open failed: " (if (string? e) e (pr-str e))))))
         else (message (ed-open-buffer m (make-buffer "" path path)) (str "new file " path))))))
 
-;; ---- minibuffer completion (pure helpers the prompts close over) ------------
-
-(defn lcp--len (a b i n)
-  (if (or (>= i n) (not (= (char-at a i) (char-at b i)))) i (lcp--len a b (inc i) n)))
-(defn lcp--2 (a b)
-  (substring a 0 (lcp--len a b 0 (min (string-length a) (string-length b)))))
-(defn lcp (strs)
-  "The longest common prefix of a non-empty sequence of strings."
-  (if (empty? strs) "" (fold lcp--2 (first strs) (rest strs))))
-
-(defn ed--last-slash (s i)
-  (cond (< i 0) -1 (= (char-at s i) "/") i else (ed--last-slash s (dec i))))
-
-(defn ed--split-path (text)
-  "Split `text` into the directory to list, the literal prefix to reattach, and
-the fragment being completed. With no `/`, the directory is `.` and there's
-nothing to reattach (relative to cwd)."
-  (let (i (ed--last-slash text (dec (string-length text))))
-    (if (< i 0)
-      {:dir "." :prefix "" :frag text}
-      {:dir (if (= i 0) "/" (substring text 0 i))
-       :prefix (substring text 0 (inc i))
-       :frag (substring text (inc i) (string-length text))})))
-
-(defn ed--join (dir name)
-  (cond (= dir "/") (str "/" name) (= dir ".") name else (str dir "/" name)))
-
-(defn ed-complete-path (text)
-  "Complete a filesystem `path` against the entries of its directory: the sole
-match (a trailing `/` for a directory), else the longest common prefix; the
-unchanged `text` when nothing matches. Tolerates a non-existent directory."
-  (let (p (ed--split-path text)
-        names (try (list-dir (get p :dir)) (catch e ()))
-        matches (filter (fn (nm) (starts-with? nm (get p :frag))) names))
-    (cond
-      (empty? matches) text
-      (= (count matches) 1) (let (full (str (get p :prefix) (first matches)))
-                              (if (dir? (ed--join (get p :dir) (first matches)))
-                                (str full "/")
-                                full))
-      else (str (get p :prefix) (lcp matches)))))
-
-(defn ed-complete-name (text names)
-  "Complete `text` against `names` (the sole match, else their common prefix)."
-  (let (matches (filter (fn (nm) (starts-with? nm text)) names))
-    (cond
-      (empty? matches) text
-      (= (count matches) 1) (first matches)
-      else (lcp matches))))
-
 ;; ---- panes (tiled splits, Emacs C-x 2/3/0/1/o) ----------------------------
 ;; Operate on the model's `:layout` pane tree (std/pane). A split shows the
 ;; same buffer in the new pane (point/scroll independent); selection/edits follow
@@ -567,9 +514,11 @@ filesystem; prefilled with the working directory."
      :complete-fn (fn (t) (ed-complete-path t))}))
 
 (defn ed-project-root (m)
-  "The current project's root — the nearest ancestor of the editor's working dir
-holding `project.blsp` — or nil when there isn't one."
-  (project-root (cwd)))
+  "The current project's root: the value `main` cached on the model at startup
+(`:project-root`), falling back to resolving it from the working dir (nearest
+ancestor holding a `*project-markers*` entry) for a model built without one — e.g.
+in tests. Nil when there's no project."
+  (or (get m :project-root) (project-root (cwd))))
 
 (defcommand cmd-project-find-file
   (m key)
@@ -601,10 +550,10 @@ shows, the registered commands (`defcommand`s); an unknown name is reported."
     :minibuffer
     {:edit (ed-mb-edit "M-x " "")
      :on-complete (fn (mm t)
-                    (command/run-command mm t (fn (mmm nm) (message mmm (str "no command: " nm)))))
-     :complete-fn (fn (t) (ed-complete-name t (command/command-names)))
+                    (interactive/run-command mm t (fn (mmm nm) (message mmm (str "no command: " nm)))))
+     :complete-fn (fn (t) (ed-complete-name t (interactive/command-names)))
      :candidates-fn (fn (t)
-                      (take 12 (filter (fn (nm) (starts-with? nm t)) (command/command-names))))}))
+                      (take 12 (filter (fn (nm) (starts-with? nm t)) (interactive/command-names))))}))
 
 ;; ---- files + quit -----------------------------------------------------------
 
@@ -629,16 +578,49 @@ area. A no-op-with-message if the buffer has no backing file."
 ;; the work (read + eval + value/output capture) as a pure `buffer -> message
 ;; string` and is shared with any editor. We just route the result to `message`.
 
-(defn ed-eval-async (m src)
+(def *eval-timeout-ms*
+  ;; Optional safeguard: auto-kill a spawned eval after this many ms (nil = no limit).
+  ;; Redefine to arm it — e.g. `(def *eval-timeout-ms* 5000)` via C-x C-e.
+  nil)
+
+(defn ed--spawn-watchdog (me job timeout)
+  "Spawn a watchdog that, after `timeout` ms, hard-kills the eval `job` and reports a
+timeout to the editor `me` (tagged with `job`'s pid, so a stale report is ignored)."
+  (spawn (do
+           (receive (after timeout nil))
+           (exit job :kill)
+           (send me [:eval-done job (str "eval timed out after " timeout "ms")]))))
+
+(defn ed-eval-async (m src timeout)
   "Evaluate Brood source string `src` in a **spawned process**, so a long-running or
 looping form never freezes the editor (`ui-run` is single-process — a synchronous
-eval would block the whole loop). The worker sends `[:eval-done <message>]` back to
-the editor process; `ed-update` shows it when it arrives. Returns the model with an
+eval would block the loop). Safeguards: a still-running prior eval is cancelled
+first; the worker tags its result with its own pid — `[:eval-done <pid> <message>]` —
+so a stale watchdog (from a cancelled/finished eval) can't clobber a newer one
+(`ed-update` shows it only when the pid matches `:eval-proc`); and with `timeout`
+(ms, else nil) a watchdog kills the eval after that long. Manual interrupt is C-g
+(`cmd-keyboard-quit`). Returns the model with the job on `:eval-proc` and an
 `evaluating…` note. (Async delivery relies on the GUI display's mailbox-`receive`
-poll; a runaway form keeps running in its own process while the editor stays live.)"
-  (let (me (self))
-    (spawn (send me [:eval-done (eval-source src)]))
-    (message m "evaluating…")))
+poll; a runaway form runs in its own process while the editor stays live.)"
+  (let (prev (get m :eval-proc)
+         _
+         (when (not (nil? prev)) (exit prev :kill))  ; cancel a still-running eval
+         me
+         (self)
+         job
+         (spawn (send me [:eval-done (self) (eval-source src)])))
+    (when (and (not (nil? timeout)) (> timeout 0)) (ed--spawn-watchdog me job timeout))
+    (message (assoc m :eval-proc job) "evaluating…")))
+
+(defcommand cmd-keyboard-quit
+  (m key)
+  "C-g: interrupt a running evaluation (hard-kill its process) if one is in flight,
+else the usual no-op quit. The kill is `(exit pid :kill)` — a runaway loop dies even
+parked; if it had already finished, this is a harmless no-op."
+  (let (p (get m :eval-proc))
+    (if (nil? p)
+      (message m "quit")
+      (do (exit p :kill) (message (dissoc m :eval-proc) "eval interrupted")))))
 
 (defcommand cmd-eval-last-sexp
   (m key)
@@ -650,7 +632,7 @@ the editor."
         src (last-sexp-source (buffer-text buf) (buffer-point buf)))
     (if (nil? src)
       (message m "no complete form before point")
-      (ed-eval-async m src))))
+      (ed-eval-async m src *eval-timeout-ms*))))
 
 (defcommand cmd-eval-region
   (m key)
@@ -658,9 +640,9 @@ the editor."
   (let (region (buffer-region (ed-current-buf m)))
     (if (nil? region)
       (message m "no region (set the mark first)")
-      (ed-eval-async m region))))
+      (ed-eval-async m region *eval-timeout-ms*))))
 
 (defcommand cmd-eval-buffer
   (m key)
   "Evaluate the whole buffer as Brood source in a separate process."
-  (ed-eval-async m (buffer-text (ed-current-buf m))))
+  (ed-eval-async m (buffer-text (ed-current-buf m)) *eval-timeout-ms*))
