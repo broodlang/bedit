@@ -26,6 +26,7 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
   (:use task)  ; task / cancel-task — the off-loop, cancellable, timeout-bounded async eval
   (:use io)  ; process-port — stream a spawned eval's output back to the editor
   (:use web)  ; web-start / web-stop! — serve the selected buffer over HTTP (C-x w)
+  (:use proctree)  ; tree-order / by-id — the *Process List* tree vs flat ordering
   (:use model))  ; current-buffer accessors, the kill ring, message
 
 ;; ---- applying buffer ops to the current buffer ------------------------------
@@ -67,6 +68,17 @@ buffer stays navigable."
 (defcommand cmd-up-list (m key) (ed-apply m (fn (b) (sexp/up b key))))
 (defcommand cmd-down-list (m key) (ed-apply m (fn (b) (sexp/down b key))))
 (defcommand cmd-beginning-of-defun (m key) (ed-apply m (fn (b) (sexp/beginning-of-defun b key))))
+
+(defcommand cmd-mark-sexp
+  (m key)
+  "Set the mark at the end of the next s-expression, leaving point — activating the
+region so it highlights (Emacs `mark-sexp`, C-M-SPC). Pressed repeatedly it extends the
+region by one more sexp each time (the mark advances; point stays put)."
+  (let (b (ed-current-buf m)
+        extending (and (= (get m :last-command) 'commands/cmd-mark-sexp) (not (nil? (buffer-mark b))))
+        from (if extending (buffer-mark b) (buffer-point b))
+        target (buffer-point (sexp/forward (goto-char b from) key)))
+    (ed-set-buf m (assoc b :mark target))))
 
 ;; ---- indentation (TAB / RET; sexp-aware via the mode's :indent service) -----
 ;; The mechanism is language-neutral: `ed-indent-target` asks the buffer's mode for
@@ -160,17 +172,71 @@ sits on a symbol, complete instead (Emacs `tab-always-indent` = `'complete`)."
 line of overlap; at least 1."
   (max 1 (dec (or (get m :view-rows) 10))))
 
+(defn ed-scroll-page (m n)
+  "Scroll the selected pane by `n` lines (negative = up), moving point with it so its
+**screen row is preserved** (Emacs `scroll-preserve-screen-position`): point and `:top`
+shift by the same amount (clamped at the buffer's last line), so the text under point
+stays put on screen rather than the cursor jumping to an edge."
+  (let (b (ed-current-buf m)
+        l0 (buffer-current-line b)
+        b2 (forward-line b n)
+        dl (- (buffer-current-line b2) l0)        ; actual lines moved (clamps near edges)
+        top (ed-current-top m))
+    (ed-set-top (ed-set-buf m b2) (max 0 (+ top dl)))))
+
 (defcommand cmd-scroll-up
   (m key)
-  "Scroll forward a screenful (C-v / PageDown): move point down ~one viewport,
-keeping a line of context. (Emacs `scroll-up-command` — the view scrolls up.)"
-  (ed-apply m (fn (b) (forward-line b (ed-page-step m)))))
+  "Scroll forward a screenful (C-v / PageDown): point and view move down together,
+keeping a line of overlap and point's screen position. (Emacs `scroll-up-command`.)"
+  (ed-scroll-page m (ed-page-step m)))
 
 (defcommand cmd-scroll-down
   (m key)
-  "Scroll back a screenful (M-v / PageUp): move point up ~one viewport, keeping a
-line of context. (Emacs `scroll-down-command` — the view scrolls down.)"
-  (ed-apply m (fn (b) (backward-line b (ed-page-step m)))))
+  "Scroll back a screenful (M-v / PageUp): point and view move up together, keeping a
+line of overlap and point's screen position. (Emacs `scroll-down-command`.)"
+  (ed-scroll-page m (- (ed-page-step m))))
+
+;; ---- recenter & window-line motion (C-l, M-r) -------------------------------
+;; Both cycle on consecutive presses via `:last-command` (the Emacs mechanism). Their
+;; targets respect the scroll margin so the post-command `ed-scroll` clamp leaves them
+;; put (a "top" that sat at row 0 would otherwise be pulled back down by the margin).
+
+(defn ed--cycle-pos (m self field)
+  "The next position 0/1/2 in a 3-way cycle for a repeated command: advance the stored
+`field` when the previous command was `self` (a quoted command symbol), else restart 0."
+  (if (= (get m :last-command) self) (mod (inc (or (get m field) 0)) 3) 0))
+
+(defcommand cmd-recenter
+  (m key)
+  "Scroll so point sits at the middle of the window, then the top, then the bottom on
+successive presses (Emacs `recenter-top-bottom`, C-l). Targets honour the scroll
+margin; the view moves, point does not."
+  (let (rows (or (get m :view-rows) 10)
+        mgn (ed-margin rows)
+        pos (ed--cycle-pos m 'commands/cmd-recenter :recenter-cycle)
+        row (cond (= pos 0) (quot rows 2) (= pos 1) mgn :else (- rows 1 mgn))
+        line (buffer-current-line (ed-current-buf m)))
+    (assoc (ed-set-top m (max 0 (- line row))) :recenter-cycle pos)))
+
+(defcommand cmd-move-to-window-line
+  (m key)
+  "Move point to the top visible line, then the middle, then the bottom on successive
+presses (Emacs `move-to-window-line-top-bottom`, M-r). Targets honour the scroll
+margin; point moves, the view does not."
+  (let (rows (or (get m :view-rows) 10)
+        mgn (ed-margin rows)
+        top (ed-current-top m)
+        buf (ed-current-buf m)
+        last (max 0 (dec (buffer-line-count buf)))
+        pos (ed--cycle-pos m 'commands/cmd-move-to-window-line :mwl-cycle)
+        target (cond (= pos 0) (+ top mgn) (= pos 1) (+ top (quot rows 2)) :else (- (+ top rows) 1 mgn))
+        line (min last (max top target)))
+    (assoc (ed-set-buf m (forward-line buf (- line (buffer-current-line buf)))) :mwl-cycle pos)))
+
+;; ---- paragraph motion (M-{ / M-}) -------------------------------------------
+
+(defcommand cmd-forward-paragraph (m key) (ed-apply m forward-paragraph))
+(defcommand cmd-backward-paragraph (m key) (ed-apply m backward-paragraph))
 
 ;; ---- editing ----------------------------------------------------------------
 
@@ -697,29 +763,46 @@ shows, the registered commands (`defcommand`s); an unknown name is reported."
 ;; `modes`): read-only, with `d`/`x`/`k` to kill the process on the current line and
 ;; `g` to refresh (Emacs `process-menu-mode`). C-g still cancels a running C-x C-e.
 
+(defn ed--proc-name (p)
+  "The NAME cell for `process-info` map `p`: its registered name (or `-`), indented
+`2×:depth` spaces in the tree view (clipped to the 14-col field so deeper rows stay
+column-aligned). `:depth` is absent (→ 0, no indent) in the flat view."
+  (let (nm (if (get p :name) (name (get p :name)) "-")
+        depth (or (get p :depth) 0)
+        s (if (> depth 0) (str (string-repeat "  " depth) nm) nm))
+    (if (> (string-length s) 14) (substring s 0 14) s)))
+
 (defn ed--proc-row (p)
-  "One `*Process List*` row from a `process-info` map."
+  "One `*Process List*` row from a `process-info` map. The ID stays flush-left (so
+`ed--line-id` and the kill keys parse it); the tree shape shows in the NAME cell."
   (str (pad-right (str (get p :id)) 5) " "
-    (pad-right (if (get p :name) (name (get p :name)) "-") 14) " "
+    (pad-right (ed--proc-name p) 14) " "
     (pad-right (name (get p :status)) 8) " "
     (pad-left (str (get p :mailbox)) 7) " "
     (pad-left (str (get p :reductions)) 12)))
 
-(defn ed-process-list-text ()
+(defn ed-process-list-text (view)
   "The `*Process List*` buffer text: a header row plus one `ed--proc-row` per live
-process (`process-info` snapshot, sorted by id). A fresh snapshot each call, so
-re-showing it after a kill reflects the change."
+process (a fresh `process-info` snapshot, so re-showing after a kill reflects the
+change). `view` is `:tree` (a parent→child forest, indented by depth — `proctree`)
+or `:flat` (ascending by id)."
   (let (infos (filter (fn (p) (not (nil? p))) (map process-info (list-processes)))
-        rows (map ed--proc-row (sort-by (fn (p) (get p :id)) infos)))
+        ordered (if (= view :flat) (proctree/by-id infos) (proctree/tree-order infos))
+        rows (map ed--proc-row ordered))
     (str (pad-right "ID" 5) " " (pad-right "NAME" 14) " " (pad-right "STATUS" 8)
       " " (pad-left "MAILBOX" 7) " " (pad-left "REDUCTIONS" 12) "\n"
       (join "\n" rows) "\n")))
 
+(defn ed-proc-view (m)
+  "The current *Process List* view mode (`:tree` default, or `:flat`), from the model."
+  (or (get m :proc-view) :tree))
+
 (defn ed-show-process-list (m)
   "Build/refresh the read-only `*Process List*` in the selected pane and show it,
-stamped `:process-menu` so its kill/refresh keys and read-only mode apply. The seam
-the list / refresh / kill commands all route through."
-  (ed-show-named m "*Process List*" (ed-process-list-text) :process-menu))
+stamped `:process-menu` so its kill/refresh keys and read-only mode apply, in the
+model's current `:proc-view` (tree by default). The seam the list / refresh / kill /
+toggle commands all route through."
+  (ed-show-named m "*Process List*" (ed-process-list-text (ed-proc-view m)) :process-menu))
 
 (defcommand cmd-list-processes
   (m key)
@@ -774,6 +857,14 @@ isn't on a process row, or the process is already gone."
   (m key)
   "Re-snapshot the live processes into the *Process List* (`g`)."
   (ed-show-process-list m))
+
+(defcommand cmd-process-menu-toggle-tree
+  (m key)
+  "Toggle the *Process List* between the tree (parent→child, indented) and flat
+(id-sorted) views (`t`); the choice persists on the model, so refresh/kill keep it."
+  (let (next (if (= (ed-proc-view m) :tree) :flat :tree))
+    (message (ed-show-process-list (assoc m :proc-view next))
+      (str (if (= next :tree) "tree" "flat") " view"))))
 
 ;; ---- files + quit -----------------------------------------------------------
 
