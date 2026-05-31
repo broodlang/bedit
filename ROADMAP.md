@@ -38,9 +38,10 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
   symbols in brood-mode** (the `:complete-at` mode service).
 - ✅ **Evaluate Brood in the buffer** — `C-x C-e` (last sexp), region, whole buffer
   (`src/eval-command.blsp`); result + captured output to the echo area / `*Messages*`.
-  Eval runs in a **spawned process** so a long/looping form never freezes the loop;
-  `C-g` interrupts a running eval, and an optional `*eval-timeout-ms*` watchdog can
-  auto-kill a runaway one.
+  Eval runs **off the loop via `std/task`** (`(require 'task)`) so a long/looping
+  form never freezes the loop; `C-g` (`cancel-task`) interrupts a running eval, and
+  an optional `*eval-timeout-ms*` arms the task's built-in timeout to auto-kill a
+  runaway one.
 - ✅ **Structural navigation (brood-mode)** — `C-M-f/b/u/d/a` over the parse-source
   CST (`std/sexp`).
 - ✅ **Syntax highlighting (brood-mode)** — live lexical colouring via the
