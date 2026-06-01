@@ -40,6 +40,12 @@ pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
   ;; redraws on input. While a key is held, `input` shortens it to the key-repeat
   ;; beat (see *repeat-delay-ms* / *repeat-rate-ms*) and restores this on release.
 
+(def *diag-debounce-ms* 250)
+  ;; The tick beat armed after a *settled* edit left diagnostics stale: a `:tick`
+  ;; fires this long after you stop typing and runs the (deferred) type-check —
+  ;; Emacs's idle-timer model. While a key auto-repeats, the typematic delay
+  ;; (*repeat-delay-ms*) already serves as the debounce, so no separate beat is set.
+
 ;; ---- construction -----------------------------------------------------------
 
 (defn ed--log-buffer (&optional (name "*Messages*"))
@@ -177,6 +183,57 @@ since the last check; otherwise `m` unchanged."
         (if (= text (get m :diag-text))
           m
           (assoc m :diagnostics (svc text) :diag-text text))))))
+
+;; ---- the post-event step: cached eldoc + debounced diagnostics --------------
+;; Both the eldoc hint and the advisory type-check are too costly to recompute on the
+;; render path (eldoc, every frame) or on every keystroke (the whole-buffer check).
+;; Emacs runs eldoc / flymake on an *idle timer*; we do the same with the editor's
+;; existing `:tick` beat. `input/ed-update` runs `ed-post-step` after each event folds
+;; in: it caches the eldoc string on the model (so `view` just paints it) and, instead
+;; of type-checking per key, arms a short debounce tick whose firing runs the check
+;; once typing settles. While a key auto-repeats, the typematic delay is the debounce.
+
+(defn ed-cache-eldoc (m)
+  "Refresh the model's cached `:eldoc` hint — the current buffer mode's `:eldoc`
+service applied to point, or nil when the mode offers none. Computed here (once per
+event) rather than in `view` (every frame); a service error caches nil rather than
+disrupting the edit."
+  (let (buf (ed-current-buf m)
+        svc (ed-mode-service buf :eldoc))
+    (if (nil? svc)
+      (assoc m :eldoc nil)
+      (assoc m :eldoc (try (svc (buffer-text buf) (buffer-point buf)) (catch e nil))))))
+
+(defn ed-diag-stale? (m)
+  "True if the current buffer offers a `:diagnostics` service and its text differs from
+`:diag-text` (the text the cached `:diagnostics` were computed from) — i.e. a recheck
+is due. Buffers whose mode offers no service are never stale (never pay)."
+  (let (buf (ed-current-buf m))
+    (and (not (nil? (ed-mode-service buf :diagnostics)))
+      (not (= (buffer-text buf) (get m :diag-text))))))
+
+(defn ed-run-diag (m)
+  "Run the deferred diagnostics check now — a no-op when not stale, via the
+`:diag-text` cache — and restore the idle tick beat. What an idle `:tick` does once the
+debounce window has elapsed."
+  (assoc (ed-refresh-diagnostics m) :tick-ms *idle-tick-ms*))
+
+(defn ed-arm-diag-beat (m)
+  "Shorten the tick to `*diag-debounce-ms*` when a settled edit left the check stale, so
+a `:tick` fires soon and runs it; otherwise leave the beat untouched."
+  (if (ed-diag-stale? m) (assoc m :tick-ms *diag-debounce-ms*) m))
+
+(defn ed-post-step (m input)
+  "The post-event step run after `input/ed-update` folds an event in: cache the eldoc
+hint and schedule the debounced diagnostics check (Emacs's idle-timer model). While a
+key-repeat is armed (`:held-key`), the typematic delay *is* the debounce — leave the
+model untouched. On an idle `:tick` with nothing held, the debounce has elapsed → run
+the check. On any other settled event, arm the debounce beat if the edit left
+diagnostics stale."
+  (cond
+    (get m :held-key) m
+    (= input :tick) (ed-run-diag (ed-cache-eldoc m))
+    :else (ed-arm-diag-beat (ed-cache-eldoc m))))
 
 ;; ---- the minibuffer (a one-line prompt over lineedit's pure editor core) -----
 ;; The `:minibuffer` field is `{:edit <lineedit-state> :on-complete :complete-fn
