@@ -1,8 +1,8 @@
 # myedit roadmap
 
 A small, Emacs-style GUI text editor written in Brood, on the standard editor
-framework (`std/buffer`, `std/keymap`, `std/layers`, `std/sexp`, `std/regex`,
-`std/display`, `std/ui`) plus the editor's own `src/eval-command.blsp` (the
+framework (`editor/buffer`, `editor/keymap`, `editor/layers`, `sexp`, `regex`,
+`editor/display`, `editor/ui`) plus the editor's own `src/eval-command.blsp` (the
 C-x C-e policy, moved out of `std/`). Nothing custom in any kernel — the
 editor is *policy* (commands, modes, keymaps) over that framework. The model is a
 single `ui-run` loop; modes are **layers** carried by each buffer (see the layers
@@ -38,23 +38,23 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
   symbols in brood-mode** (the `:complete-at` mode service).
 - ✅ **Evaluate Brood in the buffer** — `C-x C-e` (last sexp), region, whole buffer
   (`src/eval-command.blsp`); result + captured output to the echo area / `*Messages*`.
-  Eval runs **off the loop via `std/task`** (`(require 'task)`) so a long/looping
+  Eval runs **off the loop via `task`** (`(require 'task)`) so a long/looping
   form never freezes the loop; `C-g` (`cancel-task`) interrupts a running eval, and
   an optional `*eval-timeout-ms*` arms the task's built-in timeout to auto-kill a
   runaway one.
 - ✅ **Structural navigation (brood-mode)** — `C-M-f/b/u/d/a` over the parse-source
-  CST (`std/sexp`).
+  CST (`sexp`).
 - ✅ **Syntax highlighting (brood-mode)** — live lexical colouring via the
-  `:fontify` mode service over `std/highlight`; spans lexed once per frame, region
+  `:fontify` mode service over `editor/highlight`; spans lexed once per frame, region
   `:reverse` merged into the lexer face.
 - ✅ **Bracket matching + eldoc (brood-mode)** — the `:bracket-match` service marks
   the pair at point; the `:eldoc` service shows the enclosing call's signature in
-  the echo area as point moves (both reuse `std/highlight`).
+  the echo area as point moves (both reuse `editor/highlight`).
 - ✅ **Generic mode-services host** — the view/completion ask the buffer's mode for
   `:fontify` / `:bracket-match` / `:eldoc` / `:complete-at` facets
   (`ed-mode-service`) without naming any language; brood-mode is the first to
   supply them. A `json`/`ruby`/`elixir` mode is the same registration (see §C).
-- ✅ **Windows / splits** — tiled panes over a `std/pane` layout tree: `C-x 2/3`
+- ✅ **Windows / splits** — tiled panes over a `editor/pane` layout tree: `C-x 2/3`
   split, `C-x o` other, `C-x 0/1` close; each pane has independent scroll/zoom and
   shares buffer text via the pool. **Mouse**: click selects a pane, divider drag
   resizes, Ctrl+wheel zooms / plain wheel scrolls the pane *under the pointer*.
@@ -71,11 +71,11 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
 - ✅ **Incremental search** — `C-s` / `C-r` isearch + `M-%` **query-replace**
   (`src/isearch.blsp`): modal mini-loops beside the keymap, matches highlighted via
   point+mark over the region face, wrap-around, the search origin pushed to the mark
-  ring on exit. Built on new `std/buffer` `buffer-search-forward`/`-backward` (over
+  ring on exit. Built on `editor/buffer` `buffer-search-forward`/`-backward` (over
   `string-index-of`/`string-last-index-of` in the prelude). Regex isearch waits on the
-  `std/regex` gaps (§D).
+  `regex` gaps (§D).
 - ✅ **`M-x` run-command-by-name** — `defcommand` marks a function interactive and
-  registers it (`src/command.blsp`); `M-x` (`M-x`/`:alt-x`) completes against and
+  registers it (`src/interactive.blsp`); `M-x` (`M-x`/`:alt-x`) completes against and
   runs the registry. Every `cmd-*` is interactive; reachable without a binding.
 - ✅ **Comment / uncomment** — `M-;` (`cmd-comment-dwim`): toggles the region's lines
   (or the current line) — uncomments when every non-blank line is already commented,
@@ -83,7 +83,7 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
   a mode without one reports it can't comment. (`#`/`//` modes are the same facet.)
 - ✅ **Indentation** — `TAB` indents-or-completes (Emacs `tab-always-indent` =
   `'complete`), `C-M-i` always completes; in brood-mode `RET` is newline-and-indent.
-  Sexp-aware via the `:indent` mode service over `std/sexp` (body forms +2, calls
+  Sexp-aware via the `:indent` mode service over `sexp` (body forms +2, calls
   align under the first arg, vectors/maps under the first element); buffers with no
   `:indent` fall back to matching the previous line.
 - ✅ **Projects — find-file-in-project** (`C-x p f`) — `src/projects.blsp` finds the
@@ -94,9 +94,9 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
   project-wide grep, a multi-project switcher.)
 - ✅ **Prefix args & mark ring** — numeric `C-u N` (default 4; further `C-u` ×4,
   digits set it) repeats the next command N times (the common-case mechanism;
-  per-command interactive specs are a deferred `std/layers` improvement); `C-u C-SPC`
+  per-command interactive specs are a deferred `editor/layers` improvement); `C-u C-SPC`
   pops the mark. `C-SPC` now `push-mark`s, filling a per-buffer mark ring
-  (`std/buffer` `push-mark`/`pop-mark`).
+  (`editor/buffer` `push-mark`/`pop-mark`).
 - ✅ **find-file live candidates** — `C-x C-f` shows the directory's entries as you
   type (the same `view/ed-mb-candidates` path `C-x b` uses), via a shared
   `mincomplete/ed--dir-matches`.
@@ -114,7 +114,7 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
 - ⬜ **tree-sitter primitives** — an opaque tree/node resource: parse, node-at,
   parent/children/siblings, type, range, incremental reparse. Mechanism in Rust;
   policy in Brood.
-- ⬜ **Node-abstraction backend** so the existing `std/sexp` structural commands
+- ⬜ **Node-abstraction backend** so the existing `sexp` structural commands
   work over tree-sitter trees unchanged (`{:kind :start :end :kids}` shape).
 - ⬜ **`ruby-mode` / `elixir-mode`** — same layer shape as brood-mode, with a
   `:parser :tree-sitter` + `:grammar` facet instead of `:brood`.
@@ -135,10 +135,10 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
 ## D. Polish & deferred
 
 - ✅ **Syntax highlighting** — lexical colouring in brood-mode via the `:fontify`
-  mode service over `std/highlight` (see the core list above). CST-/tree-sitter-query
+  mode service over `editor/highlight` (see the core list above). CST-/tree-sitter-query
   driven highlighting for other languages comes with §C.
 - ⬜ **Browsable `*Kill Ring*`** view and a **which-key**-style popup for prefixes.
-- ⬜ **regex** ranges `[a-z]` / captures / `{m,n}` (`std/regex`, brood repo).
+- ⬜ **regex** ranges `[a-z]` / captures / `{m,n}` (`regex`, brood repo).
 - ⬜ **layers** extras (brood repo): `:commands` manifest, per-binding `when`-guards,
   cross-layer chord merging, a browsable command list.
 - ⬜ **dired / file browser**, registers, bookmarks, rectangles, macros — the long
@@ -150,9 +150,16 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
 
 - **Key encodings are best-guesses.** The `C-M-*`, `M-o`/`M-O`, `M-^`, `M-DEL`
   bindings pass tests by binding *name*, but the real keywords `gui-poll` delivers
-  haven't been confirmed on a live window — verify on a run and rebind in
+  haven't all been confirmed on a live window — verify on a run and rebind in
   `src/modes.blsp` (`text-keymap`) if they differ. Bindings are data, rebindable
   live via `C-x C-e` on a `keymap-bind`.
+  - ✅ **Shifted-punctuation chords now reach the GUI** (`M-<`/`M->`, `M-{`/`M-}`,
+    `M-%`, `M-^`): the GUI frontend was stripping Shift from Alt/Ctrl chords
+    (`key_without_modifiers`), so `Alt+Shift+.` arrived as `:alt-.` not `:alt->`.
+    Fixed in Brood (`crates/lisp/src/gui.rs` `translate_key`/`shift_char`, 2026-06-02),
+    matching the crossterm frontend — no editor binding change. Still unverified: the
+    capital-letter chords (`M-O` vs `M-o`) collapse to one keyword (both frontends
+    lower-case letters), so `M-O` open-line-above is M-x-only for now.
 - Bindings live in `src/modes.blsp`; commands in `src/commands.blsp` (the
   `defcommand` macro + M-x registry in `src/interactive.blsp`); dispatch + minibuffer
   in `src/input.blsp`; model in `src/model.blsp`; pane geometry + mouse in
