@@ -18,6 +18,26 @@ over it, so screen coordinates line up. Pure (data→data)."
 hit-testing, so a click maps to the pane the view drew there."
   (pane-layout (get m :layout) [0 0 cols (dec rows)]))
 
+;; ---- gutter geometry (shared by the view's renderer and mouse hit-testing) --
+;; The left line-number gutter's *width* and *shown?* predicate are pure geometry, so
+;; they live here with the rest of the pane layout; `view` (which `(:use panes)`) draws
+;; the cells (`view/ed-gutter-ops`) and the click handler below maps a cell past the
+;; gutter to a buffer column. Both ask the buffer's mode for its `:gutter-width` service.
+
+(defn ed-gutter-shown? (buf pane)
+  "Whether the left gutter shows for `pane`: an explicit per-pane `:line-numbers`
+(set by C-x l) wins; otherwise it defaults **on** whenever the buffer's mode offers a
+`:gutter-width` service (so a text/brood buffer shows line numbers without a toggle)."
+  (let (ln (get (get pane :payload) :line-numbers))
+    (if (nil? ln) (not (nil? (ed-mode-service buf :gutter-width))) ln)))
+
+(defn ed-gutter-width (buf shown?)
+  "Columns the left gutter reserves: the mode's `:gutter-width` service (e.g. the line-
+number digit count + a trailing space) when `shown?` and a service exists, else 0 (so
+the body fills the pane)."
+  (let (gwfn (ed-mode-service buf :gutter-width))
+    (if (and shown? (not (nil? gwfn))) (gwfn buf) 0)))
+
 (defn ed-selected-text-rows (m cols rows)
   "The text height of the *selected* pane in BUFFER lines — its rect height less the
 mode-line row, divided by the pane's font scale (a zoomed pane shows fewer lines).
@@ -32,17 +52,94 @@ At least 1."
          (max 1 (or (get (get sel :payload) :scale) 1)))
     (max 1 (quot cells s))))
 
-;; ---- mouse: select / drag-resize --------------------------------------------
+;; ---- mouse: select / move-point / scrollbar / drag-resize -------------------
+
+(defn ed--pane-payload-buf (m pane)
+  "The buffer shown in `pane` — its payload's `:buffer` pool index, fetched from `m`."
+  (ed-buf-at m (get (get pane :payload) :buffer)))
+
+(defn ed-scrollbar-hit? (pane buf row col)
+  "True if `[row col]` lands on `pane`'s scrollbar: its rightmost column, on a text row
+(above the mode line), with the bar shown — `buf` doesn't fit the `vh` text rows (the
+same predicate `view/ed-scrollbar-ops` draws under)."
+  (let ([px py pw ph] (get pane :rect)
+        vh (max 1 (dec ph)))
+    (and (= col (+ px (dec pw)))
+      (>= row py)
+      (< row (+ py vh))
+      (> (buffer-line-count buf) vh))))
+
+(defn ed-scrollbar-top-for (buf vh row sy)
+  "The pane `:top` for a scrollbar click/drag at screen `row`, on a track of `vh` rows
+starting at `sy`: a proportional map — the track top scrolls to 0, the bottom to
+`ed-max-top` — clamped into `[0, max-top]`."
+  (let (maxtop (ed-max-top buf (max 1 vh))
+        rr (max 0 (min (dec vh) (- row sy))))
+    (if (<= maxtop 0)
+      0
+      (max 0 (min maxtop (quot (* maxtop rr) (max 1 (dec vh))))))))
+
+(defn ed-buf-offset-at (buf top gw s px py row col)
+  "The buffer offset under screen cell `[row col]` for a pane at origin `(px, py)`, left
+gutter `gw` columns wide, font scale `s`, scrolled to `top` — the inverse of the view's
+pane geometry (`view/ed-pane-ops` / `ed-cursor`). Line = `top + (row-py)/s` clamped to
+the last line; column = `(col-px)/s - gw` clamped to `[0, line length]` (a click past the
+end of a short line lands at its end, never on the next line)."
+  (let (line (min (max 0 (dec (buffer-line-count buf)))
+               (+ top (quot (max 0 (- row py)) (max 1 s))))
+        vcol (quot (max 0 (- col px)) (max 1 s))
+        bufcol (max 0 (- vcol gw))
+        bol (rope-line->char (buffer-rope buf) line)
+        lt (buffer-line-at buf line)
+        llen (if (ends-with? lt "\n") (dec (string-length lt)) (string-length lt)))
+    (+ bol (min bufcol llen))))
+
+(defn ed-mouse-set-point (m pane buf row col)
+  "Move point in `pane`'s buffer to the clicked cell `[row col]` (Emacs `mouse-set-point`).
+The pane is already selected, so `buf` is the current buffer and this writes it back via
+`ed-set-buf`."
+  (let ([px py pw ph] (get pane :rect)
+        top (or (get (get pane :payload) :top) 0)
+        s (max 1 (or (get (get pane :payload) :scale) 1))
+        gw (ed-gutter-width buf (ed-gutter-shown? buf pane)))
+    (ed-set-buf m (goto-char buf (ed-buf-offset-at buf top gw s px py row col)))))
 
 (defn ed-mouse-press (m cols rows row col)
-  "Left-press at cell `[row col]`: if it lands on a divider, begin a resize drag
-(stash the divider on `:dragging` — it carries the split path + the rect to measure
-the new ratio against); otherwise select the pane under the pointer."
+  "Left-press at cell `[row col]`. On a divider → begin a resize drag (`:dragging`
+carries the split path + the rect to measure the new ratio against). On a pane's
+scrollbar → select that pane, scroll it to the clicked position, and arm a scrollbar
+drag (`:sb-drag`) so motion keeps scrolling it. Otherwise select the pane under the
+pointer and, when the click is in its text area (not the mode line), move point there
+(`mouse-set-point`)."
   (let (layout (ed-body-layout m cols rows)
-        d (divider-at layout [row col]))
-    (if (nil? d)
-      (assoc m :layout (pane-select-at (get m :layout) layout [row col]))
-      (assoc m :dragging d))))
+        d (divider-at layout [row col])
+        pane (pane-at layout [row col]))
+    (cond
+      (not (nil? d)) (assoc m :dragging d)
+      (nil? pane) m
+      else (let (buf (ed--pane-payload-buf m pane)
+                 [px py pw ph] (get pane :rect)
+                 vh (max 1 (dec ph))
+                 selected (assoc m :layout (pane-select-at (get m :layout) layout [row col])))
+             (cond
+               (ed-scrollbar-hit? pane buf row col)
+                 (assoc selected
+                   :layout (pane-update-path (get selected :layout) (get pane :path)
+                             (fn (w) (assoc w :top (ed-scrollbar-top-for buf vh row py))))
+                   :sb-drag {:path (get pane :path) :sy py :vh vh :buf (get (get pane :payload) :buffer)})
+               (< row (+ py vh)) (ed-mouse-set-point selected pane buf row col)
+               else selected)))))
+
+(defn ed-scrollbar-drag (m row col)
+  "While dragging a scrollbar (`:sb-drag` set by `ed-mouse-press`), scroll its pane to
+follow the pointer (`ed-scrollbar-top-for`). A no-op if not dragging one."
+  (let (sb (get m :sb-drag))
+    (if (nil? sb)
+      m
+      (assoc m
+        :layout
+        (pane-update-path (get m :layout) (get sb :path)
+          (fn (w) (assoc w :top (ed-scrollbar-top-for (ed-buf-at m (get sb :buf)) (get sb :vh) row (get sb :sy)))))))))
 
 (defn ed-mouse-drag (m row col)
   "While dragging a divider, set its split's ratio so the boundary follows the
@@ -106,8 +203,9 @@ an explicit `false` back to `true`. Pure."
 
 (defn ed-mouse (m input cols rows)
   "Fold a `[:mouse action button row col mods]` event into the model: left-press
-selects a pane or begins a divider drag; `:drag` resizes the dragged divider;
-`:release` ends the drag; **Ctrl+wheel zooms** and a **plain wheel scrolls** the pane
+selects a pane, moves point to the click (`mouse-set-point`), begins a divider drag, or
+grabs a scrollbar; `:drag` resizes the dragged divider or scrolls the grabbed scrollbar;
+`:release` ends either drag; **Ctrl+wheel zooms** and a **plain wheel scrolls** the pane
 **under the pointer** (`ed-zoom-pane` / `ed-scroll-pane`, one notch each), never the
 active pane. Fields are read positionally (`nth`), not by a fixed-length vector
 pattern, so the trailing `mods` element (and any future addition) can't silently
@@ -120,8 +218,9 @@ break the match. A wheel notch off every pane is ignored."
         hovered (ed-pane-at m cols rows row col))
     (cond
       (and (= action :press) (= button :left)) (ed-mouse-press m cols rows row col)
-      (and (= action :drag) (= button :left)) (ed-mouse-drag m row col)
-      (= action :release) (dissoc m :dragging)
+      (and (= action :drag) (= button :left))
+        (if (get m :sb-drag) (ed-scrollbar-drag m row col) (ed-mouse-drag m row col))
+      (= action :release) (dissoc m :dragging :sb-drag)
       (nil? hovered) m
       (and (= action :scroll-up) (includes? mods :ctrl)) (ed-zoom-pane m hovered 1)
       (and (= action :scroll-down) (includes? mods :ctrl)) (ed-zoom-pane m hovered -1)
