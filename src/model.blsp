@@ -31,7 +31,8 @@ pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
   (:use editor/layers)  ; init-buffer-layers (stamp a buffer's mode) + active-layers (mode line)
   (:use editor/pane)  ; the pane-tree layout: pane-single / selected payload / update / map
   (:use log)  ; backend — the log-routing backends (one filtered backend per buffer)
-  (:use io))  ; fn-port — the editor-targeting log sink ([:buffer-log name line])
+  (:use io)  ; fn-port — the editor-targeting log sink ([:buffer-log name line])
+  (:use task))  ; task — run the advisory diagnostics check off the loop (async recheck)
 
 (require 'editor/lineedit)  ; the minibuffer reuses the REPL line editor's pure core
 
@@ -163,26 +164,54 @@ the previous newline (0 at the first line). Tail-recursive."
 checker reports them) — `rope-line->char` of the line plus the column."
   (+ (rope-line->char (buffer-rope buf) (dec line)) (dec col)))
 
-;; ---- diagnostics cache (live, recomputed only when the text changes) --------
-;; A full advisory type-check is far heavier than per-frame highlighting, so it's
-;; kept off the render path: `ed-update` runs this after each key, but it recomputes
-;; only when the current buffer's text differs from `:diag-text` (the text the cached
-;; `:diagnostics` were computed from). Movement is therefore a no-op; an edit
-;; refreshes. The check is the buffer mode's `:diagnostics` service (brood-mode →
-;; the in-process type checker); buffers whose mode offers none never pay for it.
+;; ---- diagnostics cache (async, recomputed only when the text changes) -------
+;; A full advisory type-check is O(buffer) — hundreds of ms on a large file — far too
+;; heavy for the loop. Two things keep it off the critical path: (1) staleness is keyed
+;; on the buffer's ROPE HANDLE (an edit mints a fresh rope; movement keeps it), an O(1)
+;; check rather than a whole-buffer text compare, so movement never even materialises
+;; the text; (2) the check itself runs in a SPAWNED PROCESS (std/task) and its result is
+;; folded back through `ed-update` as a `[:task-done …]` event, so the editor stays live
+;; while the checker runs. Without a live `:editor` process (tests / headless) it falls
+;; back to a synchronous check. The check is the buffer mode's `:diagnostics` service
+;; (brood-mode → the in-process type checker); buffers whose mode offers none never pay.
 
 (defn ed-refresh-diagnostics (m)
-  "The model with `:diagnostics` (a list of `{:line :col :message}`) + `:diag-text`
-refreshed iff the current buffer has a `:diagnostics` service and its text changed
-since the last check; otherwise `m` unchanged."
+  "The model with `:diagnostics` (a list of `{:line :col :message}`) + `:diag-rope`
+refreshed iff the current buffer has a `:diagnostics` service and its rope changed since
+the last check; otherwise `m` unchanged. Synchronous — the core the async path and the
+tests share."
   (let (buf (ed-current-buf m)
         svc (ed-mode-service buf :diagnostics))
-    (if (nil? svc)
+    (if (or (nil? svc) (= (buffer-rope buf) (get m :diag-rope)))
       m
-      (let (text (buffer-text buf))
-        (if (= text (get m :diag-text))
-          m
-          (assoc m :diagnostics (svc text) :diag-text text))))))
+      (assoc m :diagnostics (svc (buffer-text buf)) :diag-rope (buffer-rope buf)))))
+
+(defn ed-launch-diag (m)
+  "Start the deferred diagnostics check. A no-op when nothing is stale or a check is
+already in flight (`:diag-proc`). With a live `:editor` process, run the check in a
+spawned task (std/task) — recording its handle on `:diag-proc` and the rope it is
+checking on `:diag-checking`, so a stale reply can't clobber a newer cache. Headless (no
+`:editor`) → synchronous (`ed-refresh-diagnostics`)."
+  (let (buf (ed-current-buf m)
+        svc (ed-mode-service buf :diagnostics))
+    (cond
+      (or (nil? svc) (not (ed-diag-stale? m))) m
+      (get m :diag-proc) m
+      (nil? (whereis :editor)) (ed-refresh-diagnostics m)
+      :else (let (text (buffer-text buf)
+                  job (task (fn () (svc text))))
+              (assoc m :diag-proc job :diag-checking (buffer-rope buf))))))
+
+(defn ed-apply-diag (m result)
+  "Fold a finished diagnostics check's `result` (its `[:task-done …]` value, `()` if it
+errored / timed out) into the model: store it against the rope it was computed for
+(`:diag-checking` → `:diag-rope`) and clear the in-flight handle. `ed-diag-stale?` then
+re-fires iff the buffer moved on while the check ran, so the next idle tick relaunches."
+  (assoc m
+    :diagnostics (or result '())
+    :diag-rope (get m :diag-checking)
+    :diag-proc nil
+    :diag-checking nil))
 
 ;; ---- the post-event step: cached eldoc + debounced diagnostics --------------
 ;; Both the eldoc hint and the advisory type-check are too costly to recompute on the
@@ -219,18 +248,20 @@ offers no eldoc never pay. (Point-move covers typing too, since inserting moves 
       (not (= (buffer-point buf) (get m :eldoc-point))))))
 
 (defn ed-diag-stale? (m)
-  "True if the current buffer offers a `:diagnostics` service and its text differs from
-`:diag-text` (the text the cached `:diagnostics` were computed from) — i.e. a recheck
-is due. Buffers whose mode offers no service are never stale (never pay)."
+  "True if the current buffer offers a `:diagnostics` service and its rope differs from
+`:diag-rope` (the rope the cached `:diagnostics` were computed from) — i.e. a recheck is
+due. An O(1) rope-handle compare, not a whole-buffer text compare, so movement (which
+keeps the rope) costs nothing. Buffers whose mode offers no service are never stale."
   (let (buf (ed-current-buf m))
     (and (not (nil? (ed-mode-service buf :diagnostics)))
-      (not (= (buffer-text buf) (get m :diag-text))))))
+      (not (= (buffer-rope buf) (get m :diag-rope))))))
 
 (defn ed-run-diag (m)
-  "Run the deferred diagnostics check now — a no-op when not stale, via the
-`:diag-text` cache — and restore the idle tick beat. What an idle `:tick` does once the
-debounce window has elapsed."
-  (assoc (ed-refresh-diagnostics m) :tick-ms *idle-tick-ms*))
+  "Launch the deferred diagnostics check (async via `ed-launch-diag` when an `:editor`
+process is live, synchronous otherwise) — a no-op when not stale or one is in flight —
+and restore the long idle tick beat. What an idle `:tick` does once the debounce window
+has elapsed."
+  (assoc (ed-launch-diag m) :tick-ms *idle-tick-ms*))
 
 (defn ed-arm-idle-beat (m)
   "Shorten the tick to `*diag-debounce-ms*` when a settled event left the **eldoc hint**
