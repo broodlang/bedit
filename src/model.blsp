@@ -195,14 +195,28 @@ since the last check; otherwise `m` unchanged."
 
 (defn ed-cache-eldoc (m)
   "Refresh the model's cached `:eldoc` hint — the current buffer mode's `:eldoc`
-service applied to point, or nil when the mode offers none. Computed here (once per
-event) rather than in `view` (every frame); a service error caches nil rather than
-disrupting the edit."
+service applied to point, or nil when the mode offers none. Also stamps `:eldoc-point`
+(the point it was computed at) so `ed-eldoc-stale?` can tell when point has moved and a
+refresh is due. Computed on the idle tick (`ed-post-step`), not per keystroke: the
+service parses around point (O(point) for brood-mode's `enclosing-call`), too costly to
+run on every key in a large buffer. A service error caches nil rather than disrupting
+the edit."
   (let (buf (ed-current-buf m)
-        svc (ed-mode-service buf :eldoc))
+        svc (ed-mode-service buf :eldoc)
+        pt (buffer-point buf))
     (if (nil? svc)
-      (assoc m :eldoc nil)
-      (assoc m :eldoc (try (svc (buffer-text buf) (buffer-point buf)) (catch e nil))))))
+      (assoc m :eldoc nil :eldoc-point pt)
+      (assoc m
+        :eldoc (try (svc (buffer-text buf) pt) (catch e nil))
+        :eldoc-point pt))))
+
+(defn ed-eldoc-stale? (m)
+  "True if the current buffer offers an `:eldoc` service and point has moved since the
+cached `:eldoc` was computed (`:eldoc-point`) — a refresh is due. Buffers whose mode
+offers no eldoc never pay. (Point-move covers typing too, since inserting moves point.)"
+  (let (buf (ed-current-buf m))
+    (and (not (nil? (ed-mode-service buf :eldoc)))
+      (not (= (buffer-point buf) (get m :eldoc-point))))))
 
 (defn ed-diag-stale? (m)
   "True if the current buffer offers a `:diagnostics` service and its text differs from
@@ -218,22 +232,26 @@ is due. Buffers whose mode offers no service are never stale (never pay)."
 debounce window has elapsed."
   (assoc (ed-refresh-diagnostics m) :tick-ms *idle-tick-ms*))
 
-(defn ed-arm-diag-beat (m)
-  "Shorten the tick to `*diag-debounce-ms*` when a settled edit left the check stale, so
-a `:tick` fires soon and runs it; otherwise leave the beat untouched."
-  (if (ed-diag-stale? m) (assoc m :tick-ms *diag-debounce-ms*) m))
+(defn ed-arm-idle-beat (m)
+  "Shorten the tick to `*diag-debounce-ms*` when a settled event left the **eldoc hint**
+or the **diagnostics check** stale, so an idle `:tick` fires soon and recomputes them;
+otherwise leave the beat untouched (so a buffer with neither service keeps the long idle
+beat). The debounce window the per-keystroke path defers both costly jobs into."
+  (if (or (ed-eldoc-stale? m) (ed-diag-stale? m)) (assoc m :tick-ms *diag-debounce-ms*) m))
 
 (defn ed-post-step (m input)
-  "The post-event step run after `input/ed-update` folds an event in: cache the eldoc
-hint and schedule the debounced diagnostics check (Emacs's idle-timer model). While a
-key-repeat is armed (`:held-key`), the typematic delay *is* the debounce — leave the
-model untouched. On an idle `:tick` with nothing held, the debounce has elapsed → run
-the check. On any other settled event, arm the debounce beat if the edit left
-diagnostics stale."
+  "The post-event step run after `input/ed-update` folds an event in. Both the eldoc
+hint and the advisory type-check are **debounced onto the idle tick** (Emacs's
+idle-timer model) — recomputing them on every keystroke makes a large buffer crawl
+(eldoc parses around point, the check scans the whole buffer). So a settled edit/motion
+recomputes nothing here; it just arms a short debounce beat when eldoc or diagnostics
+went stale (`ed-arm-idle-beat`). The idle `:tick` that follows (nothing held) recomputes
+the eldoc hint and runs the deferred check, then restores the long idle beat. A held
+key-repeat is its own debounce — leave the model untouched."
   (cond
     (get m :held-key) m
     (= input :tick) (ed-run-diag (ed-cache-eldoc m))
-    :else (ed-arm-diag-beat (ed-cache-eldoc m))))
+    :else (ed-arm-idle-beat m)))
 
 ;; ---- the minibuffer (a one-line prompt over lineedit's pure editor core) -----
 ;; The `:minibuffer` field is `{:edit <lineedit-state> :on-complete :complete-fn
