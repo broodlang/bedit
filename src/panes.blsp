@@ -207,15 +207,35 @@ end of a short line lands at its end, never on the next line)."
         llen (if (ends-with? lt "\n") (dec (string-length lt)) (string-length lt)))
     (+ bol (min bufcol llen))))
 
-(defn ed-mouse-set-point (m pane buf row col)
-  "Move point in `pane`'s buffer to the clicked cell `[row col]` (Emacs `mouse-set-point`).
-The pane is already selected, so `buf` is the current buffer and this writes it back via
-`ed-set-buf`."
+(defn ed-mouse-begin-select (m pane buf row col)
+  "Left-press in the text area (Emacs `mouse-set-point` + the start of a drag-select):
+move point to the clicked cell, clear any prior mark, and arm a text-selection drag
+(`:text-drag`, carrying the pane geometry and the click as the region `:anchor`). So a
+plain click (press then release, no drag) leaves no region; a drag sets the mark at the
+anchor and grows the region to the pointer (`ed-text-drag`). The pane is already
+selected, so `buf` is the current buffer; written back via `ed-set-buf`."
   (let ([px py pw ph] (get pane :rect)
         top (or (get (get pane :payload) :top) 0)
         s (max 1 (or (get (get pane :payload) :scale) 1))
-        gw (ed-gutter-width buf (ed-gutter-shown? buf pane)))
-    (ed-set-buf m (goto-char buf (ed-buf-offset-at buf top gw s px py row col)))))
+        gw (ed-gutter-width buf (ed-gutter-shown? buf pane))
+        off (ed-buf-offset-at buf top gw s px py row col))
+    (assoc (ed-set-buf m (clear-mark (goto-char buf off)))
+      :text-drag {:buf (get (get pane :payload) :buffer) :rect (get pane :rect)
+                  :top top :gw gw :scale s :anchor off})))
+
+(defn ed-text-drag (m row col)
+  "While dragging a text selection (`:text-drag`, armed by a left-press in the text
+area), set the mark at the press `:anchor` and move point to the pointer cell — growing
+the region that `view/ed-hl-ranges` paints in reverse video. Uses the geometry captured
+at press (the buffer can't change mid-drag), so it needs no layout. A no-op when no text
+drag is in progress."
+  (let (td (get m :text-drag))
+    (if (nil? td)
+      m
+      (let (buf (ed-buf-at m (get td :buf))
+            [px py pw ph] (get td :rect)
+            off (ed-buf-offset-at buf (get td :top) (get td :gw) (get td :scale) px py row col))
+        (ed-set-buf m (assoc (goto-char buf off) :mark (get td :anchor)))))))
 
 (defn ed-mouse-press (m cols rows row col)
   "Left-press at cell `[row col]`. On a divider → begin a resize drag (`:dragging`
@@ -223,7 +243,7 @@ carries the split path + the rect to measure the new ratio against). On a pane's
 scrollbar → select that pane, scroll it to the clicked position, and arm a scrollbar
 drag (`:sb-drag`) so motion keeps scrolling it. Otherwise select the pane under the
 pointer and, when the click is in its text area (not the mode line), move point there
-(`mouse-set-point`)."
+and arm a text-selection drag (`ed-mouse-begin-select`)."
   (let (layout (ed-body-layout m cols rows)
         d (divider-at layout [row col])
         pane (pane-at layout [row col]))
@@ -240,7 +260,7 @@ pointer and, when the click is in its text area (not the mode line), move point 
                    :layout (pane-update-path (get selected :layout) (get pane :path)
                              (fn (w) (assoc w :top (ed-scrollbar-top-for buf vh row py))))
                    :sb-drag {:path (get pane :path) :sy py :vh vh :buf (get (get pane :payload) :buffer)})
-               (< row (+ py vh)) (ed-mouse-set-point selected pane buf row col)
+               (< row (+ py vh)) (ed-mouse-begin-select selected pane buf row col)
                else selected)))))
 
 (defn ed-scrollbar-drag (m row col)
@@ -316,9 +336,10 @@ an explicit `false` back to `true`. Pure."
 
 (defn ed-mouse (m input cols rows)
   "Fold a `[:mouse action button row col mods]` event into the model: left-press
-selects a pane, moves point to the click (`mouse-set-point`), begins a divider drag, or
-grabs a scrollbar; `:drag` resizes the dragged divider or scrolls the grabbed scrollbar;
-`:release` ends either drag; **Ctrl+wheel zooms** and a **plain wheel scrolls** the pane
+selects a pane and moves point to the click (starting a text selection), begins a divider
+drag, or grabs a scrollbar; `:drag` extends the text selection (`:text-drag`), resizes the
+dragged divider, or scrolls the grabbed scrollbar; `:release` ends any drag; **Ctrl+wheel
+zooms** and a **plain wheel scrolls** the pane
 **under the pointer** (`ed-zoom-pane` / `ed-scroll-pane`, one notch each), never the
 active pane. Fields are read positionally (`nth`), not by a fixed-length vector
 pattern, so the trailing `mods` element (and any future addition) can't silently
@@ -332,8 +353,11 @@ break the match. A wheel notch off every pane is ignored."
     (cond
       (and (= action :press) (= button :left)) (ed-mouse-press m cols rows row col)
       (and (= action :drag) (= button :left))
-        (if (get m :sb-drag) (ed-scrollbar-drag m row col) (ed-mouse-drag m row col))
-      (= action :release) (dissoc m :dragging :sb-drag)
+        (cond
+          (get m :sb-drag) (ed-scrollbar-drag m row col)
+          (get m :text-drag) (ed-text-drag m row col)
+          else (ed-mouse-drag m row col))
+      (= action :release) (dissoc m :dragging :sb-drag :text-drag)
       (nil? hovered) m
       (and (= action :scroll-up) (includes? mods :ctrl)) (ed-zoom-pane m hovered 1)
       (and (= action :scroll-down) (includes? mods :ctrl)) (ed-zoom-pane m hovered -1)
