@@ -52,6 +52,123 @@ At least 1."
          (max 1 (or (get (get sel :payload) :scale) 1)))
     (max 1 (quot cells s))))
 
+(defn ed-pane-top (pane buf)
+  "The pane's scroll offset, clamped into `buf` — never negative, never past the last
+line. A pane's `:top` can outlive the buffer it points at (a `C-x k` remap re-points a
+pane to a shorter buffer keeping its scroll; a shared buffer edited shorter in another
+pane), and an out-of-range `top` would index past EOF and crash the whole renderer.
+Emacs likewise pins scroll at the last line, so clamping here is the right behaviour."
+  (max 0 (min (or (get (get pane :payload) :top) 0) (dec (buffer-line-count buf)))))
+
+(defn ed-pane-vrows (pane)
+  "The number of BUFFER lines `pane`'s text area shows: its rect height less the
+mode-line row, divided by the pane's font scale (a zoomed pane shows fewer lines). The
+single source of the viewport height the fontify window and its cache key are built on
+— `view/ed-pane-ops` reads it too, so the cached band always matches what's painted."
+  (let ([x y w h] (get pane :rect)
+        s (max 1 (or (get (get pane :payload) :scale) 1))
+        text-h (max 0 (dec h)))
+    (if (= s 1) text-h (max 1 (quot text-h s)))))
+
+;; ---- windowed fontification + a cross-frame span cache ----------------------
+;; The view paints syntax colour from the `[start end face]` spans a buffer mode's
+;; `:fontify` service produces. Lexing the whole buffer every frame makes a large file
+;; crawl, so we lex only the visible window (plus a short lead-in for lexer context).
+;; But on its own that still re-lexes on *every* event — even pure cursor motion, a
+;; selection drag, a mouse move — because the pure `view` can't remember last frame's
+;; result. So the spans are cached on the model (`:span-cache`, one band per pool
+;; buffer) and recomputed only when the rope changed (an edit) or the viewport scrolled
+;; outside the cached band. Each band is lexed a `ed-fontify-margin` taller than the
+;; viewport, so scrolling within it reuses the cache with zero lexing. The rope handle
+;; is the change token — an immutable value, fresh on every edit, with O(1) identity
+;; equality — so no separate revision counter is needed.
+
+(def ed-fontify-backscan 200)  ; max lines of lead-in above a window for a safe restart
+(def ed-fontify-margin 32)     ; lines lexed above & below the viewport, reused on scroll
+
+(defn ed-shift-spans (spans base)
+  "Shift each `[start end face]` span by `base` — maps a `:fontify` service's
+slice-local offsets into absolute buffer coordinates."
+  (map (fn ([s e f]) [(+ s base) (+ e base) f]) spans))
+
+(defn ed-window-spans (buf fontify restart lo hi)
+  "Absolute `[start end face]` syntax spans covering buffer lines `lo`..`hi-1` of `buf`.
+Fontifies a rope-slice of those lines (plus an `ed-fontify-backscan`-line lead-in) via
+the mode's `fontify` service rather than re-lexing the whole buffer. `restart` — the
+mode's optional `:fontify-restart` service (or nil) — pulls the slice start forward to a
+column-0 form so head-position context stays correct; the resulting spans are shifted
+into absolute coordinates (`ed-shift-spans`) so the per-line renderer needs no change."
+  (let (rope (buffer-rope buf)
+        nlines (buffer-line-count buf)
+        last-line (min (dec nlines) (dec hi))
+        win-line (max 0 (- lo ed-fontify-backscan))
+        win-start (rope-line->char rope win-line)
+        end-line (inc last-line)
+        win-end (if (>= end-line nlines) (buffer-length buf) (rope-line->char rope end-line))
+        chunk (rope-slice rope win-start win-end)
+        rel (if (nil? restart) 0 (restart chunk (- (rope-line->char rope lo) win-start)))
+        base (+ win-start rel)
+        src (if (= rel 0) chunk (substring chunk rel (string-length chunk))))
+    (ed-shift-spans (fontify src) base)))
+
+(defn ed--band-covers? (entry buf top vrows)
+  "True if cached span `entry` still serves a pane showing `buf` at scroll `top` over
+`vrows` rows: same rope (no edit since) and its `[blo bhi)` line band contains the
+viewport (clamped to EOF, since the last screen rows can sit past the last line)."
+  (and (not (nil? entry))
+    (= (get entry :rope) (buffer-rope buf))
+    (<= (get entry :blo) top)
+    (>= (get entry :bhi) (min (buffer-line-count buf) (+ top vrows)))))
+
+(defn ed--band-for (buf fontify restart top vrows)
+  "A fresh `:span-cache` entry for `buf`'s viewport `[top, top+vrows)`: spans lexed over
+that window widened by `ed-fontify-margin` lines each side (so a later small scroll
+reuses it), tagged with the rope and the `[blo bhi)` lines they cover."
+  (let (nlines (buffer-line-count buf)
+        blo (max 0 (- top ed-fontify-margin))
+        bhi (min nlines (+ top vrows ed-fontify-margin)))
+    {:rope (buffer-rope buf) :blo blo :bhi bhi
+     :spans (ed-window-spans buf fontify restart blo bhi)}))
+
+(defn ed-pane-spans (m pane buf top vrows)
+  "The `[start end face]` syntax spans for `pane`'s viewport — from the model's
+`:span-cache` when its band still covers the viewport, else freshly lexed for just the
+visible window (the cold/uncovered fallback; `ed-refresh-spans` widens & caches it for
+next frame). `nil` when the buffer's mode offers no `:fontify` service."
+  (let (fontify (ed-mode-service buf :fontify))
+    (if (nil? fontify)
+      nil
+      (let (bi (get (get pane :payload) :buffer)
+            entry (get (get m :span-cache) bi))
+        (if (ed--band-covers? entry buf top vrows)
+          (get entry :spans)
+          (ed-window-spans buf fontify (ed-mode-service buf :fontify-restart) top (+ top vrows)))))))
+
+(defn ed-refresh-spans (m cols rows)
+  "Refresh the per-buffer fontify `:span-cache` for every visible pane whose mode has a
+`:fontify` service — but only where the cached band no longer covers the pane's viewport
+(the rope changed, or it scrolled past the margin). A still-covering band costs nothing.
+Keyed by pool buffer index, so two panes on the same buffer share the work; a stale
+entry from a killed/re-pointed buffer is harmless (the rope check forces a recompute).
+Run by `input/ed-update` after each event so the pure `view` just reads the result."
+  (let (panes (get (ed-body-layout m cols rows) :panes))
+    (assoc m :span-cache
+      (fold
+        (fn (cache pane)
+          (let (bi (get (get pane :payload) :buffer)
+                buf (ed-buf-at m bi)
+                fontify (ed-mode-service buf :fontify))
+            (if (nil? fontify)
+              cache
+              (let (top (ed-pane-top pane buf)
+                    vrows (ed-pane-vrows pane))
+                (if (ed--band-covers? (get cache bi) buf top vrows)
+                  cache
+                  (assoc cache bi
+                    (ed--band-for buf fontify (ed-mode-service buf :fontify-restart) top vrows)))))))
+        (or (get m :span-cache) {})
+        panes))))
+
 ;; ---- mouse: select / move-point / scrollbar / drag-resize -------------------
 
 (defn ed--pane-payload-buf (m pane)
