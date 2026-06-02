@@ -72,20 +72,24 @@ feature work — surfacing it is half the point of this project.
 ## Layout
 
 ```
-src/main.blsp          entry point — opens the window, runs the ui-run loop
-src/model.blsp         the ui-run model: buffer pool, kill ring, minibuffer, *Messages*, scrolling
-src/panes.blsp         pane-layout geometry + mouse-event folding (model -> model)
-src/view.blsp          pure view: model -> render frame (std/display ops)
-src/input.blsp         dispatch: fold a key/mouse/tick event into the next model
-src/commands.blsp      the editing commands, each a (model key) -> model
-src/interactive.blsp   the `defcommand` macro + the M-x command registry
-src/modes.blsp         modes as layers: the keymaps (data) + brood-mode services
-src/complete.blsp      completion-at-point (the in-buffer Tab popup)
-src/mincomplete.blsp   minibuffer prompt completion (path / name)
-src/eval-command.blsp  eval Brood source from a buffer (the C-x C-e core)
-src/projects.blsp      project root + file walk (find-file-in-project)
-tests/main_test.blsp   pure update/view tests (no window needed)
-project.blsp           the nest manifest (:name "myedit")
+src/main.blsp               entry point — opens the window, runs the ui-run loop
+src/model.blsp              the ui-run model: buffer pool, kill ring, minibuffer, *Messages*, scrolling
+src/panes.blsp              pane-layout geometry + mouse-event folding (model -> model)
+src/view.blsp               pure view: model -> render frame (editor/display ops)
+src/input.blsp              dispatch: fold a key/mouse/tick event into the next model
+src/commands.blsp           the editing commands, each a (model key) -> model
+src/interactive.blsp        the `defcommand` macro + the M-x command registry
+src/modes.blsp              modes as layers: the keymaps (data) + brood-mode services
+src/complete.blsp           completion-at-point (the in-buffer Tab popup)
+src/mincomplete.blsp        minibuffer prompt completion (path / name)
+src/completion.blsp         shared fuzzy ranking + vertical-menu renderer (complete + minibuffer)
+src/isearch.blsp            incremental search + query-replace (C-s/C-r/M-%) modal mini-loops
+src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
+src/projects.blsp           project root + file walk (find-file-in-project)
+src/web.blsp                live HTTP mirror of the selected buffer (C-x w)
+tests/main_test.blsp        pure update/view tests (no window needed)
+tests/eval_command_test.blsp  tests for the eval-command module
+project.blsp                the nest manifest (:name "myedit")
 ```
 
 ## Commands
