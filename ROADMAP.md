@@ -132,17 +132,55 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
   well today. Full reasoning, decomposition, hard-parts-and-answers, and a staged
   (non-big-bang) path: **`docs/actor-architecture.md`**.
 
+## A.2 Emacs-parity round 2 (done)
+
+A batch of everyday Emacs commands + discoverability, all on existing primitives
+(no kernel changes; `src/*.blsp` is runtime-loaded):
+
+- ✅ **More editing commands** — upcase/downcase **region** (`C-x C-u`/`C-x C-l`),
+  `just-one-space` (`M-SPC`) / `delete-horizontal-space` (`M-\`), `transpose-words`
+  (`M-t`) / `transpose-lines` (`C-x C-t`), `zap-to-char` (`M-z`), `fill-paragraph`
+  (`M-q`, `*fill-column*` = 70; `ed-fill-text` is a candidate to promote to std).
+- ✅ **Files / buffers** — `write-file` (`C-x C-w`), `revert-buffer`, read-only toggle
+  (`C-x C-q`), `goto-line` (`M-g g`), **recentf** browser (`C-x C-r`) over the
+  persisted `~/.cache/brood/recent-files.blsp` cache (find-file also floats last-used
+  entries to the top of a directory listing).
+- ✅ **which-key** — a live bordered panel of a pending prefix's continuations
+  (`view/ed-which-key-ops` over the keymap data + shared `model/ed-key-label` /
+  `ed-cmd-label`).
+- ✅ **Help** — `describe-key` (`C-h k`, resolves a key sequence through the keymap and
+  shows the command + docstring) and `describe-function` (`C-h f`, completes the M-x
+  registry); docstrings via the `doc` primitive (`model/ed-doc`).
+- ✅ **Registers** (`C-x r SPC`/`j`/`s`/`i`) and **persistent bookmarks** (`C-x r m`/`b`,
+  in `~/.cache/brood/bookmarks.blsp`) — both on a reusable one-key reader
+  (`model/ed-read-char` + a read-char transient).
+- ✅ **Keyboard macros** (`C-x (` / `C-x )` / `C-x e`) — `ed-update` captures raw keys
+  while recording and replays by re-feeding them.
+- ✅ **occur** (`M-s o`) — matching lines in a read-only `*Occur*` buffer (occur-mode,
+  like the process list); `RET` jumps to the source line. `M-s` is now the search
+  prefix: `M-s s` is the fuzzy line search (was `M-s`), `M-s o` is occur.
+- ✅ **Undo boundary on a typing pause** — a settled idle tick arms a one-shot
+  `:undo-break` (Emacs `undo-boundary`), so `undo` after a pause removes just the last
+  run, not the whole burst.
+
 ## D. Polish & deferred
 
 - ✅ **Syntax highlighting** — lexical colouring in brood-mode via the `:fontify`
   mode service over `editor/highlight` (see the core list above). CST-/tree-sitter-query
-  driven highlighting for other languages comes with §C.
-- ⬜ **Browsable `*Kill Ring*`** view and a **which-key**-style popup for prefixes.
+  driven highlighting for other languages comes with §C. Plus **markdown-mode**,
+  **env-mode** (`.env`), and **docker-mode** (`Dockerfile`) — fontify-only layers over
+  `std/editor/{markdown,dotenv,dockerfile}`.
+- ⬜ **Browsable `*Kill Ring*`** view. (which-key ✅ — see §A.2.)
 - ⬜ **regex** ranges `[a-z]` / captures / `{m,n}` (`regex`, brood repo).
 - ⬜ **layers** extras (brood repo): `:commands` manifest, per-binding `when`-guards,
   cross-layer chord merging, a browsable command list.
-- ⬜ **dired / file browser**, registers, bookmarks, rectangles, macros — the long
-  Emacs tail, as needed.
+- ⬜ **Rectangles** (`C-x r r`/`k`/`y`/`t`) — column-based region kill/yank/insert.
+  Pure editor work on `editor/buffer` (multi-line column slicing); not yet started.
+- ⬜ **narrow-to-region / widen** (`C-x n n`/`w`) — **needs a Brood `std/editor/buffer`
+  change** (a narrowing restriction the buffer ops + the view respect), so it's the one
+  true language-gap item in the Emacs tail (the prime directive). Not yet started.
+- ⬜ **dired / file browser** — the remaining big Emacs tail item.
+- ✅ registers, bookmarks, keyboard macros, occur — see §A.2.
 
 ---
 
