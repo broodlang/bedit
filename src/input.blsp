@@ -541,6 +541,16 @@ the repeat. Other releases just keep the flag set."
 
 ;; ---- the ui-run update ------------------------------------------------------
 
+(defn ed--macro-record (m input)
+  "While a keyboard macro is recording (`:macro-recording` is a vector), append the raw key
+`input` to it — skipping ticks, focus events, and inbound `[:tag …]` system events (only
+real keystrokes belong in a macro). The C-x ) that ends recording is captured too and
+trimmed by `cmd-end-kbd-macro`."
+  (if (and (vector? (get m :macro-recording))
+        (not (= input :tick)) (not (= input :blur)) (not (vector? input)))
+    (assoc m :macro-recording (into (get m :macro-recording) (list input)))  ; keep it a vector
+    m))
+
 (defn ed-update (m input cols rows)
   "ui-run update: fold one key into the next model, then keep point on screen.
 `:tick` re-issues the currently held key (consumer-paced key repeat — see the key-repeat
@@ -558,7 +568,7 @@ owns it, else through the keymap (`ed-dispatch`)."
          textcols (ed-selected-text-cols m cols rows)
          ; selected pane text width (for horizontal scroll)
          m0
-         (assoc m :view-rows textrows))
+         (ed--macro-record (assoc m :view-rows textrows) input))  ; capture the key if recording
     ; so page commands know the viewport
     ;; A thrown error — from a command, the minibuffer, completion, or a re-check —
     ;; surfaces in the echo area and the editor keeps running: a crash must never take
@@ -571,29 +581,37 @@ owns it, else through the keymap (`ed-dispatch`)."
       ;; scrolled or changed — see panes.blsp), so the pure `view` re-lexes nothing on
       ;; plain motion; then, if a web server is running, push the resulting buffer
       ;; snapshot to it (so the browser mirror tracks edits *and* cursor motion live).
-      (web-publish!
-       (ed-refresh-spans
-        (ed-post-step
-        (cond
-          ;; a tick re-issues the held key at the fast repeat rate (consumer-paced
-          ;; key repeat) — but only after confirming via `gui-held-key` that the key is
-          ;; *still down* (so a missed key-up can't run away); if it's been released the
-          ;; poll says so and we stop. Nothing held → a no-op, leaving any pending
-          ;; prefix / open overlay intact.
-          (= input :tick) (cond
-                            (nil? (get m0 :held-key)) m0
-                            (ed--still-held? m0)
-                              (ed-repeat-key-step m0 (get m0 :held-key) textrows textcols *repeat-rate-ms*)
-                            else (ed--repeat-clear m0))
-          ;; the window lost focus (`:blur`): the key-up may now never arrive (the
-          ;; release lands in another window), so stop any repeat now — the safety net
-          ;; for a missed key-up.
-          (= input :blur) (ed--repeat-clear m0)
-          ;; an inbound async/system event (`[:tag …]`) → its registered handler.
-          (ed-system-event? input) ((get ed--event-handlers (first input)) m0 input textrows cols rows)
-          ;; otherwise a key: route through the transient overlay / keymap, then arm
-          ;; held-key repeat (initial delay before it starts) if it's repeatable.
-          else (ed-repeat-key-step m0 input textrows textcols *repeat-delay-ms*))
-        input)
-        cols rows))
+      (let (result
+            (web-publish!
+             (ed-refresh-spans
+              (ed-post-step
+              (cond
+                ;; a tick re-issues the held key at the fast repeat rate (consumer-paced
+                ;; key repeat) — but only after confirming via `gui-held-key` that the key is
+                ;; *still down* (so a missed key-up can't run away); if it's been released the
+                ;; poll says so and we stop. Nothing held → a no-op, leaving any pending
+                ;; prefix / open overlay intact.
+                (= input :tick) (cond
+                                  (nil? (get m0 :held-key)) m0
+                                  (ed--still-held? m0)
+                                    (ed-repeat-key-step m0 (get m0 :held-key) textrows textcols *repeat-rate-ms*)
+                                  else (ed--repeat-clear m0))
+                ;; the window lost focus (`:blur`): the key-up may now never arrive (the
+                ;; release lands in another window), so stop any repeat now — the safety net
+                ;; for a missed key-up.
+                (= input :blur) (ed--repeat-clear m0)
+                ;; an inbound async/system event (`[:tag …]`) → its registered handler.
+                (ed-system-event? input) ((get ed--event-handlers (first input)) m0 input textrows cols rows)
+                ;; otherwise a key: route through the transient overlay / keymap, then arm
+                ;; held-key repeat (initial delay before it starts) if it's repeatable.
+                else (ed-repeat-key-step m0 input textrows textcols *repeat-delay-ms*))
+              input)
+              cols rows)))
+        ;; C-x e (cmd-execute-kbd-macro) set `:run-macro`: replay the recorded macro by
+        ;; re-feeding its events through `ed-update` (recording is off, so they aren't
+        ;; re-captured). Done here, where cols/rows are in scope.
+        (if (get result :run-macro)
+          (fold (fn (mm ev) (ed-update mm ev cols rows))
+            (dissoc result :run-macro) (or (get result :macro-last) '()))
+          result))
       (catch e (message m0 (str "error: " (error-message e)))))))
