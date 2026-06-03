@@ -446,6 +446,43 @@ after it (M-u / M-l / M-c)."
           (replace-region b (dec p) (inc p)
             (str (buffer-char-after b) (buffer-char-before b)))
           b)))))
+(defn ed--strip-nl (s)
+  "`s` without a single trailing newline (a line's text, newline dropped)."
+  (if (ends-with? s "\n") (substring s 0 (dec (string-length s))) s))
+
+(defn ed-transpose-words (b)
+  "Swap the word before point with the word after it, leaving point after the second
+(M-t). A no-op when point isn't between two words."
+  (let (e2 (buffer-point (forward-word b))
+        s2 (buffer-point (backward-word (goto-char b e2)))
+        s1 (buffer-point (backward-word (goto-char b s2)))
+        e1 (buffer-point (forward-word (goto-char b s1))))
+    (if (and (>= s1 0) (< s1 e1) (<= e1 s2) (< s2 e2))
+      (let (txt (buffer-text b))
+        (goto-char
+          (replace-region b s1 e2
+            (str (substring txt s2 e2) (substring txt e1 s2) (substring txt s1 e1)))
+          e2))
+      b)))
+
+(defn ed-transpose-lines (b)
+  "Swap the current line with the previous one (C-x C-t). A no-op on the first line."
+  (let (cur (buffer-current-line b))
+    (if (< cur 1)
+      b
+      (let (pv (ed--strip-nl (buffer-line-at b (dec cur)))
+            cv (ed--strip-nl (buffer-line-at b cur))
+            s0 (buffer-point (beginning-of-line (backward-line b)))  ; start of the previous line
+            span-end (+ s0 (string-length pv) 1 (string-length cv)))
+        (forward-line (goto-char (replace-region b s0 span-end (str cv "\n" pv)) s0))))))
+
+(defcommand cmd-transpose-words (m key)
+  "Transpose the word before point with the one after it (M-t)."
+  (ed-edit m ed-transpose-words))
+(defcommand cmd-transpose-lines (m key)
+  "Transpose the current line with the previous one (C-x C-t)."
+  (ed-edit m ed-transpose-lines))
+
 (defcommand cmd-duplicate-line
   (m key)
   "Duplicate the current line below it (C-x d)."
@@ -462,6 +499,90 @@ after it (M-u / M-l / M-c)."
 (defcommand cmd-upcase-word (m key) (ed-xform-word m upper))
 (defcommand cmd-downcase-word (m key) (ed-xform-word m lower))
 (defcommand cmd-capitalize-word (m key) (ed-xform-word m ed-capitalize))
+
+;; ---- case the region (C-x C-u / C-x C-l) ------------------------------------
+
+(defn ed-xform-region (m f)
+  "Apply string transform `f` to the active region in place; a no-op-with-message
+when there's no region (the region case commands)."
+  (let (b (ed-current-buf m) bounds (buffer-region-bounds b))
+    (if (nil? bounds)
+      (message m "no region (set the mark with C-SPC first)")
+      (let (txt (f (buffer-region b)))
+        (ed-edit m (fn (bb) (replace-region bb (first bounds) (second bounds) txt)))))))
+
+(defcommand cmd-upcase-region (m key)
+  "Upper-case the region (C-x C-u)."
+  (ed-xform-region m upper))
+(defcommand cmd-downcase-region (m key)
+  "Lower-case the region (C-x C-l)."
+  (ed-xform-region m lower))
+
+;; ---- whitespace around point (M-SPC / M-\) ----------------------------------
+
+(defn ed--ws? (c) (or (= c " ") (= c "\t")))
+(defn ed--ws-left (txt i)
+  (if (and (> i 0) (ed--ws? (char-at txt (dec i)))) (ed--ws-left txt (dec i)) i))
+(defn ed--ws-right (txt i n)
+  (if (and (< i n) (ed--ws? (char-at txt i))) (ed--ws-right txt (inc i) n) i))
+
+(defn ed-collapse-ws (m keep)
+  "Replace the run of spaces/tabs surrounding point with `keep` (`\" \"` for
+just-one-space, `\"\"` for delete-horizontal-space)."
+  (ed-edit m
+    (fn (b)
+      (let (txt (buffer-text b) p (buffer-point b) n (string-length txt)
+            lo (ed--ws-left txt p) hi (ed--ws-right txt p n))
+        (replace-region b lo hi keep)))))
+
+(defcommand cmd-just-one-space (m key)
+  "Collapse the whitespace around point to a single space (M-SPC)."
+  (ed-collapse-ws m " "))
+(defcommand cmd-delete-horizontal-space (m key)
+  "Delete all whitespace around point (M-\\)."
+  (ed-collapse-ws m ""))
+
+;; ---- read-only toggle / write-file / revert (C-x C-q / C-x C-w / revert) ----
+
+(defcommand cmd-toggle-read-only (m key)
+  "Toggle the current buffer's read-only flag (C-x C-q)."
+  (let (b (ed-current-buf m))
+    (assoc (ed-set-buf m (set-read-only b (not (read-only? b))))
+      :echo (if (read-only? b) "writable" "read-only"))))  ; report the NEW state
+
+(defcommand cmd-write-file
+  (m key)
+  "Write the buffer to a path read in the minibuffer (C-x C-w); the buffer is then
+backed by that path (future C-x C-s save there). Same path completion as find-file."
+  (assoc m :minibuffer
+    {:edit (assoc (ed-mb-edit "Write file: " (or (buffer-file (ed-current-buf m)) (str (cwd) "/")))
+             :word-mode :path)
+     :on-complete (fn (mm t)
+                    (let (path (path-absolute t))
+                      (try
+                        (let (b (assoc (ed-current-buf mm)
+                                  :file path :name (file-display-name path (ed-project-root mm))))
+                          (save-buffer b)
+                          (message (ed-set-buf mm b) (str "wrote " path)))
+                        (catch e (message mm (str "write failed: " (error-message e)))))))
+     :complete-fn (fn (t) (ed-complete-path t))
+     :candidates-fn (fn (t) (take 12 (ed-path-candidates t)))
+     :label-fn path-label
+     :accept-selection true}))
+
+(defcommand cmd-revert-buffer
+  (m key)
+  "Re-read the current buffer from its file on disk, discarding unsaved changes
+(M-x revert-buffer). Point is kept (clamped to the new length); undo history resets."
+  (let (b (ed-current-buf m) f (buffer-file b))
+    (if (nil? f)
+      (message m "no file to revert")
+      (try
+        (let (fresh (find-file-buffer f)
+              p (min (buffer-point b) (buffer-length fresh)))
+          (message (ed-set-buf m (goto-char (assoc fresh :name (buffer-name b)) p))
+            (str "reverted " f)))
+        (catch e (message m (str "revert failed: " (error-message e))))))))
 
 ;; ---- comment / uncomment (M-;) ----------------------------------------------
 ;; Language-neutral: the comment token comes from the buffer mode's `:comment-syntax`
