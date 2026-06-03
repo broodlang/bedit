@@ -165,30 +165,28 @@ showing another buffer never highlights stray offsets."
 ;; Render ops carry absolute screen coordinates, so a pane simply offsets every
 ;; op by its rect's origin `(x, y)` and clips text to its width `w`.
 
-(defn ed-line-ops (buf line top x y w hl-ranges spans overrides)
+(defn ed-line-ops (buf line top x y w hl-ranges spans overrides hscroll)
   "Render op(s) for buffer `line` at its screen row inside a pane whose text area
-starts at column `x`, row `y`, width `w`. With neither `:fontify` `spans` nor any
-highlight range it's a single plain `text` op; otherwise the line is painted as
-coloured `[substring face]` chunks (coalesced), with the syntax spans, the highlight
-ranges (region/overlays), and bracket `overrides` merged into the per-char face."
+starts at column `x`, row `y`, width `w`, scrolled `hscroll` columns left. The visible
+text is the line's slice `[hscroll, hscroll+w)` (long lines scroll, not wrap). With
+neither `:fontify` `spans` nor any highlight range it's a single plain `text` op;
+otherwise it's coloured `[substring face]` chunks (the syntax spans + highlight ranges +
+bracket `overrides` merged), tiled from the visible slice's absolute `base` offset."
   (let (row (+ y (- line top))
-        vis (ed-fit (ed-line-text buf line) w))
+        full (ed-line-text buf line)
+        h (min hscroll (string-length full))
+        vis (ed-fit (substring full h (string-length full)) w)
+        base (+ (rope-line->char (buffer-rope buf) line) h))
     (if (and (nil? spans) (empty? hl-ranges))
       [(text row x vis)]
-      (ed-chunks->ops row
-        x
-        (ed--line-chunks vis
-          (rope-line->char (buffer-rope buf) line)
-          (or spans '())
-          hl-ranges
-          overrides)))))
+      (ed-chunks->ops row x (ed--line-chunks vis base (or spans '()) hl-ranges overrides)))))
 
-(defn ed-visible-lines (buf top textrows x y w hl-ranges spans overrides)
+(defn ed-visible-lines (buf top textrows x y w hl-ranges spans overrides hscroll)
   "`text` ops for the lines visible in a `textrows`-tall pane whose text area starts
-at `(x, y)` and is `w` wide, from line `top`; `hl-ranges` `[lo hi face]` highlight
-the region/overlays, `spans` syntax-colour (with bracket `overrides`)."
+at `(x, y)`, is `w` wide and scrolled `hscroll` columns left, from line `top`; `hl-ranges`
+`[lo hi face]` highlight the region/overlays, `spans` syntax-colour (with `overrides`)."
   (let (last-line (min (dec (buffer-line-count buf)) (dec (+ top textrows))))
-    (mapcat (fn (line) (ed-line-ops buf line top x y w hl-ranges spans overrides))
+    (mapcat (fn (line) (ed-line-ops buf line top x y w hl-ranges spans overrides hscroll))
       (range top (inc last-line)))))
 
 ;; ---- a pane: its buffer body + its mode line --------------------------------
@@ -312,6 +310,7 @@ re-anchors it — so the gutter magnifies in lock-step; the mode line stays base
   (let ([x y w h] (get pane :rect)
         buf (ed-pane-buf m pane)
         top (ed-pane-top pane buf)
+        hscroll (ed-pane-hscroll pane)
         s (max 1 (or (get (get pane :payload) :scale) 1))
         gw (ed-gutter-width buf (ed-gutter-shown? buf pane))
         text-h (max 0 (dec h))
@@ -322,13 +321,13 @@ re-anchors it — so the gutter magnifies in lock-step; the mode line stays base
         hl-ranges (ed-hl-ranges m buf (get pane :selected)))
     (if (= s 1)
       (concat (ed-gutter-ops buf top text-h x y gw)
-        (ed-visible-lines buf top text-h (+ x gw) y (max 1 (- w gw 1)) hl-ranges spans overrides)
+        (ed-visible-lines buf top text-h (+ x gw) y (max 1 (- w gw 1)) hl-ranges spans overrides hscroll)
         (ed-scrollbar-ops buf top text-h (+ x (dec w)) y)
         [(ed-pane-modeline m pane buf)])
       (let (vh (max 1 (quot text-h s))
             vw (max 1 (quot (dec w) s))
             body (concat (ed-gutter-ops buf top vh 0 0 gw)
-                   (ed-visible-lines buf top vh gw 0 (max 1 (- vw gw)) hl-ranges spans overrides)))
+                   (ed-visible-lines buf top vh gw 0 (max 1 (- vw gw)) hl-ranges spans overrides hscroll)))
         (concat (map (fn (op) (ed--scale-op op x y s)) body)
           (ed-scrollbar-ops buf top text-h (+ x (dec w)) y)
           [(ed-pane-modeline m pane buf)])))))
@@ -438,6 +437,15 @@ keeping the block cursor over the character it edits. The width-aware counterpar
         bol (rope-line->char rope (buffer-current-line buf)))
     (display-width (rope-slice rope bol (buffer-point buf)))))
 
+(defn ed-visual-column-from (buf hscroll)
+  "The cursor's display column within a view scrolled `hscroll` columns left: the cell
+width of the current line from char column `hscroll` to point (0 when point is left of
+`hscroll`). The horizontal-scroll counterpart of `ed-visual-column`."
+  (let (rope (buffer-rope buf)
+        from (+ (rope-line->char rope (buffer-current-line buf)) hscroll)
+        p (buffer-point buf))
+    (if (>= from p) 0 (display-width (rope-slice rope from p)))))
+
 ;; ---- the right-click context menu (Copy / Cut / Paste) ----------------------
 ;; Rendered through the shared `completion-menu-ops` (the same bordered box as the
 ;; autocomplete popup and the minibuffer list), so it reads as a floating menu rather
@@ -467,15 +475,17 @@ pane origin and the pane's `:top`, column clamped to the pane width)."
             [x y w h] (get pane :rect)
             buf (ed-pane-buf m pane)
             top (ed-pane-top pane buf)
+            hscroll (ed-pane-hscroll pane)
             s (max 1 (or (get (get pane :payload) :scale) 1))
             gw (ed-gutter-width buf (ed-gutter-shown? buf pane))
             vw (max 1 (quot w s))
             tw (max 1 (- vw gw)))
         ; text columns after the gutter
         ;; In a zoomed pane each char is s×s cells; the cursor lands at the scaled
-        ;; top-left of its cell, past the gutter, column clamped to the text width.
+        ;; top-left of its cell, past the gutter, the column offset by `hscroll` (long
+        ;; lines scroll sideways) and clamped to the text width.
         (cursor (+ y (* (- (buffer-current-line buf) top) s))
-          (+ x (* (+ gw (min (dec tw) (ed-visual-column buf))) s))))
+          (+ x (* (+ gw (max 0 (min (dec tw) (ed-visual-column-from buf hscroll)))) s))))
       (cursor (dec rows)
         ;; prompt width + the line editor's point
         (min (dec cols) (+ (string-length (mb-prompt mb)) (mb-point mb)))))))
