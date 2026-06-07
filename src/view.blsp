@@ -141,35 +141,34 @@ a deleted line can't index out of range mid-edit."
 
 ;; ---- highlight ranges: the region + transient overlays ----------------------
 
-(defn ed--hl-line-range (buf)
-  "A `[bol next-bol ed-face-hl-line]` range over the current line (its newline included,
-so the band reads to the line end), for the hl-line current-line highlight."
-  (let (rope (buffer-rope buf)
-        cl (buffer-current-line buf)
-        bol (rope-line->char rope cl)
-        eol (if (< (inc cl) (buffer-line-count buf))
-              (rope-line->char rope (inc cl))
-              (buffer-length buf)))
-    [bol eol ed-face-hl-line]))
-
 (defn ed-hl-ranges (m buf selected?)
   "The highlight ranges `[lo hi face]` to paint over `buf` in a pane: the active region
-(point↔mark, `:reverse`); the model's transient `:overlays` (isearch / query-replace
-matches); and — when the model opts in (`:hl-line`, set by the live editor) on the
-selected pane with **no** active region — a subtle current-line background (hl-line).
-Order is priority (the tiler merges later-wins): hl-line lowest,
-then region, then overlays. Overlays/hl-line are gated to the selected pane so a split
-showing another buffer never highlights stray offsets."
+(point↔mark, a `:bg` tint); and the model's transient `:overlays` (isearch / query-replace
+matches), gated to the selected pane. Order is priority (the tiler merges later-wins):
+region then overlays. (The hl-line current-line highlight is NOT a char range — it's a
+full-width `rect` band painted by `ed--hl-line-band`, so it covers the whole line, not just
+its text.)"
   (let (region-b (buffer-region-bounds buf)
-        hl-line (if (and (get m :hl-line) selected? (nil? region-b))
-                  (list (ed--hl-line-range buf))
-                  '())
         region (if (nil? region-b) '() (list [(first region-b) (second region-b) ed-face-region]))
         overlays (if selected?
                    (map (fn (o) [(get o :start) (get o :end) (get o :face)])
                      (or (get m :overlays) '()))
                    '()))
-    (concat hl-line region overlays)))
+    (concat region overlays)))
+
+(defn ed--hl-line-band (m pane buf top x y w text-h s)
+  "The hl-line current-line highlight as a full-width `rect` band (the whole line, not just
+its text — Emacs `hl-line-mode`): a 1-row band (or `s` rows when zoomed) spanning the pane
+width minus the scrollbar column, behind the line at point. Painted only on the selected
+pane with `:hl-line` on and **no** active region, and only when the line is on screen. `()`
+otherwise. Base-scale coords; drawn before the gutter/text so they sit on top of it."
+  (if (and (get m :hl-line) (get pane :selected) (nil? (buffer-region-bounds buf)))
+    (let (row (- (buffer-current-line buf) top)
+          vrows (max 1 (quot text-h s)))
+      (if (and (>= row 0) (< row vrows))
+        (list (rect (+ y (* row s)) x (max 1 (dec w)) s ed-face-hl-line))
+        '()))
+    '()))
 
 ;; ---- one pane's body (a buffer clipped into a sub-rect at origin x,y) -------
 ;; Render ops carry absolute screen coordinates, so a pane simply offsets every
@@ -288,13 +287,13 @@ from `by`, total width `gw`). `()` when `gw` is 0 or the mode offers no gutter."
 (def ed-face-scrollbar-thumb face-scrollbar-thumb)
 
 (defn ed-scrollbar-ops (buf top vh sx sy)
-  "A 1-column vertical scrollbar at column `sx`, rows `sy`..`sy+vh-1`: a `█` thumb sized
-by the visible fraction (`vh` rows over `buffer-line-count`) and positioned by `top`,
-on a `│` track. **Drawn only when the buffer doesn't fit** (`line-count > vh`); with the
-whole buffer on screen there's nothing to scroll, so it's hidden (`()`). The reserved
-column stays (the text width already excludes it), so a buffer growing/shrinking past the
-viewport shows/hides the bar without reflowing text. Hit-testing shares the predicate
-(`panes/ed-scrollbar-hit?`)."
+  "A 1-column vertical scrollbar at column `sx`, rows `sy`..`sy+vh-1`, drawn as solid bars
+(`rect` ops, not box-drawing glyphs): a track bar the full height with a thumb bar over it,
+sized by the visible fraction (`vh` rows over `buffer-line-count`) and positioned by `top`.
+**Drawn only when the buffer doesn't fit** (`line-count > vh`); with the whole buffer on
+screen there's nothing to scroll, so it's hidden (`()`). The reserved column stays (the
+text width already excludes it), so a buffer growing/shrinking past the viewport shows/hides
+the bar without reflowing text. Hit-testing shares the predicate (`panes/ed-scrollbar-hit?`)."
   (let (line-count (buffer-line-count buf))
     (if (<= line-count vh)
       '()
@@ -303,13 +302,8 @@ viewport shows/hides the bar without reflowing text. Hit-testing shares the pred
             maxstart (max 0 (- vh thumb-h))
             denom (max 1 (- total vh))
             thumb-y (min maxstart (quot (* maxstart top) denom)))
-        (map (fn (r)
-               (let (on (and (>= r thumb-y) (< r (+ thumb-y thumb-h))))
-                 (text (+ sy r)
-                   sx
-                   (if on "█" "│")
-                   (if on ed-face-scrollbar-thumb ed-face-scrollbar-track))))
-          (range 0 vh))))))
+        (list (rect sy sx 1 vh ed-face-scrollbar-track)                 ; the track bar
+          (rect (+ sy thumb-y) sx 1 thumb-h ed-face-scrollbar-thumb)))))) ; the thumb over it
 
 (defn ed-pane-ops (m pane)
   "All render ops for one pane: an optional left line-number gutter, its visible
@@ -336,7 +330,8 @@ re-anchors it — so the gutter magnifies in lock-step; the mode line stays base
                     '())
         hl-ranges (ed-hl-ranges m buf (get pane :selected)))
     (if (= s 1)
-      (concat (ed-gutter-ops buf top text-h x y gw)
+      (concat (ed--hl-line-band m pane buf top x y w text-h s)  ; full-width band, behind the text
+        (ed-gutter-ops buf top text-h x y gw)
         (ed-visible-lines buf
           top
           text-h
@@ -362,7 +357,8 @@ re-anchors it — so the gutter magnifies in lock-step; the mode line stays base
                      spans
                      overrides
                      hscroll)))
-        (concat (map (fn (op) (ed--scale-op op x y s)) body)
+        (concat (ed--hl-line-band m pane buf top x y w text-h s)  ; band at base scale, behind
+          (map (fn (op) (ed--scale-op op x y s)) body)
           (ed-scrollbar-ops buf top text-h (+ x (dec w)) y)
           [(ed-pane-modeline m pane buf)])))))
 
