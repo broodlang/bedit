@@ -360,9 +360,10 @@ dispatched normally (Emacs' dismiss-and-process)."
 (def *repeat-rate-ms* 35)  ; interval between repeats once it has started
 
 (def *repeat-keys*
-  ;; The non-self-inserting keys that auto-repeat while held: motion and deletion.
-  ;; (Any printable key — a 1-char string — repeats too; see `ed-repeat-key?`.) Prefix
-  ;; chords, overlay keys, and one-shot commands deliberately aren't here.
+  ;; The non-self-inserting keys that auto-repeat while held: motion, deletion, and
+  ;; open-line (C-o, like holding Enter to insert blank lines). (Any printable key — a
+  ;; 1-char string — repeats too; see `ed-repeat-key?`.) Prefix chords, overlay keys,
+  ;; and one-shot commands deliberately aren't here.
   [:ctrl-n :ctrl-p
     :ctrl-f
     :ctrl-b
@@ -379,6 +380,7 @@ dispatched normally (Emacs' dismiss-and-process)."
     :backspace
     :delete
     :ctrl-d
+    :ctrl-o  ; open-line — hold to insert successive blank lines
     :ctrl-v
     :alt-v
     :page-up
@@ -426,8 +428,8 @@ can be stopped. Re-checked each repeat, so a key whose context changed stops cle
       (ed--minibuffer-nav? m input))))
 
 (defn ed--repeat-clear (m)
-  "Stop any in-progress key repeat: drop `:held-key` and restore the idle tick beat."
-  (assoc (dissoc m :held-key) :tick-ms *idle-tick-ms*))
+  "Stop any in-progress key repeat: drop `:held-key` and remove the `:key-repeat` timer."
+  (ed-drop-timer (dissoc m :held-key) :key-repeat))
 
 (defn ed--still-held? (m)
   "Confirm the held key is *still physically down* by polling the GUI's source of
@@ -442,21 +444,53 @@ pattern — re-read the device state each frame rather than trust accumulated ed
       true
       (try (= (gui-held-key w) (get m :held-key)) (catch e true)))))
 
-(defn ed--arm-repeat (m input beat)
+(defn ed--arm-repeat (m input spec)
   "After dispatching `input`, arm repeat if it's a repeatable key still in the plain
-editing context — hold it and set the tick to `beat` (the initial delay on a fresh
-press, the faster rate on a repeat tick); otherwise stop any repeat."
+editing context — hold it and set the `:key-repeat` timer to `spec` (`{:after delay}` on
+a fresh press, `{:every rate}` once repeating — ADR-101); otherwise stop any repeat."
   (if (ed--repeatable? m input)
-    (assoc m :held-key input :tick-ms beat)
+    (ed-set-timer (assoc m :held-key input) :key-repeat spec)
     (ed--repeat-clear m)))
 
-(defn ed-repeat-key-step (m input textrows textcols beat)
+(defn ed-repeat-key-step (m input textrows textcols spec)
   "Route one key through normal dispatch, re-clamp scroll (vertical + horizontal so a long
-line follows point), then (re)arm repeat at `beat`. The shared core of a fresh keystroke
-(`beat` = the initial delay) and a held-key repeat tick (`beat` = the faster rate)."
+line follows point), then (re)arm the `:key-repeat` timer at `spec`. The shared core of a
+fresh keystroke (`spec` = `{:after delay}`) and a held-key repeat fire (`spec` =
+`{:every rate}`)."
   (ed--arm-repeat (ed-scroll-horizontal (ed-scroll (ed-route-transient m input) textrows) textcols)
     input
-    beat))
+    spec))
+
+;; ---- named timers (ADR-101): firing the model's declared `:timers` -------------
+;; `ed-update` routes a `[:timer name]` firing here. The arming side (which timers are
+;; present) lives in `model/ed-sync-timers`; this is the dispatch for what each does when
+;; it fires. Note `[:timer …]` is a vector, so its arm must precede `ed-system-event?`
+;; (else it'd fall through to key dispatch); `ed--macro-record` already skips vectors.
+
+(defn ed--timer-event? (input)
+  "True if `input` is a named-timer firing — a `[:timer name]` vector (ADR-101)."
+  (and (vector? input) (= (first input) :timer)))
+
+(defn ed--timer-fire (m name textrows textcols cols rows)
+  "Service the fired timer `name`: `:key-repeat` re-issues the held key at the repeat rate
+(confirming it's still physically down first, so a missed key-up can't run away);
+`:idle-recompute` runs the debounced eldoc cache + diagnostics check; `:which-key` reveals
+the prefix panel; `:undo-pause` closes the typing run (next edit starts a fresh undo
+group); `:cursor-blink` toggles the caret. An unknown name is a no-op."
+  (cond
+    (= name :key-repeat) (cond
+                           (nil? (get m :held-key)) (ed-drop-timer m :key-repeat)
+                           (ed--still-held? m) (ed-repeat-key-step m
+                                                 (get m :held-key)
+                                                 textrows
+                                                 textcols
+                                                 {:every *repeat-rate-ms*})
+                           else (ed--repeat-clear m))
+    (= name :idle-recompute) (ed-run-diag (ed-cache-eldoc m))
+    (= name :which-key) (ed-which-key-reveal m)
+    (= name :undo-pause) (ed-break-undo-run m)
+    (= name :cursor-blink) (assoc m :blink-on? (not (get m :blink-on?)))
+    else m))
 
 ;; ---- inbound system / async events (the loop's event bus) -------------------
 ;; Besides keys, the ui-run loop receives async `[:tag …]` messages on its mailbox:
@@ -604,19 +638,18 @@ owns it, else through the keymap (`ed-dispatch`)."
                      (ed-refresh-spans
                        (ed-post-step
                          (cond
-                           ;; a tick re-issues the held key at the fast repeat rate (consumer-paced
-                           ;; key repeat) — but only after confirming via `gui-held-key` that the key is
-                           ;; *still down* (so a missed key-up can't run away); if it's been released the
-                           ;; poll says so and we stop. Nothing held → a no-op, leaving any pending
-                           ;; prefix / open overlay intact.
-                           (= input :tick) (cond
-                                             (nil? (get m0 :held-key)) m0
-                                             (ed--still-held? m0) (ed-repeat-key-step m0
-                                                                    (get m0 :held-key)
-                                                                    textrows
-                                                                    textcols
-                                                                    *repeat-rate-ms*)
-                                             else (ed--repeat-clear m0))
+                           ;; a named timer fired (ADR-101): key-repeat / debounce / which-key / undo /
+                           ;; blink. Must precede `ed-system-event?` — `[:timer …]` is a vector but isn't
+                           ;; in the event-handler registry, so it'd otherwise fall through to key dispatch.
+                           (ed--timer-event? input) (ed--timer-fire m0
+                                                      (nth input 1)
+                                                      textrows
+                                                      textcols
+                                                      cols
+                                                      rows)
+                           ;; a bare `:tick` (only reachable via a legacy `:tick-ms` model — not ours):
+                           ;; nothing to do, leave any pending prefix / open overlay intact.
+                           (= input :tick) m0
                            ;; the window lost focus (`:blur`): the key-up may now never arrive (the
                            ;; release lands in another window), so stop any repeat now — the safety net
                            ;; for a missed key-up.
@@ -629,7 +662,7 @@ owns it, else through the keymap (`ed-dispatch`)."
                                                       rows)
                            ;; otherwise a key: route through the transient overlay / keymap, then arm
                            ;; held-key repeat (initial delay before it starts) if it's repeatable.
-                           else (ed-repeat-key-step m0 input textrows textcols *repeat-delay-ms*))
+                           else (ed-repeat-key-step m0 input textrows textcols {:after *repeat-delay-ms*}))
                          input)
                        cols
                        rows)))

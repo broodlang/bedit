@@ -18,7 +18,8 @@ The model is a map threaded through the `ui-run` loop:
   :pending   the active prefix sub-keymap mid-chord (e.g. after C-x), else nil
   :echo      the one-line echo area (the latest message, newlines flattened)
   :status    the mode-line message
-  :done      set to quit; :tick-ms the refresh beat (large — nothing animates)
+  :done      set to quit; :timers the named timers (ADR-101: blink, debounce,
+             which-key, undo-pause, key-repeat); :blink-on? the caret on/off phase
 
 The whole loop runs in one process, so buffers live in the model directly. `message`
 is the editor's echo primitive — like Emacs `message`, it writes to *both* the
@@ -37,10 +38,11 @@ pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
 
 (require 'editor/lineedit)  ; the minibuffer reuses the REPL line editor's pure core
 
-(def *idle-tick-ms* 60000)
-;; The poll/refresh beat when nothing is animating — large, since the editor only
-;; redraws on input. While a key is held, `input` shortens it to the key-repeat
-;; beat (see *repeat-delay-ms* / *repeat-rate-ms*) and restores this on release.
+(def *blink-ms* 530)
+;; The cursor-blink half-period (Emacs `blink-cursor-interval` ≈ 0.5s): an idle
+;; `:cursor-blink` timer (ADR-101) toggles `:blink-on?` this often once typing
+;; settles, and a real keystroke forces the caret solid (`ed-real-input?`). Idle, so
+;; the caret stays solid while you type and only blinks at rest.
 
 (def *diag-debounce-ms* 250)
 ;; The tick beat armed after a *settled* edit left diagnostics stale: a `:tick`
@@ -62,8 +64,8 @@ pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
 (def *typing-commands*
   ;; The commands whose consecutive repeats amalgamate into one undo step (a typing /
   ;; deletion run) AND whose settling arms the undo-pause boundary. Shared by `input`
-  ;; (amalgamation) and `ed--arm-undo-pause` below. `:self-insert` is the
-  ;; unbound-printable-key fallback.
+  ;; (amalgamation) and `ed-sync-timers` (the `:undo-pause` timer). `:self-insert` is
+  ;; the unbound-printable-key fallback.
   (list :self-insert 'commands/cmd-delete-backward 'commands/cmd-delete-char))
 
 ;; ---- construction -----------------------------------------------------------
@@ -100,7 +102,8 @@ minibuffer/prefix."
    :echo ""
    :status (str "editing " (buffer-name buf))
    :done false
-   :tick-ms *idle-tick-ms*})
+   :blink-on? true
+   :timers {:cursor-blink {:every *blink-ms* :idle? true}}})
 
 ;; ---- the selected pane + its buffer ---------------------------------------
 
@@ -278,17 +281,57 @@ keeps the rope) costs nothing. Buffers whose mode offers no service are never st
 
 (defn ed-run-diag (m)
   "Launch the deferred diagnostics check (async via `ed-launch-diag` when an `:editor`
-process is live, synchronous otherwise) — a no-op when not stale or one is in flight —
-and restore the long idle tick beat. What an idle `:tick` does once the debounce window
-has elapsed."
-  (assoc (ed-launch-diag m) :tick-ms *idle-tick-ms*))
+process is live, synchronous otherwise) — a no-op when not stale or one is in flight.
+What the `:idle-recompute` timer (ADR-101) runs once the debounce window has elapsed."
+  (ed-launch-diag m))
 
-(defn ed-arm-idle-beat (m)
-  "Shorten the tick to `*diag-debounce-ms*` when a settled event left the **eldoc hint**
-or the **diagnostics check** stale, so an idle `:tick` fires soon and recomputes them;
-otherwise leave the beat untouched (so a buffer with neither service keeps the long idle
-beat). The debounce window the per-keystroke path defers both costly jobs into."
-  (if (or (ed-eldoc-stale? m) (ed-diag-stale? m)) (assoc m :tick-ms *diag-debounce-ms*) m))
+;; ---- named timers (ADR-101): the model declares time-driven work as `:timers` ----
+;; `ed-sync-timers` reconciles `:timers` with the model state after each event (the
+;; declarative replacement for the old "shorten :tick-ms" arming cascade); the per-timer
+;; firing is dispatched in `input/ed--timer-fire`. `ed-set-timer`/`ed-drop-timer` are the
+;; imperative pair for key-repeat (which transitions delay→rate as it fires).
+
+(defn ed-set-timer (m name spec)
+  "Add or replace the `:timers` entry `name` with `spec` (a `{:every ms}`/`{:after ms}`
+map, optionally `:idle? true`). See ADR-101."
+  (assoc-in m [:timers name] spec))
+
+(defn ed-drop-timer (m name)
+  "Remove the `:timers` entry `name` (a no-op if absent)."
+  (assoc m :timers (dissoc (or (get m :timers) {}) name)))
+
+(defn ed-real-input? (input)
+  "True if `input` is direct user input — a key or a mouse event — as opposed to a timer
+firing (`[:timer …]`), a `:tick`/`:blur`, or an async system event (`[:task-done …]` …).
+Used to keep the caret solid while you actively type/click: the blink resets on real
+input, then the idle `:cursor-blink` timer takes over once you stop."
+  (cond
+    (= input :tick) false
+    (= input :blur) false
+    (vector? input) (= (first input) :mouse)
+    else true))
+
+(defn ed-sync-timers (m)
+  "Reconcile `:timers` (ADR-101) with the model after each event — the declarative
+replacement for the old arm-the-tick cascade. `:cursor-blink` is always present; the
+idle one-shots — eldoc/diagnostics debounce (`:idle-recompute`), the which-key reveal
+delay, the undo-pause boundary — are present only while their work is pending; the
+imperatively-managed `:key-repeat` is preserved untouched. A held key suppresses the idle
+one-shots (as the old held-key short-circuit did). Also clears the `:which-key` reveal
+flag once no prefix is pending (what `ed--which-key-arm` used to do)."
+  (let (m (if (get m :pending) m (dissoc m :which-key))
+        idle (if (get m :held-key)
+               {}
+               (merge
+                 (if (or (ed-eldoc-stale? m) (ed-diag-stale? m))
+                   {:idle-recompute {:after *diag-debounce-ms* :idle? true}} {})
+                 (if (and (get m :pending) (not (get m :which-key)))
+                   {:which-key {:after *which-key-delay-ms* :idle? true}} {})
+                 (if (and (member? (get m :this-command) *typing-commands*) (not (get m :undo-break)))
+                   {:undo-pause {:after *undo-pause-ms* :idle? true}} {})))
+        managed (merge {:cursor-blink {:every *blink-ms* :idle? true}} idle)
+        kept (dissoc (or (get m :timers) {}) :cursor-blink :idle-recompute :which-key :undo-pause))
+    (assoc m :timers (merge kept managed))))
 
 ;; ---- key / command labels (which-key + describe-key) ------------------------
 ;; Presentation helpers shared by the which-key panel (view) and describe-key (input):
@@ -353,46 +396,25 @@ typed before the pause (Emacs `undo-boundary` on idle). `input/ed--dispatch-key`
 the flag. Leaves `:last-command` untouched, so kill coalescing / yank-pop are unaffected."
   (assoc m :undo-break true))
 
-(defn ed--which-key-arm (m)
-  "While a prefix chord is pending and the which-key panel isn't shown yet, shorten the
-tick to `*which-key-delay-ms*` so the panel reveals after a brief pause (Emacs
-`which-key-idle-delay`); with no chord pending, clear any prior reveal."
-  (cond
-    (not (get m :pending)) (dissoc m :which-key)
-    (get m :which-key) m
-    ; already shown — leave it (and its beat) alone
-    :else (assoc m :tick-ms *which-key-delay-ms*)))
-
-(defn ed--which-key-reveal (m)
-  "On an idle tick with a prefix still pending, reveal the which-key panel."
+(defn ed-which-key-reveal (m)
+  "When the `:which-key` timer fires with a prefix still pending, reveal the panel
+(`ed-sync-timers` then drops the now-satisfied timer); if the chord ended first, clear it.
+Public (called cross-module from `input/ed--timer-fire`)."
   (if (get m :pending) (assoc m :which-key true) (dissoc m :which-key)))
 
-(defn ed--arm-undo-pause (m)
-  "After a typing/deletion command, shorten the tick to `*undo-pause-ms*` (only when the
-beat is longer) so a pause fires a `:tick` that closes the undo run — giving undo a
-proper history even in a plain buffer with no eldoc/diagnostics debounce."
-  (if (and (member? (get m :this-command) *typing-commands*) (> (get m :tick-ms) *undo-pause-ms*))
-    (assoc m :tick-ms *undo-pause-ms*)
-    m))
-
 (defn ed-post-step (m input)
-  "The post-event step run after `input/ed-update` folds an event in. Both the eldoc
-hint and the advisory type-check are **debounced onto the idle tick** (Emacs's
-idle-timer model) — recomputing them on every keystroke makes a large buffer crawl
-(eldoc parses around point, the check scans the whole buffer). So a settled edit/motion
-recomputes nothing here; it just arms a short debounce beat when eldoc or diagnostics
-went stale (`ed-arm-idle-beat`) — or, mid-chord, the which-key delay (`ed--which-key-arm`).
-The idle `:tick` that follows (nothing held) recomputes the eldoc hint, runs the deferred
-check, and reveals the which-key panel if a chord is still pending. A held key-repeat is
-its own debounce — leave the model untouched. Finally refreshes the open minibuffer's
-memoized candidate list (`ed-cache-mb-candidates`) so the view/input read it cheaply."
+  "The post-event step run after `input/ed-update` folds an event in. The eldoc hint and
+the advisory type-check are **debounced onto idle timers** (ADR-101; Emacs's idle-timer
+model) — recomputing them per keystroke makes a large buffer crawl. So this recomputes
+nothing directly; it just reconciles `:timers` (`ed-sync-timers`) with the new model
+state — arming the eldoc/diagnostics debounce, the which-key delay, and the undo-pause
+boundary when each is due — and the timers' firing (in `input/ed--timer-fire`) does the
+work. A real keystroke/click also forces the caret solid (`ed-real-input?`), so it only
+blinks at rest. Finally refreshes the open minibuffer's memoized candidate list
+(`ed-cache-mb-candidates`) so the view/input read it cheaply."
   (ed-cache-mb-candidates
-    (cond
-      (get m :held-key) m
-      ;; a settled idle tick: run the debounced eldoc/diagnostics, reveal which-key if a
-      ;; chord is still pending, AND close the typing run for undo (next edit = new group).
-      (= input :tick) (ed--which-key-reveal (ed-break-undo-run (ed-run-diag (ed-cache-eldoc m))))
-      :else (ed--which-key-arm (ed--arm-undo-pause (ed-arm-idle-beat m))))))
+    (ed-sync-timers
+      (if (ed-real-input? input) (assoc m :blink-on? true) m))))
 
 ;; ---- the minibuffer (a one-line prompt over lineedit's pure editor core) -----
 ;; The `:minibuffer` field is `{:edit <lineedit-state> :on-complete :complete-fn
