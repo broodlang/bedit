@@ -64,12 +64,22 @@ digits, and `- _ ? ! * / < > = +` etc. — i.e. not whitespace or a delimiter."
         done (second r))
     (if (empty? cur) done (cons (list->string (reverse cur)) done))))
 
+(defn complete--buffer-words (m)
+  "The distinct words of the current buffer — the (prefix-independent) word *universe*
+the baseline completion source draws from. Scanning the buffer is O(buffer); the popup
+caches this on open so a narrowing keystroke re-filters the cache instead of re-scanning."
+  (distinct (complete--words (buffer-text (ed-current-buf m)))))
+
+(defn completion-candidates-of (words prefix)
+  "The `words` that start with `prefix` and aren't exactly it, sorted — the pure
+prefix-filter shared by the open scan and the cached narrowing path."
+  (sort (filter (fn (w) (and (starts-with? w prefix) (not (= w prefix)))) words)))
+
 (defn completion-candidates (m prefix)
   "Candidates for `prefix`. **Redefine to plug in another source** (global symbols
 via `all-globals`, file paths, snippets, …). Baseline: the distinct words in the
 current buffer that start with `prefix` and aren't exactly it, sorted."
-  (sort (distinct (filter (fn (w) (and (starts-with? w prefix) (not (= w prefix))))
-                    (complete--words (buffer-text (ed-current-buf m)))))))
+  (completion-candidates-of (complete--buffer-words m) prefix))
 
 ;; ---- applying a completion --------------------------------------------------
 
@@ -80,13 +90,19 @@ current buffer that start with `prefix` and aren't exactly it, sorted."
         buf2 (replace-region buf start p word))
     (assoc (ed-set-buf m buf2) :completion nil :status "modified")))
 
-(defn complete--default-at (m text p)
-  "The baseline `[start prefix candidates]` for point `p`: the buffer word before
-point + the matching distinct buffer words (`completion-candidates`). The fallback
-when the buffer's mode offers no `:complete-at` service."
-  (let (start (complete--prefix-start text p)
-        prefix (substring text start p))
-    [start prefix (completion-candidates m prefix)]))
+(defn complete--default-at (m)
+  "The baseline `[start prefix candidates words]` for completion at point: the buffer
+word before point, the prefix-matching distinct buffer words, and `words` — the full
+distinct-word *universe* the candidates were filtered from. The popup caches `words` so a
+narrowing keystroke re-filters it (`completion-candidates-of`) instead of re-scanning the
+whole buffer. The fallback when the buffer's mode offers no `:complete-at` service."
+  (let (buf (ed-current-buf m)
+        text (buffer-text buf)
+        p (buffer-point buf)
+        start (complete--prefix-start text p)
+        prefix (substring text start p)
+        words (distinct (complete--words text)))
+    [start prefix (completion-candidates-of words prefix) words]))
 
 (defn complete--at (m)
   "`[start prefix candidates]` for completion at point. Delegates to the current
@@ -97,20 +113,27 @@ language mode supply its own completion without `complete` naming the language."
         text (buffer-text buf)
         p (buffer-point buf)
         svc (ed-mode-service buf :complete-at))
-    (if (nil? svc) (complete--default-at m text p) (svc text p))))
+    (if (nil? svc)
+      (let ([start prefix candidates words] (complete--default-at m)) [start prefix candidates])
+      (svc text p))))
 
 (defn cmd-complete (m key)
   "Completion-at-point (Tab): complete the symbol/word before point via the current
 buffer's mode (`:complete-at`) or the buffer-word default, **fuzzy-ranked**. One match
 inserts directly; several open the popup; none echoes a note; an empty prefix is a no-op."
-  (let ([start prefix items0] (complete--at m)
+  (let (svc (ed-mode-service (ed-current-buf m) :complete-at)
+        ;; default source → [start prefix items words]; mode source → words = nil (the
+        ;; service is re-queried each refresh, so there's nothing buffer-scoped to cache).
+        [start prefix items0 words] (if (nil? svc)
+                                      (complete--default-at m)
+                                      (let ([s p c] (complete--at m)) [s p c nil]))
         items (completion-rank prefix items0))
     (if (= prefix "")
       (message m "nothing to complete")
       (cond
         (empty? items) (message m (str "no completions for \"" prefix "\""))
         (= (count items) 1) (complete--apply m start (first items))
-        else (assoc m :completion {:items items :index 0 :start start :prefix prefix})))))
+        else (assoc m :completion {:items items :index 0 :start start :prefix prefix :words words})))))
 
 ;; ---- popup navigation (input routes control keys here) ----------------------
 
@@ -142,14 +165,28 @@ the narrowing keystroke's insert/delete."
   (assoc (ed-set-buf m (f (ed-current-buf m))) :status "modified"))
 
 (defn complete--refresh (m)
-  "Recompute the popup from the current point after a narrowing edit: re-rank the
-mode's candidates against the (now longer/shorter) prefix, or close the popup when the
-prefix is empty or nothing matches."
-  (let ([start prefix items0] (complete--at m)
-        items (completion-rank prefix items0))
-    (if (or (= prefix "") (empty? items))
-      (assoc m :completion nil)
-      (assoc m :completion {:items items :index 0 :start start :prefix prefix}))))
+  "Recompute the popup from the current point after a narrowing edit, closing it when the
+prefix is empty or nothing matches. The default (buffer-word) source re-filters the
+**cached word universe** (`:words`, captured on open) against the new prefix — read with
+an O(prefix) `rope-slice`, not a whole-buffer scan — so narrowing a large buffer costs
+nothing per keystroke; only the word at point ever changes and it's always excluded, so
+the cache stays exact across both typing and backspace. A mode source (`:words` nil) is
+re-queried via `complete--at`."
+  (let (c (get m :completion)
+        words (get c :words))
+    (if (nil? words)
+      (let ([start prefix items0] (complete--at m)
+            items (completion-rank prefix items0))
+        (if (or (= prefix "") (empty? items))
+          (assoc m :completion nil)
+          (assoc m :completion {:items items :index 0 :start start :prefix prefix})))
+      (let (buf (ed-current-buf m)
+            start (get c :start)
+            prefix (rope-slice (buffer-rope buf) start (buffer-point buf))
+            items (completion-rank prefix (completion-candidates-of words prefix)))
+        (if (or (= prefix "") (empty? items))
+          (assoc m :completion nil)
+          (assoc m :completion {:items items :index 0 :start start :prefix prefix :words words}))))))
 
 (defn complete-handle (m input)
   "Fold a popup-control key: C-n/↓ C-p/↑ move; Enter/Tab accept; a word-char inserts and
