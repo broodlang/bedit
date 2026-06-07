@@ -85,25 +85,25 @@
   (defn gui-m (text) (assoc (m-of text) :gui-keys true))
   (test "a key-up marks the frontend release-capable (:gui-keys)"
     (is (get (ed-update (m-of "x") [:key-up "x"] 80 24) :gui-keys)))
-  (test "a repeatable key-down moves once, arms held-key, and shortens the tick"
+  (test "a repeatable key-down moves once, arms held-key, and arms the key-repeat timer"
     (let (m (ed-update (gui-m "a\nb\nc\nd") :ctrl-n 80 24))
       (assert= (buffer-current-line (cur m)) 1)  ; the down itself moved once
       (assert= (get m :held-key) :ctrl-n)
-      (assert= (get m :tick-ms) *repeat-delay-ms*)))  ; initial delay before repeat
-  (test "a tick while held re-issues the key at the faster repeat rate"
+      (assert= (get-in m [:timers :key-repeat]) {:after *repeat-delay-ms*})))  ; initial delay before repeat
+  (test "a key-repeat timer fire re-issues the key at the faster repeat rate"
     (let (m1 (ed-update (gui-m "a\nb\nc\nd\ne") :ctrl-n 80 24)  ; line 1
-          m2 (ed-update m1 :tick 80 24)  ; line 2
-          m3 (ed-update m2 :tick 80 24))
+          m2 (ed-update m1 [:timer :key-repeat] 80 24)  ; line 2
+          m3 (ed-update m2 [:timer :key-repeat] 80 24))
       ; line 3
       (assert= (buffer-current-line (cur m2)) 2)
       (assert= (buffer-current-line (cur m3)) 3)
-      (assert= (get m3 :tick-ms) *repeat-rate-ms*)))
-  (test "key-up stops the repeat: held-key cleared, idle tick restored, ticks inert"
+      (assert= (get-in m3 [:timers :key-repeat]) {:every *repeat-rate-ms*})))  ; now at the faster rate
+  (test "key-up stops the repeat: held-key cleared, key-repeat timer removed, fires inert"
     (let (m1 (ed-update (gui-m "a\nb\nc") :ctrl-n 80 24)
           m2 (ed-update m1 [:key-up :ctrl-n] 80 24)
-          m3 (ed-update m2 :tick 80 24))
+          m3 (ed-update m2 [:timer :key-repeat] 80 24))
       (is (nil? (get m2 :held-key)))
-      (assert= (get m2 :tick-ms) *idle-tick-ms*)
+      (is (nil? (get-in m2 [:timers :key-repeat])))
       (assert= (buffer-current-line (cur m3)) (buffer-current-line (cur m2)))))
   (test "key-up matches modifier-insensitively (the modifier released before the key)"
     (let (m1 (ed-update (gui-m "a\nb\nc") :ctrl-n 80 24)
@@ -113,20 +113,24 @@
   (test "a self-inserting key repeats too"
     (let (m (ed-update (gui-m "") "x" 80 24))
       (assert= (get m :held-key) "x")
-      (assert= (buffer-text (cur (ed-update m :tick 80 24))) "xx")))
+      (assert= (buffer-text (cur (ed-update m [:timer :key-repeat] 80 24))) "xx")))
+  (test "C-o (open-line) repeats while held"
+    (let (m (ed-update (gui-m "x") :ctrl-o 80 24))
+      (assert= (get m :held-key) :ctrl-o)
+      (assert= (get-in m [:timers :key-repeat]) {:after *repeat-delay-ms*})))
   (test "a prefix key does not arm repeat"
     (is (nil? (get (ed-update (gui-m "x") :ctrl-x 80 24) :held-key))))
   (test "losing focus (:blur) stops the repeat — the missed-key-up safety net"
     (let (m1 (ed-update (gui-m "a\nb\nc") :ctrl-n 80 24)
           m2 (ed-update m1 :blur 80 24)
-          m3 (ed-update m2 :tick 80 24))
+          m3 (ed-update m2 [:timer :key-repeat] 80 24))
       (is (nil? (get m2 :held-key)))
-      (assert= (get m2 :tick-ms) *idle-tick-ms*)
+      (is (nil? (get-in m2 [:timers :key-repeat])))
       (assert= (buffer-current-line (cur m3)) (buffer-current-line (cur m2)))))
-  (test "without :gui-keys (terminal) a key never arms repeat, tick stays idle"
+  (test "without :gui-keys (terminal) a key never arms repeat"
     (let (m (ed-update (m-of "a\nb\nc") :ctrl-n 80 24))
       (is (nil? (get m :held-key)))
-      (assert= (get m :tick-ms) *idle-tick-ms*)))
+      (is (nil? (get-in m [:timers :key-repeat])))))
   ;; The poll safety: ed--still-held? confirms via gui-held-key the key is still down
   ;; before a repeat tick, so a missed key-up can't run away. Here we can only exercise
   ;; the fallbacks (a real held-key poll needs a live window).
@@ -134,6 +138,26 @@
     (is (input/ed--still-held? (m-of "x"))))
   (test "still-held? tolerates a poll error (unknown window) by falling back to true"
     (is (input/ed--still-held? (assoc (m-of "x") :window 999999 :held-key :ctrl-n)))))
+
+(describe "cursor blink (ADR-101 named timers)"
+  (test "the initial model starts solid and carries the cursor-blink timer"
+    (let (m (m-of "x"))
+      (is (get m :blink-on?))
+      (assert= (get-in m [:timers :cursor-blink]) {:every *blink-ms* :idle? true})))
+  (test "a cursor-blink timer fire toggles the caret phase"
+    (let (m1 (ed-update (m-of "x") [:timer :cursor-blink] 80 24)  ; on -> off
+          m2 (ed-update m1 [:timer :cursor-blink] 80 24))         ; off -> on
+      (is (not (get m1 :blink-on?)))
+      (is (get m2 :blink-on?))))
+  (test "a real keystroke forces the caret solid again (so it never blinks while typing)"
+    (let (off (assoc (m-of "") :blink-on? false)
+          typed (ed-update off "a" 80 24))
+      (is (get typed :blink-on?))))
+  (test "a timer fire does NOT reset the blink phase (only real input does)"
+    ;; an idle-recompute fire is not user input, so it leaves :blink-on? alone
+    (is (not (get (ed-update (assoc (m-of "x") :blink-on? false) [:timer :idle-recompute] 80 24) :blink-on?))))
+  (test "the cursor-blink timer is always present after an event"
+    (is (not (nil? (get-in (ed-update (m-of "x") "a" 80 24) [:timers :cursor-blink]))))))
 
 (describe "editor quit + save (Emacs C-x chords)"
   (test "Esc does NOT quit — it's keyboard-escape-quit (cancel), an Emacs command"
@@ -174,28 +198,29 @@
       "abcd"))
   (test "M-/ redoes an undone edit"
     (assert= (buffer-text (cur (press (m-of "") ["a" :ctrl-/ :alt-/]))) "a"))
-  (test "a typing PAUSE (idle tick) splits the undo groups"
-    ;; type "hello", pause (an idle :tick inserts an undo boundary), type " he" →
+  (test "a typing PAUSE (the undo-pause timer) splits the undo groups"
+    ;; type "hello", pause (the :undo-pause timer fires an undo boundary), type " he" →
     ;; one undo removes only " he", leaving "hello" (not the whole run)
     (assert= (buffer-text (cur (press (m-of "")
                                  (append (string->list "hello")
-                                   (append [:tick] (append (string->list " he") [:ctrl-/]))))))
+                                   (append [[:timer :undo-pause]] (append (string->list " he") [:ctrl-/]))))))
       "hello"))
   (test "redo after a pause-split undo re-adds the second run"
     (assert= (buffer-text (cur (press (m-of "")
                                  (append (string->list "hello")
-                                   (append [:tick] (append (string->list " he") [:ctrl-/ :alt-/]))))))
+                                   (append [[:timer :undo-pause]] (append (string->list " he") [:ctrl-/ :alt-/]))))))
       "hello he"))
-  (test "a typing command arms the undo-pause tick (so plain buffers get boundaries too)"
+  (test "a typing command arms the undo-pause timer (so plain buffers get boundaries too)"
     ;; the fix for 'undo has no history': without an eldoc/diagnostics debounce, a plain
-    ;; buffer must still shorten its idle beat after an edit so a pause fires a boundary.
-    (assert= (get (ed-update (m-of "") "a" 80 24) :tick-ms) *undo-pause-ms*))
+    ;; buffer must still arm an idle timer after an edit so a pause fires a boundary.
+    (assert= (get-in (ed-update (m-of "") "a" 80 24) [:timers :undo-pause])
+      {:after *undo-pause-ms* :idle? true}))
   (test "undo tree: after a break, undoing redoes your undos (no state lost)"
     ;; type "a"<pause>"b" (two groups); undo twice -> ""; break with C-f; undo twice walks
     ;; the recorded undos forward, back to "ab" — Emacs undo-tree, the whole point.
     (assert= (buffer-text (cur (press (m-of "")
                                  (append (string->list "a")
-                                   (append [:tick]
+                                   (append [[:timer :undo-pause]]
                                      (append (string->list "b")
                                        [:ctrl-/ :ctrl-/ :ctrl-f :ctrl-/ :ctrl-/]))))))
       "ab"))
@@ -203,7 +228,7 @@
     ;; type "a"<pause>"b"; undo twice -> ""; M-/ M-/ redoes both -> "ab"
     (assert= (buffer-text (cur (press (m-of "")
                                  (append (string->list "a")
-                                   (append [:tick]
+                                   (append [[:timer :undo-pause]]
                                      (append (string->list "b")
                                        [:ctrl-/ :ctrl-/ :alt-/ :alt-/]))))))
       "ab")))
