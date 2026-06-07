@@ -1,0 +1,152 @@
+;; Editor tests (split from the original monolithic main_test.blsp by concern).
+;; Every split file keeps the `main-test` module name, so a helper defined in any
+;; file is visible to every test body at run time (test bodies are lazy thunks the
+;; runner evaluates only after all files load into the shared image). The common
+;; model helpers below are repeated in each file so a standalone `nest check` of a
+;; single file still resolves them.
+(defmodule main-test
+  (:use model)
+  (:use input)
+  (:use view)
+  (:use commands)
+  (:use mincomplete)
+  (:use panes)
+  (:use complete)
+  (:use web)
+  (:use main)
+  (:use proc/supervisor)
+  (:use editor/buffer)
+  (:use test))
+
+(defn m-of (text) (ed-init (make-buffer text)))
+(defn cur (m) (ed-current-buf m))
+(defn after (text k) (buffer-text (cur (ed-update (m-of text) k 80 24))))
+(defn press (m keys) (fold (fn (acc k) (ed-update acc k 80 24)) m keys))
+(defn type-str (m s) (press m (string->list s)))
+
+;; The full text of the *Messages* buffer in model `m`.
+(defn messages-text (m)
+  (buffer-text (nth (get m :buffers) (ed-buffer-index-by-name m "*Messages*"))))
+
+;; Output redirected to the editor process (std/io `process-port` / std/log
+;; `process-backend`) arrives as `[:io-write s]`; `ed-update` folds it into
+;; *Messages*. This is the pure half of that path — the message-delivery half is
+;; the kernel mailbox, exercised live by the running editor.
+(describe "editor output sink (std/io · std/log → *Messages*)"
+  (test "[:io-write s] appends to *Messages* and echoes it, trimming the newline"
+    (let (m (ed-update (m-of "x") [:io-write "log line\n"] 80 24))
+      (is (string-contains? (messages-text m) "log line"))
+      (assert= (get m :echo) "log line")))
+  (test "[:io-write s] leaves the current buffer untouched"
+    (assert= (buffer-text (cur (ed-update (m-of "hello") [:io-write "noise\n"] 80 24))) "hello"))
+  (test "two [:io-write]s accumulate as separate lines in *Messages*"
+    (let (m (press (m-of "x") [[:io-write "one\n"] [:io-write "two\n"]]))
+      (is (string-contains? (messages-text m) "one"))
+      (is (string-contains? (messages-text m) "two")))))
+
+;; The buffer web mirror (C-x w). The socket/process half (publisher + serve-loop)
+;; runs live; here we test the pure pieces exactly as the server renders them —
+;; the snapshot the editor pushes, and the HTML a worker turns it into — plus the
+;; command's non-spawning branches (already-serving / not-running).
+(describe "web mirror (serve-buffer · src/web.blsp)"
+  ;; A model whose point sits on line 1, column 1 of "ab\ncd" (char offset 4 = 'd').
+  (defn m-at-cd () (ed-set-buf (m-of "ab\ncd") (goto-char (cur (m-of "ab\ncd")) 4)))
+  (test "web-snapshot captures text, name, and 0-based point line:col"
+    (let (s (web-snapshot (m-at-cd)))
+      (assert= (get s :text) "ab\ncd")
+      (assert= (get s :line) 1)
+      (assert= (get s :col) 1)
+      (is (string-contains? (get s :name) "scratch"))))
+  (test "web-snapshot materialises the line-number gutter, web-render-app draws it"
+    ;; the scratch buffer is text-mode, which carries the :gutter-* service, so the
+    ;; snapshot renders the per-line numbers to plain data and the page shows them
+    (let (s (web-snapshot (m-at-cd))
+          g (get s :gutter)
+          html (web-render-app s))
+      (assert= (get g :width) 2)                     ; 2 lines → 1 digit + 1 space
+      (assert= (first (nth (get g :cells) 0)) "1 ")  ; row 0's cell: "1" right-aligned + space
+      (is (string-contains? html "class=\"gutter\""))  ; non-selectable gutter span
+      (is (string-contains? html ">1 </span>"))))      ; line 1's number, in the gutter
+  (test "web-render-app embeds the buffer text and the cursor caret"
+    (let (html (web-render-app (web-snapshot (m-at-cd))))
+      (is (string-contains? html "<pre>"))
+      (is (string-contains? html "ab"))  ; the non-cursor line, verbatim
+      ;; point is at col 1 of "cd", so the caret splits it: c│d
+      (is (string-contains? html "c<span class=\"cursor\"></span>d"))
+      (is (string-contains? html "2:1"))))  ; header pos: line shown 1-based, col 0-based
+  (test "web-render-page wraps the app region and wires up the SSE EventSource"
+    (let (html (web-render-page (web-snapshot (m-at-cd))))
+      (is (string-contains? html "<div id=\"app\">"))
+      (is (string-contains? html "EventSource('/events')"))
+      (is (string-contains? html "<pre>"))           ; the app region is embedded
+      (refute (string-contains? html "http-equiv=\"refresh\""))))  ; SSE replaced polling
+  (test "web-render-app HTML-escapes buffer content"
+    (let (html (web-render-app (web-snapshot (m-of "a<b>&c"))))
+      (is (string-contains? html "a&lt;b&gt;&amp;c"))
+      (is (not (string-contains? html "<b>")))))
+  (test "web-render-app colours syntax spans and shades the active region"
+    ;; A hand-built snapshot (plain data, exactly what the publisher pushes): chars
+    ;; [0 2) carry a :green lexer face, chars [2 4) sit in the selection. Cursor parked
+    ;; on line 1 so the rendered line 0 ("abcd") isn't split by the caret.
+    (let (snap {:name "t" :mode "x" :text "abcd\nx" :line 1 :col 0 :lines 2 :status ""
+                :spans (list [0 2 {:fg :green}]) :region [2 4]}
+          html (web-render-app snap))
+      (is (string-contains? html "color:#a6e3a1"))      ; :green -> catppuccin green
+      (is (string-contains? html ">ab</span>"))          ; the faced run, coalesced
+      (is (string-contains? html "background:#45475a"))  ; region [2 4) shaded
+      (is (string-contains? html ">cd</span>"))))
+  (test "web-render-app header shows the mode-line status and line count"
+    (let (html (web-render-app {:name "t" :mode "x" :text "a\nb\nc" :line 0 :col 0
+                                :lines 3 :status "modified" :spans '() :region nil}))
+      (is (string-contains? html "modified"))   ; the :status mode-line message
+      (is (string-contains? html "3L"))))        ; total line count in the header pos
+  (test "serve-buffer on an already-running server reports its URL, doesn't respawn"
+    (let (m (assoc (m-of "x") :server {:port 5000 :pub nil :proc nil})
+          r (cmd-serve-buffer m nil))
+      (is (string-contains? (get r :echo) "http://localhost:5000"))
+      (assert= (get (get r :server) :port) 5000)))  ; unchanged — no new server
+  (test "stop-serving with nothing running just says so"
+    (is (string-contains? (get (cmd-stop-serving (m-of "x") nil) :echo) "no web server"))))
+
+;; ---- log routing: per-buffer logging (one logger, a filtered backend per buffer) --
+(describe "editor log routing (pure)"
+  (test "ed-append-named appends to a named buffer, creating it, leaving current point"
+    (let (m (ed-set-buf (m-of "abc") (goto-char (make-buffer "abc") 2))  ; current point at 2
+          m2 (ed-append-named m "*LSP*" "line one")
+          m3 (ed-append-named m2 "*LSP*" "line two\n")   ; already newline-terminated
+          i (ed-buffer-index-by-name m3 "*LSP*"))
+      (is (not (nil? i)))
+      (assert= (buffer-text (ed-buf-at m3 i)) "line one\nline two\n")  ; one newline each
+      (assert= (buffer-text (cur m3)) "abc")    ; current buffer untouched…
+      (assert= (buffer-point (cur m3)) 2)))     ; …point too
+  (test "a [:buffer-log name s] event appends to that buffer with no echo"
+    (let (m (ed-update (m-of "x") [:buffer-log "*LSP*" "hello lsp\n"] 80 24)
+          i (ed-buffer-index-by-name m "*LSP*"))
+      (is (not (nil? i)))
+      (is (string-contains? (buffer-text (ed-buf-at m i)) "hello lsp"))
+      (assert= (get m :echo) "")))   ; routed logs never touch the echo area
+  (test "ed-buffer-backend filters partition records by category"
+    (let (default-b (ed-buffer-backend "*Messages*" {:filter (fn (r) (nil? (get (get r :meta) :category)))})
+          lsp-b (ed-buffer-backend "*LSP*" {:filter (fn (r) (= (get (get r :meta) :category) :lsp))})
+          uncat {:level :info :meta {}}
+          lsp {:level :info :meta {:category :lsp}})
+      (is ((get default-b :filter) uncat))      ; uncategorised → *Messages*
+      (refute ((get default-b :filter) lsp))    ; …but not the :lsp record
+      (is ((get lsp-b :filter) lsp))            ; :lsp → *LSP*
+      (refute ((get lsp-b :filter) uncat)))))
+
+(describe "editor log routing (live)"
+  :isolated
+  (test "register-log-route adds a category→buffer backend to the logger's set"
+    (register-log-route :lsp-test "*LSP-test*")
+    (let (bs (ed-log-backends))
+      (is (>= (count bs) 2))   ; the default *Messages* backend + our route
+      ;; some route backend accepts a :lsp-test record
+      (is (some? (fn (b) (let (f (get b :filter)) (and f (f {:level :info :meta {:category :lsp-test}}))))
+            (rest bs)))))
+  (test "ed-buffer-backend streams a written line to the editor as [:buffer-log …]"
+    (register :editor (self))                 ; the backend sink targets :editor
+    (let (b (ed-buffer-backend "*LSP*"))
+      (io/io-write (get b :sink) "a line\n")   ; what the logger does per record
+      (assert= (receive ([:buffer-log nm s] [nm s]) (after 500 :timeout))
+        ["*LSP*" "a line\n"]))))

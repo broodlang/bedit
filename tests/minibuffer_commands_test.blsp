@@ -1,0 +1,380 @@
+;; Editor tests (split from the original monolithic main_test.blsp by concern).
+;; Every split file keeps the `main-test` module name, so a helper defined in any
+;; file is visible to every test body at run time (test bodies are lazy thunks the
+;; runner evaluates only after all files load into the shared image). The common
+;; model helpers below are repeated in each file so a standalone `nest check` of a
+;; single file still resolves them.
+(defmodule main-test
+  (:use model)
+  (:use input)
+  (:use view)
+  (:use commands)
+  (:use mincomplete)
+  (:use panes)
+  (:use complete)
+  (:use web)
+  (:use main)
+  (:use proc/supervisor)
+  (:use editor/buffer)
+  (:use test))
+
+(defn m-of (text) (ed-init (make-buffer text)))
+(defn cur (m) (ed-current-buf m))
+(defn after (text k) (buffer-text (cur (ed-update (m-of text) k 80 24))))
+(defn press (m keys) (fold (fn (acc k) (ed-update acc k 80 24)) m keys))
+(defn type-str (m s) (press m (string->list s)))
+;; A model whose current buffer is `text` with point at `p`.
+(defn cm (text p) (ed-set-buf (m-of "") (goto-char (make-buffer text) p)))
+
+;; ---- Emacs editing in the minibuffer (find-file / switch-buffer prompts) -----
+(defn mb-input (m) (mb-text (get m :minibuffer)))
+
+(describe "editor minibuffer editing"
+  (test "C-a moves to start, then a key inserts at point"
+    (let (m (type-str (press (m-of "x") [:ctrl-x "b"]) "abc")
+           ; input "abc", point 3
+           ins
+           (ed-update (ed-update m :ctrl-a 80 24) "Z" 80 24))
+      ; C-a → 0, insert Z
+      (assert= (mb-input ins) "Zabc")))
+  (test "C-b then Backspace deletes the char before point"
+    (let (m (type-str (press (m-of "x") [:ctrl-x "b"]) "abc")
+           ; "abc" point 3
+           m2
+           (ed-update (ed-update m :ctrl-b 80 24) :backspace 80 24))
+      ; point 2, del 'b'
+      (assert= (mb-input m2) "ac")))
+  (test "C-d deletes the char at point"
+    (let (m (type-str (press (m-of "x") [:ctrl-x "b"]) "abc")
+          m2 (ed-update (ed-update m :ctrl-a 80 24) :ctrl-d 80 24))
+      ; point 0, del 'a'
+      (assert= (mb-input m2) "bc")))
+  (test "C-k kills from point to the end"
+    (let (m (type-str (press (m-of "x") [:ctrl-x "b"]) "abcdef")
+           m2
+           (ed-update (ed-update m :ctrl-a 80 24)
+             :ctrl-f
+             80
+             24)  ; point 1
+           m3
+           (ed-update m2 :ctrl-k 80 24))
+      ; kill to end
+      (assert= (mb-input m3) "a")))
+  (test "editing then Enter accepts the corrected text"
+    (let (m (type-str (press (m-of "x") [:ctrl-x "b"]) "*Messages*X")
+           ; trailing typo
+           fixed
+           (ed-update m :backspace 80 24)  ; delete X → "*Messages*"
+           done
+           (ed-update fixed :enter 80 24))
+      (assert= (mb-input fixed) "*Messages*")  ; the edit landed
+      (assert= (buffer-name (cur done)) "*Messages*")))  ; …and Enter switched
+  (test "the minibuffer gained lineedit word-motion (M-b) from the shared core"
+    ;; the old hand-rolled minibuffer had no M-f/M-b; reusing lineedit brings it
+    (let (m (type-str (press (m-of "x") [:ctrl-x "b"]) "ab cd")
+           ; point at end (5)
+           moved
+           (ed-update m :alt-b 80 24)  ; M-b → start of "cd" (3)
+           ins
+           (ed-update moved "Z" 80 24))
+      (assert= (mb-input ins) "ab Zcd"))))
+
+;; ---- live completion candidates in switch-buffer -----------------------------
+(describe "editor switch-buffer completion"
+  (test "shows the matching buffer names as you type"
+    (let (m (press (m-of "x") [:ctrl-x "b"]))
+      ; *scratch* + *Messages*
+      (is (string-contains? (ed-mb-candidates (get m :minibuffer)) "*scratch*"))
+      (is (string-contains? (ed-mb-candidates (get m :minibuffer)) "*Messages*"))))
+  (test "candidates narrow to the typed prefix"
+    (let (m (type-str (press (m-of "x") [:ctrl-x "b"]) "*M"))
+      (is (string-contains? (ed-mb-candidates (get m :minibuffer)) "*Messages*"))
+      (is (not (string-contains? (ed-mb-candidates (get m :minibuffer)) "*scratch*")))))
+  (test "Tab completes the buffer name"
+    (let (m (type-str (press (m-of "x") [:ctrl-x "b"]) "*Mess")
+          done (ed-update (ed-update m :tab 80 24) :enter 80 24))
+      ; Tab → "*Messages*", Enter
+      (assert= (buffer-name (cur done)) "*Messages*")))
+  (test "find-file lists a directory's entries sorted by name"
+    (let (d (temp-dir "myedit-sort-")
+          _ (make-dir d)
+          _ (spit (str d "/c.txt") "")
+          _ (spit (str d "/a.txt") "")
+          _ (spit (str d "/b.txt") "")
+          m0 (press (m-of "x") [:ctrl-x :ctrl-f])
+          m (assoc m0 :minibuffer
+              (assoc (get m0 :minibuffer) :edit
+                (ed-mb-set-text (get (get m0 :minibuffer) :edit) (str d "/"))))
+          cands (mb-candidates (get m :minibuffer)))
+      (assert= cands (list (str d "/a.txt") (str d "/b.txt") (str d "/c.txt")))))
+  (test "Tab fills the HOVERED candidate (a directory), not the top item"
+    ;; find-file in a temp dir with two subdirs: hover the 2nd, Tab fills it (not aaa/).
+    (let (d (temp-dir "myedit-tab-")
+          _ (make-dir d)
+          _ (make-dir (str d "/aaa"))
+          _ (make-dir (str d "/bbb"))
+          m0 (press (m-of "x") [:ctrl-x :ctrl-f])
+          m (assoc m0 :minibuffer
+              (assoc (get m0 :minibuffer) :edit
+                (ed-mb-set-text (get (get m0 :minibuffer) :edit) (str d "/"))))
+          cands (mb-candidates (get m :minibuffer))
+          ;; C-n moves the selection to the 2nd candidate, then Tab fills it
+          hovered (ed-update (ed-update m :ctrl-n 80 24) :tab 80 24))
+      (is (= (count cands) 2))
+      (assert= (mb-text (get hovered :minibuffer)) (nth cands 1))   ; the hovered dir, not (nth cands 0)
+      (is (ends-with? (mb-text (get hovered :minibuffer)) "/")))))   ; a directory → ready to expand
+
+;; ---- the new line/word editing commands -------------------------------------
+(describe "editor case-region / whitespace / read-only / file commands"
+  (test "C-x C-u upper-cases the region"
+    (assert= (buffer-text (cur (press (m-of "abcdef") [(keyword "ctrl- ") :right :right :right :ctrl-x :ctrl-u])))
+      "ABCdef"))
+  (test "C-x C-l lower-cases the region"
+    (assert= (buffer-text (cur (press (m-of "ABCDEF") [(keyword "ctrl- ") :right :right :right :ctrl-x :ctrl-l])))
+      "abcDEF"))
+  (test "case-region with no region is a no-op-with-message"
+    (let (m (cmd-upcase-region (m-of "abc") nil))
+      (assert= (buffer-text (cur m)) "abc")
+      (is (string-contains? (get m :echo) "no region"))))
+  (test "M-SPC collapses surrounding whitespace to one space"
+    (assert= (buffer-text (cur (press (m-of "a   b") [:right :right (keyword "alt- ")]))) "a b"))
+  (test "M-\\ deletes all surrounding whitespace"
+    (assert= (buffer-text (cur (press (m-of "a   b") [:right :right (keyword "alt-\\")]))) "ab"))
+  (test "C-x C-q toggles read-only and then blocks edits"
+    (let (ro (press (m-of "x") [:ctrl-x :ctrl-q]))
+      (is (read-only? (cur ro)))
+      (assert= (buffer-text (cur (ed-update ro "y" 80 24))) "x")))  ; edit refused
+  (test "write-file saves the buffer to a new path and backs it"
+    (let (path (str (temp-dir "myedit-wf-") ".txt")
+          prompt (cmd-write-file (m-of "hello") nil)
+          done (ed-update
+                 (assoc prompt :minibuffer
+                   (assoc (get prompt :minibuffer) :edit
+                     (ed-mb-set-text (get (get prompt :minibuffer) :edit) path)))
+                 :enter 80 24))
+      (is (file-exists? path))
+      (assert= (slurp path) "hello")
+      (assert= (buffer-file (cur done)) path)))
+  (test "revert-buffer re-reads the file from disk, discarding edits"
+    (let (path (str (temp-dir "myedit-rev-") ".txt")
+          _ (spit path "disk\n")
+          edited (ed-update (ed-find-file (m-of "x") path) "Z" 80 24)
+          reverted (cmd-revert-buffer edited nil))
+      (assert= (buffer-text (cur reverted)) "disk\n")))
+  (test "M-t transposes the words around point"
+    ;; point between "foo" and "bar" → "bar foo"
+    (let (m (cm "foo bar" 3))
+      (assert= (buffer-text (cur (ed-update m :alt-t 80 24))) "bar foo")))
+  (test "C-x C-t transposes the current line with the previous"
+    ;; on line 1 (\"bbb\"), swap with line 0 (\"aaa\") → "bbb\naaa"
+    (let (m (cm "aaa\nbbb" 4))
+      (assert= (buffer-text (cur (press m [:ctrl-x :ctrl-t]))) "bbb\naaa"))))
+
+(describe "editor occur (M-s o)"
+  (test "occur lists matching lines with 1-based source line numbers"
+    (let (b (make-buffer "foo\nbar\nfoobar\nbaz")
+          ms (commands/ed--occur-matches b "foo")
+          txt (commands/ed-occur-text ms "foo"))
+      (assert= (map first ms) (list 0 2))     ; 0-based lines 0 and 2 match
+      (is (string-contains? txt "1: foo"))
+      (is (string-contains? txt "3: foobar"))))
+  (test "ed--leading-int parses a result row's source line"
+    (assert= (commands/ed--leading-int "12: some text") 12)
+    (assert= (commands/ed--leading-int "header line") nil))
+  (test "M-s o builds an *Occur* buffer; RET jumps to the source line"
+    (let (m (m-of "alpha\nbeta\ngamma\nbeta two")
+          op (cmd-occur m nil)
+          shown (ed-update
+                  (assoc op :minibuffer
+                    (assoc (get op :minibuffer) :edit
+                      (ed-mb-set-text (get (get op :minibuffer) :edit) "gamma")))
+                  :enter 80 24))
+      (assert= (buffer-name (cur shown)) "*Occur*")
+      ;; put point on the "3: gamma" row, then RET jumps back to the source at line 3
+      (let (pos (string-index-of (buffer-text (cur shown)) "3: gamma" 0)
+            on-row (ed-set-buf shown (goto-char (cur shown) pos))
+            jumped (cmd-occur-jump on-row nil))
+        (assert= (buffer-name (cur jumped)) "*scratch*")
+        (assert= (buffer-current-line (cur jumped)) 2)))))   ; line 3 → 0-based index 2
+
+(describe "editor keyboard macros (C-x ( / ) / e)"
+  (test "record a macro and execute it replays the keys"
+    ;; C-x ( type "ab" C-x ) then C-x e → "ab" typed twice = "abab"
+    (let (m (press (m-of "") [:ctrl-x "(" "a" "b" :ctrl-x ")" :ctrl-x "e"]))
+      (assert= (buffer-text (cur m)) "abab")))
+  (test "the macro body excludes the C-x ) that ended it"
+    (let (m (press (m-of "") [:ctrl-x "(" "x" :ctrl-x ")"]))
+      (assert= (get m :macro-last) (list "x"))))
+  (test "C-x e with no macro reports it"
+    (is (string-contains? (get (press (m-of "") [:ctrl-x "e"]) :echo) "no keyboard macro"))))
+
+(describe "editor fill-paragraph"
+  (test "ed-fill-text wraps greedily to the width"
+    (assert= (commands/ed-fill-text "a b c d" 3) "a b\nc d"))
+  (test "M-q wraps a long paragraph, keeping every word"
+    (let (long "one two three four five six seven eight nine ten eleven twelve thirteen fourteen"
+          txt (buffer-text (cur (ed-update (cm long 0) :alt-q 80 24))))
+      (is (every? (fn (ln) (<= (string-length ln) *fill-column*)) (string-split txt "\n")))
+      (assert= (replace txt "\n" " ") long)   ; same words, only the line breaks changed
+      (is (string-contains? txt "\n")))))      ; it actually wrapped (>1 line)
+
+(describe "editor zap-to-char / registers"
+  (test "M-z kills up to and including the next occurrence of a char"
+    ;; "hello world", point 0, zap to 'o' → kills "hello", leaving " world"
+    (assert= (buffer-text (cur (press (m-of "hello world") [(keyword "alt-z") "o"]))) " world"))
+  (test "M-z reports when the char isn't found"
+    (let (m (press (m-of "abc") [(keyword "alt-z") "z"]))
+      (assert= (buffer-text (cur m)) "abc")
+      (is (string-contains? (get m :echo) "not found"))))
+  (test "point-to-register (C-x r SPC) then jump (C-x r j) returns to the saved point"
+    (let (m (press (cm "abcdef" 3) [:ctrl-x "r" " " "a" :ctrl-a :ctrl-x "r" "j" "a"]))
+      (assert= (buffer-point (cur m)) 3)))
+  (test "copy-to-register (C-x r s) then insert (C-x r i) yanks the saved text"
+    ;; select "abc" → save to register t → go to end → insert → "abcdefabc"
+    (let (m (press (m-of "abcdef")
+              [(keyword "ctrl- ") :right :right :right :ctrl-x "r" "s" "t"
+               :end :ctrl-x "r" "i" "t"]))
+      (assert= (buffer-text (cur m)) "abcdefabc"))))
+
+(describe "editor goto-line / recentf"
+  (test "M-g g jumps to a line number"
+    (let (m (cmd-goto-line (cm "a\nb\nc\nd" 0) nil)
+          done (ed-update
+                 (assoc m :minibuffer
+                   (assoc (get m :minibuffer) :edit
+                     (ed-mb-set-text (get (get m :minibuffer) :edit) "3")))
+                 :enter 80 24))
+      (assert= (buffer-current-line (cur done)) 2)))   ; line 3 → 0-based index 2
+  (test "recentf prompt lists the given files and opens the chosen one"
+    (let (prompt (commands/ed--recentf-prompt (m-of "x") ["/a/one.txt" "/b/two.txt"]))
+      (is (not (nil? (get prompt :minibuffer))))
+      (is (string-contains? (ed-mb-candidates (get prompt :minibuffer)) "one.txt"))))
+  (test "recentf with no files reports it"
+    (is (string-contains? (get (commands/ed--recentf-prompt (m-of "x") []) :echo) "no recent"))))
+
+(describe "editor which-key / describe-key"
+  (test "which-key stays hidden until the idle delay, then reveals the continuations"
+    ;; C-x alone: pending but not revealed → no panel (a fast chord never flashes it)
+    (assert= (ed-which-key-ops (press (m-of "x") [:ctrl-x]) 80 24) [])
+    ;; the delay tick, fired while still pending, reveals it
+    (let (m (press (m-of "x") [:ctrl-x :tick])
+          ops (ed-which-key-ops m 80 24)
+          txt (join "\n" (map (fn (op) (nth op 3 "")) (filter (fn (op) (= (first op) :text)) ops))))
+      (is (get m :which-key))
+      (is (> (count ops) 0))
+      (is (string-contains? txt "find-file"))))   ; C-x C-f → "find-file" row
+  (test "completing the chord clears the which-key reveal"
+    (is (nil? (get (press (m-of "x") [:ctrl-x :tick :ctrl-f]) :which-key))))
+  (test "which-key is empty with no pending prefix"
+    (assert= (ed-which-key-ops (m-of "x") 80 24) []))
+  (test "C-h k describes the next key's command and docstring"
+    (let (m (press (m-of "x") [:ctrl-h "k" :ctrl-e]))
+      (is (string-contains? (get m :echo) "end-of-line"))
+      (is (nil? (get m :describe-key)))))          ; describe mode cleared after reporting
+  (test "C-h k describes a chord (C-x C-s)"
+    (is (string-contains? (get (press (m-of "x") [:ctrl-h "k" :ctrl-x :ctrl-s]) :echo) "save")))
+  (test "C-h k on an unbound key says so"
+    (is (string-contains? (get (press (m-of "x") [:ctrl-h "k" :f12]) :echo) "undefined")))
+  (test "C-h f describes a command by name from the registry"
+    (let (m (cmd-describe-function (m-of "x") nil)
+          done (ed-update
+                 (assoc m :minibuffer
+                   (assoc (get m :minibuffer) :edit
+                     (ed-mb-set-text (get (get m :minibuffer) :edit) "save")))
+                 :enter 80 24))
+      (is (string-contains? (get done :echo) "save"))
+      (is (string-contains? (get done :echo) "file")))))   ; cmd-save's docstring mentions the file
+
+(describe "editor line/word editing"
+  (test "M-o opens a line below and moves there"
+    (let (m (ed-update (m-of "abc") :alt-o 80 24))
+      (assert= (buffer-text (cur m)) "abc\n")
+      (assert= (buffer-current-line (cur m)) 1)))
+  (test "M-O opens a line above and moves there"
+    (let (m (ed-update (m-of "abc") (keyword "alt-O") 80 24))
+      (assert= (buffer-text (cur m)) "\nabc")
+      (assert= (buffer-current-line (cur m)) 0)))
+  (test "C-o opens a line, keeping point"
+    (let (m (ed-update (m-of "abc") :ctrl-o 80 24))
+      (assert= (buffer-text (cur m)) "\nabc")
+      (assert= (buffer-point (cur m)) 0)))
+  (test "C-k kills to end of line (onto the kill ring)"
+    (let (m (ed-update (m-of "abc\ndef") :ctrl-k 80 24))
+      (assert= (buffer-text (cur m)) "\ndef")
+      (assert= (first (get m :kill-ring)) "abc")))
+  (test "C-k at end of line kills the newline"
+    (let (m (ed-update (ed-set-buf (m-of "ab\ncd") (end-of-line (cur (m-of "ab\ncd"))))
+              :ctrl-k
+              80
+              24))
+      (assert= (buffer-text (cur m)) "abcd")))
+  (test "M-d kills the word after point"
+    (let (m (ed-update (m-of "foo bar") :alt-d 80 24))
+      (assert= (buffer-text (cur m)) " bar")
+      (assert= (first (get m :kill-ring)) "foo")))
+  (test "M-DEL kills the word before point"
+    (assert= (buffer-text (cur (press (m-of "foo bar") [:end (keyword "alt-backspace")]))) "foo "))
+  (test "C-t transposes the two characters around point"
+    (let (m (ed-update (ed-set-buf (m-of "ab") (forward-char (make-buffer "ab"))) :ctrl-t 80 24))
+      (assert= (buffer-text (cur m)) "ba")))
+  (test "M-u / M-l / M-c change word case"
+    (assert= (buffer-text (cur (ed-update (m-of "foo bar") :alt-u 80 24))) "FOO bar")
+    (assert= (buffer-text (cur (ed-update (m-of "FOO") :alt-l 80 24))) "foo")
+    (assert= (buffer-text (cur (ed-update (m-of "foo") :alt-c 80 24))) "Foo"))
+  (test "C-x d duplicates the current line"
+    (assert= (buffer-text (cur (press (m-of "abc") [:ctrl-x "d"]))) "abc\nabc"))
+  (test "M-^ joins the next line onto this one"
+    (assert= (buffer-text (cur (ed-update (m-of "abc\ndef") (keyword "alt-^") 80 24))) "abcdef")))
+
+;; ---- Emacs kill-ring semantics: coalescing + M-y yank-pop -------------------
+(describe "editor kill ring (Emacs semantics)"
+  (test "consecutive C-k coalesce into one kill-ring entry"
+    (let (m (press (m-of "abc\ndef") [:ctrl-k :ctrl-k]))
+      ; kill "abc", then the "\n"
+      (assert= (buffer-text (cur m)) "def")
+      (assert= (first (get m :kill-ring)) "abc\n")  ; appended, not two entries
+      (assert= (count (get m :kill-ring)) 1)))
+  (test "a non-kill between kills starts a new entry"
+    (let (m (press (m-of "abc\ndef") [:ctrl-k :right :ctrl-k]))
+      ; kill, move, kill
+      (assert= (count (get m :kill-ring)) 2)))
+  (test "M-DEL (backward kill) coalesces by prepending"
+    (let (m (press (ed-set-buf (m-of "foo bar") (end-of-buffer (cur (m-of "foo bar"))))
+              [(keyword "alt-backspace") (keyword "alt-backspace")]))
+      ; kill "bar", then "foo "
+      (assert= (first (get m :kill-ring)) "foo bar")
+      (assert= (buffer-text (cur m)) "")))
+  (test "C-y yanks the newest; M-y pops to the next-older kill"
+    (let (m0 (assoc (m-of "") :kill-ring (list "newest" "older"))
+          yanked (ed-update m0 :ctrl-y 80 24)
+          popped (ed-update yanked :alt-y 80 24))
+      (assert= (buffer-text (cur yanked)) "newest")
+      (assert= (buffer-text (cur popped)) "older")))
+  (test "M-y cycles the whole ring and wraps around"
+    (let (m (assoc (m-of "") :kill-ring (list "a" "b" "c"))
+          y0 (ed-update m :ctrl-y 80 24)
+          y1 (ed-update y0 :alt-y 80 24)
+          y2 (ed-update y1 :alt-y 80 24)
+          y3 (ed-update y2 :alt-y 80 24))
+      (assert= (buffer-text (cur y0)) "a")
+      (assert= (buffer-text (cur y1)) "b")
+      (assert= (buffer-text (cur y2)) "c")
+      (assert= (buffer-text (cur y3)) "a")))  ; wrapped
+  (test "M-y only works right after a yank"
+    (let (no-yank (ed-update (assoc (m-of "") :kill-ring (list "x")) :alt-y 80 24)
+           ;; editing between yank and M-y breaks it
+           broke
+           (ed-update (ed-update (assoc (m-of "") :kill-ring (list "a" "b")) :ctrl-y 80 24)
+             "z"
+             80
+             24))
+      (is (string-contains? (get no-yank :echo) "not a yank"))
+      (is (string-contains? (get (ed-update broke :alt-y 80 24) :echo) "not a yank"))))
+  ;; The OS-clipboard sync is gated on `:os-clipboard` (set only by the live editor), so
+  ;; pure model tests never touch the process-global clipboard — proven by the no-op.
+  (test "yank does not consult the OS clipboard without :os-clipboard (deterministic)"
+    (let (m (assoc (m-of "") :kill-ring (list "ring-top")))
+      (assert= (commands/ed--adopt-clipboard m) m)  ; identical model — clipboard untouched
+      ;; and yank still inserts the ring head, not whatever is on the OS clipboard
+      (assert= (buffer-text (cur (ed-update m :ctrl-y 80 24))) "ring-top"))))
+
