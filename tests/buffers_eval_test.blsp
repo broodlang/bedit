@@ -1,0 +1,242 @@
+;; Editor tests (split from the original monolithic main_test.blsp by concern).
+;; Every split file keeps the `main-test` module name, so a helper defined in any
+;; file is visible to every test body at run time (test bodies are lazy thunks the
+;; runner evaluates only after all files load into the shared image). The common
+;; model helpers below are repeated in each file so a standalone `nest check` of a
+;; single file still resolves them.
+(defmodule main-test
+  (:use model)
+  (:use input)
+  (:use view)
+  (:use commands)
+  (:use mincomplete)
+  (:use panes)
+  (:use complete)
+  (:use web)
+  (:use main)
+  (:use proc/supervisor)
+  (:use editor/buffer)
+  (:use test))
+
+(defn m-of (text) (ed-init (make-buffer text)))
+(defn cur (m) (ed-current-buf m))
+(defn after (text k) (buffer-text (cur (ed-update (m-of text) k 80 24))))
+(defn press (m keys) (fold (fn (acc k) (ed-update acc k 80 24)) m keys))
+(defn type-str (m s) (press m (string->list s)))
+
+(describe "editor multiple buffers"
+  (test "a fresh model has the scratch buffer plus *Messages*"
+    (let (m (m-of "hi"))
+      (assert= (buffer-name (cur m)) "*scratch*")
+      (is (not (nil? (ed-buffer-index-by-name m "*Messages*"))))))
+  (test "C-x →/← cycle through buffers (wrapping)"
+    (let (m1 (press (m-of "hi") [:ctrl-x :right]))
+      (assert= (buffer-name (cur m1)) "*Messages*")
+      (assert= (buffer-name (cur (press m1 [:ctrl-x :right]))) "*scratch*")))
+  (test "switching buffers preserves each buffer's point"
+    (let (m (press (m-of "hello") [:right :right])
+           ; point 2 in *scratch*
+           back
+           (press m [:ctrl-x :right :ctrl-x :left]))
+      ; to *Messages* and back
+      (assert= (buffer-point (cur back)) 2)))
+  (test "*Messages* cannot be killed"
+    (let (m (press (m-of "x") [:ctrl-x :right :ctrl-x "k"]))
+      ; on *Messages*, try kill
+      (is (not (nil? (ed-buffer-index-by-name m "*Messages*"))))
+      (is (string-contains? (get m :echo) "cannot kill"))))
+  (test "killing the last editable buffer leaves a fresh *scratch* and selects it"
+    (let (m (press (m-of "x") [:ctrl-x "k"]))
+      ; kill the only editable buffer
+      (is (ed-has-editable? (get m :buffers)))
+      (is (< (ed-current-index m) (count (get m :buffers))))
+      (assert= (buffer-name (cur m)) "*scratch*")  ; lands on the new scratch, not *Messages*
+      (assert= (buffer-text (cur m)) "")))
+  (test "switching buffers clears the stale per-model status"
+    ;; edit (status -> "modified"), then switch; the new buffer isn't modified
+    (let (m (press (m-of "x") ["z" :ctrl-x :right]))
+      (assert= (get m :status) ""))))
+
+(describe "editor minibuffer (switch-buffer & find-file)"
+  (test "C-x b switches to a buffer by name via the minibuffer"
+    (let (m (press (m-of "x") [:ctrl-x "b"]))
+      ; open the minibuffer
+      (is (not (nil? (get m :minibuffer))))
+      (let (done (ed-update (type-str m "*Messages*") :enter 80 24))
+        (is (nil? (get done :minibuffer)))
+        (assert= (buffer-name (cur done)) "*Messages*"))))
+  (test "C-g aborts the minibuffer"
+    (let (m (press (m-of "x") [:ctrl-x "b" :ctrl-g]))
+      (is (nil? (get m :minibuffer)))
+      (assert= (buffer-name (cur m)) "*scratch*")))
+  (test "C-x C-f opens an existing file into a new buffer"
+    (let (path (str (temp-dir "myedit-") ".txt")
+          _ (spit path "from disk\n")
+          m (press (m-of "x") [:ctrl-x :ctrl-f])
+          m2 (assoc m
+               :minibuffer
+               (assoc (get m :minibuffer)
+                 :edit
+                 (ed-mb-set-text (get (get m :minibuffer) :edit) path)))
+          done (ed-update m2 :enter 80 24))
+      (assert= (buffer-text (cur done)) "from disk\n")
+      (assert= (buffer-file (cur done)) path)))
+  (test "C-x C-f on a new path starts an empty file-backed buffer"
+    (let (path (str (temp-dir "myedit-new-") ".txt")
+          m (press (m-of "x") [:ctrl-x :ctrl-f])
+          m2 (assoc m
+               :minibuffer
+               (assoc (get m :minibuffer)
+                 :edit
+                 (ed-mb-set-text (get (get m :minibuffer) :edit) path)))
+          done (ed-update m2 :enter 80 24))
+      (assert= (buffer-text (cur done)) "")
+      (assert= (buffer-file (cur done)) path)))
+  (test "C-x C-f prefills the cwd path (so deleting back traverses up, no ../)"
+    (let (m (press (m-of "x") [:ctrl-x :ctrl-f]))
+      (assert= (mb-text (get m :minibuffer)) (str (cwd) "/"))))
+  (test "find-file shows a candidate's basename as its label, keeping the full-path value"
+    ;; path-label is the :label-fn — the Vertico list shows `src/` / `foo.txt`, not the
+    ;; absolute path, while the candidate value (what accept opens) stays full.
+    (assert= (mincomplete/path-label "/home/u/proj/src/") "src/")
+    (assert= (mincomplete/path-label "/home/u/proj/commands.blsp") "commands.blsp"))
+  (test "find-file resolves a relative path to absolute on open"
+    ;; the suite runs in the repo root, so project.blsp exists relative to (cwd)
+    (let (done (commands/ed-find-file (m-of "x") "project.blsp"))
+      (assert= (buffer-file (cur done)) (path-join (cwd) "project.blsp"))))
+  (test "C-x C-f descends into a directory (re-prompts) instead of opening it as a file"
+    (let (d (temp-dir "myedit-dir-")
+          _ (make-dir d)
+          m (press (m-of "x") [:ctrl-x :ctrl-f])
+          ;; accept the (empty) directory path, which ends in "/" → descend, no file opened
+          m2 (assoc m :minibuffer
+               (assoc (get m :minibuffer) :edit
+                 (ed-mb-set-text (get (get m :minibuffer) :edit) (str d "/"))))
+          descended (ed-update m2 :enter 80 24))
+      (is (not (nil? (get descended :minibuffer))))          ; still prompting (descended)
+      (assert= (buffer-name (cur descended)) "*scratch*"))))  ; nothing opened
+
+(describe "editor open-file naming (project-relative vs basename)"
+  ;; A project file's buffer reads as its project-relative path; a file outside any
+  ;; project is just its basename — consistent whether opened via C-x C-f, project
+  ;; find-file, or the CLI. `:file` always keeps the full path (save / dedup).
+  (test "file-display-name is project-relative inside the project, basename outside"
+    (assert= (projects/file-display-name "/proj/src/view.blsp" "/proj") "src/view.blsp")
+    (assert= (projects/file-display-name "/elsewhere/notes.txt" "/proj") "notes.txt")
+    (assert= (projects/file-display-name "/elsewhere/notes.txt" nil) "notes.txt"))
+  (test "ed-find-file names a project file by its project-relative path"
+    (let (done (ed-find-file (assoc (m-of "x") :project-root "/proj") "/proj/src/x.blsp"))
+      (assert= (buffer-name (cur done)) "src/x.blsp")
+      (assert= (buffer-file (cur done)) "/proj/src/x.blsp")))  ; full path kept for saving
+  (test "ed-find-file names a non-project file by its basename"
+    (let (done (ed-find-file (assoc (m-of "x") :project-root "/proj") "/elsewhere/y.txt"))
+      (assert= (buffer-name (cur done)) "y.txt")))
+  (test "reopening the same file switches to it (dedup by :file, not display name)"
+    (let (m1 (ed-find-file (assoc (m-of "x") :project-root "/proj") "/proj/a.txt")
+          n (count (get m1 :buffers))
+          m2 (ed-find-file m1 "/proj/a.txt"))
+      (assert= (count (get m2 :buffers)) n)               ; no duplicate buffer
+      (assert= (buffer-file (cur m2)) "/proj/a.txt"))))
+
+(describe "editor completion helpers"
+  (test "ed-complete-name returns the sole match"
+    (assert= (ed-complete-name "*M" ["*scratch*" "*Messages*"]) "*Messages*"))
+  (test "ed-complete-name returns the common prefix of several matches"
+    (assert= (ed-complete-name "f" ["foo" "foobar" "fizz"]) "f"))  ; 'foo'/'fizz' share only 'f'
+  (test "ed-complete-path completes a unique filename in a directory"
+    (let (d (temp-dir "myedit-dir-")
+          _ (make-dir d)
+          _ (spit (str d "/unique-file.txt") "x"))
+      (assert= (ed-complete-path (str d "/uni")) (str d "/unique-file.txt"))))
+  ;; the shared Tab core behind find-file *and* project find-file
+  (test "complete-prefix returns the sole candidate whole"
+    (assert= (mincomplete/complete-prefix "sr" ["src/"]) "src/"))
+  (test "complete-prefix returns the common prefix of several candidates"
+    (assert= (mincomplete/complete-prefix "co" ["src/commands.blsp" "src/complete.blsp"])
+      "src/com")                                           ; shared up to 'src/com' ('m' vs 'p' diverge)
+    (assert= (mincomplete/complete-prefix "x" []) "x"))            ; no candidates → unchanged
+  (test "ed-sort-candidates orders by name when nothing is recent"
+    (assert= (mincomplete/ed-sort-candidates ["/d/src/" "/d/aaa.txt" "/d/m.txt"] [])
+      (list "/d/aaa.txt" "/d/m.txt" "/d/src/")))                    ; aaa, m, src by name
+  (test "ed-sort-candidates floats recent files to the top (MRU), then by name"
+    (assert= (mincomplete/ed-sort-candidates
+               ["/d/a.txt" "/d/b.txt" "/d/c.txt" "/d/sub/"]
+               ["/d/c.txt" "/d/a.txt"])                            ; recency: c then a
+      (list "/d/c.txt" "/d/a.txt" "/d/b.txt" "/d/sub/"))))          ; c,a recent; b,sub by name
+
+(describe "editor messages"
+  (test "message sets the one-line echo and appends to *Messages*"
+    (let (m (message (m-of "x") "hi\nthere")
+          msgs (nth (get m :buffers) (ed-buffer-index-by-name m "*Messages*")))
+      (assert= (get m :echo) "hi there")  ; newlines flattened for the echo area
+      (is (string-contains? (buffer-text msgs) "hi"))))
+  (test "message leaves the current buffer's point untouched"
+    (let (m (message (press (m-of "hello") [:right :right]) "note"))
+      (assert= (buffer-point (cur m)) 2)))
+  (test "the *Messages* buffer does not accumulate undo history"
+    (let (m (-> (m-of "x") (message "one") (message "two") (message "three"))
+          msgs (nth (get m :buffers) (ed-buffer-index-by-name m "*Messages*")))
+      (assert= (get msgs :undo) ()))))
+
+;; eval-last-sexp evals the form *before point*, so put point at end of buffer
+;; first (as it naturally is after typing the form) before the C-x C-e chord. Eval
+;; now runs off the loop via `std/task` (so a long form can't freeze the editor): the
+;; command returns an "evaluating…" model and the task delivers `[:task-done <handle>
+;; msg]` (or `[:task-timeout <handle>]`) back. `eval-spawn` is just the C-x C-e
+;; (returns immediately); `eval-result` receives the task's reply and folds it in;
+;; `eval-buf` is the round-trip.
+(defn eval-spawn (text)
+  (press (ed-set-buf (m-of text) (end-of-buffer (cur (m-of text)))) [:ctrl-x :ctrl-e]))
+(defn eval-result (m) (ed-update m (receive (x x)) 80 24))
+(defn eval-buf (text) (eval-result (eval-spawn text)))
+
+(describe "editor eval-last-sexp (C-x C-e)"
+  (test "evaluates the form before point and shows the value"
+    (is (string-contains? (get (eval-buf "(+ 1 2)") :echo) "=> 3")))
+  (test "evaluates a multi-line form, not just the current line"
+    (is (string-contains? (get (eval-buf "(+ 1\n   2\n   3)") :echo) "=> 6")))
+  (test "evaluates the LAST form before point when several precede it"
+    (is (string-contains? (get (eval-buf "(+ 1 1)\n(+ 2 2)") :echo) "=> 4")))
+  (test "captures printed output into the message area (not the console)"
+    (let (m (eval-buf "(println \"foo\")"))
+      (is (string-contains? (get m :echo) "foo"))
+      (is (string-contains? (get m :echo) "=> nil"))))
+  (test "a def persists, so you can define then call across evals"
+    ;; define on one model, then call from another — globals persist in the image
+    (let (_ (eval-buf "(defn myedit-demo-greet () (println \"hi-from-demo\"))"))
+      (is (string-contains? (get (eval-buf "(myedit-demo-greet)") :echo) "hi-from-demo"))))
+  (test "an eval error is reported, not raised"
+    (let (m (eval-buf "(this-is-not-defined)"))
+      (is (not (get m :done)))
+      (is (string-contains? (get m :echo) "error"))))
+  (test "cmd-eval-buffer evaluates the whole buffer"
+    (is (string-contains? (get (eval-result (cmd-eval-buffer (m-of "(+ 4 5)") nil)) :echo) "=> 9")))
+  (test "cmd-eval-region evaluates the region between point and mark"
+    (let (b (-> (make-buffer "(+ 2 3)") set-mark end-of-buffer)
+           ; mark 0, point 7 → region is the whole form
+           m
+           (ed-set-buf (m-of "") b))
+      (is (string-contains? (get (eval-result (cmd-eval-region m nil)) :echo) "=> 5"))))
+  (test "eval runs in a separate process — the command returns immediately (no freeze)"
+    ;; the C-x C-e command must return *without* running the form, so a slow/looping
+    ;; form can't block the ui-run loop; it leaves an 'evaluating…' note and spawns.
+    (let (m (eval-spawn "(+ 1 2)"))
+      (is (string-contains? (get m :echo) "evaluating"))
+      (is (not (get m :done)))
+      (is (not (nil? (get m :eval-proc))))))  ; the eval process is tracked for interrupt
+
+  ;; ---- safeguards: C-g interrupt + optional timeout ----
+  (test "C-g interrupts a running eval — kills its process and clears :eval-proc"
+    ;; eval a form that parks ~100s; C-g must kill it instantly (not wait).
+    (let (running (eval-spawn "(receive (after 100000 nil))")
+          done (cmd-keyboard-quit running nil))
+      (is (string-contains? (get done :echo) "interrupted"))
+      (is (nil? (get done :eval-proc)))))
+  (test "C-g with no eval in flight is a plain quit"
+    (is (string-contains? (get (cmd-keyboard-quit (m-of "x") nil) :echo) "quit")))
+  (test "an optional timeout kills a runaway eval and reports it"
+    ;; arm a 50ms timeout on a form that would otherwise park ~100s; the watchdog
+    ;; fires, kills the eval, and reports the timeout (received via eval-result).
+    (let (m (eval-result (ed-eval-async (m-of "x") "(receive (after 100000 nil))" 50)))
+      (is (string-contains? (get m :echo) "timed out")))))
+

@@ -1,0 +1,634 @@
+;; Editor tests (split from the original monolithic main_test.blsp by concern).
+;; Every split file keeps the `main-test` module name, so a helper defined in any
+;; file is visible to every test body at run time (test bodies are lazy thunks the
+;; runner evaluates only after all files load into the shared image). The common
+;; model helpers below are repeated in each file so a standalone `nest check` of a
+;; single file still resolves them.
+(defmodule main-test
+  (:use model)
+  (:use input)
+  (:use view)
+  (:use commands)
+  (:use mincomplete)
+  (:use panes)
+  (:use complete)
+  (:use web)
+  (:use main)
+  (:use proc/supervisor)
+  (:use editor/buffer)
+  (:use test))
+
+(defn m-of (text) (ed-init (make-buffer text)))
+(defn cur (m) (ed-current-buf m))
+(defn after (text k) (buffer-text (cur (ed-update (m-of text) k 80 24))))
+(defn press (m keys) (fold (fn (acc k) (ed-update acc k 80 24)) m keys))
+(defn type-str (m s) (press m (string->list s)))
+;; A model whose current buffer is a brood-mode (.blsp) buffer of `text`, point at `p`.
+(defn blsp-cm (text p)
+  (let (m (ed-init (make-buffer text "x.blsp" "x.blsp")))
+    (ed-set-buf m (goto-char (ed-current-buf m) p))))
+;; The `[... face]` text ops in render frame `f` whose string satisfies `pred`.
+(defn text-ops-where (f pred)
+  (filter (fn (op) (and (= (first op) :text) (pred (nth op 3 "")))) f))
+
+;; ---- the mode in the mode line ----------------------------------------------
+(defn mode-line-text (m)
+  "The mode-line op's text (the reverse-video bar carrying the buffer name)."
+  (nth (first (filter (fn (op)
+                        (and (= (first op) :text)
+                          (= (nth op 4 nil) {:reverse true})
+                          (string-contains? (nth op 3 "") (buffer-name (cur m)))))
+                (ed-view m 80 24)))
+    3))
+
+
+(describe "editor context menu (right-click Copy / Cut / Paste)"
+  (test "a right-press opens the menu at the pointer; Esc closes it"
+    (let (opened (ed-update (m-of "abc") [:mouse :press :right 3 7 []] 80 24))
+      (is (not (nil? (get opened :menu))))
+      (assert= (get (get opened :menu) :row) 3)
+      (assert= (get (get opened :menu) :col) 7)
+      (assert= (get (get opened :menu) :sel) 0)
+      (assert= (count (get (get opened :menu) :items)) 3)
+      (is (nil? (get (ed-update opened :escape 80 24) :menu)))))
+  (test "arrows move the selection, wrapping"
+    (let (m (assoc (m-of "") :menu {:row 0 :col 0 :sel 0 :items commands/ed-menu-items}))
+      (assert= (get (get (ed-update m :down 80 24) :menu) :sel) 1)
+      (assert= (get (get (ed-update m :up 80 24) :menu) :sel) 2)))  ; wraps to Paste
+  (test "Enter on Copy copies the region to the kill ring and closes the menu"
+    (let (m0 (m-of "hello")
+          m1 (ed-set-buf m0 (goto-char (set-mark (ed-current-buf m0)) 5))  ; region "hello"
+          m (assoc m1 :menu {:row 0 :col 0 :sel 0 :items commands/ed-menu-items})
+          ran (ed-update m :enter 80 24))
+      (is (nil? (get ran :menu)))                      ; menu closed
+      (assert= (first (get ran :kill-ring)) "hello")))  ; Copy ran (same as M-w)
+  (test "a click on an item runs it and closes; a click outside just closes"
+    ;; box top-border at row 2 → item 0 (Copy) is at row 3; a region is set so Copy works
+    (let (m0 (m-of "hello")
+          m1 (ed-set-buf m0 (goto-char (set-mark (ed-current-buf m0)) 5))  ; region "hello"
+          m (assoc m1 :menu {:row 2 :col 4 :sel 0 :items commands/ed-menu-items})
+          on-item (ed-update m [:mouse :press :left 3 5 []] 80 24)      ; row 3 = item 0 (Copy)
+          outside (ed-update m [:mouse :press :left 12 40 []] 80 24))    ; off the box
+      (is (nil? (get on-item :menu)))
+      (assert= (first (get on-item :kill-ring)) "hello")  ; Copy actually ran
+      (is (nil? (get outside :menu)))))
+  (test "the open menu renders its labels as ops"
+    (let (m (assoc (m-of "x") :menu {:row 1 :col 2 :sel 0 :items commands/ed-menu-items})
+          labels (map (fn (op) (nth op 3 "")) (text-ops-where (ed-view m 80 24)
+                       (fn (s) (or (string-contains? s "Copy") (string-contains? s "Paste"))))))
+      (is (> (count labels) 0)))))
+
+(describe "editor known projects (C-x p p)"
+  (test "projects--remember dedups, moves to front, and round-trips through the file"
+    (let (f (str (temp-dir "myedit-proj-") "/projects.blsp"))
+      (projects/projects--remember f "/a")
+      (projects/projects--remember f "/b")
+      (projects/projects--remember f "/a")           ; re-use /a → back to front
+      (assert= (projects/projects--read f) ["/a" "/b"])))
+  (test "projects--read tolerates a missing / unreadable cache"
+    (assert= (projects/projects--read "/tmp/myedit-no-such-zzz/projects.blsp") []))
+  (test "recent--remember dedups, moves to front, and round-trips (recentf)"
+    (let (f (str (temp-dir "myedit-rf-") "/recent.blsp"))
+      (projects/recent--remember f "/x/a")
+      (projects/recent--remember f "/x/b")
+      (projects/recent--remember f "/x/a")           ; re-open /a → back to front
+      (assert= (projects/projects--read f) ["/x/a" "/x/b"])))
+  (test "bookmarks--set dedups by name, moves to front, and round-trips"
+    (let (f (str (temp-dir "myedit-bm-") "/bm.blsp"))
+      (projects/bookmarks--set f "a" "/x" 5)
+      (projects/bookmarks--set f "b" "/y" 9)
+      (projects/bookmarks--set f "a" "/x" 12)         ; same name → replace + front
+      (assert= (count (projects/bookmarks--read f)) 2)
+      (assert= (get (first (projects/bookmarks--read f)) :name) "a")
+      (assert= (get (first (projects/bookmarks--read f)) :pos) 12)))
+  (test "C-x p is a prefix — its keys are captured, not self-inserted"
+    (let (started (press (m-of "") [:ctrl-x "p"]))
+      (is (not (nil? (get started :pending))))                              ; C-x p opens a chord
+      (assert= (buffer-text (cur (press (m-of "") [:ctrl-x "p" "z"]))) "")))  ; a wrong key drops
+  (test "C-x p p is a chord, not self-inserts"
+    (assert= (buffer-text (cur (press (m-of "") [:ctrl-x "p" "p"]))) "")))
+
+;; ---- M-x: run interactive commands by name ----------------------------------
+(describe "editor M-x"
+  (test "defcommand registered the editing commands (interactive)"
+    (is (> (count (interactive/command-names)) 20))
+    (is (some? (fn (n) (= n "kill-line")) (interactive/command-names)))
+    (is (some? (fn (n) (= n "newline")) (interactive/command-names))))
+  (test "M-x runs a command by name"
+    (let (m (press (m-of "ab") [:alt-x])
+          done (ed-update (type-str m "open-line-below") :enter 80 24))
+      (assert= (buffer-text (cur done)) "ab\n")))  ; open-line-below ran
+  (test "M-x on an unknown name reports it (no crash)"
+    (let (done (ed-update (type-str (press (m-of "x") [:alt-x]) "no-such-command") :enter 80 24))
+      (is (not (get done :done)))
+      (is (string-contains? (get done :echo) "no command"))))
+  (test "M-x completion narrows the candidate list"
+    (let (cands (ed-mb-candidates (get (type-str (press (m-of "x") [:alt-x]) "kill-") :minibuffer)))
+      (is (string-contains? cands "kill-line"))
+      (is (not (string-contains? cands "forward-char"))))))
+
+;; ---- Vertico-style minibuffer: fuzzy vertical list + selection + accept ------
+(describe "editor minibuffer completion (Vertico-style)"
+  (test "M-x is a selection prompt with fuzzy candidates"
+    (let (mb (get (type-str (press (m-of "x") [:alt-x]) "buffer") :minibuffer))
+      (is (get mb :accept-selection))
+      (is (> (count (mb-candidates mb)) 1))))         ; several *-buffer commands match "buffer"
+  (test "C-n moves the candidate selection"
+    (let (typed (type-str (press (m-of "x") [:alt-x]) "buffer"))
+      (assert= (mb-sel (get (ed-update typed :ctrl-n 80 24) :minibuffer)) 1)))
+  (test "fuzzy matches a non-prefix subsequence (sb → switch-buffer)"
+    (let (cands (mb-candidates (get (type-str (press (m-of "x") [:alt-x]) "sb") :minibuffer)))
+      (is (some? (fn (c) (= c "switch-buffer")) cands))))
+  (test "Enter runs the selected (top fuzzy) command"
+    (let (done (press (m-of "x") (cons :alt-x (append (string->list "list-proc") [:enter]))))
+      (is (string-contains? (buffer-name (cur done)) "*Process List*"))))  ; list-processes ran
+  (test "C-x b accepts the selected buffer (fuzzy)"
+    (let (done (press (m-of "hi") (append [:ctrl-x "b"] (append (string->list "Messa") [:enter]))))
+      (is (string-contains? (buffer-name (cur done)) "*Messages*"))))
+  (test "a Vertico prompt renders its candidates as a vertical list"
+    (let (ops (ed-mb-candidates-ops (press (m-of "x") [:alt-x]) 80 24))
+      (is (> (count ops) 0))
+      (is (= (first (first ops)) :text))))
+  (test "completion--cell keeps a long item's tail behind an ellipsis"
+    (let (cell (completion/completion--cell "/very/long/path/to/file.txt" 12))
+      (is (string-contains? cell "file.txt"))   ; the filename survives the shortening
+      (is (string-contains? cell "…"))))          ; ...with a leading ellipsis
+  (test "holding ↓/↑ repeats only in a Vertico candidate list, not while typing"
+    (let (mbm (assoc (m-of "x") :minibuffer {:accept-selection true}))
+      (is (input/ed--minibuffer-nav? mbm :down))
+      (is (input/ed--minibuffer-nav? mbm :ctrl-p))
+      (is (not (input/ed--minibuffer-nav? mbm "a")))            ; a typed char does not repeat
+      (is (not (input/ed--minibuffer-nav? (m-of "x") :down))))))  ; no minibuffer → no repeat
+
+(describe "editor fuzzy line search (M-s)"
+  (test "M-s opens a Vertico minibuffer of the buffer's non-blank lines"
+    (let (m (cmd-fuzzy-find-line (m-of "foo\n\nbar baz") nil)
+          mb (get m :minibuffer)
+          cands ((get mb :candidates-fn) ""))
+      (is (get mb :accept-selection))
+      (is (includes? cands "1: foo"))
+      (is (includes? cands "3: bar baz"))      ; line 2 is blank → skipped
+      (is (not (includes? cands "2: ")))))
+  (test "accepting a candidate jumps point to that line"
+    (let (jumped (ed-goto-line-cand (m-of "aaa\nbbb\nccc") "3: ccc"))
+      (assert= (buffer-current-line (cur jumped)) 2)))
+  (test "a bare number jumps to that line; a non-numeric candidate leaves point"
+    (let (m (m-of "l0\nl1\nl2\nl3"))
+      (assert= (buffer-current-line (cur (ed-goto-line-cand m "3"))) 2)
+      (assert= (buffer-point (cur (ed-goto-line-cand m "nope"))) (buffer-point (cur m)))))
+  (test "M-s s end-to-end: type to narrow, Enter jumps to the matched line"
+    ;; M-s is now the search prefix; M-s s is the fuzzy line search
+    (let (done (press (m-of "alpha\nbeta\ngamma") (append [:alt-s "s"] (append (string->list "gam") [:enter]))))
+      (assert= (buffer-current-line (cur done)) 2))))  ; jumped to "gamma"
+
+;; ---- system layers (global) are active but hidden from the mode line --------
+(describe "editor system layers"
+  (test "the global layer is active (its keys work) but not shown as the mode"
+    (let (m (m-of "x"))
+      (is (some? (fn (l) (= (get l :name) 'global)) (editor/layers/active-layers (cur m))))
+      (assert= (ed-buf-mode-name (cur m)) "text")))  ; global is :system → hidden; text shows
+  (test "global bindings still dispatch (e.g. C-k) on a plain buffer"
+    (assert= (buffer-text (cur (ed-update (m-of "abc") :ctrl-k 80 24))) "")))  ; kill-line via global
+
+;; ---- panes (splits / other-pane / delete) -------------------------------
+(describe "editor panes"
+  (test "C-x 2 / C-x 3 split into two panes"
+    (assert= (editor/pane/pane-count (get (press (m-of "x") [:ctrl-x "2"]) :layout)) 2)
+    (assert= (editor/pane/pane-count (get (press (m-of "x") [:ctrl-x "3"]) :layout)) 2))
+  (test "C-x 1 collapses back to one pane"
+    (assert= (editor/pane/pane-count (get (press (m-of "x") [:ctrl-x "2" :ctrl-x "1"]) :layout)) 1))
+  (test "C-x 0 deletes the selected pane"
+    (assert= (editor/pane/pane-count (get (press (m-of "x") [:ctrl-x "2" :ctrl-x "0"]) :layout)) 1))
+  (test "C-x o moves selection to the other pane"
+    (let (split (press (m-of "x") [:ctrl-x "2"])
+          moved (press split [:ctrl-x "o"]))
+      (is (not (= (editor/pane/pane-selected-path (get moved :layout))
+                 (editor/pane/pane-selected-path (get split :layout)))))))
+  (test "M-x runs a pane command by name (split-pane-right)"
+    (let (done (ed-update (type-str (press (m-of "x") [:alt-x]) "split-pane-right") :enter 80 24))
+      (assert= (editor/pane/pane-count (get done :layout)) 2))))
+
+;; ---- panes: mouse (click-select + divider drag-resize, over :drag events) --
+;; On an 80x24 frame the body is [0 0 80 23]; C-x 3 makes left [0 0 40 23] | a
+;; divider at col 40 | right [41 0 39 23], the left pane selected.
+(describe "editor panes — mouse"
+  (defn pane-w0 (m) (nth (get (first (get (ed-body-layout m 80 24) :panes)) :rect) 2))
+  (test "a click in the other pane selects it"
+    (let (split (press (m-of "x") [:ctrl-x "3"])
+          clicked (ed-update split [:mouse :press :left 5 60] 80 24))
+      (is (not (= (editor/pane/pane-selected-path (get split :layout))
+                 (editor/pane/pane-selected-path (get clicked :layout)))))))
+  (test "press on a divider starts a drag; release ends it"
+    (let (split (press (m-of "x") [:ctrl-x "3"])
+          pressed (ed-update split [:mouse :press :left 5 40] 80 24)
+          released (ed-update pressed [:mouse :release :left 5 40] 80 24))
+      (is (not (nil? (get pressed :dragging))))
+      (is (nil? (get released :dragging)))))
+  (test "dragging a divider moves the boundary to the pointer"
+    (let (split (press (m-of "x") [:ctrl-x "3"])
+          dragged (ed-update (ed-update split [:mouse :press :left 5 40] 80 24)
+                    [:mouse :drag :left 5 20]
+                    80
+                    24))
+      (assert= (pane-w0 dragged) 20)))
+  (defn pane-scale-at (m sel?)
+    ;; the :scale of the (non-)selected pane in `m`'s layout
+    (let (p (first (filter (fn (p) (= sel? (= true (get p :selected))))
+                     (get (ed-body-layout m 80 24) :panes))))
+      (max 1 (or (get (get p :payload) :scale) 1))))
+  (defn pane-top-at (m sel?)
+    (let (p (first (filter (fn (p) (= sel? (= true (get p :selected))))
+                     (get (ed-body-layout m 80 24) :panes))))
+      (or (get (get p :payload) :top) 0)))
+
+  (test "Ctrl+wheel zooms the pane UNDER THE POINTER, not the active pane"
+    (let (base (m-of "x"))
+      ;; a lone pane (which is the hovered one): zoom up, then clamp at 1
+      (assert= (pane-scale-at (ed-update base [:mouse :scroll-up nil 5 5 [:ctrl]] 80 24) true) 2)
+      (assert= (pane-scale-at (ed-update base [:mouse :scroll-down nil 5 5 [:ctrl]] 80 24) true) 1)
+      ;; split (left selected, right at col 60): hovering the RIGHT pane zooms IT,
+      ;; while the active (left) pane stays at scale 1.
+      (let (split (press (m-of "x") [:ctrl-x "3"])
+            zoomed (ed-update split [:mouse :scroll-up nil 5 60 [:ctrl]] 80 24))
+        (assert= (pane-scale-at zoomed true) 1)  ; active pane untouched
+        (assert= (pane-scale-at zoomed false) 2))))  ; hovered pane zoomed
+  (test "a plain wheel scrolls the hovered pane's viewport (:top), leaving point + zoom"
+    (let (text (apply str (map (fn (i) (str "L" i "\n")) (range 30)))
+          down (ed-update (m-of text) [:mouse :scroll-down nil 5 5 []] 80 24))
+      (assert= (ed-current-top down) 3)  ; *wheel-lines* = 3 — the viewport moved
+      (assert= (buffer-current-line (cur down)) 0)  ; ...but point did not
+      (assert= (pane-scale-at down true) 1)  ; plain wheel doesn't zoom
+      ;; scrolling up from the top clamps at 0
+      (assert= (ed-current-top (ed-update (m-of text) [:mouse :scroll-up nil 5 5 []] 80 24)) 0)))
+  (test "a plain wheel scrolls the pane under the pointer, not the active pane"
+    (let (text (apply str (map (fn (i) (str "L" i "\n")) (range 30)))
+          split (press (m-of text) [:ctrl-x "3"])
+          scrolled (ed-update split [:mouse :scroll-down nil 5 60 []] 80 24))
+      ; hover RIGHT
+      (assert= (pane-top-at scrolled true) 0)  ; active (left) pane not scrolled
+      (assert= (pane-top-at scrolled false) 3)))  ; hovered (right) pane scrolled
+  (test "a left-click in the buffer body moves point to the clicked cell"
+    ;; 5 short lines → a 2-col line-number gutter (1 digit + space); clicking row 2,
+    ;; col 5 lands on line 2 ("cccc"), text column 3 (col 5 − gutter 2).
+    (let (text "aaaa\nbbbb\ncccc\ndddd\neeee"
+          buf (cur (ed-update (m-of text) [:mouse :press :left 2 5] 80 24)))
+      (assert= (buffer-current-line buf) 2)
+      (assert= (buffer-column buf) 3)))
+  (test "a click past a short line's end clamps point to the line end (not the next line)"
+    (let (text "ab\ncdef"
+          buf (cur (ed-update (m-of text) [:mouse :press :left 0 70] 80 24)))
+      (assert= (buffer-current-line buf) 0)
+      (assert= (buffer-column buf) 2)))  ; "ab" is 2 long
+  (test "clicking the scrollbar scrolls that pane and arms a drag; release clears it"
+    ;; 100 lines in a 22-row text area → a scrollbar at col 79; a click positions :top
+    ;; proportionally (and leaves point alone — it bypasses the point-clamp).
+    (let (text (apply str (map (fn (i) (str "L" i "\n")) (range 100)))
+          clicked (ed-update (m-of text) [:mouse :press :left 11 79] 80 24)
+          dragged (ed-update clicked [:mouse :drag :left 21 79] 80 24)
+          released (ed-update dragged [:mouse :release :left 21 79] 80 24))
+      (is (> (ed-current-top clicked) 0))            ; the click scrolled down
+      (assert= (buffer-current-line (cur clicked)) 0) ; ...but point did not move
+      (is (not (nil? (get clicked :sb-drag))))        ; a drag is armed
+      (is (> (ed-current-top dragged) (ed-current-top clicked)))  ; dragging keeps scrolling
+      (is (nil? (get released :sb-drag)))             ; release ends the drag
+      (assert= (ed-current-top released) (ed-current-top dragged))))  ; without snapping back
+  (test "no scrollbar to grab when the buffer fits — the click selects/moves point instead"
+    ;; 3 lines fit the 22-row text area, so col 79 row 1 is NOT a scrollbar hit; it's a
+    ;; plain body click (point to line 1), and no drag is armed.
+    (let (clicked (ed-update (m-of "aa\nbb\ncc") [:mouse :press :left 1 79] 80 24))
+      (is (nil? (get clicked :sb-drag)))
+      (assert= (buffer-current-line (cur clicked)) 1)))
+  (test "press → drag selects a region (mark at the press anchor, point follows)"
+    ;; 5 lines → 2-col gutter; press at row 0 col 2 = line 0 col 0 (offset 0); drag to
+    ;; row 2 col 5 = line 2 col 3 (offset 13).
+    (let (text "aaaa\nbbbb\ncccc\ndddd\neeee"
+          pressed (ed-update (m-of text) [:mouse :press :left 0 2] 80 24)
+          dragged (ed-update pressed [:mouse :drag :left 2 5] 80 24)
+          released (ed-update dragged [:mouse :release :left 2 5] 80 24))
+      (assert= (buffer-point (cur pressed)) 0)          ; press moved point to the click
+      (is (nil? (buffer-mark (cur pressed))))            ; ...but no region yet
+      (is (not (nil? (get pressed :text-drag))))         ; a text-selection drag is armed
+      (assert= (buffer-mark (cur dragged)) 0)            ; drag sets the mark at the anchor
+      (assert= (buffer-point (cur dragged)) 13)          ; ...and point follows the pointer
+      (is (nil? (get released :text-drag)))              ; release ends the drag
+      (assert= (buffer-mark (cur released)) 0)           ; selection persists after release
+      (assert= (buffer-point (cur released)) 13)))
+  (test "a plain click (no drag) clears any prior mark and leaves no region"
+    (let (text "aaaa\nbbbb\ncccc"
+          m0 (m-of text)
+          m1 (ed-set-buf m0 (set-mark (ed-current-buf m0)))  ; a stale mark at 0
+          clicked (ed-update m1 [:mouse :press :left 1 4] 80 24)
+          released (ed-update clicked [:mouse :release :left 1 4] 80 24))
+      (is (nil? (buffer-mark (cur clicked))))            ; the click cleared the old mark
+      (assert= (buffer-point (cur clicked)) 7)           ; line 1 col 2
+      (is (nil? (buffer-mark (cur released))))))         ; ...and no drag set a new one
+  (test "C-x l toggles the per-pane line-number gutter (default on for text-mode)"
+    ;; text-mode carries the :gutter-* service, so the gutter is shown by default; C-x l
+    ;; flips the *effective* state — first press hides it, the second shows it again.
+    (let (off (press (m-of "a\nb\nc") [:ctrl-x "l"]))
+      (assert= (get (ed-current-pane off) :line-numbers) false)  ; hidden
+      (is (not (= false (get (ed-current-pane (press off [:ctrl-x "l"])) :line-numbers))))  ; shown again
+      ;; in a split, the override is pane-local — only the selected pane is touched
+      (let (split (press (m-of "a\nb\nc") [:ctrl-x "3"])
+            ln-off (press split [:ctrl-x "l"])
+            other (first (filter (fn (p) (not (get p :selected)))
+                           (get (ed-body-layout ln-off 80 24) :panes))))
+        (assert= (get (ed-current-pane ln-off) :line-numbers) false)
+        (is (nil? (get (get other :payload) :line-numbers))))))  ; untouched → still default-on
+  (test "ed-gutter-width = digit-count + 1 when shown, 0 when hidden"
+    ;; a pooled buffer carries the text-mode layer, so the :gutter-width service resolves
+    (let (buf (ed-current-buf (m-of "a\nb\nc")))
+      (assert= (ed-gutter-width buf true) 2)    ; 3 lines → 1 digit + 1 space
+      (assert= (ed-gutter-width buf false) 0)))
+  (test "with the gutter shown (default), the view draws right-aligned line numbers at col 0"
+    (let (ops (ed-view (m-of "a\nb\nc") 80 24)
+          ;; the gutter cell for the top line: a text op at row 0, col 0
+          gut (first (filter (fn (op) (and (= (first op) :text) (= (nth op 1) 0) (= (nth op 2) 0)))
+                       ops)))
+      (is (not (nil? gut)))
+      (is (string-contains? (nth gut 3) "1"))))  ; line 1's number
+  (test "the view emits a resize cursor-zone over each divider (GUI hover/drag affordance)"
+    ;; C-x 3 → a :col-resize zone; C-x 2 → a :row-resize zone. (The terminal ignores
+    ;; the op; the GUI shows the resize cursor over it — ADR-080.)
+    (let (zone-shape (fn (keys)
+                       (let (z (first (filter (fn (op) (= (first op) :cursor-zone))
+                                        (ed-view (press (m-of "x") keys) 80 24))))
+                         (and z (last z)))))
+      (assert= (zone-shape [:ctrl-x "3"]) :col-resize)
+      (assert= (zone-shape [:ctrl-x "2"]) :row-resize)
+      (is (nil? (zone-shape []))))))  ; a lone pane has no divider, so no zone
+
+;; ---- projects: find-file-in-project (C-x p f) -------------------------------
+;; The suite runs *in* the myedit project, so (cwd) is the real repo root — these
+;; assertions hold against the actual tree.
+(describe "editor projects (find-file-in-project)"
+  (test "project-root finds the repo root; project-files lists it recursively"
+    (let (root (projects/project-root (cwd)))
+      (is (not (nil? root)))
+      (is (includes? (projects/project-files root) "src/model.blsp"))
+      (is (includes? (projects/project-files root) "tests/editing_test.blsp"))
+      ;; the walk skips .git, so no path is under it
+      (is (empty? (filter (fn (f) (string-contains? f ".git/")) (projects/project-files root))))))
+  (test "project-root returns nil above any project"
+    (is (nil? (projects/project-root "/"))))
+  (test "a .git root (no project.blsp) is recognized; the nearest marker wins"
+    (let (d (temp-dir "myedit-git-")
+           _
+           (make-dir (str d "/.git"))  ; mkdir -p creates d + d/.git
+           _
+           (make-dir (str d "/sub")))
+      (assert= (projects/project-root (str d "/sub")) d)))
+  (test "project-matches narrows by relative-path prefix"
+    (assert= (projects/project-matches "src/mo" (list "src/model.blsp" "src/modes.blsp" "README"))
+      (list "src/model.blsp" "src/modes.blsp")))
+  (test "C-x p f opens a file chosen by its project-relative name"
+    (let (opened (press (m-of "") [:ctrl-x "p" "f"]))
+      (is (not (nil? (get opened :minibuffer))))  ; the chord opened the minibuffer
+      (let (done (press (type-str opened "src/model.blsp") [:enter]))
+        (is (nil? (get done :minibuffer)))
+        (is (string-contains? (buffer-name (cur done)) "src/model.blsp"))
+        (is (string-contains? (buffer-text (cur done)) "defmodule model")))))
+  (test "C-x p f reports the typed fragment when nothing matches"
+    (let (opened (press (m-of "") [:ctrl-x "p" "f"])
+          done (press (type-str opened "no/such/file.zzz") [:enter]))
+      (is (string-contains? (get done :echo) "no project file matching"))))
+  (test "the mode line shows the project name when :project-root is set"
+    (is (string-contains? (mode-line-text (assoc (m-of "x") :project-root "/home/u/src/myedit"))
+          "[myedit]"))))
+
+;; ---- crash resilience: a thrown error must never take down the editor --------
+;; ui-run restores the screen and RE-RAISES a view/update throw, so myedit guards
+;; both `ed-update` (commands) and `ed-view` (rendering): the error surfaces in the
+;; echo area / a safe frame, and the loop keeps running.
+(describe "editor crash resilience"
+  (test "a command that throws is caught — the editor survives with the error echoed"
+    ;; register a throwing interactive command, run it via M-x, and confirm the model
+    ;; comes back (not raised), not quit, with the message in the echo area.
+    (interactive/register-command 'cmd-test-boom (fn (m key) (throw "kaboom")))
+    (let (opened (press (m-of "x") [:alt-x])
+          done (press (type-str opened "test-boom") [:enter]))
+      (is (not (get done :done)))  ; the editor did NOT quit
+      (is (string-contains? (get done :echo) "kaboom"))))  ; the error surfaced
+  (test "a render error yields a safe frame instead of crashing the window"
+    ;; an empty model has no :layout, so ed-body-layout throws inside ed-view; the
+    ;; guard must return a frame carrying the error, not propagate it. The guard also
+    ;; logs to `*err*` (useful in a live session); redirect it to a sink here so this
+    ;; deliberately-triggered error stays out of the test output.
+    (let (f (binding (*err* (fn (s) nil)) (ed-view {} 80 24)))
+      (is (> (count (filter (fn (op)
+                              (and (= (first op) :text)
+                                (string-contains? (nth op 3 "") "render error")))
+                      f))
+            0)))))
+
+;; ---- Section A additions ----------------------------------------------------
+;; Place point at offset `p` in a fresh model over `text` (the common test setup).
+(defn at (text p) (ed-set-buf (m-of text) (goto-char (make-buffer text) p)))
+
+(describe "editor kill-whole-line (C-S-backspace)"
+  (test "C-S-backspace kills the whole current line, newline included"
+    (let (m (ed-update (at "abc\ndef\nghi" 5) (keyword "ctrl-shift-backspace") 80 24))
+      (assert= (buffer-text (cur m)) "abc\nghi")
+      (assert= (first (get m :kill-ring)) "def\n"))))
+
+(describe "editor find-file live candidates"
+  ;; A fixture directory with two files + a subdir; candidates narrow as the
+  ;; fragment grows (mirrors how `ed-mb-candidates` renders C-x C-f live).
+  (test "ed-path-candidates lists a directory's entries and narrows by fragment"
+    (let (d (temp-dir "myedit-ff-")
+          _ (make-dir d)
+          _ (spit (str d "/alpha.txt") "a")
+          _ (spit (str d "/beta.txt") "b")
+          all (ed-path-candidates (str d "/"))
+          narrowed (ed-path-candidates (str d "/al")))
+      ;; candidates are full paths (the typed prefix + the entry), so accepting one opens it
+      (is (includes? all (str d "/alpha.txt")))
+      (is (includes? all (str d "/beta.txt")))
+      (assert= narrowed (list (str d "/alpha.txt")))))
+  (test "ed-path-candidates marks a subdirectory with a trailing slash"
+    (let (d (temp-dir "myedit-ff2-")
+          _ (make-dir (str d "/sub"))
+          cs (ed-path-candidates (str d "/")))
+      (is (includes? cs (str d "/sub/")))))
+  (test "ed-path-candidates tolerates a non-existent directory"
+    (assert= (ed-path-candidates "/tmp/myedit-does-not-exist-zzz/") ())))
+
+(describe "editor comment/uncomment (M-;)"
+  ;; M-; arrives as the keyword named "alt-;"; brood-mode supplies :comment-syntax.
+  (test "M-; comments the current line in brood-mode, preserving indent"
+    (let (m (ed-update (blsp-cm "  (foo)\n(bar)" 3) (keyword "alt-;") 80 24))
+      (assert= (buffer-text (cur m)) "  ;; (foo)\n(bar)")))
+  (test "M-; on an already-commented line uncomments it (round-trips)"
+    (let (commented (ed-update (blsp-cm "(foo)" 0) (keyword "alt-;") 80 24)
+          back (ed-update commented (keyword "alt-;") 80 24))
+      (assert= (buffer-text (cur commented)) ";; (foo)")
+      (assert= (buffer-text (cur back)) "(foo)")))
+  (test "M-; comments every line spanned by the region"
+    (let (b (-> (make-buffer "(a)\n(b)\n(c)" "x.blsp" "x.blsp") (goto-char 0) set-mark (goto-char 7))
+          m (ed-update (ed-set-buf (ed-init (make-buffer "" "x.blsp" "x.blsp")) b) (keyword "alt-;") 80 24))
+      ;; region covers lines 0–1 (point at start of line 2 doesn't pull line 2 in)
+      (assert= (buffer-text (cur m)) ";; (a)\n;; (b)\n(c)")))
+  (test "a region of commented lines uncomments only when all are commented"
+    (let (b (-> (make-buffer ";; (a)\n(b)" "x.blsp" "x.blsp") (goto-char 0) set-mark (goto-char 9))
+          m (ed-update (ed-set-buf (ed-init (make-buffer "" "x.blsp" "x.blsp")) b) (keyword "alt-;") 80 24))
+      ;; not all commented → comment the rest
+      (assert= (buffer-text (cur m)) ";; ;; (a)\n;; (b)")))
+  (test "M-; in plain text-mode reports there's no comment syntax"
+    (let (m (ed-update (m-of "hello") (keyword "alt-;") 80 24))
+      (assert= (buffer-text (cur m)) "hello")
+      (is (string-contains? (get m :echo) "no comment syntax")))))
+
+(describe "editor incremental search (C-s / C-r)"
+  ;; point of the current buffer after folding keys
+  (test "C-s then typing lands point on the match (point at match end)"
+    (let (m (press (m-of "hello world") [:ctrl-s "w" "o"]))
+      (is (not (nil? (get m :isearch))))
+      (assert= (buffer-point (cur m)) 8)            ; "wo" matched at 6, point at end
+      (is (string-contains? (get m :echo) "I-search: wo"))))
+  (test "the match is shown via a transient :overlay, not by moving the mark"
+    (let (m (press (m-of "hello world") [:ctrl-s "w" "o"]))
+      (assert= (get m :overlays) [{:start 6 :end 8 :face isearch/ed-face-isearch}])
+      (is (nil? (buffer-mark (cur m))))             ; the user's mark is untouched
+      (let (done (press m [:ctrl-g]))
+        (is (nil? (get done :overlays))))))          ; cleared on exit
+  (test "C-s is incremental — extending the string keeps/advances the match"
+    (let (m (press (m-of "foo foobar") [:ctrl-s "f" "o" "o" "b"]))
+      (assert= (buffer-point (cur m)) 8)))           ; "foob" only matches at 4
+  (test "C-s C-s advances to the next occurrence"
+    (let (m (press (m-of "ab ab ab") [:ctrl-s "a" "b" :ctrl-s]))
+      (assert= (buffer-point (cur m)) 5)))           ; first at 0 (pt 2), next at 3 (pt 5)
+  (test "a failing search keeps point and shows Failing"
+    (let (m (press (m-of "hello") [:ctrl-s "x" "y"]))
+      (is (nil? (get (get m :isearch) :match)))
+      (is (string-contains? (get m :echo) "Failing"))))
+  (test "Enter exits leaving point at the match and clears the search"
+    (let (m (press (m-of "hello world") [:ctrl-s "w" "o" :enter]))
+      (is (nil? (get m :isearch)))
+      (assert= (buffer-point (cur m)) 8)
+      (is (nil? (buffer-mark (cur m))))))             ; region cleared on exit
+  (test "C-g aborts, returning point to where the search began"
+    (let (m (press (m-of "hello world") [:ctrl-s "w" "o" :ctrl-g]))
+      (is (nil? (get m :isearch)))
+      (assert= (buffer-point (cur m)) 0)              ; back to the origin
+      (is (string-contains? (get m :echo) "quit"))))
+  (test "C-r searches backward, extending the hit in place"
+    ;; "ab ab ab": a0 b1 _ a3 b4 _ a6 b7. From end, C-r "a" lands on a6; "b" extends
+    ;; that hit to "ab" at 6 (not jumping back to the "ab" at 3).
+    (let (m (press (ed-set-buf (m-of "ab ab ab") (goto-char (make-buffer "ab ab ab") 8))
+              [:ctrl-r "a" "b"]))
+      (assert= (buffer-point (cur m)) 6)))
+  (test "forward C-s repeat finds the next NON-overlapping match"
+    ;; "aaaa", search "aa": first at 0 (pt 2); C-s advances past it to 2 (pt 4),
+    ;; not to the overlapping match at 1.
+    (let (m (press (m-of "aaaa") [:ctrl-s "a" "a" :ctrl-s]))
+      (assert= (buffer-point (cur m)) 4)))
+  (test "a non-control key exits the search and is then dispatched"
+    ;; after matching, C-a (beginning-of-line) exits isearch and runs
+    (let (m (press (m-of "hello world") [:ctrl-s "w" "o" :ctrl-a]))
+      (is (nil? (get m :isearch)))
+      (assert= (buffer-point (cur m)) 0)))             ; C-a moved to line start
+  (test "exiting pushes the search origin onto the mark ring"
+    (let (m (press (m-of "hello world") [:ctrl-s "w" "o" :enter]))
+      (assert= (get (cur m) :mark-ring) (list 0)))))   ; origin (0) recorded
+
+;; Begin a query-replace: M-%, type `from`, Enter, type `to`, Enter — landing in the
+;; y/n/!/./q loop on the first match (or finished if there is none).
+(defn qr-begin (text from to)
+  (press (press (press (m-of text) [(keyword "alt-%")]) (string->list from))
+    (cons :enter (append (string->list to) [:enter]))))
+
+(describe "editor query-replace (M-%)"
+  (test "M-% prompts twice then highlights the first match"
+    (let (m (qr-begin "foo foo foo" "foo" "bar"))
+      (is (nil? (get m :minibuffer)))                  ; both prompts done
+      (is (not (nil? (get m :query-replace))))
+      (assert= (get (get m :query-replace) :match) 0)  ; first match highlighted
+      (is (string-contains? (get m :echo) "Query replacing foo with bar"))))
+  (test "y replaces the current match and advances to the next"
+    (let (m (press (qr-begin "foo foo" "foo" "bar") ["y"]))
+      (assert= (buffer-text (cur m)) "bar foo")        ; first replaced
+      (assert= (get (get m :query-replace) :match) 4)))  ; next match (now at 4)
+  (test "n skips without replacing, advancing to the next match"
+    (let (m (press (qr-begin "foo foo" "foo" "bar") ["n"]))
+      (assert= (buffer-text (cur m)) "foo foo")         ; nothing changed
+      (assert= (get (get m :query-replace) :match) 4)))
+  (test "! replaces all remaining matches and finishes"
+    (let (m (press (qr-begin "foo foo foo" "foo" "bar") ["!"]))
+      (assert= (buffer-text (cur m)) "bar bar bar")
+      (is (nil? (get m :query-replace)))
+      (is (string-contains? (get m :echo) "Replaced 3 occurrences"))))
+  (test ". replaces the current match and stops"
+    (let (m (press (qr-begin "foo foo foo" "foo" "bar") ["."]))
+      (assert= (buffer-text (cur m)) "bar foo foo")
+      (is (nil? (get m :query-replace)))))
+  (test "q stops the loop, leaving the rest untouched"
+    (let (m (press (qr-begin "foo foo" "foo" "bar") ["y" "q"]))
+      (assert= (buffer-text (cur m)) "bar foo")         ; one replaced, then stopped
+      (is (nil? (get m :query-replace)))))
+  (test "finishing reports when there are no matches from point"
+    (let (m (qr-begin "hello" "zzz" "x"))
+      (is (nil? (get m :query-replace)))
+      (is (string-contains? (get m :echo) "Replaced 0 occurrences")))))
+
+(describe "editor prefix arguments (C-u) + mark ring"
+  (test "C-u with explicit digits repeats the next command N times"
+    (let (m (press (m-of "l0\nl1\nl2\nl3\nl4") [:ctrl-u "3" :ctrl-n]))
+      (assert= (buffer-current-line (cur m)) 3)
+      (is (nil? (get m :prefix-arg)))))            ; arg consumed
+  (test "C-u alone means 4"
+    (let (m (press (m-of "0\n1\n2\n3\n4\n5") [:ctrl-u :ctrl-n]))
+      (assert= (buffer-current-line (cur m)) 4)))
+  (test "current-prefix-arg reads the active numeric arg (nil when none)"
+    (is (nil? (interactive/current-prefix-arg (m-of "x"))))
+    (assert= (interactive/current-prefix-arg (press (m-of "x") [:ctrl-u "7"])) 7))
+  (test "an explicit C-u 0 runs the command zero times"
+    (let (m (press (m-of "0\n1\n2") [:ctrl-u "0" :ctrl-n]))
+      (assert= (buffer-current-line (cur m)) 0)        ; C-u 0 C-n does not move
+      (is (nil? (get m :prefix-arg)))))
+  (test "C-u C-u multiplies (16)"
+    (let (big (join "\n" (map (fn (i) (str "L" i)) (range 20)))
+          m (press (m-of big) [:ctrl-u :ctrl-u :ctrl-n]))
+      (assert= (buffer-current-line (cur m)) 16)))
+  (test "C-u N then a printable key self-inserts it N times"
+    (let (m (press (m-of "") [:ctrl-u "5" "-"]))
+      (assert= (buffer-text (cur m)) "-----")))   ; the `-` after digits self-inserts, not negate
+  (test "M-- runs the next command's inverse (negative argument, Emacs M--)"
+    ;; C-f forward → backward; from col 3 of "abcde" one step back lands on 2
+    (let (m (press (at "abcde" 3) [(keyword "alt--") :ctrl-f]))
+      (assert= (buffer-point (cur m)) 2)))
+  (test "M-- with digits accumulates a negative count (M-- 3 C-f = back 3)"
+    (let (m (press (at "abcdefgh" 6) [(keyword "alt--") "3" :ctrl-f]))
+      (assert= (buffer-point (cur m)) 3)
+      (is (nil? (get m :prefix-arg)))))
+  (test "M-- C-b runs forward (inverse of backward-char)"
+    (let (m (press (at "abcde" 1) [(keyword "alt--") :ctrl-b]))
+      (assert= (buffer-point (cur m)) 2)))
+  (test "C-M-- is also negative-argument (Emacs; the chord reached for mid-sexp-nav)"
+    ;; Ctrl+Meta+`-` (keyword `ctrl-meta--`) seeds the negative arg just like M-- / C--.
+    (let (m (press (at "abcde" 3) [(keyword "ctrl-meta--") :ctrl-f]))
+      (assert= (buffer-point (cur m)) 2)))
+  (test "C-u - negates (a leading `-` after C-u), so C-u - C-n moves up"
+    (let (m (press (at "0\n1\n2\n3" 4) [:ctrl-u "-" :ctrl-n]))  ; point on line 2, one line up
+      (assert= (buffer-current-line (cur m)) 1)))
+  (test "a negative argument on a command with no inverse just repeats |N| times"
+    (let (m (press (m-of "") [(keyword "alt--") "3" "z"]))     ; self-insert has no inverse
+      (assert= (buffer-text (cur m)) "zzz")))
+  (test "digits only accumulate while a prefix arg is active (plain 7 self-inserts)"
+    (assert= (after "" "7") "7"))                  ; no C-u: just a normal char
+  (test "C-g (keyboard-quit) deactivates the region and clears a pending prefix arg"
+    (let (region (press (at "hello" 0) [(keyword "ctrl- ") :right :right])  ; mark at 0, point→2
+          quit (ed-update (assoc region :prefix-arg {:count 4 :raw true}) :ctrl-g 80 24))
+      (is (not (nil? (buffer-mark (cur region)))))  ; region was active before C-g
+      (is (nil? (buffer-mark (cur quit))))           ; mark deactivated
+      (is (nil? (get quit :prefix-arg)))))           ; prefix arg cleared
+  (test "C-u C-SPC pops the mark ring, returning point to a previous mark"
+    (let (marked (ed-update (at "hello world" 5) (keyword "ctrl- ") 80 24)  ; C-SPC: push mark at 5
+          moved (press marked [:ctrl-a])                                    ; point → 0
+          popped (press moved [:ctrl-u (keyword "ctrl- ")]))                ; C-u C-SPC: pop
+      (assert= (buffer-point (cur popped)) 5)
+      (is (nil? (get popped :prefix-arg)))))
+  (test "C-SPC sets the mark and records it on the ring"
+    (let (m (ed-update (at "abcdef" 3) (keyword "ctrl- ") 80 24))
+      (assert= (buffer-mark (cur m)) 3)
+      (assert= (get (cur m) :mark-ring) (list 3)))))
+
