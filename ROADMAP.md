@@ -104,8 +104,15 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
 
 ## B. Structural editing for brood-mode
 
-- ⬜ **paredit-style** slurp / barf / raise / splice / wrap, and a sexp-aware
-  `C-k` — tree edits over the CST re-serialised (the node API already exists).
+- ✅ **paredit-style** slurp / barf / raise / splice / wrap, and a sexp-aware
+  `C-k` — tree edits over the CST re-serialised (the node API already exists). The
+  edits are **pure `(text point) -> [text point]` functions in `std/tool/sexp.blsp`**
+  (the prime-directive home — next to the navigation they mirror, reusable by any CST
+  backend), applied via a whole-buffer splice (one undo unit). brood-mode binds them:
+  `C-)`/`C-}` slurp/barf forward, `C-(`/`C-{` backward, `M-r` raise, `M-(` wrap,
+  `C-M-s` splice (`M-s` is the search prefix), and `C-k` rebinds to the sexp-aware kill
+  (won't break parens). All M-x-reachable (`slurp-forward`, …). Shifted-Ctrl chord
+  encodings are best-guesses to confirm on a live GUI — see "Loose ends".
 
 ## C. Multi-language via tree-sitter (the big architectural piece)
 
