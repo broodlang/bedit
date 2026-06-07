@@ -186,7 +186,16 @@ A batch of everyday Emacs commands + discoverability, all on existing primitives
 - ⬜ **narrow-to-region / widen** (`C-x n n`/`w`) — **needs a Brood `std/editor/buffer`
   change** (a narrowing restriction the buffer ops + the view respect), so it's the one
   true language-gap item in the Emacs tail (the prime directive). Not yet started.
-- ⬜ **dired / file browser** — the remaining big Emacs tail item.
+- ✅ **dired / file browser** (`C-x C-d`, `M-x dired`) — a read-only directory listing
+  (`src/commands.blsp` `ed-show-dired`, mode `:dired` in `src/modes.blsp`), same
+  generated-buffer pattern as occur/process-list. Single-key UX: `RET`/`f` visit-or-enter,
+  `^` parent, `g` refresh, `q` quit, `+` mkdir, `R` rename, `C` copy, `D` delete (y/n
+  confirm). Entry under point recovered by line-index into the model's `:dired-names` (no
+  column re-parsing). Built on the kernel fs primitives — including a new **`copy-file`**
+  builtin added to Brood (the one gap; binary-safe `std::fs::copy`, prime directive).
+  Listing shows type + size + name; **richer `ls -l` columns (perms / owner / date) await
+  a Brood `stat`/`file-info` builtin + a `std/time` epoch→calendar formatter** — the next
+  language additions that would upgrade dired (deferred, not built).
 - ✅ registers, bookmarks, keyboard macros, occur — see §A.2.
 
 ---

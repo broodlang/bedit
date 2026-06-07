@@ -854,6 +854,162 @@ rows (1-based source line numbers, which `cmd-occur-jump` parses back)."
       else (ed-apply (ed-select m (ed-buffer-index-by-name m src))
              (fn (b) (ed--goto-line b ln))))))
 
+;; ---- dired (a directory browser, C-x C-d) -----------------------------------
+;; The same generated-read-only-buffer pattern as occur/process-menu: a listing of a
+;; directory, navigated and operated by single keys (see modes/dired-keymap). State
+;; lives on the model — `:dired-dir` (absolute dir) and `:dired-names` (entry names in
+;; display order) — so the command under point recovers its target by INDEX (the current
+;; line minus the one header line → `:dired-names[i]`), robust to any filename (spaces
+;; included), never re-parsing formatted columns. File ops are the kernel fs primitives
+;; (make-dir/rename-file/copy-file/delete-file/delete-dir); richer ls -l columns
+;; (perms/owner/date) await a Brood `stat` + a `std/time` formatter (see ROADMAP §D).
+
+(def ed--dired-header-lines 1)  ; the leading header line (the directory path)
+
+(defn ed--dired-entries (dir)
+  "The entry names of `dir` in display order: `.` and `..`, then subdirectories, then
+files — each group alphabetical (`list-dir` is already sorted). `()` if `dir` is unreadable."
+  (let (names (try (list-dir dir) (catch e '()))
+        dirs (filter (fn (n) (dir? (path-join dir n))) names)
+        files (filter (fn (n) (not (dir? (path-join dir n)))) names))
+    (into (into ["." ".."] dirs) files)))
+
+(defn ed--dired-row (dir name)
+  "One dired listing row: a type char (`d`/`-`), the size (right-aligned; `-` for a
+directory), then the name."
+  (let (path (path-join dir name)
+        d? (dir? path)
+        size (if d? "-" (str (or (file-size path) "?"))))
+    (str (if d? "d" "-") "  " (pad-left size 10) "  " name)))
+
+(defn ed-dired-text (dir names)
+  "The dired buffer text: a header line (the directory) then one `ed--dired-row` per entry."
+  (str dir ":\n"
+    (join "\n" (map (fn (n) (ed--dired-row dir n)) names))
+    "\n"))
+
+(defn ed-show-dired (m dir &optional (line nil))
+  "Build/refresh the read-only dired listing for `dir` in the selected pane (the buffer
+is named by the absolute directory path, so revisiting reuses it), recording
+`:dired-dir`/`:dired-names`, and put point on (1-based) `line` — default the first entry."
+  (let (dir (path-absolute dir)
+        names (ed--dired-entries dir)
+        m1 (ed-show-named (assoc m :dired-dir dir :dired-names names)
+             dir
+             (ed-dired-text dir names)
+             :dired))
+    (ed-apply m1 (fn (b) (ed--goto-line b (or line (inc ed--dired-header-lines)))))))
+
+(defn ed--dired-name-at (m)
+  "The entry name on the current line of the dired buffer, or nil on the header / a
+blank line (the index is the line offset past the header into `:dired-names`)."
+  (let (i (- (buffer-current-line (ed-current-buf m)) ed--dired-header-lines)
+        names (get m :dired-names))
+    (if (and (>= i 0) (< i (count names))) (nth names i) nil)))
+
+(defcommand cmd-dired
+  (m key)
+  "Open a directory browser (dired) on a prompted directory (C-x C-d), defaulting to the
+current buffer's directory (else the working dir)."
+  (let (f (buffer-file (ed-current-buf m))
+        default (str (if (nil? f) (cwd) (parent-dir f)) "/"))
+    (assoc m
+      :minibuffer
+      {:edit (ed-mb-edit "Dired: " default)
+       :on-complete (fn (mm t)
+                      (if (blank? t)
+                        (message mm "(no directory)")
+                        (let (dir (path-absolute t))
+                          (if (dir? dir)
+                            (ed-show-dired mm dir)
+                            (message mm (str "not a directory: " dir))))))})))
+
+(defcommand cmd-dired-open
+  (m key)
+  "Visit the file or enter the directory on the current dired line (RET / f)."
+  (let (dir (get m :dired-dir)
+        name (ed--dired-name-at m))
+    (cond
+      (nil? name) (message m "not on an entry")
+      (= name ".") (ed-show-dired m dir (inc (buffer-current-line (ed-current-buf m))))
+      (= name "..") (ed-show-dired m (parent-dir dir))
+      :else (let (path (path-join dir name))
+              (if (dir? path) (ed-show-dired m path) (ed-find-file m path))))))
+
+(defcommand cmd-dired-up
+  (m key)
+  "Go to the parent directory (^)."
+  (ed-show-dired m (parent-dir (get m :dired-dir))))
+
+(defcommand cmd-dired-refresh
+  (m key)
+  "Re-read and redisplay the directory (g), keeping point on the same line."
+  (ed-show-dired m (get m :dired-dir) (inc (buffer-current-line (ed-current-buf m)))))
+
+(defcommand cmd-dired-quit
+  (m key)
+  "Kill the dired buffer (q)."
+  (cmd-kill-buffer m key))
+
+(defn ed--dired-prompt (m prompt initial run)
+  "A minibuffer prompt for a dired file op: `run` is `(model dir text) -> model`,
+called with the model, the current `:dired-dir`, and the entered text (a no-op-with-
+message on blank input)."
+  (let (dir (get m :dired-dir))
+    (assoc m
+      :minibuffer
+      {:edit (ed-mb-edit prompt initial)
+       :on-complete (fn (mm t) (if (blank? t) (message mm "(no name)") (run mm dir t)))})))
+
+(defcommand cmd-dired-create-dir
+  (m key)
+  "Create a new subdirectory (+)."
+  (ed--dired-prompt m "Create directory: " ""
+    (fn (mm dir t)
+      (try
+        (do (make-dir (path-join dir t)) (ed-show-dired mm dir))
+        (catch e (message mm (str "mkdir failed: " (error-message e))))))))
+
+(defcommand cmd-dired-rename
+  (m key)
+  "Rename/move the file on the current line (R)."
+  (let (name (ed--dired-name-at m))
+    (if (or (nil? name) (= name ".") (= name ".."))
+      (message m "not on a renamable entry")
+      (ed--dired-prompt m (str "Rename " name " to: ") name
+        (fn (mm dir t)
+          (try
+            (do (rename-file (path-join dir name) (path-join dir t)) (ed-show-dired mm dir))
+            (catch e (message mm (str "rename failed: " (error-message e))))))))))
+
+(defcommand cmd-dired-copy
+  (m key)
+  "Copy the file on the current line (C)."
+  (let (name (ed--dired-name-at m))
+    (if (or (nil? name) (= name ".") (= name ".."))
+      (message m "not on a copyable entry")
+      (ed--dired-prompt m (str "Copy " name " to: ") name
+        (fn (mm dir t)
+          (try
+            (do (copy-file (path-join dir name) (path-join dir t)) (ed-show-dired mm dir))
+            (catch e (message mm (str "copy failed: " (error-message e))))))))))
+
+(defcommand cmd-dired-delete
+  (m key)
+  "Delete the file or directory on the current line, after a y/n confirm (D)."
+  (let (dir (get m :dired-dir)
+        name (ed--dired-name-at m))
+    (if (or (nil? name) (= name ".") (= name ".."))
+      (message m "not on a deletable entry")
+      (ed-read-char m (str "Delete " name "? (y/n)")
+        (fn (mm k)
+          (if (or (= k "y") (= k "Y"))
+            (let (path (path-join dir name))
+              (try
+                (do (if (dir? path) (delete-dir path) (delete-file path)) (ed-show-dired mm dir))
+                (catch e (message mm (str "delete failed: " (error-message e))))))
+            (message mm "canceled")))))))
+
 ;; ---- describe-key (C-h k) ---------------------------------------------------
 
 (defcommand cmd-describe-key
