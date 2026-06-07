@@ -116,15 +116,36 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
 
 ## C. Multi-language via tree-sitter (the big architectural piece)
 
-- ⬜ **An editor Rust crate** that embeds the Brood runtime and adds host
-  primitives (the embedder-extends-the-runtime hook).
-- ⬜ **tree-sitter primitives** — an opaque tree/node resource: parse, node-at,
-  parent/children/siblings, type, range, incremental reparse. Mechanism in Rust;
-  policy in Brood.
-- ⬜ **Node-abstraction backend** so the existing `sexp` structural commands
-  work over tree-sitter trees unchanged (`{:kind :start :end :kids}` shape).
-- ⬜ **`ruby-mode` / `elixir-mode`** — same layer shape as brood-mode, with a
-  `:parser :tree-sitter` + `:grammar` facet instead of `:brood`.
+Done — but **simpler than this section first sketched** (ADR-103 in the brood
+repo). No editor Rust crate and no opaque tree/node resource: the right design
+fell out of the prime directive. Because `tree-sitter-parse` projects the foreign
+tree into the *same* positioned-node maps Brood's own reader gives
+(`{:kind :start :end :named :kids/:text}`), there was nothing new to host — the
+existing `std/tool/sexp` node abstraction and the editor's mode-services already
+consume that shape. So the whole feature is one Rust builtin + Brood policy.
+
+- ✅ **tree-sitter parse primitive** — `(tree-sitter-parse source lang)` (Rust,
+  feature `treesit`; `crates/lisp/src/treesit.rs`). Parses Ruby/Elixir and projects
+  the tree into the positioned-CST node shape (char offsets, `:named` to flag
+  anonymous tokens) — **no new `Value` variant, no GC surgery**. Mechanism =
+  parse+project; everything above is Brood. (No separate editor crate; no opaque
+  resource — see ADR-103 for why eager projection beat a live-tree handle.)
+- ✅ **Node-abstraction backend** — `std/editor/treesit.blsp`: generic `fontify`
+  (a per-language kind→face table, whole-node colouring, a cross-language
+  keyword heuristic) + structural motions (`point-forward/-backward/-up/-down/
+  -defun-start`) over the node maps. The editor's `C-M-f/b/u/d/a` commands are now
+  mode-polymorphic (dispatch on a `:ts-lang` facet — `commands/ed--structural`), so
+  the *same* structural commands run over a tree-sitter tree unchanged.
+- ✅ **`ruby-mode` / `elixir-mode`** — `src/modes.blsp`: same layer shape as
+  brood-mode, with `:parser :tree-sitter` + a `:ts-lang` facet and a face table;
+  `.rb` → ruby-mode, `.ex`/`.exs` → elixir-mode, `:comment-syntax "# "`. Syntax
+  colouring + structural nav, all by data registration. Tests in
+  `tests/modes_test.blsp`.
+- 🟡 **Deferred (same data shape, no policy change needed):** incremental reparse /
+  lazy node access (eager whole-(window) projection is fast enough today — ADR-103);
+  query-driven call-head / def-name highlighting; `:indent` (RET stays the global
+  newline, falling back to previous-line match); more grammars (each is one
+  `Cargo.toml` dep + one `language_for` arm + a face table + a layer).
 - ⬜ Complements (not replaces) LSP: tree-sitter = fast local syntax/structure;
   `brood-lsp` & others = semantics.
 
