@@ -30,6 +30,7 @@ pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
   (:use editor/buffer)  ; make-buffer / insert / end-of-buffer / buffer-name / accessors
   (:use editor/layers)  ; init-buffer-layers (stamp a buffer's mode) + active-layers (mode line)
   (:use editor/pane)  ; the pane-tree layout: pane-single / selected payload / update / map
+  (:use completion)  ; completion-rank-incremental — the minibuffer's narrowable fuzzy rank
   (:use log)  ; backend — the log-routing backends (one filtered backend per buffer)
   (:use io)  ; fn-port — the editor-targeting log sink ([:buffer-log name line])
   (:use task))  ; task — run the advisory diagnostics check off the loop (async recheck)
@@ -413,33 +414,58 @@ text (point at end). Stored as the minibuffer's `:edit`."
 (defn mb-point (mb) "The minibuffer cursor index (into its input)." (get (get mb :edit) :point))
 (defn mb-prompt (mb) "The minibuffer prompt string." (get (get mb :edit) :prompt))
 (defn mb-sel (mb) "The selected candidate index (Vertico-style), default 0." (or (get mb :sel) 0))
+(defn mb-source? (mb)
+  "True if `mb` produces candidates from either a fixed `:rank-source` (fuzzy-ranked,
+narrowable) or a `:candidates-fn` (computed each keystroke)."
+  (or (not (nil? (get mb :rank-source))) (not (nil? (get mb :candidates-fn)))))
+
+(defn mb--rank (mb text prev-for prev-ranked)
+  "`[ranked cands]` for minibuffer `mb` at input `text`. For a `:rank-source` prompt,
+fuzzy-rank the source — narrowing from `prev-ranked` when `text` extends `prev-for`
+(`completion/completion-rank-incremental`) — and cap to `:rank-cap` for display; `ranked`
+(the full, untruncated ranking) is cached so the *next* keystroke can narrow from it. For a
+`:candidates-fn` prompt there's nothing to narrow: `ranked` is nil and `cands` is the fn's
+result. `[nil ()]` when the prompt has neither source."
+  (cond
+    (not (nil? (get mb :rank-source))) (let (ranked (completion-rank-incremental text
+                                                      prev-for
+                                                      prev-ranked
+                                                      (get mb :rank-source)))
+                                         [ranked (take (or (get mb :rank-cap) 20) ranked)])
+    (not (nil? (get mb :candidates-fn))) [nil ((get mb :candidates-fn) text)]
+    :else [nil ()]))
+
 (defn mb-candidates (mb)
-  "The current candidate list for minibuffer `mb` — its `:candidates-fn` applied to the
-typed text (already fuzzy-ranked by the prompt's source), or `()` with no source.
+  "The current candidate list for minibuffer `mb` — fuzzy-ranked from its `:rank-source`,
+or its `:candidates-fn` applied to the typed text, or `()` with neither.
 **Memoized on the input text** via `:cand-cache` (refreshed by `ed-cache-mb-candidates`
 each event): the view reads this every frame and input reads it on every selection move,
 so without the memo a large candidate set (e.g. a whole project's files) would be
 re-ranked several times per keystroke and again on every idle tick. The shared seam the
-view (the vertical list) and input (selection + accept) both read."
+view (the vertical list) and input (selection + accept) both read. A cache miss computes
+fresh (no narrowing — that needs the previous ranking, which `ed-cache-mb-candidates`
+threads in)."
   (let (cache (get mb :cand-cache))
     (if (and cache (= (get cache :for) (mb-text mb)))
       (get cache :cands)
-      (let (f (get mb :candidates-fn)) (if (nil? f) () (f (mb-text mb)))))))
+      (second (mb--rank mb (mb-text mb) nil nil)))))
 
 (defn ed-cache-mb-candidates (m)
-  "Refresh the open minibuffer's `:cand-cache` (`{:for <text> :cands …}`) when its input
-text changed since the last computation — so `mb-candidates` returns a memoized list
-rather than re-ranking the full candidate set per frame / selection move / tick. Run once
-per event by `ed-post-step`; a no-op with no minibuffer, no candidate source, or unchanged
-text (so a selection move or idle tick recomputes nothing)."
+  "Refresh the open minibuffer's `:cand-cache` (`{:for <text> :ranked <full> :cands …}`)
+when its input text changed since the last computation — so `mb-candidates` returns a
+memoized list rather than re-ranking the full candidate set per frame / selection move /
+tick. For a `:rank-source` prompt it also **narrows incrementally**: each keystroke ranks
+the previous result (`:ranked`) instead of the whole source when the query grew (see
+`mb--rank`). Run once per event by `ed-post-step`; a no-op with no minibuffer, no candidate
+source, or unchanged text."
   (let (mb (get m :minibuffer))
-    (if (or (nil? mb)
-          (nil? (get mb :candidates-fn))
-          (= (get (get mb :cand-cache) :for) (mb-text mb)))
+    (if (or (nil? mb) (not (mb-source? mb)) (= (get (get mb :cand-cache) :for) (mb-text mb)))
       m
-      (assoc m
-        :minibuffer
-        (assoc mb :cand-cache {:for (mb-text mb) :cands ((get mb :candidates-fn) (mb-text mb))})))))
+      (let (cache (get mb :cand-cache)
+            [ranked cands] (mb--rank mb (mb-text mb) (get cache :for) (get cache :ranked)))
+        (assoc m
+          :minibuffer
+          (assoc mb :cand-cache {:for (mb-text mb) :ranked ranked :cands cands}))))))
 
 (defn ed-set-buf (m buf)
   "The model with the selected pane's buffer replaced by `buf` in the POOL — so
