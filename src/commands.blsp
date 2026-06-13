@@ -28,6 +28,7 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
   (:use io)  ; process-port — stream a spawned eval's output back to the editor
   (:use web)  ; web-start / web-stop! — serve the selected buffer over HTTP (C-x w)
   (:use proctree)  ; tree-order / by-id — the *Process List* tree vs flat ordering
+  (:use keymaps)  ; ed-set-profile + vim-to-* — the emacs/vim keybinding profiles
   (:use model))  ; current-buffer accessors, the kill ring, message
 
 ;; ---- applying buffer ops to the current buffer ------------------------------
@@ -2029,6 +2030,245 @@ M-x stop-serving tears it down. (The push/render lives in `web`.)"
   "Activate brood-mode on the current buffer — sexp navigation, smart indentation,
 syntax highlighting, eldoc, and completion for `.blsp` source."
   (ed-set-mode m :brood))
+
+;; ---- keybinding profiles + Vim modal commands (M-x emacs-mode / vim-mode) ---
+;; The profile is a MODEL-scope keybinding layer (src/keymaps.blsp), orthogonal to the
+;; buffer's major mode above. `cmd-emacs-mode` / `cmd-vim-mode` swap it; the `cmd-vim-*`
+;; below are the Vim mode transitions and the modal grammar — each reuses the shared
+;; `(model key) -> model` command pool, so Vim is bindings + a little state machine.
+
+(defcommand cmd-emacs-mode
+  (m key)
+  "Switch to the Emacs keybinding profile (the default chorded bindings)."
+  (message (ed-set-profile m :emacs) "emacs mode"))
+
+(defcommand cmd-vim-mode
+  (m key)
+  "Switch to the Vim keybinding profile (modal: normal/insert/visual), starting in
+normal mode."
+  (message (ed-set-profile m :vim) "vim mode (normal)"))
+
+(defcommand cmd-vim-normal
+  (m key)
+  "Return to Vim normal mode, clearing any visual selection (Esc)."
+  (vim-to-normal (ed-apply m clear-mark)))
+
+(defcommand cmd-vim-insert-bol
+  (m key)
+  "Enter Vim insert mode at the first column (I)."
+  (vim-to-insert (ed-apply m beginning-of-line)))
+
+(defcommand cmd-vim-append-eol
+  (m key)
+  "Enter Vim insert mode at end of line (A)."
+  (vim-to-insert (ed-apply m end-of-line)))
+
+(defcommand cmd-vim-open-below
+  (m key)
+  "Open a new line below and enter insert mode (o)."
+  (vim-to-insert (cmd-open-line-below m key)))
+
+(defcommand cmd-vim-open-above
+  (m key)
+  "Open a new line above and enter insert mode (O)."
+  (vim-to-insert (cmd-open-line-above m key)))
+
+(defcommand cmd-vim-visual
+  (m key)
+  "Enter Vim visual mode, anchoring the selection at point (v) — motions then extend
+the point↔mark region."
+  (vim-to-visual (ed-apply m set-mark)))
+
+(defcommand cmd-vim-visual-yank
+  (m key)
+  "Copy the visual selection to the kill ring and return to normal mode (y)."
+  (vim-to-normal (cmd-copy-region m key)))
+
+(defcommand cmd-vim-visual-delete
+  (m key)
+  "Kill the visual selection (to the kill ring) and return to normal mode (d / x)."
+  (vim-to-normal (cmd-kill-region m key)))
+
+;; ---- the Vim grammar: [count] operator [count] motion|text-object -----------
+;; The modal grammar is plain state on the model (`:vim-pending`) read by the commands
+;; below — no operator-pending keymap layer needed: after `d`, the SAME normal keymap
+;; dispatches the next key, and the motion / text-object commands see the pending
+;; operator and act on the region the motion spans instead of moving point. Counts
+;; multiply (`2d3w` = 6); a doubled operator (`dd`/`cc`/`yy`) is linewise on the current
+;; line(s); `.` replays the last change. Operators reuse the kill-ring region commands by
+;; activating the target as the point↔mark region. Motions are the existing buffer ops,
+;; applied `count` times. (Future: more text objects/motions, register prefixes, insert-`.`.)
+
+(def *vim-motions*
+  ;; key -> {:op <buffer op> :linewise?}. The operator target is the point after `op` is
+  ;; applied `count` times; a linewise motion makes the operator act on whole lines.
+  {"h" {:op backward-char :linewise false}
+   "l" {:op forward-char :linewise false}
+   "j" {:op forward-line :linewise true}
+   "k" {:op backward-line :linewise true}
+   "w" {:op forward-word :linewise false}
+   "b" {:op backward-word :linewise false}
+   "e" {:op forward-word :linewise false}  ; approx: end-of-word ≈ next word boundary
+   "^" {:op beginning-of-line :linewise false}
+   "$" {:op end-of-line :linewise false}
+   :left {:op backward-char :linewise false}
+   :right {:op forward-char :linewise false}
+   :up {:op backward-line :linewise true}
+   :down {:op forward-line :linewise true}})
+
+(def *vim-digits* {"0" 0 "1" 1 "2" 2 "3" 3 "4" 4 "5" 5 "6" 6 "7" 7 "8" 8 "9" 9})
+
+(defn ed--vim-pending (m) "The Vim command accumulator map, or `{}`." (or (get m :vim-pending) {}))
+(defn ed--vim-clear (m) "Drop the Vim command accumulator." (dissoc m :vim-pending))
+
+(defn ed--vim-count (m)
+  "The effective repeat count: the pre-operator count × the post-operator count (each
+defaulting to 1), so `2d3w` is 6."
+  (let (p (ed--vim-pending m)) (* (or (get p :count1) 1) (or (get p :count2) 1))))
+
+(defn ed--vim-apply-n (buf op n) "Apply buffer op `op` `n` times (n≥0)." (if (<= n 0) buf (ed--vim-apply-n (op buf) op (dec n))))
+(defn ed--vim-target (buf op n) "The point after `op` applied `n` times from `buf`." (buffer-point (ed--vim-apply-n buf op n)))
+(defn ed--vim-remember (m change) "Record the last change for `.` (dot-repeat)." (assoc m :vim-last-change change))
+
+(defn ed--vim-operate (m op s e linewise?)
+  "Apply Vim operator `op` (`:delete`/`:change`/`:yank`) over buffer range [s,e] (expanded
+to whole lines when `linewise?`), reusing the kill-ring region commands by activating the
+range as the point↔mark region. Delete leaves point at the range start; change then enters
+insert; yank leaves point at the start without editing. Clears `:vim-pending`."
+  (let (buf (ed-current-buf m)
+        rope (buffer-rope buf)
+        rb (if linewise?
+             (ed--reselect-lines buf (rope-char->line rope (min s e)) (rope-char->line rope (max s e)))
+             (assoc buf :point (max s e) :mark (min s e)))
+        start (min (buffer-point rb) (buffer-mark rb))
+        m1 (ed-set-buf (ed--vim-clear m) rb))
+    (cond
+      (= op :yank) (let (copied (cmd-copy-region m1 nil))
+                     (vim-to-normal (ed-set-buf copied (clear-mark (goto-char (ed-current-buf copied) start)))))
+      (= op :change) (vim-to-insert (cmd-kill-region m1 nil))
+      :else (vim-to-normal (cmd-kill-region m1 nil)))))
+
+(defn ed--vim-run-motion (m motion-op linewise?)
+  "Run a Vim motion: with an operator pending, apply it over [point, target] and record
+the change for `.`; otherwise move point to the target. `count` repeats the motion."
+  (let (op (get (ed--vim-pending m) :operator)
+        n (ed--vim-count m)
+        buf (ed-current-buf m)
+        target (ed--vim-target buf motion-op n))
+    (if (nil? op)
+      (ed--vim-clear (ed-set-buf m (goto-char buf target)))
+      (let (done (ed--vim-operate m op (buffer-point buf) target linewise?))
+        (if (= op :yank) done
+          (ed--vim-remember done {:kind :motion :op op :motion-op motion-op :linewise? linewise? :count n}))))))
+
+(defn ed--vim-linewise-current (m op n)
+  "Operate linewise on `n` whole lines from the current line — the `dd`/`cc`/`yy` form."
+  (let (buf (ed-current-buf m)
+        cur (buffer-current-line buf)
+        last (min (dec (buffer-line-count buf)) (+ cur (dec (max 1 n))))
+        rb (ed--reselect-lines buf cur last)
+        done (ed--vim-operate (ed-set-buf m rb) op (buffer-mark rb) (buffer-point rb) false))
+    (if (= op :yank) done (ed--vim-remember done {:kind :linewise :op op :count n}))))
+
+(defn ed--vim-word-region (buf around?)
+  "`[s e)` of the word at point — the inner word, or (when `around?`) the word plus its
+trailing whitespace. Approximate, built on forward-word/backward-word."
+  (let (e (buffer-point (forward-word buf))
+        s (buffer-point (backward-word (goto-char buf e)))
+        ea (if around?
+             (max e (buffer-point (backward-word (goto-char buf (buffer-point (forward-word (goto-char buf e)))))))
+             e))
+    [s ea]))
+
+(defn ed--vim-word-object (m op around?)
+  "Apply operator `op` over the word text object at point (`iw`/`aw`)."
+  (let (buf (ed-current-buf m)
+        [s e] (ed--vim-word-region buf around?)
+        done (ed--vim-operate m op s e false))
+    (if (= op :yank) done (ed--vim-remember done {:kind :textobj :op op :around around?}))))
+
+(defn ed--vim-delete-chars (m n)
+  "Delete `n` chars at point (`x`), recording it for `.`"
+  (let (buf (ed-current-buf m)
+        e (min (buffer-length buf) (+ (buffer-point buf) (max 1 n)))
+        rb (assoc buf :point e :mark (buffer-point buf)))
+    (ed--vim-remember (ed--vim-clear (ed-edit (ed-set-buf m rb) delete-region)) {:kind :delete-char :count (max 1 n)})))
+
+(defn ed--vim-add-digit (m d)
+  "Append count digit `d` to the pre-operator count (`:count1`) or, once an operator is
+pending, the post-operator count (`:count2`)."
+  (let (pend (ed--vim-pending m)
+        slot (if (nil? (get pend :operator)) :count1 :count2))
+    (assoc m :vim-pending (assoc pend slot (+ (* (or (get pend slot) 0) 10) d)))))
+
+(defcommand cmd-vim-digit (m key) "Accumulate a Vim count digit (1–9)." (ed--vim-add-digit m (get *vim-digits* key)))
+
+(defcommand cmd-vim-zero
+  (m key)
+  "`0`: a count digit when a count is already being entered, else the beginning-of-line
+motion (so `d0` deletes to the line start)."
+  (let (pend (ed--vim-pending m))
+    (if (or (get pend :count1) (get pend :count2))
+      (ed--vim-add-digit m 0)
+      (ed--vim-run-motion m beginning-of-line false))))
+
+(defcommand cmd-vim-operator
+  (m key)
+  "Begin a Vim operator (`d`/`c`/`y`): record it as pending so the next motion or text
+object defines the region. A doubled operator (`dd`/`cc`/`yy`) acts linewise on the
+current line(s)."
+  (let (op (cond (= key "d") :delete (= key "c") :change :else :yank)
+        pend (ed--vim-pending m))
+    (if (= (get pend :operator) op)
+      (ed--vim-linewise-current m op (ed--vim-count m))
+      (assoc m :vim-pending (assoc pend :operator op)))))
+
+(defcommand cmd-vim-motion
+  (m key)
+  "Dispatch a Vim motion from `*vim-motions*` (operator-aware via `ed--vim-run-motion`).
+When a text object is pending (after `di`/`da`), interpret the key as the object (`w` →
+word) instead."
+  (let (pend (ed--vim-pending m) tobj (get pend :textobj))
+    (if (not (nil? tobj))
+      (if (= key "w") (ed--vim-word-object m (get pend :operator) (= tobj :around)) (ed--vim-clear m))
+      (let (spec (get *vim-motions* key))
+        (if (nil? spec) m (ed--vim-run-motion m (get spec :op) (get spec :linewise)))))))
+
+(defcommand cmd-vim-goto-last-line (m key) "End of buffer, or operate to it (`G`)." (ed--vim-run-motion m end-of-buffer true))
+(defcommand cmd-vim-goto-first-line (m key) "Start of buffer, or operate to it (`gg`)." (ed--vim-run-motion m beginning-of-buffer true))
+(defcommand cmd-vim-delete-char (m key) "Delete `count` chars at point (`x`)." (ed--vim-delete-chars m (ed--vim-count m)))
+
+(defcommand cmd-vim-insert
+  (m key)
+  "Enter insert mode at point (`i`); after an operator, begin an *inner* text object (`diw`)."
+  (let (pend (ed--vim-pending m))
+    (if (nil? (get pend :operator))
+      (vim-to-insert m)
+      (assoc m :vim-pending (assoc pend :textobj :inner)))))
+
+(defcommand cmd-vim-append
+  (m key)
+  "Enter insert mode after point (`a`); after an operator, begin an *around* text object (`daw`)."
+  (let (pend (ed--vim-pending m))
+    (if (nil? (get pend :operator))
+      (vim-to-insert (ed-apply m forward-char))
+      (assoc m :vim-pending (assoc pend :textobj :around)))))
+
+(defcommand cmd-vim-dot
+  (m key)
+  "`.`: replay the last change — operator+motion, doubled operator, `x`, or text object.
+(Insert-mode changes aren't replayed yet.)"
+  (let (lc (get m :vim-last-change) m0 (ed--vim-clear m))
+    (cond
+      (nil? lc) m
+      (= (get lc :kind) :motion)
+        (let (buf (ed-current-buf m0)
+              target (ed--vim-target buf (get lc :motion-op) (get lc :count)))
+          (ed--vim-operate m0 (get lc :op) (buffer-point buf) target (get lc :linewise?)))
+      (= (get lc :kind) :linewise) (ed--vim-linewise-current m0 (get lc :op) (get lc :count))
+      (= (get lc :kind) :delete-char) (ed--vim-delete-chars m0 (get lc :count))
+      (= (get lc :kind) :textobj) (ed--vim-word-object m0 (get lc :op) (get lc :around))
+      :else m)))
 
 (defcommand cmd-stop-serving
   (m key)
