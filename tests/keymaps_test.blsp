@@ -1,0 +1,142 @@
+;; Keybinding-profile tests: the emacs/vim profiles on the model scope (src/keymaps.blsp)
+;; and the Vim modal dispatch. Same `main-test` module as the other test files; the
+;; common model helpers are repeated so a standalone `nest check` of this file resolves.
+(defmodule main-test
+  (:use model)
+  (:use input)
+  (:use view)
+  (:use commands)
+  (:use keymaps)
+  (:use editor/buffer)
+  (:use test))
+
+(defn m-of (text) (ed-init (make-buffer text)))
+(defn cur (m) (ed-current-buf m))
+(defn press (m keys) (fold (fn (acc k) (ed-update acc k 80 24)) m keys))
+(defn type-str (m s) (press m (string->list s)))
+;; A model in the Vim profile (normal mode), editing `text` with point at the start.
+(defn vim-of (text) (ed-set-profile (m-of text) :vim))
+
+(describe "keybinding profiles"
+  (test "the editor starts in the emacs profile with no modal state"
+    (let (m (m-of "abc"))
+      (assert= (get m :profile) :emacs)
+      (is (nil? (get m :edit-state)))))
+
+  (test "vim-mode switches profile and starts in normal mode; emacs-mode switches back"
+    (let (v (cmd-vim-mode (m-of "abc") nil))
+      (assert= (get v :profile) :vim)
+      (assert= (get v :edit-state) :normal)
+      (let (e (cmd-emacs-mode v nil))
+        (assert= (get e :profile) :emacs)
+        (is (nil? (get e :edit-state))))))
+
+  (test "the mode line shows the vim modal indicator, nothing under emacs"
+    (assert= (view/ed--edit-state-label (vim-of "abc")) "  <N>")
+    (assert= (view/ed--edit-state-label (m-of "abc")) ""))
+
+  (test "the caret shape follows the modal state: block in normal/visual, bar otherwise"
+    (assert= (view/ed--cursor-style (vim-of "abc")) :block)                       ; normal
+    (assert= (view/ed--cursor-style (press (vim-of "abc") (list "i"))) :bar)       ; insert
+    (assert= (view/ed--cursor-style (press (vim-of "abc") (list "v"))) :block)     ; visual
+    (assert= (view/ed--cursor-style (m-of "abc")) :bar))                           ; emacs (no modal state)
+
+  (test "the profile registry resolves both registered profiles to layers"
+    (is (not (empty? (keymaps/profile-layers :vim))))
+    (is (not (empty? (keymaps/profile-layers :emacs))))
+    ;; an unknown profile falls back to the emacs set
+    (assert= (keymaps/profile-layers :nope) (keymaps/profile-layers :emacs))))
+
+(describe "vim normal mode"
+  (test "h/l/j/k move point and plain letters are commands, not self-insert"
+    (let (m (vim-of "abc"))
+      (assert= (buffer-point (cur (press m (list "l" "l")))) 2)  ; l l → right twice
+      (assert= (buffer-point (cur (press m (list "l" "h")))) 0)  ; l then h → back
+      ;; j/k are line motion, not text: the buffer is unchanged (no "j"/"k" inserted)
+      (assert= (buffer-text (cur (press m (list "j" "k")))) "abc")))
+
+  (test "x deletes the char at point; dd kills the whole line"
+    (assert= (buffer-text (cur (press (vim-of "abc") (list "x")))) "bc")
+    (assert= (buffer-text (cur (press (vim-of "one\ntwo\nthree") (list "d" "d"))))
+      "two\nthree"))
+
+  (test "G / gg jump to end / start of buffer"
+    (let (m (vim-of "a\nb\nc"))
+      (assert= (buffer-current-line (cur (press m (list "G")))) 2)
+      (assert= (buffer-current-line (cur (press (press m (list "G")) (list "g" "g")))) 0))))
+
+(describe "vim insert mode"
+  (test "i enters insert; typing self-inserts; Esc returns to normal"
+    (let (ins (press (vim-of "abc") (list "i")))
+      (assert= (get ins :edit-state) :insert)
+      (let (typed (type-str ins "XY"))
+        (assert= (buffer-text (cur typed)) "XYabc")  ; inserted at point 0
+        (assert= (get (press typed (list :escape)) :edit-state) :normal))))
+
+  (test "a appends after point; o opens a line below, both entering insert"
+    (let (appended (type-str (press (vim-of "ab") (list "a")) "X"))
+      (assert= (get appended :edit-state) :insert)
+      (assert= (buffer-text (cur appended)) "aXb"))  ; a → after point 0, insert X
+    (let (opened (press (vim-of "ab") (list "o")))
+      (assert= (get opened :edit-state) :insert)
+      (assert= (buffer-text (cur opened)) "ab\n"))))  ; new line below
+
+(describe "vim visual mode"
+  (test "v anchors the selection; a motion extends it; d kills the region → normal"
+    (let (vis (press (vim-of "abcdef") (list "v")))
+      (assert= (get vis :edit-state) :visual)
+      (is (not (nil? (buffer-mark (cur vis)))))  ; mark set at the anchor
+      (let (deleted (press vis (list "l" "l" "d")))  ; extend over "ab", delete
+        (assert= (buffer-text (cur deleted)) "cdef")
+        (assert= (get deleted :edit-state) :normal))))
+
+  (test "y copies the selection and returns to normal without changing the text"
+    (let (yanked (press (vim-of "abcdef") (list "v" "l" "l" "y")))
+      (assert= (buffer-text (cur yanked)) "abcdef")
+      (assert= (get yanked :edit-state) :normal))))
+
+(describe "vim grammar: counts, operators, motions, text objects, dot"
+  (test "a count repeats a motion (3l moves three right)"
+    (assert= (buffer-point (cur (press (vim-of "abcdef") (list "3" "l")))) 3))
+
+  (test "operator + motion: dw deletes to the next word boundary"
+    (assert= (buffer-text (cur (press (vim-of "abc def ghi") (list "d" "w")))) " def ghi"))
+
+  (test "counts compose: d2w and 2dw both delete two words"
+    (assert= (buffer-text (cur (press (vim-of "abc def ghi") (list "d" "2" "w")))) " ghi")
+    (assert= (buffer-text (cur (press (vim-of "abc def ghi") (list "2" "d" "w")))) " ghi"))
+
+  (test "d0 deletes to the line start; d$ deletes to the line end"
+    ;; point at 4 (the 'd' of "def"); d0 removes "abc " before it
+    (assert= (buffer-text (cur (press (vim-of "abc def") (list "l" "l" "l" "l" "d" "0")))) "def")
+    (assert= (buffer-text (cur (press (vim-of "abc def") (list "d" "$")))) ""))
+
+  (test "linewise operators: dd deletes the line, dj deletes two lines"
+    (assert= (buffer-text (cur (press (vim-of "one\ntwo\nthree") (list "d" "d")))) "two\nthree")
+    (assert= (buffer-text (cur (press (vim-of "one\ntwo\nthree") (list "d" "j")))) "three"))
+
+  (test "yy then p duplicates the current line"
+    (assert= (buffer-text (cur (press (vim-of "one\ntwo") (list "y" "y" "p")))) "one\none\ntwo"))
+
+  (test "cc deletes the line content and enters insert mode"
+    (let (m (press (vim-of "one\ntwo") (list "c" "c")))
+      (assert= (get m :edit-state) :insert)
+      (assert= (buffer-text (cur m)) "two")))
+
+  (test "text objects: diw deletes the inner word, daw deletes it with a trailing space"
+    ;; point moved into "def" (index 4) first
+    (assert= (buffer-text (cur (press (vim-of "abc def ghi") (list "l" "l" "l" "l" "d" "i" "w"))))
+      "abc  ghi")
+    (assert= (buffer-text (cur (press (vim-of "abc def ghi") (list "l" "l" "l" "l" "d" "a" "w"))))
+      "abc ghi"))
+
+  (test "x deletes count chars; . repeats the last change"
+    (assert= (buffer-text (cur (press (vim-of "abcdef") (list "3" "x")))) "def")
+    ;; dw deletes "abc"; . repeats, deleting " def" → " ghi"
+    (assert= (buffer-text (cur (press (vim-of "abc def ghi") (list "d" "w" ".")))) " ghi"))
+
+  (test "Esc clears a half-entered count/operator"
+    (let (m (press (vim-of "abcdef") (list "2" "d" :escape)))
+      (is (nil? (get m :vim-pending)))
+      ;; after Esc, a plain motion moves once (the pending 2d is gone)
+      (assert= (buffer-point (cur (press m (list "l")))) 1))))
