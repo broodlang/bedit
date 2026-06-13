@@ -78,6 +78,7 @@ src/panes.blsp              pane-layout geometry + mouse-event folding (model ->
 src/view.blsp               pure view: model -> render frame (editor/display ops)
 src/input.blsp              dispatch: fold a key/mouse/tick event into the next model
 src/commands.blsp           the editing commands, each a (model key) -> model
+src/keymaps.blsp            keybinding profiles (emacs / modal vim) as model-scope layers
 src/interactive.blsp        the `defcommand` macro + the M-x command registry
 src/modes.blsp              modes as layers: the keymaps (data) + brood-mode services
 src/complete.blsp           completion-at-point (the in-buffer Tab popup)
