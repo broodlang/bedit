@@ -1,0 +1,68 @@
+;; Redisplay/typing profiler — NOT a correctness test (lives in bench/, so
+;; `nest test` doesn't auto-run it). Exercises the editor's per-frame hot paths —
+;; `ed-view` (redisplay: line layout, font-lock spans, face lookup, render ops) and
+;; `ed-update` (keymap dispatch → command → buffer edit) — and reads the `(vm-stats)`
+;; delta to classify a frame's cost (VM dispatch vs native/env/alloc). It answered
+;; ADR-101's JIT gate (2026-06-08: editor redisplay is env/alloc-bound, NOT
+;; dispatch-bound — see brood/docs/vm-perf-and-jit-runway.md); keep it for re-profiling.
+;;
+;; Run on demand under a perf-stats-built nest, sequentially so the global counter
+;; isn't polluted by concurrent tests:
+;;   BROOD_PERF_STATS=1 nest test -j 1 bench/redisplay_profile.blsp
+;; Scale the loop counts up for a longer sample (raise *test-timeout-ms* if needed).
+(defmodule redisplay-profile
+  (:use model)   ; ed-init / accessors
+  (:use input)   ; ed-update
+  (:use view)    ; ed-view
+  (:use editor/buffer)
+  (:use test))
+
+(def sample
+  (str "(defmodule demo (:use editor/buffer) (:use test))\n"
+       "(defn fib (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))\n"
+       "(defn map-sq (xs) (map (fn (x) (* x x)) xs))\n"
+       "(def names [:alpha :beta :gamma 42 3.14 \"a string\" \\c])\n"
+       "(defn loop- (n acc) (if (= n 0) acc (loop- (- n 1) (+ acc n))))\n"
+       "(defn classify (x) (cond ((nil? x) :nil) ((number? x) :num) (true :other)))\n"
+       ";; a comment line with some words to fontify\n"
+       "(defn greet (who) (str \"hello, \" who \"!\"))\n"
+       "(def m {:a 1 :b 2 :c [3 4 5] :d {:nested true}})\n"
+       "(defn process (items) (reduce + 0 (filter even? (map inc items))))\n"))
+
+;; Render the same model `n` times — a clean ×n measure of one redisplay's cost.
+(defn render-loop (m n cols rows)
+  (if (= n 0) :done (do (ed-view m cols rows) (render-loop m (- n 1) cols rows))))
+
+;; A recorded realistic edit pattern: type a small `defn`, move by char/word/line,
+;; delete — so each frame's font-lock sees evolving real Brood tokens, not `x`-spam.
+(def edit-keys
+  ["(" "d" "e" "f" "n" " " "f" " " "(" "x" ")" " " "(" "+" " " "x" " " "1" ")" ")"
+   :enter :right :right :alt-f :alt-b :down :up :left "y" :backspace])
+
+;; Apply one pass of `keys` (rendering after each), then repeat `reps` times.
+(defn apply-keys (m keys cols rows)
+  (if (empty? keys) m
+      (let (m2 (ed-update m (first keys) cols rows)
+            _  (ed-view m2 cols rows))
+        (apply-keys m2 (rest keys) cols rows))))
+
+(defn type-and-render (m reps cols rows)
+  (if (= reps 0) m
+      (type-and-render (apply-keys m edit-keys cols rows) (- reps 1) cols rows)))
+
+(defn dump-delta (label before after)
+  (println (str "=== vm-stats: " label " (subtract BEFORE from AFTER) ==="))
+  (println (str "BEFORE " before))
+  (println (str "AFTER  " after)))
+
+(describe "jit profile"
+  (test "redisplay-only loop (ed-view x600 on real source)"
+    (let (m0 (ed-init (make-buffer sample "x.blsp" "x.blsp")) b (vm-stats))
+      (render-loop m0 600 80 24)
+      (dump-delta "redisplay-only x600" b (vm-stats))
+      (assert= 1 1)))
+  (test "type+redisplay loop (realistic edits, ~15 passes ≈ 450 frames)"
+    (let (m0 (ed-init (make-buffer sample "x.blsp" "x.blsp")) b (vm-stats))
+      (type-and-render m0 15 80 24)
+      (dump-delta "type+redisplay ~450 frames" b (vm-stats))
+      (assert= 1 1))))
