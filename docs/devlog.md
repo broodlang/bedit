@@ -12,6 +12,16 @@ Language-level changes live in the Brood repo's `docs/devlog.md` + `docs/decisio
 
 ## 2026-06-14
 
+### git: syntax-highlight the diff / log / status buffers — `3951530`
+- **Why:** make the diff page (and status/log) readable at a glance.
+- **What:** a `:fontify` per git mode — diff lines coloured by prefix (green `+`, red `-`,
+  blue `@@` hunks, dim file headers/metadata); the classifier trims indent so it serves both
+  raw `*git-diff*` and the inline diff in `*git-status*`. Status section headers bold-blue;
+  log commit hashes coloured. Split the shared report layer into `:git-diff`/`:git-log` so
+  each gets its own fontify.
+- **Files:** `src/magit.blsp` (fontify), `src/modes.blsp` (`:fontify` + layer split).
+  **Tests:** +4 in `tests/magit_test.blsp`.
+
 ### magit: TAB expands a file's diff inline; click / RET visits the file — `0b76e4a`
 - **Why:** review changes without leaving the status buffer, and open files by clicking.
 - **What:** in `*git-status*`, `TAB` toggles the file's diff inline below its row
