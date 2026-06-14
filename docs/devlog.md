@@ -12,6 +12,29 @@ Language-level changes live in the Brood repo's `docs/devlog.md` + `docs/decisio
 
 ## 2026-06-14
 
+### view: region selection fills blank / short lines through end-of-line — `0b21cc0`
+- **Why:** selecting across blank lines only tinted the text, not the empty lines or the
+  ragged end-of-line gap — the opposite of the hl-line band, which covers the whole line.
+- **What:** `ed--region-eol-bands` — the full-width counterpart to `ed--hl-line-band`. For
+  each visible line whose terminating newline falls inside the region it paints a
+  `face-region` `rect` from end-of-text to the pane's right edge, so blank lines and the
+  end-of-line gap show the selection (Emacs behaviour). The char-range tint still paints the
+  text; the band only fills past it (no overlap), and scales with font zoom like the hl-line
+  band. **No language gap** — pure view geometry on existing primitives.
+- **Files:** `src/view.blsp` (`ed--region-eol-bands`, wired into `ed-pane-ops`).
+  **Tests:** +1 in `tests/view_scroll_test.blsp`.
+
+### gutter: reserve a minimum line-number width so the text doesn't jump — `27dad3e`
+- **Why:** the gutter was sized from the buffer's current line-count digit count, so crossing
+  99→100 / 999→1000 lines widened it a column and shifted all the text right mid-edit.
+- **What:** `line-number-min-digits` (4) — `line-number-width` reserves `max(actual, min)`
+  digit columns, so files up to 9999 lines keep a stable gutter (Emacs
+  `display-line-numbers-width`); it still grows beyond that. **No language gap** — pure
+  editor geometry.
+- **Files:** `src/modes.blsp` (`line-number-min-digits`, `line-number-width`).
+  **Tests:** updated the hardcoded 2-col gutter expectations in
+  `tests/panes_projects_test.blsp` (+ mouse click columns) and `tests/web_logging_test.blsp`.
+
 ### git: syntax-highlight the diff / log / status buffers — `3951530`
 - **Why:** make the diff page (and status/log) readable at a glance.
 - **What:** a `:fontify` per git mode — diff lines coloured by prefix (green `+`, red `-`,
