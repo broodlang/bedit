@@ -28,6 +28,7 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
   (:use task)  ; task / cancel-task — the off-loop, cancellable, timeout-bounded async eval
   (:use io)  ; process-port — stream a spawned eval's output back to the editor
   (:use web)  ; web-start / web-stop! — serve the selected buffer over HTTP (C-x w)
+  (:use lsp)  ; lsp-connect / lsp-server-for — the LSP completion source (M-x lsp-connect)
   (:use proctree)  ; tree-order / by-id — the *Process List* tree vs flat ordering
   (:use keymaps)  ; ed-set-profile + vim-to-* — the emacs/vim keybinding profiles
   (:use model))  ; current-buffer accessors, the kill ring, message
@@ -2033,6 +2034,37 @@ M-x stop-serving tears it down. (The push/render lives in `web`.)"
             "web server starting…"
             (str "already serving on http://localhost:" p)))))))
 
+(defcommand cmd-lsp-connect
+  (m key)
+  "Start a language server for the current buffer's file type and turn its completions
+on (M-x lsp-connect). Looks the file extension up in `lsp/*lsp-servers*` (rust-analyzer,
+ruby-lsp, …), spawns it for the buffer's project root, stores the connection on the model
+(`:lsp`), and registers `lsp-complete-source` so Tab now also offers the server's
+candidates — merged with the mode and buffer-word sources. M-x lsp-disconnect stops it."
+  (let (buf (ed-current-buf m)
+        file (buffer-file buf))
+    (cond
+      (nil? file) (message m "lsp: the buffer has no file")
+      (not (nil? (get m :lsp))) (message m "lsp: already connected (M-x lsp-disconnect first)")
+      :else
+      (let (srv (lsp-server-for file))
+        (if (nil? srv)
+          (message m (str "lsp: no server configured for ." (lsp/lsp--extension file)))
+          (let ([cmd args] srv
+                root (project-root (parent-dir file))
+                conn (lsp-connect cmd args (lsp/lsp--path->uri root)))
+            (complete/complete-add-source! 'lsp/lsp-complete-source)
+            (message (assoc m :lsp conn) (str "lsp: " cmd " connected for " root))))))))
+
+(defcommand cmd-lsp-disconnect
+  (m key)
+  "Stop the buffer's language server and drop its completion connection (M-x lsp-disconnect).
+The `lsp-complete-source` stays registered but no-ops with no connection on the model."
+  (let (conn (get m :lsp))
+    (if (nil? conn)
+      (message m "lsp: not connected")
+      (do (lsp-shutdown conn) (message (dissoc m :lsp) "lsp: disconnected")))))
+
 ;; ---- major-mode commands (M-x text-mode / brood-mode) ----------------------
 ;; Like Emacs: each major mode is an interactive command that activates it on the
 ;; current buffer. `replace-base-layer` (via `ed-set-mode`) swaps the base layer
@@ -2117,24 +2149,34 @@ the point↔mark region."
 ;; activating the target as the point↔mark region. Motions are the existing buffer ops,
 ;; applied `count` times. (Future: more text objects/motions, register prefixes, insert-`.`.)
 
+(defn ed--vim-skip-blank-fwd (buf)
+  "Move point past any run of whitespace immediately ahead of it."
+  (let (c (buffer-char-after buf))
+    (if (and c (blank? c)) (ed--vim-skip-blank-fwd (forward-char buf)) buf)))
+
+(defn ed--vim-word-start (buf)
+  "Vim `w`: to the start of the *next* word — this word's end (`forward-word`), then past
+the gap to the next word. (`forward-word` alone lands at the word *end*, which is Vim `e`.)"
+  (ed--vim-skip-blank-fwd (forward-word buf)))
+
 (def *vim-motions*
   ;; key -> {:op <buffer op> :linewise?}. The operator target is the point after `op` is
   ;; applied `count` times; a linewise motion makes the operator act on whole lines.
-  {"h" {:op backward-char :linewise false}
-   "l" {:op forward-char :linewise false}
-   "j" {:op forward-line :linewise true}
-   "k" {:op backward-line :linewise true}
-   "w" {:op forward-word :linewise false}
-   "b" {:op backward-word :linewise false}
-   "e" {:op forward-word :linewise false}  ; approx: end-of-word ≈ next word boundary
-   "^" {:op beginning-of-line :linewise false}
-   "$" {:op end-of-line :linewise false}
-   :left {:op backward-char :linewise false}
-   :right {:op forward-char :linewise false}
-   :up {:op backward-line :linewise true}
-   :down {:op forward-line :linewise true}})
+  {"h" {:op backward-char :linewise? false}
+   "l" {:op forward-char :linewise? false}
+   "j" {:op forward-line :linewise? true}
+   "k" {:op backward-line :linewise? true}
+   "w" {:op ed--vim-word-start :linewise? false}  ; next word start
+   "b" {:op backward-word :linewise? false}
+   "e" {:op forward-word :linewise? false}  ; word end — where forward-word lands
+   "^" {:op beginning-of-line :linewise? false}
+   "$" {:op end-of-line :linewise? false}
+   :left {:op backward-char :linewise? false}
+   :right {:op forward-char :linewise? false}
+   :up {:op backward-line :linewise? true}
+   :down {:op forward-line :linewise? true}})
 
-(def *vim-digits* {"0" 0 "1" 1 "2" 2 "3" 3 "4" 4 "5" 5 "6" 6 "7" 7 "8" 8 "9" 9})
+(def *vim-digits* {"1" 1 "2" 2 "3" 3 "4" 4 "5" 5 "6" 6 "7" 7 "8" 8 "9" 9})  ; `0` → cmd-vim-zero
 
 (defn ed--vim-pending (m) "The Vim command accumulator map, or `{}`." (or (get m :vim-pending) {}))
 (defn ed--vim-clear (m) "Drop the Vim command accumulator." (dissoc m :vim-pending))
@@ -2250,7 +2292,7 @@ word) instead."
     (if (not (nil? tobj))
       (if (= key "w") (ed--vim-word-object m (get pend :operator) (= tobj :around)) (ed--vim-clear m))
       (let (spec (get *vim-motions* key))
-        (if (nil? spec) m (ed--vim-run-motion m (get spec :op) (get spec :linewise)))))))
+        (if (nil? spec) m (ed--vim-run-motion m (get spec :op) (get spec :linewise?)))))))
 
 (defcommand cmd-vim-goto-last-line (m key) "End of buffer, or operate to it (`G`)." (ed--vim-run-motion m end-of-buffer true))
 (defcommand cmd-vim-goto-first-line (m key) "Start of buffer, or operate to it (`gg`)." (ed--vim-run-motion m beginning-of-buffer true))

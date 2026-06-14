@@ -1,0 +1,319 @@
+(defmodule lsp
+  "A minimal **Language Server Protocol client** — the first consumer of Brood's
+persistent-subprocess primitive (`proc-spawn`/`proc-send`, ADR-104) and a completion
+*source* for the multi-source `complete` framework.
+
+A language server is a long-lived child spoken to in JSON-RPC framed with
+`Content-Length` headers over stdio. `lsp-connect` spawns one inside a dedicated
+**connection process** that owns the `proc` handle (so the server's stdout never
+pollutes the editor's mailbox), runs the `initialize` handshake, and then answers
+completion requests. `lsp-complete-source` plugs into `*completion-sources*`: on Tab
+it does **one bounded synchronous round-trip** to the connection (completion is an
+explicit trigger, never a per-keystroke auto-popup, so a short blocking request is
+fine), and the returned labels are merged + fuzzy-ranked with the mode and
+buffer-word sources by `complete` like any other source.
+
+The bug-prone logic — frame encode/decode across chunk boundaries, request/response
+correlation, completion-result shapes — is **pure** (`lsp--ingest`,
+`lsp--request-complete`, `lsp-decode`, `lsp-completion-labels`), so it's unit-tested
+without a server (tests/lsp_test.blsp); the connection process is a thin IO shell
+around it.
+
+Opt-in: no server runs until something calls `lsp-connect` and stores the pid on the
+model under `:lsp` (see `lsp-complete-source`). Enable per language by adding
+`'lsp/lsp-complete-source` to `complete/*completion-sources*`.
+
+Framing is **byte-accurate**: `Content-Length` is LSP's byte count, and bodies are
+sliced by UTF-8 byte offset (`string->utf8-bytes`), so multi-byte content — which
+rust-analyzer's completion items routinely carry — round-trips correctly.
+
+Caveats (v1): the underlying `proc` mechanism decodes each stdout chunk with
+`from_utf8_lossy`, so a multi-byte char split across a read-buffer (64 KiB) boundary
+is mangled — and, because that changes the byte count, can desync framing for a frame
+that large. A fully faithful client needs `proc` to deliver **raw bytes** (the bytes
+roadmap item flagged in `../brood` net.rs/proc.rs), not lossy strings; small/medium
+responses (the common case) are unaffected. Document positions use 0-based
+**character** columns, which equal LSP's UTF-16 code units for ASCII. Full-text
+document sync (no incremental edits)."
+  (:use model)  ; ed-current-buf — the source reads the current buffer
+  (:use editor/buffer)  ; buffer-file / buffer-text / buffer-point / line+column
+  (:use json))  ; json-encode / json-parse — the JSON-RPC payloads
+
+;; ---- tunables (redefine live) -----------------------------------------------
+
+(def *lsp-timeout-ms* 1000)  ; how long a Tab waits for the server before giving up
+
+(def *lsp-servers*
+  ;; file extension → [server-command arg-vector]. The `M-x lsp-connect` command looks
+  ;; the buffer's extension up here. Extend live to add a language/server.
+  {"rs" ["rust-analyzer" []]
+    "rb" ["ruby-lsp" []]
+    "ex" ["elixir-ls" []] "exs" ["elixir-ls" []]
+    "py" ["pylsp" []]
+    "go" ["gopls" []]
+    "ts" ["typescript-language-server" ["--stdio"]]})
+
+;; ---- pure protocol: framing -------------------------------------------------
+
+(defn lsp--frame (body)
+  "Wrap a JSON `body` string in an LSP `Content-Length` frame. The length is the body's
+UTF-8 **byte** count (LSP's unit) — not its char count, which differs whenever the body
+carries a multi-byte char (e.g. a `didOpen` of a source file with unicode)."
+  (str "Content-Length: " (count (string->utf8-bytes body)) "\r\n\r\n" body))
+
+(defn lsp-request (id method params)
+  "A framed JSON-RPC request: `{jsonrpc 2.0, id, method, params}`."
+  (lsp--frame (json-encode {:jsonrpc "2.0" :id id :method method :params params})))
+
+(defn lsp-notification (method params)
+  "A framed JSON-RPC notification (no `id`, so no response expected)."
+  (lsp--frame (json-encode {:jsonrpc "2.0" :method method :params params})))
+
+;; ---- pure protocol: decoding a byte stream into messages --------------------
+
+(defn lsp--content-length (header)
+  "The `Content-Length` value in a frame `header` block (the text before the blank
+line), or `nil` if absent/malformed."
+  (let (i (string-index-of header "Content-Length:"))
+    (if (< i 0)
+      nil
+      (let (after (substring header (+ i 15) (string-length header))
+            eol (string-index-of after "\r")
+            tok (trim (if (< eol 0) after (substring after 0 eol)))
+            n (string->number tok))
+        (if (int? n) n nil)))))
+
+;; `Content-Length` counts BYTES, but a `proc` chunk is a char string, so the body
+;; must be sliced by UTF-8 byte offset, not char index — a frame with any multi-byte
+;; char (rust-analyzer's completion items routinely carry them) is longer in bytes
+;; than in chars, and a char-based length check would wait forever for bytes that, as
+;; chars, never arrive. The header up to `\r\n\r\n` is ASCII (LSP spec), so the
+;; separator's char index equals its byte offset and only the body needs byte math.
+(defn lsp--decode-acc (buf acc)
+  (let (sep (string-index-of buf "\r\n\r\n"))
+    (if (< sep 0)
+      [(reverse acc) buf]  ; no complete header yet — keep buffering
+      (let (clen (lsp--content-length (substring buf 0 sep)))
+        (if (nil? clen)
+          [(reverse acc) buf]  ; malformed header — bail (caller keeps the buffer)
+          (let (body-start (+ sep 4)  ; char index == byte offset (prefix is ASCII)
+                bytes (string->utf8-bytes buf)
+                total (count bytes))
+            (if (< (- total body-start) clen)
+              [(reverse acc) buf]  ; body's bytes not fully arrived — wait for more
+              (let (body (utf8-bytes->string (take clen (drop body-start bytes)))
+                    rest (utf8-bytes->string (drop (+ body-start clen) bytes))
+                    msg (try (json-parse body) (catch e nil)))
+                (lsp--decode-acc rest (if (nil? msg) acc (cons msg acc)))))))))))
+
+(defn lsp-decode (buf)
+  "`[messages remaining]` — every complete `Content-Length`-framed JSON-RPC message in
+`buf` (parsed to maps), plus the leftover bytes of an incomplete trailing frame. The
+seam that turns a chunked stdout stream into discrete messages; a frame split across
+`proc` chunks just stays in `remaining` until the rest arrives."
+  (lsp--decode-acc buf '()))
+
+;; ---- pure protocol: completion-result shapes --------------------------------
+
+(defn lsp-completion-labels (result)
+  "The candidate label strings from a `textDocument/completion` `result`, which is
+either a `CompletionItem[]` (a vector) or a `{:items [...] :isIncomplete b}` object
+(or `nil`). Each item's `:label` is its display/insert text."
+  (let (items (cond (nil? result) '()
+                (vector? result) result
+                :else (get result :items '())))
+    (filter (fn (l) (not (nil? l)))
+      (map (fn (it) (get it :label)) items))))
+
+;; ---- pure connection logic (state -> [state effects]) -----------------------
+;; The connection process's state:
+;;   {:proc handle :buf "" :next-id N :pending {jsonrpc-id -> [reply-to corr]}
+;;    :opened {uri -> true} :version V}
+;; `lsp--ingest` and `lsp--request-complete` are pure transitions returning the new
+;; state plus the IO the shell must perform (messages to send / frames to write), so
+;; correlation and framing are testable without a process or a server.
+
+(defn lsp--did-open (uri lang text)
+  (lsp-notification "textDocument/didOpen"
+    {:textDocument {:uri uri :languageId lang :version 1 :text text}}))
+
+(defn lsp--did-change (uri version text)
+  (lsp-notification "textDocument/didChange"
+    {:textDocument {:uri uri :version version}
+      :contentChanges [{:text text}]}))
+
+(defn lsp--completion-request (id uri line char)
+  (lsp-request id "textDocument/completion"
+    {:textDocument {:uri uri}
+      :position {:line line :character char}}))
+
+(defn lsp--request-complete (state corr reply-to uri lang text line char)
+  "Pure: the frames to send for a completion at `(uri, line, char)` and the next state.
+Syncs the document first (`didOpen` the first time a uri is seen — tagged with `lang`,
+the LSP languageId — else a full-text `didChange`), then the completion request; records
+`corr`→`reply-to` under the request's jsonrpc id so the response can be routed back.
+Returns `[state' frames]`."
+  (let (id (get state :next-id)
+        opened (get state :opened)
+        version (get state :version)
+        seen? (get opened uri)
+        sync-frame (if seen? (lsp--did-change uri version text) (lsp--did-open uri lang text))
+        state2 (assoc state
+                 :next-id (+ id 1)
+                 :version (+ version 1)
+                 :opened (assoc opened uri true)
+                 :pending (assoc (get state :pending) id [reply-to corr])))
+    [state2 [sync-frame (lsp--completion-request id uri line char)]]))
+
+(defn lsp--dispatch (acc msg)
+  ;; Fold step: route one decoded message. A response whose `:id` is pending becomes a
+  ;; `[reply-to [:lsp-completion corr labels]]` reply; anything else (a notification
+  ;; like publishDiagnostics, or an unmatched id) is ignored.
+  (let ([state replies] acc
+        id (get msg :id)
+        entry (if (nil? id) nil (get (get state :pending) id)))
+    (if (nil? entry)
+      [state replies]
+      (let ([reply-to corr] entry
+            labels (lsp-completion-labels (get msg :result)))
+        [(assoc state :pending (dissoc (get state :pending) id))
+          (cons [reply-to [:lsp-completion corr labels]] replies)]))))
+
+(defn lsp--ingest (state chunk)
+  "Pure: fold a stdout `chunk` into the connection. Appends it to the frame buffer,
+decodes every complete message, and routes each. Returns `[state' replies]` where each
+reply is `[pid message]` for the shell to `send`."
+  (let (buf (str (get state :buf) chunk)
+        [msgs remaining] (lsp-decode buf))
+    (fold lsp--dispatch [(assoc state :buf remaining) '()] msgs)))
+
+;; ---- the connection process (the thin IO shell) -----------------------------
+
+(defn lsp--send-all (proc frames)
+  (doseq (f frames) (proc-send proc f)))
+
+(defn lsp--await-init (state id)
+  "Read frames until the `initialize` response (jsonrpc `id`) arrives, returning the
+state with the consumed bytes drained. Bounded so a server that never replies can't
+hang the connection process forever."
+  (receive
+    ([:proc p chunk]
+      (let (buf (str (get state :buf) chunk)
+            [msgs remaining] (lsp-decode buf)
+            st (assoc state :buf remaining))
+        (if (some? (fn (msg) (= (get msg :id) id)) msgs)
+          st
+          (lsp--await-init st id))))
+    ([:proc-err p chunk] (lsp--await-init state id))
+    ([:proc-closed p code] state)
+    (after 10000 state)))
+
+(defn lsp--loop (state)
+  "The connection's main receive loop: server output folds in via `lsp--ingest` (replies
+routed to waiters); a `[:complete …]` request is turned into frames and written to the
+server; `:shutdown` or the server dying stops it."
+  (receive
+    ([:proc p chunk]
+      (let ([st2 replies] (lsp--ingest state chunk))
+        (doseq (r replies) (send (first r) (second r)))
+        (lsp--loop st2)))
+    ([:proc-err p chunk] (lsp--loop state))
+    ([:proc-closed p code] :lsp-stopped)
+    ([:complete corr reply-to uri lang text line char]
+      (let ([st2 frames] (lsp--request-complete state corr reply-to uri lang text line char))
+        (lsp--send-all (get st2 :proc) frames)
+        (lsp--loop st2)))
+    ([:shutdown] (do (proc-close (get state :proc)) :lsp-stopped))))
+
+(defn lsp--init-params (root-uri)
+  {:processId nil
+    :rootUri root-uri
+    :clientInfo {:name "myedit"}
+    :capabilities {:textDocument {:completion {:completionItem {:snippetSupport false}}}}})
+
+(defn lsp--run (cmd cmd-args root-uri)
+  "The connection process body: spawn the server, do the `initialize`/`initialized`
+handshake, then loop. Must call `proc-spawn` itself so it owns the handle (is the
+subscriber for the server's `[:proc …]` output)."
+  (let (p (proc-spawn cmd cmd-args)
+        state {:proc p :buf "" :next-id 1 :pending {} :opened {} :version 2})
+    (proc-send p (lsp-request 0 "initialize" (lsp--init-params root-uri)))
+    (let (state2 (lsp--await-init state 0))
+      (proc-send p (lsp-notification "initialized" {}))
+      (lsp--loop state2))))
+
+(defn lsp-connect (cmd cmd-args root-uri)
+  "Spawn language server `cmd` (with `cmd-args`, a list/vector of strings) for project
+`root-uri` and return the connection process pid. Store it on the model under `:lsp` to
+turn `lsp-complete-source` on. `(lsp-shutdown conn)` stops it."
+  (spawn (lsp--run cmd cmd-args root-uri)))
+
+(defn lsp-shutdown (conn)
+  "Stop a connection: kill the server and end the connection process."
+  (send conn [:shutdown]))
+
+(defn lsp-complete-sync (conn uri lang text line char timeout)
+  "Ask `conn` for completions at `(uri, line, char)` with the buffer `text` (LSP
+languageId `lang`), blocking up to `timeout` ms for the reply (then `()`). Safe to call
+only on an explicit trigger, not per keystroke."
+  (let (corr (ref))
+    (send conn [:complete corr (self) uri lang text line char])
+    (receive
+      ([:lsp-completion ~corr labels] labels)
+      (after timeout '()))))
+
+;; ---- the completion source --------------------------------------------------
+
+(defn lsp--word-char? (c)
+  (not (includes? " \t\n()[]{}\";',`" c)))
+
+(defn lsp--prefix-start (text p)
+  "The start of the word-char run ending at `p` — the completion region's left edge."
+  (if (or (<= p 0) (not (lsp--word-char? (char-at text (dec p)))))
+    p
+    (lsp--prefix-start text (dec p))))
+
+(defn lsp--path->uri (path)
+  (str "file://" path))
+
+(def *lsp-language-ids*
+  ;; file extension → LSP languageId. Servers key document handling off this, so it
+  ;; must be the id the server expects (e.g. rust-analyzer wants "rust"). Extend live.
+  {"rs" "rust" "rb" "ruby" "ex" "elixir" "exs" "elixir" "py" "python"
+    "ts" "typescript" "js" "javascript" "go" "go" "c" "c" "h" "c"})
+
+(defn lsp--extension (path)
+  "The file extension of `path` (without the dot), or \"\" if none."
+  (let (dot (string-last-index-of path "."))
+    (if (< dot 0) "" (substring path (+ dot 1) (string-length path)))))
+
+(defn lsp--language-id (path)
+  "The LSP languageId for `path`, from its extension (`*lsp-language-ids*`); the bare
+extension when unmapped, or \"\" when there's none."
+  (let (ext (lsp--extension path))
+    (get *lsp-language-ids* ext ext)))
+
+(defn lsp-server-for (path)
+  "`[command args]` for the server configured (`*lsp-servers*`) for `path`'s extension,
+or `nil` if none."
+  (get *lsp-servers* (lsp--extension path)))
+
+(defn lsp-complete-source (m)
+  "The LSP completion source (a `complete/*completion-sources*` entry): `[start prefix
+labels]` from the server stored on the model under `:lsp`, or `nil` when LSP is off, the
+buffer has no file, or the server returns nothing. `complete` merges these with the mode
+and buffer-word sources."
+  (let (conn (get m :lsp))
+    (if (nil? conn)
+      nil
+      (let (buf (ed-current-buf m)
+            file (buffer-file buf))
+        (if (nil? file)
+          nil
+          (let (text (buffer-text buf)
+                p (buffer-point buf)
+                start (lsp--prefix-start text p)
+                prefix (substring text start p)
+                labels (lsp-complete-sync conn (lsp--path->uri file) (lsp--language-id file)
+                         text (buffer-current-line buf) (buffer-column buf) *lsp-timeout-ms*))
+            (if (empty? labels) nil [start prefix labels])))))))
