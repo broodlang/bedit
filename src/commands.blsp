@@ -33,6 +33,9 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
   (:use keymaps)  ; ed-set-profile + vim-to-* — the emacs/vim keybinding profiles
   (:use model))  ; current-buffer accessors, the kill ring, message
 
+(require 'theme)     ; face-dired-* — the dired listing colours (qualified refs)
+(require 'datetime)  ; epoch-ms->dt / dt-format — the dired mtime column
+
 ;; ---- applying buffer ops to the current buffer ------------------------------
 
 (defn ed-apply (m f)
@@ -879,48 +882,147 @@ rows (1-based source line numbers, which `cmd-occur-jump` parses back)."
 ;; ---- dired (a directory browser, C-x C-d) -----------------------------------
 ;; The same generated-read-only-buffer pattern as occur/process-menu: a listing of a
 ;; directory, navigated and operated by single keys (see modes/dired-keymap). State
-;; lives on the model — `:dired-dir` (absolute dir) and `:dired-names` (entry names in
-;; display order) — so the command under point recovers its target by INDEX (the current
-;; line minus the one header line → `:dired-names[i]`), robust to any filename (spaces
-;; included), never re-parsing formatted columns. File ops are the kernel fs primitives
-;; (make-dir/rename-file/copy-file/delete-file/delete-dir); richer ls -l columns
-;; (perms/owner/date) await a Brood `stat` + a `std/time` formatter (see ROADMAP §D).
+;; lives on the model — `:dired-dir` (absolute dir), `:dired-names` (entry names in
+;; display order) and `:dired-marks` (the marked names) — so the command under point
+;; recovers its target by INDEX (the current line minus the one header line →
+;; `:dired-names[i]`), robust to any filename (spaces included), never re-parsing
+;; formatted columns. File ops are the kernel fs primitives (make-dir/rename-file/
+;; copy-file/delete-file/delete-dir).
+;;
+;; The listing is the classic GNU `ls -l` layout (emacs `diredfl`): each row is
+;; `<mark><perms> <nlink> <owner> <group> <size> <Mon DD HH:MM> <name>`, one `file-stat`
+;; per entry (a single syscall yielding perms/nlink/owner/group/size/mtime — the Brood
+;; primitive this pass added/extended). `dired-fontify` (the mode's :fontify service)
+;; paints directory names blue, symlinks teal, executables green, the permission string
+;; and owner/group/size dim, the date warm, and a `*` mark peach. Colours live in
+;; `theme/face-dired-*` so the whole look re-skins from src/theme.blsp.
 
 (def ed--dired-header-lines 1)  ; the leading header line (the directory path)
 
-(defn ed--dired-entries (dir)
-  "The entry names of `dir` in display order: `.` and `..`, then subdirectories, then
-files — each group alphabetical (`list-dir` is already sorted). `()` if `dir` is unreadable."
+;; Fixed leading layout: a 1-char mark cell, then the 10-char permission string; the
+;; whitespace-delimited fields (nlink/owner/group/size + the 3 date tokens) follow,
+;; their widths computed per listing so the columns align like `ls`. `dired-fontify`
+;; finds the name by skipping those fields, so a long/space-bearing name never confuses
+;; it; `ed--dired-name-at` never parses columns at all (it indexes by line).
+(def ed--dired-perms-col 1)     ; the permission string (after the 1-char mark)
+(def ed--dired-perms-w 10)      ; "drwxr-xr-x"
+(def ed--dired-fields-col 11)   ; where the whitespace-delimited fields begin (mark+perms)
+(def ed--dired-date-w 12)       ; "Mon DD HH:MM"
+(def ed--month-abbrevs ["Jan" "Feb" "Mar" "Apr" "May" "Jun" "Jul" "Aug" "Sep" "Oct" "Nov" "Dec"])
+
+;; ---- per-entry stat → class / perms / size / date ---------------------------
+
+(defn ed--stat-dir? (st) "True if stat map `st` is a (followed) directory." (and st (get st :dir?)))
+
+(defn ed--dired-class (st)
+  "The one-char type/class for stat `st`: `d` dir, `l` symlink, `x` executable file, `-`
+regular (or unreadable). Symlink wins over dir so a linked directory reads as `l`."
+  (cond
+    (nil? st) "-"
+    (get st :symlink?) "l"
+    (get st :dir?) "d"
+    (get st :exec?) "x"
+    :else "-"))
+
+(defn ed--rwx (n)
+  "The `rwx`/`-` triad for a 3-bit permission group `n` (0–7)."
+  (str (if (>= (rem (quot n 4) 2) 1) "r" "-")
+    (if (>= (rem (quot n 2) 2) 1) "w" "-")
+    (if (>= (rem n 2) 1) "x" "-")))
+
+(defn ed--perms-string (st)
+  "The 10-char `ls -l` permission string for stat `st`: a type char (`d`/`l`/`-`) then
+the owner/group/other rwx triads from `:mode`. `----------` for an unreadable entry."
+  (if (nil? st)
+    "----------"
+    (let (mode (or (get st :mode) 0)
+          type (cond (get st :symlink?) "l" (get st :dir?) "d" :else "-"))
+      (str type
+        (ed--rwx (quot (rem mode 512) 64))   ; owner triad (bits 6–8)
+        (ed--rwx (quot (rem mode 64) 8))     ; group triad (bits 3–5)
+        (ed--rwx (rem mode 8))))))           ; other triad (bits 0–2)
+
+(defn ed--dired-date (mtime)
+  "The mtime column `Mon DD HH:MM` (UTC, `ls`-style), or `ed--dired-date-w` spaces when
+unknown — always that width so the name column stays aligned."
+  (if (nil? mtime)
+    (pad-right "" ed--dired-date-w)
+    (let (dt (datetime/epoch-ms->dt mtime))
+      (str (nth ed--month-abbrevs (dec (datetime/dt-month dt)))
+        " " (pad-left (str (datetime/dt-day dt)) 2)
+        " " (datetime/dt-format dt "%H:%M")))))
+
+;; ---- listing: stat each entry once, dirs-first, then render -----------------
+
+(defn ed--dired-list (dir)
+  "The display-ordered entries of `dir`, each `{:name :stat}` (one `file-stat` per
+entry): `.` then `..`, then subdirectories, then files — each group alphabetical
+(`list-dir` is already sorted). Robust to an unreadable `dir` (just `.`/`..`)."
   (let (names (try (list-dir dir) (catch e '()))
-        dirs (filter (fn (n) (dir? (path-join dir n))) names)
-        files (filter (fn (n) (not (dir? (path-join dir n)))) names))
-    (into (into ["." ".."] dirs) files)))
+        ents (map (fn (n) {:name n :stat (file-stat (path-join dir n))}) names)
+        dirs (filter (fn (e) (ed--stat-dir? (get e :stat))) ents)
+        files (filter (fn (e) (not (ed--stat-dir? (get e :stat)))) ents))
+    (into (into [{:name "." :stat (file-stat dir)}
+                 {:name ".." :stat (file-stat (parent-dir dir))}]
+            dirs)
+      files)))
 
-(defn ed--dired-row (dir name)
-  "One dired listing row: a type char (`d`/`-`), the size (right-aligned; `-` for a
-directory), then the name."
-  (let (path (path-join dir name)
-        d? (dir? path)
-        size (if d? "-" (str (or (file-size path) "?"))))
-    (str (if d? "d" "-") "  " (pad-left size 10) "  " name)))
+(defn ed--stat-field-str (st k dflt)
+  "Stat field `k` of `st` as a string, or `dflt` when the stat or field is missing."
+  (str (or (and st (get st k)) dflt)))
 
-(defn ed-dired-text (dir names)
-  "The dired buffer text: a header line (the directory) then one `ed--dired-row` per entry."
-  (str dir ":\n"
-    (join "\n" (map (fn (n) (ed--dired-row dir n)) names))
-    "\n"))
+(defn ed--dired-cols (entries)
+  "Per-listing column widths so the fields align like `ls`: the max string width of the
+nlink / owner / group / size fields across `entries`."
+  (let (widths (fn (k dflt)
+                 (apply max 1 (map (fn (e) (string-length (ed--stat-field-str (get e :stat) k dflt)))
+                                entries))))
+    {:nlink-w (widths :nlink "1")
+     :owner-w (widths :owner "?")
+     :group-w (widths :group "?")
+     :size-w (widths :size "0")}))
+
+(defn ed--dired-row (marked? st name cols)
+  "One `ls -l` row: `<mark><perms> <nlink> <owner> <group> <size> <date> <name>`, each
+field padded to `cols`' widths so the columns line up."
+  (str (if marked? "*" " ")
+    (ed--perms-string st)
+    " " (pad-left (ed--stat-field-str st :nlink "1") (get cols :nlink-w))
+    " " (pad-right (ed--stat-field-str st :owner "?") (get cols :owner-w))
+    " " (pad-right (ed--stat-field-str st :group "?") (get cols :group-w))
+    " " (pad-left (ed--stat-field-str st :size "0") (get cols :size-w))
+    " " (ed--dired-date (and st (get st :mtime)))
+    " " name))
+
+(defn ed--dired-header (dir entries)
+  "The header line: the absolute directory path (trailing `:`, `ls`/dired style)."
+  (str dir ":"))
+
+(defn ed-dired-text (dir entries marks)
+  "The dired buffer text: the header line then one `ed--dired-row` per entry (columns
+sized to the listing), a row flagged when its name is in `marks`."
+  (let (cols (ed--dired-cols entries))
+    (str (ed--dired-header dir entries) "\n"
+      (join "\n"
+        (map (fn (e) (ed--dired-row (includes? marks (get e :name)) (get e :stat) (get e :name) cols))
+          entries))
+      "\n")))
 
 (defn ed-show-dired (m dir &optional (line nil))
   "Build/refresh the read-only dired listing for `dir` in the selected pane (the buffer
 is named by the absolute directory path, so revisiting reuses it), recording
-`:dired-dir`/`:dired-names`, and put point on (1-based) `line` — default the first entry."
+`:dired-dir`/`:dired-names`, and put point on (1-based) `line` — default the first entry.
+Marks (`:dired-marks`) persist across a same-dir refresh and reset on a directory change."
   (let (dir (path-absolute dir)
-        names (ed--dired-entries dir)
-        m1 (ed-show-named (assoc m :dired-dir dir :dired-names names)
+        marks (if (= dir (get m :dired-dir)) (or (get m :dired-marks) '()) '())
+        entries (ed--dired-list dir)
+        names (into [] (map (fn (e) (get e :name)) entries))
+        m1 (ed-show-named (assoc m :dired-dir dir :dired-names names :dired-marks marks)
              dir
-             (ed-dired-text dir names)
+             (ed-dired-text dir entries marks)
              :dired))
-    (ed-apply m1 (fn (b) (ed--goto-line b (or line (inc ed--dired-header-lines)))))))
+    ;; land point ON the filename (not the leading mark column), Emacs dired-style
+    (ed-apply m1 (fn (b) (ed--dired-move-to-filename (ed--goto-line b (or line (inc ed--dired-header-lines))))))))
 
 (defn ed--dired-name-at (m)
   "The entry name on the current line of the dired buffer, or nil on the header / a
@@ -928,6 +1030,130 @@ blank line (the index is the line offset past the header into `:dired-names`)."
   (let (i (- (buffer-current-line (ed-current-buf m)) ed--dired-header-lines)
         names (get m :dired-names))
     (if (and (>= i 0) (< i (count names))) (nth names i) nil)))
+
+;; ---- dired-fontify: the :fontify service that colours the listing -----------
+;; A pure `slice -> [start end face]` like every mode's `:fontify` — it receives a
+;; windowed rope-slice (the view shifts the spans to absolute coords), so it can't
+;; assume slice-line-0 is the header: it classifies each line by STRUCTURE. A row is a
+;; mark cell (space/`*`) then a permission string (`drwx…`); anything else is the header
+;; path. A row is painted in `ls -l` columns: the `*` mark, the perms dim, the
+;; nlink/owner/group/size fields dim, the date warm, and the name in its type colour.
+;; The name is found by skipping the fixed leading columns + the seven whitespace fields,
+;; so a filename with spaces (or any width) never confuses the colouring.
+
+(defn ed--dired-row-line? (lt)
+  "True if line `lt` looks like an `ls -l` row — a mark cell (space/`*`), a type char
+(`d`/`l`/`-`), then the first permission bit (`r`/`-`)."
+  (and (>= (string-length lt) ed--dired-fields-col)
+    (member? (substring lt 0 1) (list " " "*"))
+    (member? (substring lt 1 2) (list "d" "l" "-"))
+    (member? (substring lt 2 3) (list "r" "-"))))
+
+(defn ed--dired-name-face (lt)
+  "The name colour for an `ls -l` row, read from its permission string: dir → blue,
+symlink → teal, an owner-executable file → green, else the plain file colour."
+  (cond
+    (= (substring lt 1 2) "d") theme/face-dired-dir
+    (= (substring lt 1 2) "l") theme/face-dired-symlink
+    (= (substring lt 4 5) "x") theme/face-dired-exec   ; the owner-execute bit
+    :else theme/face-dired-file))
+
+(defn ed--dired-skip-spaces (s i n)
+  (if (and (< i n) (= (char-at s i) " ")) (ed--dired-skip-spaces s (inc i) n) i))
+
+(defn ed--dired-token-end (s i n)
+  (if (and (< i n) (not (= (char-at s i) " "))) (ed--dired-token-end s (inc i) n) i))
+
+(defn ed--dired-fields (s i n k acc)
+  "Collect the `[start end]` of the next `k` whitespace-delimited tokens from index `i`,
+returning `[token-spans name-start]` — `name-start` the first non-space past them."
+  (if (= k 0)
+    [(reverse acc) (ed--dired-skip-spaces s i n)]
+    (let (st (ed--dired-skip-spaces s i n)
+          en (ed--dired-token-end s st n))
+      (if (>= st n)
+        [(reverse acc) n]
+        (ed--dired-fields s en n (dec k) (cons [st en] acc))))))
+
+(defn ed--dired-meta-spans (off toks i acc)
+  "Spans for the metadata tokens at slice offset `off`: nlink/owner/group/size (the first
+four) in the dim size face, the three date tokens in the date face."
+  (if (empty? toks)
+    (reverse acc)
+    (let ([s e] (first toks))
+      (ed--dired-meta-spans off (rest toks) (inc i)
+        (cons [(+ off s) (+ off e) (if (>= i 4) theme/face-dired-date theme/face-dired-size)] acc)))))
+
+(defn ed--dired-row-spans (lt off len)
+  "The `[start end face]` spans for an `ls -l` row `lt` whose first char is at slice
+offset `off` (`len` its length): the `*` mark, the perms string, the metadata fields, and
+the name in its type colour. Ascending + non-overlapping."
+  (let ([toks name-start] (ed--dired-fields lt ed--dired-fields-col len 7 '())
+        name-face (ed--dired-name-face lt))
+    (concat
+      (if (= (substring lt 0 1) "*") (list [off (+ off 1) theme/face-dired-mark]) '())
+      (list [(+ off ed--dired-perms-col) (+ off ed--dired-perms-col ed--dired-perms-w) theme/face-dired-perms])
+      (ed--dired-meta-spans off toks 0 '())
+      (if (> len name-start) (list [(+ off name-start) (+ off len) name-face]) '()))))
+
+(defn ed--dired-line-spans (lt off)
+  "Spans for one dired line at slice offset `off`: a row's columns, or the whole line in
+the header face when it isn't a row (and `()` for a blank trailing line)."
+  (let (len (string-length lt))
+    (cond
+      (= len 0) '()
+      (ed--dired-row-line? lt) (ed--dired-row-spans lt off len)
+      :else (list [off (+ off len) theme/face-dired-header]))))
+
+(defn ed--dired-spans-acc (lines off acc)
+  "Tail-recursive: accumulate each line's spans, advancing the offset by the line length
++ 1 (the stripped newline). Tail position so a long listing can't overflow the stack."
+  (if (empty? lines)
+    acc
+    (ed--dired-spans-acc (rest lines)
+      (+ off (string-length (first lines)) 1)
+      (concat acc (ed--dired-line-spans (first lines) off)))))
+
+(defn dired-fontify (src)
+  "The dired `:fontify` service: `[start end face]` colour spans for a rendered listing
+slice `src`. Line-structural (no lexer state), so the windowed slice the view passes
+fontifies correctly wherever it starts."
+  (ed--dired-spans-acc (string-split src "\n") 0 '()))
+
+;; ---- point-on-filename: keep the cursor on the name, not column 0 -----------
+;; Emacs dired puts point (and the block cursor) on the filename. The name's column
+;; varies per listing (owner/group widths), so it's found the same way `dired-fontify`
+;; does: skip the mark+perms and the seven whitespace fields. Line motion (n/p/arrows)
+;; snaps through here, and `ed-show-dired` lands here too.
+
+(defn ed--dired-filename-col (lt)
+  "The column on dired row `lt` where the filename starts — past the mark+perms and the
+seven whitespace fields; 0 when `lt` isn't a row (so point isn't pulled off the header)."
+  (if (ed--dired-row-line? lt)
+    (second (ed--dired-fields lt ed--dired-fields-col (string-length lt) 7 '()))
+    0))
+
+(defn ed--dired-move-to-filename (b)
+  "Move point onto the current line's filename (the cursor sits on the name, not the
+leading mark column) — a no-op on the header line."
+  (let (line (buffer-current-line b)
+        lt (ed-strip-newline (buffer-line-at b line))
+        bol (rope-line->char (buffer-rope b) line))
+    (goto-char b (+ bol (ed--dired-filename-col lt)))))
+
+(defn ed--dired-snap (m)
+  "Apply `ed--dired-move-to-filename` to the current buffer (after a line move)."
+  (ed-apply m (fn (b) (ed--dired-move-to-filename b))))
+
+(defcommand cmd-dired-next-line
+  (m key)
+  "Move to the next line and onto its filename (n / C-n / down)."
+  (ed--dired-snap (cmd-next-line m key)))
+
+(defcommand cmd-dired-previous-line
+  (m key)
+  "Move to the previous line and onto its filename (p / C-p / up)."
+  (ed--dired-snap (cmd-previous-line m key)))
 
 (defcommand cmd-dired
   (m key)
@@ -972,6 +1198,48 @@ current buffer's directory (else the working dir)."
   (m key)
   "Kill the dired buffer (q)."
   (cmd-kill-buffer m key))
+
+;; ---- marking (m / u / U / t, acted on by x / D) -----------------------------
+;; `:dired-marks` is the set (a list, deduped) of marked entry names; a marked row
+;; renders with a `*` flag (peach, via dired-fontify) and `cmd-dired-delete` operates on
+;; the whole set. Marks survive a same-dir refresh (ed-show-dired) and reset on cd.
+
+(defn ed--dired-mark-set (m name on?)
+  "Return `m` with entry `name` marked (`on?` true) or unmarked — marks kept a deduped set."
+  (let (marks (or (get m :dired-marks) '()))
+    (assoc m :dired-marks
+      (if on?
+        (if (includes? marks name) marks (cons name marks))
+        (filter (fn (x) (not (= x name))) marks)))))
+
+(defn ed--dired-remark (m on?)
+  "Mark (`on?`) or unmark the entry under point, then advance to the next line and
+re-render. The `.`/`..` pseudo-entries can't be marked — just advance past them."
+  (let (name (ed--dired-name-at m)
+        next (+ (buffer-current-line (ed-current-buf m)) 2)  ; 1-based line below point
+        m1 (if (or (nil? name) (= name ".") (= name "..")) m (ed--dired-mark-set m name on?)))
+    (ed-show-dired m1 (get m :dired-dir) next)))
+
+(defcommand cmd-dired-mark (m key) "Mark the entry under point, then advance (m)." (ed--dired-remark m true))
+
+(defcommand cmd-dired-unmark (m key) "Unmark the entry under point, then advance (u)." (ed--dired-remark m false))
+
+(defcommand cmd-dired-unmark-all
+  (m key)
+  "Remove every mark (U)."
+  (ed-show-dired (assoc m :dired-marks '())
+    (get m :dired-dir)
+    (inc (buffer-current-line (ed-current-buf m)))))
+
+(defcommand cmd-dired-toggle-marks
+  (m key)
+  "Toggle all marks — every unmarked entry becomes marked and vice versa, excluding
+`.`/`..` (t)."
+  (let (all (filter (fn (n) (not (or (= n ".") (= n "..")))) (get m :dired-names))
+        marked (or (get m :dired-marks) '()))
+    (ed-show-dired (assoc m :dired-marks (filter (fn (n) (not (includes? marked n))) all))
+      (get m :dired-dir)
+      (inc (buffer-current-line (ed-current-buf m))))))
 
 (defn ed--dired-prompt (m prompt initial run)
   "A minibuffer prompt for a dired file op: `run` is `(model dir text) -> model`,
@@ -1019,19 +1287,35 @@ message on blank input)."
           (ed--dired-op mm dir "copy"
             (fn () (copy-file (path-join dir name) (path-join dir t)))))))))
 
+(defn ed--dired-delete-targets (mm dir names)
+  "Delete each entry `names` under `dir` (a dir recursively, else a file), then clear the
+marks and re-render; report the first failure in the echo area."
+  (try
+    (do
+      (fold (fn (_ n) (let (p (path-join dir n)) (if (dir? p) (delete-dir p) (delete-file p))))
+        nil names)
+      (ed-show-dired (assoc mm :dired-marks '()) dir))
+    (catch e (message mm (str "delete failed: " (error-message e))))))
+
 (defcommand cmd-dired-delete
   (m key)
-  "Delete the file or directory on the current line, after a y/n confirm (D)."
+  "Delete the marked entries — or the entry under point when none are marked — after a
+y/n confirm (D / x)."
   (let (dir (get m :dired-dir)
-        name (ed--dired-name-at m))
-    (if (or (nil? name) (= name ".") (= name ".."))
+        marks (or (get m :dired-marks) '())
+        under (ed--dired-name-at m)
+        targets (if (empty? marks)
+                  (if (or (nil? under) (= under ".") (= under "..")) '() (list under))
+                  marks))
+    (if (empty? targets)
       (message m "not on a deletable entry")
-      (ed-read-char m (str "Delete " name "? (y/n)")
+      (ed-read-char m
+        (if (empty? marks)
+          (str "Delete " (first targets) "? (y/n)")
+          (str "Delete " (count targets) " marked? (y/n)"))
         (fn (mm k)
           (if (or (= k "y") (= k "Y"))
-            (let (path (path-join dir name))
-              (ed--dired-op mm dir "delete"
-                (fn () (if (dir? path) (delete-dir path) (delete-file path)))))
+            (ed--dired-delete-targets mm dir targets)
             (message mm "canceled")))))))
 
 ;; ---- describe-key (C-h k) ---------------------------------------------------

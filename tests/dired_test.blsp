@@ -103,6 +103,106 @@
       (is (file-exists? (path-join d "a.txt")))
       (delete-dir d))))
 
+(describe "editor dired: ls -l columns (class / perms / date)"
+  (test "ed--dired-class: dir d, symlink l (wins over dir), exec x, else -"
+    (assert= (commands/ed--dired-class {:dir? true}) "d")
+    (assert= (commands/ed--dired-class {:dir? true :symlink? true}) "l")
+    (assert= (commands/ed--dired-class {:exec? true}) "x")
+    (assert= (commands/ed--dired-class {}) "-")
+    (assert= (commands/ed--dired-class nil) "-"))
+  (test "ed--rwx: a 3-bit group → the rwx triad"
+    (assert= (commands/ed--rwx 7) "rwx")
+    (assert= (commands/ed--rwx 5) "r-x")
+    (assert= (commands/ed--rwx 6) "rw-")
+    (assert= (commands/ed--rwx 0) "---"))
+  (test "ed--perms-string: the 10-char ls -l permission string from :mode + type"
+    (assert= (commands/ed--perms-string {:dir? true :mode 493}) "drwxr-xr-x")    ; 0o755 dir
+    (assert= (commands/ed--perms-string {:mode 420}) "-rw-r--r--")               ; 0o644 file
+    (assert= (commands/ed--perms-string {:symlink? true :mode 509}) "lrwxrwxr-x"); 0o775 link
+    (assert= (commands/ed--perms-string nil) "----------"))
+  (test "ed--dired-date: epoch-ms → Mon DD HH:MM (UTC), 12-wide blank when nil"
+    (assert= (commands/ed--dired-date 0) "Jan  1 00:00")
+    (assert= (string-length (commands/ed--dired-date nil)) 12)))
+
+(describe "editor dired: fontify (diredfl colours)"
+  (test "dired-fontify paints the header, the perms column, and a directory name"
+    (let (d (dired-fixture)
+          spans (commands/dired-fontify (buffer-text (cur (dired-on d 2))))
+          faces (map (fn (s) (nth s 2)) spans))
+      (is (not (empty? spans)))
+      (is (member? theme/face-dired-header faces))  ; the directory-path header line
+      (is (member? theme/face-dired-perms faces))   ; the rwx permission column
+      (is (member? theme/face-dired-dir faces))     ; sub is a directory → blue
+      (delete-dir d)))
+  (test "the name span survives a filename containing spaces"
+    (let (d (dired-fixture)
+          _ (spit (path-join d "a b c.txt") "x")      ; a space-bearing name
+          spans (commands/dired-fontify (buffer-text (cur (dired-on d 2))))
+          ;; a file-name span (file face) is emitted past the metadata columns
+          file-spans (filter (fn (s) (= (nth s 2) theme/face-dired-file)) spans))
+      (is (not (empty? file-spans)))
+      (delete-dir d)))
+  (test "a marked row's * flag is painted in the mark face"
+    (let (d (dired-fixture)
+          marked (cmd-dired-mark (dired-on d 4) nil)  ; mark sub
+          spans (commands/dired-fontify (buffer-text (cur marked)))
+          faces (map (fn (s) (nth s 2)) spans))
+      (is (member? theme/face-dired-mark faces))
+      (delete-dir d))))
+
+(describe "editor dired: marking"
+  (test "m marks the entry under point and advances; * shows in the listing"
+    (let (d (dired-fixture)
+          marked (cmd-dired-mark (dired-on d 4) nil))   ; point on sub
+      (is (includes? (get marked :dired-marks) "sub"))
+      (is (string-contains? (buffer-text (cur marked)) "*"))
+      (delete-dir d)))
+  (test "u/U: a second mark, then unmark-all clears them"
+    (let (d (dired-fixture)
+          m1 (cmd-dired-mark (dired-on d 4) nil)        ; mark sub (point advances to a.txt)
+          m2 (cmd-dired-mark m1 nil)                    ; mark a.txt
+          cleared (cmd-dired-unmark-all m2 nil))
+      (assert= (count (get m2 :dired-marks)) 2)
+      (is (empty? (get cleared :dired-marks)))
+      (delete-dir d)))
+  (test ". and .. cannot be marked — m just advances"
+    (let (d (dired-fixture)
+          done (cmd-dired-mark (dired-on d 2) nil))     ; point on "."
+      (is (empty? (get done :dired-marks)))
+      (delete-dir d)))
+  (test "x deletes every marked entry after a y confirm"
+    (let (d (dired-fixture)
+          marked (cmd-dired-mark (dired-on d 4) nil)    ; mark sub (a directory)
+          done (ed-update (cmd-dired-delete marked nil) "y" 80 24))
+      (refute (dir? (path-join d "sub")))
+      (is (empty? (get done :dired-marks)))
+      (delete-dir d))))
+
+;; point's column on its line, and the line text from point to EOL — to assert the
+;; cursor sits on the filename.
+(defn col-at (b)
+  (- (buffer-point b) (rope-line->char (buffer-rope b) (buffer-current-line b))))
+(defn name-under (b)
+  (let (line (buffer-current-line b)
+        lt (ed-strip-newline (buffer-line-at b line)))
+    (substring lt (col-at b) (string-length lt))))
+
+(describe "editor dired: point sits on the filename"
+  (test "show lands point on the name, not the leading mark column"
+    (let (d (dired-fixture)
+          b (cur (dired-on d 4)))                        ; line 4 = sub
+      (is (> (col-at b) 0))                              ; past column 0
+      (assert= (name-under b) "sub")                    ; the cursor is on the name
+      (delete-dir d)))
+  (test "n / p move by line and re-snap point onto the filename"
+    (let (d (dired-fixture)
+          down (cmd-dired-next-line (dired-on d 4) nil)) ; sub → a.txt
+      (assert= (commands/ed--dired-name-at down) "a.txt")
+      (assert= (name-under (cur down)) "a.txt")
+      (let (up (cmd-dired-previous-line down nil))       ; back to sub
+        (assert= (name-under (cur up)) "sub"))
+      (delete-dir d))))
+
 (describe "editor dired: keybindings"
   (test "C-x C-j opens dired (Emacs dired-jump), same as C-x C-d"
     (let (j (press (m-of "x") [:ctrl-x :ctrl-j])
