@@ -84,7 +84,8 @@ src/modes.blsp              modes as layers: the keymaps (data) + brood-mode ser
 src/complete.blsp           completion-at-point (the in-buffer Tab popup) — multi-source merge
 src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — a completion source
 src/mincomplete.blsp        minibuffer prompt completion (path / name)
-src/completion.blsp         shared fuzzy ranking + vertical-menu renderer (complete + minibuffer)
+src/completion.blsp         shared fuzzy ranking + vertical-menu card + ls -l perms (complete + plume + dired)
+src/plume.blsp              the minibuffer completion UI — vertical list + marginalia + N/M counter (our Vertico/Marginalia)
 src/isearch.blsp            incremental search + query-replace (C-s/C-r/M-%) modal mini-loops
 src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
 src/projects.blsp           project root + file walk (find-file-in-project)

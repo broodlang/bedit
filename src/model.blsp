@@ -45,6 +45,12 @@ pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
 ;; settles, and a real keystroke forces the caret solid (`ed-real-input?`). Idle, so
 ;; the caret stays solid while you type and only blinks at rest.
 
+(def *complete-debounce-min* 800)
+;; A minibuffer completion source larger than this is **debounced**: its candidate list is
+;; re-ranked only after you pause (the idle `:idle-recompute` timer), not on every keystroke
+;; — so a large project stays responsive while typing. Small sources (M-x, buffer/project
+;; lists, small find-file) re-rank synchronously per keystroke — instant, no lag.
+
 (def *diag-debounce-ms* 250)
 ;; The tick beat armed after a *settled* edit left diagnostics stale: a `:tick`
 ;; fires this long after you stop typing and runs the (deferred) type-check —
@@ -83,8 +89,13 @@ addition; if the running `nest` predates it the call throws, so we degrade grace
   "Mode-stamp `buf` for the pool: `init-buffer-layers` resolves its type (filename /
 `:type` → `text-mode` by default, `brood-mode` for `.blsp`) and seeds its `:layers`.
 Use at every buffer-creation site so the mode is set from the first frame (the mode
-line reads it, and dispatch composes its keymap)."
-  (init-buffer-layers buf))
+line reads it, and dispatch composes its keymap). Also gives a *file* buffer its
+`:dir` (default-directory = the file's folder) if it has none yet — every buffer
+carries a `:dir`; a fileless one inherits it where it's opened (see `ed-open-buffer`)."
+  (let (b (init-buffer-layers buf))
+    (if (and (nil? (get b :dir)) (not (nil? (buffer-file b))))
+      (assoc b :dir (parent-dir (buffer-file b)))
+      b)))
 
 (defn ed-pane (idx)
   "A pane payload showing pool buffer `idx`, scrolled to the top, at font scale 1
@@ -329,7 +340,7 @@ flag once no prefix is pending (what `ed--which-key-arm` used to do)."
         idle (if (get m :held-key)
                {}
                (merge
-                 (if (or (ed-eldoc-stale? m) (ed-diag-stale? m))
+                 (if (or (ed-eldoc-stale? m) (ed-diag-stale? m) (mb-cands-stale? m))
                    {:idle-recompute {:after *diag-debounce-ms* :idle? true}} {})
                  (if (and (get m :pending) (not (get m :which-key)))
                    {:which-key {:after *which-key-delay-ms* :idle? true}} {})
@@ -418,9 +429,17 @@ boundary when each is due — and the timers' firing (in `input/ed--timer-fire`)
 work. A real keystroke/click also forces the caret solid (`ed-real-input?`), so it only
 blinks at rest. Finally refreshes the open minibuffer's memoized candidate list
 (`ed-cache-mb-candidates`) so the view/input read it cheaply."
-  (ed-cache-mb-candidates
-    (ed-sync-timers
-      (if (ed-real-input? input) (assoc m :blink-on? true) m))))
+  (let (m2 (ed-sync-timers (if (ed-real-input? input) (assoc m :blink-on? true) m))
+        mb (get m2 :minibuffer))
+    ;; Refresh the memoized candidate list. A small source re-ranks every keystroke (snappy).
+    ;; A large source (`mb--debounce?`) re-ranks only its *initial* list here and defers later
+    ;; refreshes to the idle `:idle-recompute` timer — so typing fast doesn't re-rank tens of
+    ;; thousands of candidates per keystroke (the completion debounce). `mb-candidates` returns
+    ;; the cached list meanwhile; a deliberate Tab/↑/↓/Enter forces a fresh refresh.
+    (cond
+      (or (nil? mb) (not (mb-source? mb))) m2
+      (and (mb--debounce? mb) (not (nil? (get mb :cand-cache)))) m2
+      :else (ed-cache-mb-candidates m2))))
 
 ;; ---- the minibuffer (a one-line prompt over lineedit's pure editor core) -----
 ;; The `:minibuffer` field is `{:edit <lineedit-state> :on-complete :complete-fn
@@ -463,6 +482,32 @@ result. `[nil ()]` when the prompt has neither source."
     (not (nil? (get mb :candidates-fn))) [nil ((get mb :candidates-fn) text)]
     :else [nil ()]))
 
+(def ed-minibuffer-max 10)  ; most list rows the echo area grows to (Emacs vertico-count)
+
+(defn ed-which-key-count (m)
+  "Number of pending which-key continuation rows (0 when the panel isn't showing — no
+pending prefix, not yet revealed, or a minibuffer/menu is open)."
+  (let (km (get m :pending))
+    (if (or (nil? km) (not (get m :which-key)) (get m :minibuffer) (get m :menu))
+      0
+      (count (map-pairs km)))))
+
+(defn ed--list-rows (n rows)
+  "Echo-area height for an `n`-row list below the prompt: 0 → 1 (just the prompt), else
+1 + the list capped to `ed-minibuffer-max` and the screen."
+  (if (= n 0) 1 (+ 1 (min ed-minibuffer-max n (max 1 (- rows 4))))))
+
+(defn ed-echo-rows (m rows)
+  "How many bottom screen rows the echo area occupies. It grows **downward** from below
+the mode line (Emacs-style): 1 (the prompt/message row) plus a list — Plume's candidate
+list for an open selection prompt, or the which-key continuations for a pending prefix.
+`ed-body-layout` reserves this many rows so the pane + its mode line sit above; `view`
+lays the prompt + list into them."
+  (let (mb (get m :minibuffer))
+    (if (and mb (get mb :accept-selection))
+      (ed--list-rows (count (mb-candidates mb)) rows)
+      (ed--list-rows (ed-which-key-count m) rows))))
+
 (defn mb-candidates (mb)
   "The current candidate list for minibuffer `mb` — fuzzy-ranked from its `:rank-source`,
 or its `:candidates-fn` applied to the typed text, or `()` with neither.
@@ -474,9 +519,29 @@ view (the vertical list) and input (selection + accept) both read. A cache miss 
 fresh (no narrowing — that needs the previous ranking, which `ed-cache-mb-candidates`
 threads in)."
   (let (cache (get mb :cand-cache))
-    (if (and cache (= (get cache :for) (mb-text mb)))
-      (get cache :cands)
-      (second (mb--rank mb (mb-text mb) nil nil)))))
+    (cond
+      ;; a fresh hit (the cache is for the current text) — the common case
+      (and cache (= (get cache :for) (mb-text mb))) (get cache :cands)
+      ;; a large source whose cache is stale: return it as-is — re-ranking is *debounced*
+      ;; onto the idle timer, so typing fast doesn't re-rank tens of thousands of candidates
+      (and cache (mb--debounce? mb)) (get cache :cands)
+      ;; otherwise (small source, or no cache yet) recompute now — instant, and what the
+      ;; per-keystroke and direct-text-set paths rely on
+      :else (second (mb--rank mb (mb-text mb) (get cache :for) (get cache :ranked))))))
+
+(defn mb--debounce? (mb)
+  "Whether minibuffer `mb`'s candidate ranking should be debounced — a fixed `:rank-source`
+larger than `*complete-debounce-min*` (a `:candidates-fn` prompt computes its own way)."
+  (let (src (get mb :rank-source))
+    (and (not (nil? src)) (> (count src) *complete-debounce-min*))))
+
+(defn mb-cands-stale? (m)
+  "True if an open candidate prompt's cached list is for a different input than the current
+text — a recompute is due. Drives the idle (`:idle-recompute`) debounce timer for a large
+source; a small source is kept current synchronously, so it's never stale here."
+  (let (mb (get m :minibuffer))
+    (and (not (nil? mb)) (mb-source? mb)
+      (not (= (get (get mb :cand-cache) :for) (mb-text mb))))))
 
 (defn ed-cache-mb-candidates (m)
   "Refresh the open minibuffer's `:cand-cache` (`{:for <text> :ranked <full> :cands …}`)

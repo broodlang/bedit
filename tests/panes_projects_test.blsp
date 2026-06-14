@@ -121,12 +121,135 @@
       (assert= (count (projects/bookmarks--read f)) 2)
       (assert= (get (first (projects/bookmarks--read f)) :name) "a")
       (assert= (get (first (projects/bookmarks--read f)) :pos) 12)))
+  (test "persist-write! is atomic — leaves no stray .tmp file behind"
+    (let (f (str (temp-dir "myedit-atomic-") "/state.blsp"))
+      (projects/persist-write! f ["one" "two"])
+      (assert= (projects/persist-read f) ["one" "two"])
+      (is (not (file-exists? (str f ".tmp"))))))  ; the temp file was renamed away
+  (test "persist-read of a corrupt file yields [] (never crashes, never partial)"
+    (let (d (temp-dir "myedit-corrupt-")
+          f (str d "/state.blsp"))
+      (make-dir d)
+      (spit f "[\"unterminated")  ; a half-written / truncated literal
+      (assert= (projects/persist-read f) [])))
+  (test "projects--remember-live! prunes vanished roots and dedups the live one"
+    (let (d (temp-dir "myedit-known-")
+          f (str d "/projects.blsp"))    ; d itself is a dir that exists
+      (projects/persist-write! f [d "/no/such/dead/root"])  ; seed with one dead entry
+      (projects/projects--remember-live! f d)  ; re-remember the live root
+      (assert= (projects/persist-read f) [d])))  ; dead entry pruned, live deduped to front
   (test "C-x p is a prefix — its keys are captured, not self-inserted"
     (let (started (press (m-of "") [:ctrl-x "p"]))
       (is (not (nil? (get started :pending))))  ; C-x p opens a chord
       (assert= (buffer-text (cur (press (m-of "") [:ctrl-x "p" "z"]))) "")))  ; a wrong key drops
   (test "C-x p p is a chord, not self-inserts"
-    (assert= (buffer-text (cur (press (m-of "") [:ctrl-x "p" "p"]))) "")))
+    (assert= (buffer-text (cur (press (m-of "") [:ctrl-x "p" "p"]))) ""))
+  (test "project-root walks backwards up to the depth limit, then gives up"
+    (let (root (temp-dir "myedit-deep-")
+          _ (make-dir root)
+          _ (spit (path-join root "project.blsp") "(project :name deep)")
+          ;; root/a/b/c — the file's dir is 3 levels below the marker
+          a (path-join root "a") b (path-join a "b") c (path-join b "c")
+          _ (make-dir c))
+      (assert= (projects/project-root c 3) root)      ; 3 levels up → found
+      (is (nil? (projects/project-root c 2)))         ; limit too shallow → not found
+      (assert= (projects/project-root root 0) root)   ; dir itself is the root (no climb needed)
+      (delete-dir root)))
+  (test "project-files is bounded — a huge/looping tree can't hang the walk (C-x p p crash)"
+    ;; A root with many subdirs: with a tiny budget the walk stops between directories
+    ;; instead of visiting everything (the symlink-cycle / giant-root hang guard).
+    (let (root (temp-dir "myedit-wide-")
+          _ (make-dir root)
+          _ (fold (fn (acc i)
+                    (let (d (path-join root (str "d" i)))
+                      (make-dir d)
+                      (spit (path-join d "f.txt") "x")
+                      acc))
+              nil (range 40)))
+      ;; unbounded walk sees all 40 files; a budget of 5 entries stops early (fewer)
+      (assert= (count (projects/project-files root)) 40)
+      (is (< (count (projects/project-files root 5)) 40))
+      (delete-dir root)))
+  (test "project-files honours .gitignore in a git repo (git ls-files, not the raw walk)"
+    ;; a 12k-file project is mostly build/coverage output git ignores — listing via
+    ;; `git ls-files` keeps find-file to the actual source (fast + relevant).
+    (let (root (temp-dir "myedit-git-")
+          _ (make-dir root)
+          _ (%os-cmd "git" ["-C" root "init" "-q"])
+          _ (spit (path-join root "keep.ex") "x")
+          _ (spit (path-join root "build.log") "x")
+          _ (spit (path-join root ".gitignore") "*.log\n")
+          files (projects/project-files root))
+      (is (includes? files "keep.ex"))         ; tracked-or-untracked, not ignored → listed
+      (is (not (includes? files "build.log")))  ; matches .gitignore → excluded
+      (delete-dir root)))
+  (test "project-files--order: per-project recency first, then the rest by mtime (newest first)"
+    (let (mtime {"a" 10 "b" 20 "c" 30 "d" 99}  ; d is most-recently *written*
+          ;; recent (visited) = [b], so b leads; the rest (a,c,d) sort by mtime desc
+          ordered (projects/project-files--order (list "b") (list "a" "b" "c" "d")
+                    (fn (rel) (get mtime rel))))
+      (assert= ordered (list "b" "d" "c" "a")))
+    ;; nothing visited yet → pure last-written order (newest first)
+    (assert= (projects/project-files--order (list) (list "x" "y")
+               (fn (rel) (get {"x" 5 "y" 50} rel)))
+      (list "y" "x"))
+    ;; a recent entry no longer in the project is dropped
+    (assert= (projects/project-files--order (list "gone" "a") (list "a" "b")
+               (fn (rel) (get {"a" 1 "b" 2} rel)))
+      (list "a" "b")))
+  (test "project-recent--file: one file per project under the auto-gen state folder"
+    (let (f (projects/project-recent--file "/home/u/proj"))
+      (is (ends-with? f "%home%u%proj.blsp"))             ; slashes encoded → its own file
+      (is (string-contains? f "/brood-edit/state/recent/"))))  ; the dedicated auto-gen folder
+  (test "switch-project excludes the project you're already in"
+    ;; you can't switch to where you are — the current root is filtered out
+    (assert= (commands/ed--projects-to-switch "/b" ["/a" "/b" "/c"]) (list "/a" "/c"))
+    (assert= (commands/ed--projects-to-switch "/x" ["/a" "/b"]) (list "/a" "/b"))  ; not in list → all
+    (assert= (commands/ed--projects-to-switch nil ["/a" "/b"]) (list "/a" "/b")))
+  (test "ed-project-root follows the current buffer's file, not the cached root"
+    (let (root (temp-dir "myedit-proj-")
+          _ (make-dir root)
+          _ (spit (path-join root "project.blsp") "(project :name a)")
+          _ (spit (path-join root "f.txt") "hi")
+          ;; current buffer visits a file in this project; a *different* cached root is set
+          m (assoc (ed-set-buf (m-of "") (make-buffer "" "f.txt" (path-join root "f.txt")))
+              :project-root "/some/other/project"))
+      (assert= (commands/ed-project-root m) root)  ; the visited file's project wins over the cache
+      (delete-dir root)))
+  (test "project commands follow the Dired directory, not the launch dir"
+    ;; a Dired buffer has no :file, so without `:dired-dir` ed--default-dir would fall back to
+    ;; the launch dir — and C-x p f would list the wrong project (the reported bug).
+    (let (root (temp-dir "myedit-dproj-")
+          _ (make-dir root)
+          _ (spit (path-join root "project.blsp") "(project :name d)")
+          sub (path-join root "sub")
+          _ (make-dir sub)
+          _ (spit (path-join sub "a.txt") "x")
+          ;; viewing the subdir in Dired, with a *different* cached project root
+          m (commands/ed-show-dired (assoc (m-of "") :project-root "/some/other/project") sub))
+      (assert= (commands/ed--default-dir m) sub)   ; the dired directory, not the launch/cached dir
+      (assert= (commands/ed-project-root m) root)  ; → that directory's project
+      (delete-dir root)))
+  (test "find-file-in-project lists the GIVEN project's files, not the current buffer's"
+    ;; the C-x p p bug: switching to project B must list B's files even though the current
+    ;; buffer still sits in project A. `ed-find-file-in-project` keys off the explicit root.
+    (let (a (temp-dir "myedit-a-") b (temp-dir "myedit-b-")
+          _ (make-dir a) _ (make-dir b)
+          _ (spit (path-join a "project.blsp") "(project :name a)")
+          _ (spit (path-join b "project.blsp") "(project :name b)")
+          _ (spit (path-join b "only-in-b.txt") "x")
+          ;; ed-find-file-in-project calls remember-project! → writes the REAL projects cache;
+          ;; save it and restore *before* asserting so this test never pollutes it (the source
+          ;; of the stray /tmp entries seen earlier).
+          pf (projects/projects-file)
+          saved (if (file-exists? pf) (slurp pf) nil)
+          ;; current buffer is in project A; switch lists project B (passed explicitly)
+          m (ed-set-buf (m-of "") (make-buffer "" "pa" (path-join a "project.blsp")))
+          switched (commands/ed-find-file-in-project m b)
+          _ (if (nil? saved) (delete-file pf) (spit pf saved)))
+      (assert= (get-in switched [:minibuffer :anno-base]) b)        ; rows are B-relative
+      (is (includes? (get-in switched [:minibuffer :rank-source]) "only-in-b.txt"))  ; B's file listed
+      (delete-dir a) (delete-dir b))))  ; no current → all
 
 ;; ---- M-x: run interactive commands by name ----------------------------------
 (describe "editor M-x"
@@ -165,11 +288,16 @@
   (test "C-x b accepts the selected buffer (fuzzy)"
     (let (done (press (m-of "hi") (append [:ctrl-x "b"] (append (string->list "Messa") [:enter]))))
       (is (string-contains? (buffer-name (cur done)) "*Messages*"))))
-  (test "a Vertico prompt renders its candidates as a vertical list"
-    (let (ops (ed-mb-candidates-ops (press (m-of "x") [:alt-x]) 80 24))
-      (is (> (count ops) 0))
-      (is (= (first (first ops)) :rect))  ; the solid card fills behind the rows
-      (is (some? (fn (op) (= (first op) :text)) ops))))  ; …with the candidate rows on top
+  (test "a Plume prompt renders its candidates as a flat list at the bottom"
+    (let (m (press (m-of "x") [:alt-x])
+          ops (ed-mb-candidates-ops m 80 24)
+          rows (filter (fn (op) (= (first op) :text)) ops))
+      (is (> (count rows) 1))                              ; one text op per candidate row (no card frame)
+      (is (every? (fn (op) (= (first op) :text)) ops))     ; flat: text rows only, no :rect card
+      ;; the rows sit at the very bottom (below the prompt), growing downward
+      (is (= (nth (last rows) 1) 23))                      ; last row on the last screen line (rows-1)
+      ;; the selected (top) row carries the highlight band
+      (is (some? (fn (op) (= (nth op 4 nil) theme/face-popup-selected)) ops))))
   (test "completion--cell keeps a long item's tail behind an ellipsis"
     (let (cell (completion/completion--cell "/very/long/path/to/file.txt" 12))
       (is (string-contains? cell "file.txt"))  ; the filename survives the shortening

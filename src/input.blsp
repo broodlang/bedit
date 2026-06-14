@@ -24,6 +24,7 @@ self-editing editor)."
   (:use editor/keymap)  ; keymap-step — the std chord dispatcher
   (:use editor/ui)  ; overlay-route — the shared modal-overlay dispatch fallthrough
   (:use web)  ; web-publish! (per-event snapshot push) + the [:web-port] reply
+  (:use bshell)  ; the project shell (C-x p e): its [:bshell-output]/[:bshell-done] handlers
   (:use keymaps)  ; ed-ensure-profile — seed the model-scope keybinding profile (emacs/vim)
   (:use editor/layers))  ; scope-keymap (compose buffer + model layers) + init-buffer-layers
 
@@ -189,12 +190,16 @@ chord completes); a prefix-consuming command (set-mark) runs once and reads the 
                  ;; negative (`ed--run-arg`) — then clear the arg
                  pa (dissoc (ed--run-arg mc step this-cmd input n) :prefix-arg)
                  else (step mc)))
-    (cond
-      (map? binding) (assoc result :echo (str (ed-key-label input) "-"))
-      (and (nil? binding) (get m :pending)) (assoc result
-                                              :echo
-                                              (str (ed-key-label input) " is undefined"))
-      else result)))
+    ;; `:chord` accumulates the keys of the in-progress prefix chord, so the echo shows the
+    ;; FULL chord ("C-x p-", "C-x p e is undefined") — not just the last key. Carried while a
+    ;; prefix is pending; cleared the moment the chord resolves (a command ran) or aborts.
+    (let (chord (append (or (get m :chord) []) [input]))
+      (cond
+        (map? binding) (assoc result :echo (str (ed-keys-label chord) "-") :chord chord)
+        (and (nil? binding) (get m :pending)) (assoc result
+                                                :echo (str (ed-keys-label chord) " is undefined")
+                                                :chord [])
+        else (assoc result :chord [])))))
 
 ;; ---- repeat-mode (Emacs `repeat-mode`: tap the last key to repeat the command) -----
 ;; After a command in `*repeat-commands*` runs (typically via a chord like C-x o), arm a
@@ -251,7 +256,11 @@ otherwise resolve and run the key through the active keymap (`ed--dispatch-key`)
 `:complete-fn` of the input; Esc / C-g abort; every other key drives lineedit's pure
 editor (`lineedit--handle`) — on `:submit` (Enter) run `:on-complete` with the text,
 on `:cancel` close. Movement, kill-ring, yank, and history all come from lineedit."
-  (let (mb (get m :minibuffer)
+  (let (m (if (and (get-in m [:minibuffer :accept-selection])
+                (member? input [:tab :enter :ctrl-n :ctrl-p :up :down]))
+            (ed-cache-mb-candidates m)  ; a deliberate candidate action forces a fresh list (a
+            m)                          ; large debounced source may be showing a stale one)
+        mb (get m :minibuffer)
         sel? (get mb :accept-selection)  ; Vertico-style prompts (M-x, C-x b, C-x p f)
         cands (if sel? (mb-candidates mb) ())
         n (count cands)
@@ -535,7 +544,8 @@ group); `:cursor-blink` toggles the caret. An unknown name is a no-op."
                                                  textcols
                                                  {:every *repeat-rate-ms*})
                            else (ed--repeat-clear m))
-    (= name :idle-recompute) (ed-run-diag (ed-cache-eldoc m))
+    ;; the idle debounce: eldoc + diagnostics + a large completion source's candidate re-rank
+    (= name :idle-recompute) (ed-cache-mb-candidates (ed-run-diag (ed-cache-eldoc m)))
     (= name :which-key) (ed-which-key-reveal m)
     (= name :undo-pause) (ed-break-undo-run m)
     (= name :cursor-blink) (assoc m :blink-on? (not (get m :blink-on?)))
@@ -637,7 +647,9 @@ the repeat. Other releases just keep the flag set."
    :task-timeout ed--ev-task-reply
    :resize ed--ev-resize
    :mouse ed--ev-mouse
-   :web-port ed--ev-web-port})
+   :web-port ed--ev-web-port
+   :bshell-output bshell/ed--ev-bshell-output
+   :bshell-done bshell/ed--ev-bshell-done})
 
 (defn ed-system-event? (input)
   "Whether `input` is an inbound `[:tag …]` event with a registered handler."
@@ -733,15 +745,18 @@ owns it, else through the keymap (`ed-dispatch`)."
                            ;; cursor) — skipped while a transient overlay owns input, and NOT for other
                            ;; commands (recenter/goto/search act on the real point). Then route through
                            ;; the keymap and arm held-key repeat if it's repeatable.
-                           else (ed-repeat-key-step
-                                  (if (and (member? input *view-resume-keys*)
-                                        (nil? (overlay-active ed--transient-handlers m0)))
-                                    (ed--point-into-view m0 textrows)
-                                    m0)
-                                  input
-                                  textrows
-                                  textcols
-                                  {:after *repeat-delay-ms*}))
+                           ;; A bshell buffer keeps the cursor out of its read-only prompt
+                           ;; (`bshell-enforce-boundary`): a no-op in every other buffer.
+                           else (bshell-enforce-boundary
+                                  (ed-repeat-key-step
+                                    (if (and (member? input *view-resume-keys*)
+                                          (nil? (overlay-active ed--transient-handlers m0)))
+                                      (ed--point-into-view m0 textrows)
+                                      m0)
+                                    input
+                                    textrows
+                                    textcols
+                                    {:after *repeat-delay-ms*})))
                          input)
                        cols
                        rows)))

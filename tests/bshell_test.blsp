@@ -1,0 +1,274 @@
+;; The project shell (`C-x p e`) — `src/bshell.blsp`. A bshell is **per project**: each gets
+;; its own `*bshell: <root>*` buffer carrying its own state (`:bshell-proc`/`-running`/
+;; `-input-start`/history) on the buffer, plus the generic `:dir` (= its project root). These
+;; cover the GUI-free pieces: ANSI stripping, the input-region/prompt bookkeeping, RET, history,
+;; fontify, completion. The shell process is a thin IO shell around `proc-spawn` (the `:cwd`
+;; path is in brood's proc_test.blsp), so it isn't re-tested here.
+
+(defmodule bshell-test
+  (:use test)
+  (:use model)
+  (:use commands)
+  (:use bshell)
+  (:use input)
+  (:use editor/buffer))
+
+(require 'bshell)
+
+;; The per-project buffer name for /tmp (what `C-x p e` would create there).
+(def bshell-name (bshell/bshell--buffer-name "/tmp"))
+
+;; A model whose current buffer is a /tmp bshell — all state ON the buffer, no live process.
+(defn bshell-model ()
+  (let (prompt (bshell/bshell--prompt "/tmp")
+        raw (end-of-buffer (insert (make-buffer "" bshell-name) prompt))
+        buf (assoc (editor/layers/set-buffer-type raw :bshell)
+              :dir "/tmp"
+              :bshell-proc nil :bshell-running false
+              :bshell-input-start (string-length prompt)
+              :bshell-history [] :bshell-hist-idx nil :bshell-draft nil))
+    (ed-open-buffer (ed-init (make-buffer "")) buf)))
+
+(defn bshell-buf (m) (nth (get m :buffers) (ed-buffer-index-by-name m bshell-name)))
+(defn bshell-text (m) (buffer-text (bshell-buf m)))
+(defn bshell-istart (m) (get (bshell-buf m) :bshell-input-start))
+(defn bshell-running (m) (get (bshell-buf m) :bshell-running))
+(defn bshell-input (m) (let (t (bshell-text m)) (substring t (bshell-istart m) (string-length t))))
+(defn set-field (m k v) (ed-set-buf m (assoc (ed-current-buf m) k v)))  ; set a field on the current buffer
+(defn bshell-point (m) (buffer-point (ed-current-buf m)))
+(defn type-into (m s) (fold (fn (acc k) (ed-update acc k 80 24)) m (string->list s)))
+(defn at-point (m p) (ed-set-buf m (goto-char (ed-current-buf m) p)))
+
+;; A model 'in' /tmp (no project marker there) so `ed-project-root` resolves to /tmp.
+(defn tmp-project-model ()
+  (assoc (ed-set-buf (ed-init (make-buffer "")) (make-buffer "" "scratch" "/tmp/scratch"))
+    :project-root "/tmp"))
+
+;; ---- ANSI stripping ---------------------------------------------------------
+
+(describe "bshell--strip-ansi"
+  (test "drops SGR colour sequences"
+    (assert= (bshell/bshell--strip-ansi "\e[31mred\e[0m") "red"))
+  (test "drops a cursor-op sequence mid-string"
+    (assert= (bshell/bshell--strip-ansi "a\e[2Kb") "ab"))
+  (test "drops carriage returns, keeps newlines"
+    (assert= (bshell/bshell--strip-ansi "a\r\nb\r") "a\nb"))
+  (test "passes plain text through unchanged"
+    (assert= (bshell/bshell--strip-ansi "hello world") "hello world")))
+
+;; ---- the async output/done handlers (per buffer, by name) -------------------
+
+(describe "ed--ev-bshell-output"
+  (test "appends the chunk verbatim (no forced newline)"
+    (let (m (bshell/ed--ev-bshell-output (bshell-model) [:bshell-output bshell-name "hi"] 24 80 24))
+      (is (ends-with? (bshell-text m) "tmp $ hi"))))
+  (test "consecutive chunks concatenate without a line break between them"
+    (let (m1 (bshell/ed--ev-bshell-output (bshell-model) [:bshell-output bshell-name "ab"] 24 80 24)
+          m2 (bshell/ed--ev-bshell-output m1 [:bshell-output bshell-name "cd"] 24 80 24))
+      (is (ends-with? (bshell-text m2) "abcd")))))
+
+(describe "ed--ev-bshell-done"
+  (test "a clean exit (0) is silent — no [exit] line, but a fresh prompt and idle shell"
+    (let (m0 (set-field (bshell-model) :bshell-running true)
+          m (bshell/ed--ev-bshell-done m0 [:bshell-done bshell-name 0] 24 80 24))
+      (is (not (includes? (bshell-text m) "[exit")))
+      (is (ends-with? (bshell-text m) "tmp $ "))  ; the fresh prompt
+      (assert= (bshell-running m) false)))
+  (test "a non-zero exit shows [exit N]"
+    (let (m (bshell/ed--ev-bshell-done (bshell-model) [:bshell-done bshell-name 2] 24 80 24))
+      (is (includes? (bshell-text m) "[exit 2]"))))
+  (test "a signal-killed child (nil code) reads as [exit killed]"
+    (let (m (bshell/ed--ev-bshell-done (bshell-model) [:bshell-done bshell-name nil] 24 80 24))
+      (is (includes? (bshell-text m) "[exit killed]"))))
+  (test "input-start is reset to the new buffer end (after the fresh prompt)"
+    (let (m (bshell/ed--ev-bshell-done (bshell-model) [:bshell-done bshell-name 1] 24 80 24))
+      (assert= (bshell-istart m) (string-length (bshell-text m))))))
+
+;; ---- Brood-form detection (shell command vs REPL form) ----------------------
+
+(describe "bshell--brood-form?"
+  (test "a line starting with ( is evaluated as Brood"
+    (is (bshell/bshell--brood-form? "(+ 1 2)")))
+  (test "leading whitespace before ( is ignored"
+    (is (bshell/bshell--brood-form? "   (println 1)")))
+  (test "a shell command line is not a Brood form"
+    (is (not (bshell/bshell--brood-form? "nest test"))))
+  (test "a bare word is not a Brood form"
+    (is (not (bshell/bshell--brood-form? "ls")))))
+
+;; ---- fontify: prompt detected from the buffer text (per buffer, no global) ---
+
+(describe "bshell-fontify"
+  (test "spans the prompt prefix (detected from the first line) and an [exit N] line"
+    (let (spans (bshell/bshell-fontify "/tmp $ ls\nfile\n[exit 2]\n"))
+      ;; the prompt is the first line up to " $ " → "/tmp $ " (offsets [0, 7))
+      (assert= (first (first spans)) 0)
+      (assert= (second (first spans)) 7)
+      (is (>= (count spans) 2)))))
+
+;; ---- input-region boundary (can't edit/move left of the prompt) -------------
+
+(describe "bshell input-region boundary"
+  (test "backward-char is a no-op exactly at the input start (won't enter the prompt)"
+    (let (m (bshell-model))  ; point sits at the input start (just the prompt so far)
+      (assert= (bshell-point (cmd-bshell-backward-char m nil)) (bshell-istart m))))
+  (test "backward-char still moves within typed input"
+    (let (m (type-into (bshell-model) "ab"))
+      (assert= (bshell-point (cmd-bshell-backward-char m nil)) (dec (bshell-point m)))))
+  (test "backspace at the input start leaves the prompt intact"
+    (let (m (bshell-model))
+      (assert= (bshell-text (cmd-bshell-delete-backward m nil)) (bshell-text m))))
+  (test "backspace deletes a typed char within the input"
+    (let (m (type-into (bshell-model) "x"))
+      (assert= (bshell-text (cmd-bshell-delete-backward m nil)) (bshell-text (bshell-model)))))
+  (test "C-a jumps to the input start, not into the prompt"
+    (let (m (type-into (bshell-model) "abc"))
+      (assert= (bshell-point (cmd-bshell-beginning-of-input m nil)) (bshell-istart m)))))
+
+(describe "bshell-enforce-boundary (the post-keystroke safety net)"
+  (test "pulls point out of the prompt region to the input start (e.g. Down landed there)"
+    (let (m0 (bshell-model)
+          m (at-point m0 3))  ; point inside the "/tmp $ " prompt
+      (assert= (bshell-point (bshell-enforce-boundary m)) (bshell-istart m0))))
+  (test "leaves point alone when it's already in the input"
+    (let (m (bshell-model))  ; point at the input start
+      (assert= (bshell-point (bshell-enforce-boundary m)) (bshell-point m))))
+  (test "leaves point alone in the output above the input line (output stays navigable)"
+    (let (raw (end-of-buffer (insert (make-buffer "" bshell-name) "out\n/tmp $ "))
+          buf (assoc (editor/layers/set-buffer-type raw :bshell) :dir "/tmp" :bshell-input-start 11)
+          m0 (ed-open-buffer (ed-init (make-buffer "")) buf)
+          m (at-point m0 1))  ; inside "out" (output, above the input line)
+      (assert= (bshell-point (bshell-enforce-boundary m)) 1)))
+  (test "a no-op in a non-bshell buffer"
+    (let (m (at-point (ed-init (make-buffer "hello")) 2))
+      (assert= (bshell-point (bshell-enforce-boundary m)) 2))))
+
+;; ---- command history (↑/↓ recall, per buffer) -------------------------------
+
+(describe "bshell command history"
+  (test "↑ recalls the newest command, then older ones"
+    (let (m0 (set-field (bshell-model) :bshell-history ["ls" "pwd"])
+          m1 (cmd-bshell-previous-history m0 nil)
+          m2 (cmd-bshell-previous-history m1 nil))
+      (assert= (bshell-input m1) "pwd")
+      (assert= (bshell-input m2) "ls")))
+  (test "↓ walks back toward the newest, then restores the live draft"
+    (let (m0 (set-field (bshell-model) :bshell-history ["ls" "pwd"])
+          up2 (cmd-bshell-previous-history (cmd-bshell-previous-history m0 nil) nil)  ; → "ls"
+          dn1 (cmd-bshell-next-history up2 nil)   ; → "pwd"
+          dn2 (cmd-bshell-next-history dn1 nil))  ; → live draft ("")
+      (assert= (bshell-input dn1) "pwd")
+      (assert= (bshell-input dn2) "")))
+  (test "↑ with no history is a no-op"
+    (let (m (bshell-model))
+      (assert= (bshell-input (cmd-bshell-previous-history m nil)) "")))
+  (test "submitting a command records it in this buffer's history"
+    (let (typed (type-into (set-field (bshell-model) :bshell-proc (self)) "echo hi")
+          m (cmd-bshell-send typed nil))
+      (is (includes? (get (bshell-buf m) :bshell-history) "echo hi")))))
+
+;; ---- completion: filenames for a command, Brood globals for a form ----------
+
+(describe "bshell-complete-source"
+  (test "completes a filename under the shell's directory for a shell command"
+    (let (m (type-into (set-field (bshell-model) :dir ".") "sr")
+          [start prefix items] (bshell/bshell-complete-source m))
+      (assert= prefix "sr")
+      (is (includes? items "src/"))))  ; the project's src/ directory, dir-suffixed
+  (test "completes Brood globals for a (-form line (the REPL)"
+    (let (m (type-into (bshell-model) "(ca")
+          [start prefix items] (bshell/bshell-complete-source m))
+      (is (includes? items "car"))))
+  (test "is inert outside a bshell buffer"
+    (is (nil? (bshell/bshell-complete-source (ed-init (make-buffer "x")))))))
+
+;; ---- RET: cmd-bshell-send ---------------------------------------------------
+
+(describe "cmd-bshell-send"
+  :isolated  ; sends to a process (here, the test itself, via :bshell-proc = self)
+  (test "slices the input line and sends it to the shell process, marking :running"
+    (let (typed (type-into (set-field (bshell-model) :bshell-proc (self)) "pwd")
+          m (cmd-bshell-send typed nil))
+      (let (got (receive ([:bshell-run line] line) (after 2000 :timeout)))
+        (assert= got "pwd"))
+      (is (ends-with? (bshell-text m) "tmp $ pwd\n"))
+      (assert= (bshell-running m) true)))
+
+  (test "an empty input line just emits a fresh prompt — nothing is sent, not running"
+    (let (m (cmd-bshell-send (set-field (bshell-model) :bshell-proc (self)) nil))
+      (assert= (bshell-running m) false)
+      (assert= (bshell-istart m) (string-length (bshell-text m)))
+      (is (nil? (receive ([:bshell-run line] line) (after 200 nil))))))
+
+  (test "RET is ignored while a command is already running"
+    (let (m0 (set-field (bshell-model) :bshell-running true)
+          m (cmd-bshell-send m0 nil))
+      (assert= m m0))))
+
+;; ---- multi-line input (an incomplete Brood form keeps editing) --------------
+
+(describe "bshell--complete-input?"
+  (test "a complete Brood form is ready to submit"
+    (is (bshell/bshell--complete-input? "(+ 1 2)")))
+  (test "an unclosed Brood form is not (RET should add a line)"
+    (is (not (bshell/bshell--complete-input? "(+ 1 2"))))
+  (test "an unterminated string is not complete"
+    (is (not (bshell/bshell--complete-input? "(println \"hi"))))
+  (test "a shell command is always ready"
+    (is (bshell/bshell--complete-input? "nest test")))
+  (test "a complete-but-malformed form still submits (eval reports it)"
+    (is (bshell/bshell--complete-input? "(1 2 3)"))))
+
+(describe "cmd-bshell-send multi-line"
+  :isolated
+  (test "an incomplete form inserts a newline instead of submitting (stays not-running)"
+    (let (typed (type-into (set-field (bshell-model) :bshell-proc (self)) "(+ 1")
+          m (cmd-bshell-send typed nil))
+      (is (ends-with? (bshell-text m) "(+ 1\n"))
+      (assert= (bshell-running m) false))))
+
+;; ---- persistent history (serialize/parse, the pure core) --------------------
+
+(describe "bshell history persistence"
+  (test "trim keeps the whole history when under the cap (oldest first)"
+    (assert= (bshell/bshell--history-trim ["ls" "pwd" "echo hi"]) ["ls" "pwd" "echo hi"]))
+  (test "trim drops the oldest entries beyond the cap, keeping the most-recent tail"
+    (let (big (into [] (map str (range 0 5000)))   ; well past any sane cap
+          kept (bshell/bshell--history-trim big)
+          n (count kept))
+      (is (< n 5000))                              ; something was dropped
+      (assert= kept (into [] (drop (- 5000 n) big)))))  ; what's kept is the newest tail
+  (test "save then load round-trips through the shared persist layer (atomic)"
+    (let (f "/tmp/myedit-bshell-hist-test.blsp")
+      (projects/persist-write! f ["a" "b"])
+      (assert= (projects/persist-read f) ["a" "b"])))
+  (test "loading a missing file yields an empty history (never errors)"
+    (is (vector? (bshell/bshell--load-history)))))
+
+;; ---- per-project: each project gets its own shell buffer --------------------
+
+(describe "cmd-project-bshell (per project)"
+  :isolated  ; starts real (idle) shell processes
+  (test "opens a per-project *bshell: <root>* buffer with its prompt + buffer-local state"
+    (let (m (cmd-project-bshell (tmp-project-model) nil)
+          buf (nth (get m :buffers) (ed-buffer-index-by-name m bshell-name)))
+      (is (not (nil? (ed-buffer-index-by-name m bshell-name))))
+      (is (not (nil? (get buf :bshell-proc))))
+      (assert= (get buf :bshell-running) false)
+      (assert= (get buf :dir) "/tmp")            ; root is the generic per-buffer :dir
+      (is (ends-with? (buffer-text buf) "$ "))
+      (bshell-shutdown (get buf :bshell-proc))))
+
+  (test "a different project opens a DISTINCT buffer (not the last project's shell)"
+    (let (m1 (cmd-project-bshell (tmp-project-model) nil)
+          ;; now 'in' a different project: open (not replace) a file buffer there, so /tmp's
+          ;; shell stays in the pool; its :dir (= /var/tmp) drives ed-project-root
+          m2model (assoc (ed-open-buffer m1 (make-buffer "" "x" "/var/tmp/x")) :project-root "/var/tmp")
+          m2 (cmd-project-bshell m2model nil)
+          na (bshell/bshell--buffer-name "/tmp")
+          nb (bshell/bshell--buffer-name "/var/tmp"))
+      (is (not (= na nb)))                              ; distinct per-project names
+      (is (not (nil? (ed-buffer-index-by-name m2 na))))  ; /tmp's shell still there
+      (is (not (nil? (ed-buffer-index-by-name m2 nb))))  ; /var/tmp got its own
+      (bshell-shutdown (get (nth (get m2 :buffers) (ed-buffer-index-by-name m2 na)) :bshell-proc))
+      (bshell-shutdown (get (nth (get m2 :buffers) (ed-buffer-index-by-name m2 nb)) :bshell-proc)))))
