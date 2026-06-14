@@ -81,7 +81,8 @@ src/commands.blsp           the editing commands, each a (model key) -> model
 src/keymaps.blsp            keybinding profiles (emacs / modal vim) as model-scope layers
 src/interactive.blsp        the `defcommand` macro + the M-x command registry
 src/modes.blsp              modes as layers: the keymaps (data) + brood-mode services
-src/complete.blsp           completion-at-point (the in-buffer Tab popup)
+src/complete.blsp           completion-at-point (the in-buffer Tab popup) — multi-source merge
+src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — a completion source
 src/mincomplete.blsp        minibuffer prompt completion (path / name)
 src/completion.blsp         shared fuzzy ranking + vertical-menu renderer (complete + minibuffer)
 src/isearch.blsp            incremental search + query-replace (C-s/C-r/M-%) modal mini-loops

@@ -7,13 +7,16 @@ While the popup is open `input` routes control keys here — C-n/↓ and C-p/↑
 Enter/Tab accept, Esc/C-g cancel; any other key dismisses it and is processed
 normally (so you keep typing). `view` overlays `complete-popup-ops`.
 
-The SOURCE hook `completion-candidates` is redefinable live (baseline = distinct words
-in the current buffer; redefine to complete global symbols, file paths, snippets, …).
-The LOOK (`*completion-*-face*`, `*completion-max*`) and the menu rendering itself live
-in the shared `completion` framework, which `mincomplete`/the minibuffer also use.
+SOURCES are **multi**: `cmd-complete` merges candidates from an ordered list,
+`*completion-sources*` (Emacs' `completion-at-point-functions`) — the always-on
+buffer-word source, the buffer's language mode (`:complete-at` → brood-mode globals),
+and any added source (an LSP server via `src/lsp.blsp`). Each is a fn
+`(model) -> nil | [start prefix items]`; the first non-nil fixes the region and the
+rest merge in. The LOOK (`*completion-*-face*`, `*completion-max*`) and the menu
+rendering live in the shared `completion` framework, which the minibuffer also uses.
 
-Pure (data→data) apart from reading the buffer; the popup is plain render ops, so
-it's unit-testable without a window."
+Pure (data→data) apart from reading the buffer and (for an LSP source) a bounded
+synchronous request; the popup is plain render ops, unit-testable without a window."
   (:use editor/buffer)  ; buffer text/point + edit ops
   (:use model)  ; current-buffer accessors, message
   (:use completion)  ; the shared fuzzy ranking + vertical-menu renderer (+ the look config)
@@ -81,6 +84,56 @@ via `all-globals`, file paths, snippets, …). Baseline: the distinct words in t
 current buffer that start with `prefix` and aren't exactly it, sorted."
   (completion-candidates-of (complete--buffer-words m) prefix))
 
+;; ---- multi-source completion-at-point (CAPF-style) --------------------------
+;; Completion draws from an ordered LIST of sources, not one. A source is a fn
+;;   (model) -> nil | [start prefix items]
+;; returning `nil` when it doesn't apply at point (e.g. no prefix). The FIRST
+;; non-nil source fixes the completion region `[start prefix]`; every other
+;; non-nil source that agrees on `start` contributes its `items` to the merge
+;; (deduped, source order preserved). This is Emacs' `completion-at-point-functions`:
+;; the buffer-word source is always present; a language mode prepends its own
+;; (brood-mode → live globals), and an LSP source plugs in the same way.
+
+(def *completion-sources*
+  ;; The ordered completion sources, highest precedence first. A list of fn *symbols*
+  ;; `(model) -> nil | [start prefix items]`, resolved late so a redefined source
+  ;; hot-swaps live. `complete-source-mode` adapts the buffer's `:complete-at` mode
+  ;; service (brood-mode → live globals); `complete-source-buffer-words` is always on.
+  ;; Insert another symbol (e.g. an LSP source) to plug it into the merge — ricing.
+  (list 'complete/complete-source-mode
+    'complete/complete-source-buffer-words))
+
+(defn complete-add-source! (sym)
+  "Add completion source `sym` (a fn symbol) to the front of `*completion-sources*`,
+idempotently — the way a feature turns its source on (e.g. `lsp` adds its source when a
+server connects). Highest precedence; redefining the global directly also works."
+  (when (not (includes? *completion-sources* sym))
+    (def *completion-sources* (cons sym *completion-sources*)))
+  nil)
+
+(defn complete-source-mode (m)
+  "The mode source: the current buffer's `:complete-at` language service (e.g. brood-mode's
+live globals), adapted to the source protocol. `nil` when the mode offers no service or
+there's no prefix at point. The seam that keeps `complete` language-agnostic."
+  (let (buf (ed-current-buf m)
+        svc (ed-mode-service buf :complete-at))
+    (if (nil? svc)
+      nil
+      (let ([start prefix items] (svc (buffer-text buf) (buffer-point buf)))
+        (if (= prefix "") nil [start prefix items])))))
+
+(defn complete-source-buffer-words (m)
+  "The baseline source: the distinct words of the current buffer that start with the
+word before point. `nil` when there's no word before point."
+  (let (buf (ed-current-buf m)
+        text (buffer-text buf)
+        p (buffer-point buf)
+        start (complete--prefix-start text p)
+        prefix (substring text start p))
+    (if (= prefix "")
+      nil
+      [start prefix (completion-candidates-of (distinct (complete--words text)) prefix)])))
+
 ;; ---- applying a completion --------------------------------------------------
 
 (defn complete--apply (m start word)
@@ -90,50 +143,34 @@ current buffer that start with `prefix` and aren't exactly it, sorted."
         buf2 (replace-region buf start p word))
     (assoc (ed-set-buf m buf2) :completion nil :status "modified")))
 
-(defn complete--default-at (m)
-  "The baseline `[start prefix candidates words]` for completion at point: the buffer
-word before point, the prefix-matching distinct buffer words, and `words` — the full
-distinct-word *universe* the candidates were filtered from. The popup caches `words` so a
-narrowing keystroke re-filters it (`completion-candidates-of`) instead of re-scanning the
-whole buffer. The fallback when the buffer's mode offers no `:complete-at` service."
-  (let (buf (ed-current-buf m)
-        text (buffer-text buf)
-        p (buffer-point buf)
-        start (complete--prefix-start text p)
-        prefix (substring text start p)
-        words (distinct (complete--words text)))
-    [start prefix (completion-candidates-of words prefix) words]))
-
 (defn complete--at (m)
-  "`[start prefix candidates]` for completion at point. Delegates to the current
-buffer's mode `:complete-at` service when it has one (e.g. `brood-mode` completes
-live global symbols), else the buffer-word default. This is the seam that lets a
-language mode supply its own completion without `complete` naming the language."
-  (let (buf (ed-current-buf m)
-        text (buffer-text buf)
-        p (buffer-point buf)
-        svc (ed-mode-service buf :complete-at))
-    (if (nil? svc)
-      (let ([start prefix candidates words] (complete--default-at m)) [start prefix candidates])
-      (svc text p))))
+  "`[start prefix items]` for completion at point, **merged across every applicable
+source** (`*completion-sources*`). The first non-nil source fixes the region `[start
+prefix]`; the others contribute items only if they agree on `start` (deduped, source
+order kept). `[point \"\" ()]` when nothing applies. The seam that lets a language
+mode (or LSP) supply completions without `complete` naming the language."
+  (let (results (filter (fn (r) (not (nil? r)))
+                  (map (fn (s) ((eval s) m)) *completion-sources*)))
+    (if (empty? results)
+      [(buffer-point (ed-current-buf m)) "" '()]
+      (let ([start prefix _] (first results)
+            items (distinct
+                    (apply concat
+                      (map (fn (r) (if (= (first r) start) (nth r 2) '())) results))))
+        [start prefix items]))))
 
 (defn cmd-complete (m key)
-  "Completion-at-point (Tab): complete the symbol/word before point via the current
-buffer's mode (`:complete-at`) or the buffer-word default, **fuzzy-ranked**. One match
+  "Completion-at-point (Tab): complete the symbol/word before point, merged across the
+buffer's completion sources (mode + buffer words + …) and **fuzzy-ranked**. One match
 inserts directly; several open the popup; none echoes a note; an empty prefix is a no-op."
-  (let (svc (ed-mode-service (ed-current-buf m) :complete-at)
-        ;; default source → [start prefix items words]; mode source → words = nil (the
-        ;; service is re-queried each refresh, so there's nothing buffer-scoped to cache).
-        [start prefix items0 words] (if (nil? svc)
-                                      (complete--default-at m)
-                                      (let ([s p c] (complete--at m)) [s p c nil]))
+  (let ([start prefix items0] (complete--at m)
         items (completion-rank prefix items0))
     (if (= prefix "")
       (message m "nothing to complete")
       (cond
         (empty? items) (message m (str "no completions for \"" prefix "\""))
         (= (count items) 1) (complete--apply m start (first items))
-        else (assoc m :completion {:items items :index 0 :start start :prefix prefix :words words})))))
+        else (assoc m :completion {:items items :index 0 :start start :prefix prefix})))))
 
 ;; ---- popup navigation (input routes control keys here) ----------------------
 
@@ -166,27 +203,14 @@ the narrowing keystroke's insert/delete."
 
 (defn complete--refresh (m)
   "Recompute the popup from the current point after a narrowing edit, closing it when the
-prefix is empty or nothing matches. The default (buffer-word) source re-filters the
-**cached word universe** (`:words`, captured on open) against the new prefix — read with
-an O(prefix) `rope-slice`, not a whole-buffer scan — so narrowing a large buffer costs
-nothing per keystroke; only the word at point ever changes and it's always excluded, so
-the cache stays exact across both typing and backspace. A mode source (`:words` nil) is
-re-queried via `complete--at`."
-  (let (c (get m :completion)
-        words (get c :words))
-    (if (nil? words)
-      (let ([start prefix items0] (complete--at m)
-            items (completion-rank prefix items0))
-        (if (or (= prefix "") (empty? items))
-          (assoc m :completion nil)
-          (assoc m :completion {:items items :index 0 :start start :prefix prefix})))
-      (let (buf (ed-current-buf m)
-            start (get c :start)
-            prefix (rope-slice (buffer-rope buf) start (buffer-point buf))
-            items (completion-rank prefix (completion-candidates-of words prefix)))
-        (if (or (= prefix "") (empty? items))
-          (assoc m :completion nil)
-          (assoc m :completion {:items items :index 0 :start start :prefix prefix :words words}))))))
+prefix is empty or nothing matches. Re-queries every source through `complete--at` so the
+merge stays correct across all of them (a mode/LSP source can't be prefix-cached the way a
+single word universe could) — the word at point changed, so the sources rescan it."
+  (let ([start prefix items0] (complete--at m)
+        items (completion-rank prefix items0))
+    (if (or (= prefix "") (empty? items))
+      (assoc m :completion nil)
+      (assoc m :completion {:items items :index 0 :start start :prefix prefix}))))
 
 (defn complete-handle (m input)
   "Fold a popup-control key: C-n/↓ C-p/↑ move; Enter/Tab accept; a word-char inserts and
