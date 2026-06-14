@@ -172,6 +172,78 @@ SymbolInformation, or nil) flattened to a list of `{:name :kind :line :char}`, p
 before children, in document order."
   (if (nil? result) '() (reverse (lsp--flatten-symbols result "" '()))))
 
+;; ---- pure protocol: location / hover / edit shapes (goto, refs, hover, rename) ----
+
+(defn lsp--uri->path (uri)
+  "The filesystem path of a `file://` `uri` (the inverse of `lsp--path->uri`); `uri`
+unchanged if it has no scheme."
+  (if (starts-with? uri "file://") (substring uri 7 (string-length uri)) uri))
+
+(defn lsp--location (loc)
+  "Normalise one LSP `Location` (`:uri`+`:range`) or `LocationLink` (`:targetUri`+
+`:targetSelectionRange`/`:targetRange`) to `{:path :line :char}` (0-based)."
+  (let (uri (or (get loc :uri) (get loc :targetUri) "")
+        rng (or (get loc :range) (get loc :targetSelectionRange) (get loc :targetRange))
+        start (if (nil? rng) nil (get rng :start)))
+    {:path (lsp--uri->path uri) :line (get start :line 0) :char (get start :character 0)}))
+
+(defn lsp-locations (result)
+  "The `textDocument/definition`/`references` `result` — a single `Location`/`LocationLink`,
+a vector of them, or nil — as a list of `{:path :line :char}`."
+  (cond (nil? result) '()
+    (vector? result) (map lsp--location result)
+    :else (list (lsp--location result))))
+
+(defn lsp--marked (x)
+  "The text of one hover content item — a plain string, or a `{:value …}` (MarkupContent /
+MarkedString object)."
+  (cond (string? x) x (map? x) (get x :value "") :else ""))
+
+(defn lsp-hover-text (result)
+  "The plain text of a `textDocument/hover` `result` — its `:contents`, which is a string, a
+`{:value …}`, or a vector of either (joined by blank lines). `\"\"` when empty/nil."
+  (if (nil? result) ""
+    (let (c (get result :contents))
+      (cond (nil? c) ""
+        (string? c) c
+        (vector? c) (join "\n\n" (filter (fn (s) (not (= s ""))) (map lsp--marked c)))
+        :else (lsp--marked c)))))
+
+(defn lsp--text-edit (e)
+  "Normalise one `TextEdit` (`:range {:start :end}` + `:newText`) to
+`{:start-line :start-char :end-line :end-char :text}` (0-based)."
+  (let (rng (get e :range) s (get rng :start) en (get rng :end))
+    {:start-line (get s :line 0) :start-char (get s :character 0)
+     :end-line (get en :line 0) :end-char (get en :character 0)
+     :text (get e :newText "")}))
+
+(defn lsp-text-edits (result)
+  "A `TextEdit[]` (`textDocument/formatting`, or null) as a list of normalised edits
+(`lsp--text-edit`)."
+  (if (nil? result) '() (map lsp--text-edit result)))
+
+(defn lsp-workspace-edit (result)
+  "A `WorkspaceEdit` (`textDocument/rename` result) as `{path -> [edit …]}` (paths, not
+uris; edits normalised). Handles both the `:changes` map and the `:documentChanges` array
+shapes; `{}` when nil."
+  (if (nil? result) {}
+    (let (changes (get result :changes)
+          docs (get result :documentChanges))
+      (cond
+        (not (nil? changes))
+        ;; JSON object keys parse to keywords, so a `:changes` uri arrives as `:file:///a`,
+        ;; not a string — coerce back with `name` before stripping the scheme.
+        (reduce (fn (acc uri)
+                  (assoc acc (lsp--uri->path (if (keyword? uri) (name uri) uri))
+                    (map lsp--text-edit (get changes uri))))
+          {} (keys changes))
+        (not (nil? docs))
+        (reduce (fn (acc dc)
+                  (assoc acc (lsp--uri->path (get (get dc :textDocument) :uri))
+                    (map lsp--text-edit (get dc :edits))))
+          {} docs)
+        :else {}))))
+
 ;; ---- pure connection logic (state -> [state effects]) -----------------------
 ;; The connection process's state:
 ;;   {:proc handle :buf "" :next-id N :pending {jsonrpc-id -> [reply-to corr]}
@@ -189,55 +261,76 @@ before children, in document order."
     {:textDocument {:uri uri :version version}
       :contentChanges [{:text text}]}))
 
-(defn lsp--completion-request (id uri line char)
-  (lsp-request id "textDocument/completion"
-    {:textDocument {:uri uri}
-      :position {:line line :character char}}))
+;; Each request is `{:textDocument {:uri …}}` plus a method-specific body. `lsp--pos`
+;; adds the `:position` every cursor-located request (completion/definition/references/
+;; hover/rename) carries.
+(defn lsp--pos (line char) {:line line :character char})
 
+(defn lsp--completion-request (id uri line char)
+  (lsp-request id "textDocument/completion" {:textDocument {:uri uri} :position (lsp--pos line char)}))
 (defn lsp--document-symbol-request (id uri)
   (lsp-request id "textDocument/documentSymbol" {:textDocument {:uri uri}}))
+(defn lsp--definition-request (id uri line char)
+  (lsp-request id "textDocument/definition" {:textDocument {:uri uri} :position (lsp--pos line char)}))
+(defn lsp--references-request (id uri line char)
+  (lsp-request id "textDocument/references"
+    {:textDocument {:uri uri} :position (lsp--pos line char) :context {:includeDeclaration true}}))
+(defn lsp--hover-request (id uri line char)
+  (lsp-request id "textDocument/hover" {:textDocument {:uri uri} :position (lsp--pos line char)}))
+(defn lsp--formatting-request (id uri)
+  (lsp-request id "textDocument/formatting"
+    {:textDocument {:uri uri} :options {:tabSize 2 :insertSpaces true}}))
+(defn lsp--rename-request (id uri line char new-name)
+  (lsp-request id "textDocument/rename"
+    {:textDocument {:uri uri} :position (lsp--pos line char) :newName new-name}))
+
+(defn lsp--issue (state corr reply-to uri lang text kind make-request)
+  "Pure: the frames + next state for one request. Syncs the document first (`didOpen` the
+first time a uri is seen — tagged with `lang`, the LSP languageId — else a full-text
+`didChange`), then `(make-request id)` (a framed request), recording `[reply-to corr kind]`
+under its jsonrpc id so the response is routed back and shaped per `kind` (`lsp--shape`).
+The one transition behind every request — completion, symbols, definition, references,
+hover, formatting, rename. Returns `[state' frames]`."
+  (let (id (get state :next-id)
+        opened (get state :opened)
+        version (get state :version)
+        seen? (get opened uri)
+        sync-frame (if seen? (lsp--did-change uri version text) (lsp--did-open uri lang text))
+        state2 (assoc state
+                 :next-id (+ id 1)
+                 :version (+ version 1)
+                 :opened (assoc opened uri true)
+                 :pending (assoc (get state :pending) id [reply-to corr kind])))
+    [state2 [sync-frame (make-request id)]]))
 
 (defn lsp--request-complete (state corr reply-to uri lang text line char)
-  "Pure: the frames to send for a completion at `(uri, line, char)` and the next state.
-Syncs the document first (`didOpen` the first time a uri is seen — tagged with `lang`,
-the LSP languageId — else a full-text `didChange`), then the completion request; records
-`corr`→`reply-to` under the request's jsonrpc id so the response can be routed back.
-Returns `[state' frames]`."
-  (let (id (get state :next-id)
-        opened (get state :opened)
-        version (get state :version)
-        seen? (get opened uri)
-        sync-frame (if seen? (lsp--did-change uri version text) (lsp--did-open uri lang text))
-        state2 (assoc state
-                 :next-id (+ id 1)
-                 :version (+ version 1)
-                 :opened (assoc opened uri true)
-                 :pending (assoc (get state :pending) id [reply-to corr])))
-    [state2 [sync-frame (lsp--completion-request id uri line char)]]))
+  "Completion at `(uri, line, char)` — see `lsp--issue`. `[state' frames]`."
+  (lsp--issue state corr reply-to uri lang text :completion
+    (fn (id) (lsp--completion-request id uri line char))))
 
 (defn lsp--request-symbols (state corr reply-to uri lang text)
-  "Pure: the frames to send for a `textDocument/documentSymbol` on `uri` and the next
-state. Syncs the document first (`didOpen`/`didChange`, exactly as completion does), then
-the documentSymbol request; records `[reply-to corr :symbols]` under its id so the response
-is shaped as symbols (not completion labels). Returns `[state' frames]`."
-  (let (id (get state :next-id)
-        opened (get state :opened)
-        version (get state :version)
-        seen? (get opened uri)
-        sync-frame (if seen? (lsp--did-change uri version text) (lsp--did-open uri lang text))
-        state2 (assoc state
-                 :next-id (+ id 1)
-                 :version (+ version 1)
-                 :opened (assoc opened uri true)
-                 :pending (assoc (get state :pending) id [reply-to corr :symbols])))
-    [state2 [sync-frame (lsp--document-symbol-request id uri)]]))
+  "documentSymbol on `uri` — see `lsp--issue`. `[state' frames]`."
+  (lsp--issue state corr reply-to uri lang text :symbols
+    (fn (id) (lsp--document-symbol-request id uri))))
+
+(defn lsp--shape (kind result)
+  "The `[reply-tag value]` for a response of the given request `kind`, shaping the raw
+`result` into what the waiting command wants. `:completion` is also the fallback for an
+untagged (2-element) pending entry."
+  (cond
+    (= kind :symbols) [:lsp-symbols (lsp-document-symbols result)]
+    (= kind :definition) [:lsp-definition (lsp-locations result)]
+    (= kind :references) [:lsp-references (lsp-locations result)]
+    (= kind :hover) [:lsp-hover (lsp-hover-text result)]
+    (= kind :formatting) [:lsp-text-edits (lsp-text-edits result)]
+    (= kind :rename) [:lsp-workspace-edit (lsp-workspace-edit result)]
+    :else [:lsp-completion (lsp-completion-labels result)]))
 
 (defn lsp--dispatch (acc msg)
-  ;; Fold step: route one decoded message. A response whose `:id` is pending becomes a
-  ;; reply to its waiter — `[:lsp-symbols corr syms]` when the request was tagged `:symbols`
-  ;; in `:pending`, else `[:lsp-completion corr labels]` (an absent tag = completion, so the
-  ;; original 2-element `[reply-to corr]` entries still route as before). A notification
-  ;; (publishDiagnostics) or an unmatched id is ignored.
+  ;; Fold step: route one decoded message. A response whose `:id` is pending is shaped by
+  ;; its `:pending` kind tag (`lsp--shape`) and sent to its waiter as `[tag corr value]`; an
+  ;; absent tag (the original 2-element `[reply-to corr]` entries) shapes as completion. A
+  ;; notification (publishDiagnostics) or an unmatched id is ignored.
   (let ([state replies] acc
         id (get msg :id)
         entry (if (nil? id) nil (get (get state :pending) id)))
@@ -246,12 +339,9 @@ is shaped as symbols (not completion labels). Returns `[state' frames]`."
       (let (reply-to (first entry)
             corr (second entry)
             kind (if (>= (count entry) 3) (nth entry 2) nil)
-            result (get msg :result)
-            reply (if (= kind :symbols)
-                    [:lsp-symbols corr (lsp-document-symbols result)]
-                    [:lsp-completion corr (lsp-completion-labels result)]))
+            [tag value] (lsp--shape kind (get msg :result)))
         [(assoc state :pending (dissoc (get state :pending) id))
-          (cons [reply-to reply] replies)]))))
+          (cons [reply-to [tag corr value]] replies)]))))
 
 (defn lsp--ingest (state chunk)
   "Pure: fold a stdout `chunk` into the connection. Appends it to the frame buffer,
@@ -299,6 +389,31 @@ server; `:shutdown` or the server dying stops it."
         (lsp--loop st2)))
     ([:document-symbols corr reply-to uri lang text]
       (let ([st2 frames] (lsp--request-symbols state corr reply-to uri lang text))
+        (lsp--send-all (get st2 :proc) frames)
+        (lsp--loop st2)))
+    ([:definition corr reply-to uri lang text line char]
+      (let ([st2 frames] (lsp--issue state corr reply-to uri lang text :definition
+                           (fn (id) (lsp--definition-request id uri line char))))
+        (lsp--send-all (get st2 :proc) frames)
+        (lsp--loop st2)))
+    ([:references corr reply-to uri lang text line char]
+      (let ([st2 frames] (lsp--issue state corr reply-to uri lang text :references
+                           (fn (id) (lsp--references-request id uri line char))))
+        (lsp--send-all (get st2 :proc) frames)
+        (lsp--loop st2)))
+    ([:hover corr reply-to uri lang text line char]
+      (let ([st2 frames] (lsp--issue state corr reply-to uri lang text :hover
+                           (fn (id) (lsp--hover-request id uri line char))))
+        (lsp--send-all (get st2 :proc) frames)
+        (lsp--loop st2)))
+    ([:formatting corr reply-to uri lang text]
+      (let ([st2 frames] (lsp--issue state corr reply-to uri lang text :formatting
+                           (fn (id) (lsp--formatting-request id uri))))
+        (lsp--send-all (get st2 :proc) frames)
+        (lsp--loop st2)))
+    ([:rename corr reply-to uri lang text line char new-name]
+      (let ([st2 frames] (lsp--issue state corr reply-to uri lang text :rename
+                           (fn (id) (lsp--rename-request id uri line char new-name))))
         (lsp--send-all (get st2 :proc) frames)
         (lsp--loop st2)))
     ([:shutdown] (do (proc-close (get state :proc)) :lsp-stopped))))
@@ -351,6 +466,41 @@ round-trip the `imenu` command (M-g i) rides on — fine on an explicit trigger.
     (receive
       ([:lsp-symbols ~corr syms] syms)
       (after timeout '()))))
+
+(defn lsp-definition-sync (conn uri lang text line char &optional (timeout *lsp-timeout-ms*))
+  "Ask `conn` for the definition(s) of the symbol at `(line, char)`, blocking up to
+`timeout` ms (then `()`). Returns a list of `{:path :line :char}` (M-. rides this)."
+  (let (corr (ref))
+    (send conn [:definition corr (self) uri lang text line char])
+    (receive ([:lsp-definition ~corr locs] locs) (after timeout '()))))
+
+(defn lsp-references-sync (conn uri lang text line char &optional (timeout *lsp-symbol-timeout-ms*))
+  "Ask `conn` for all references to the symbol at `(line, char)` (including its
+declaration), blocking up to `timeout` ms (then `()`). Returns `{:path :line :char}` list."
+  (let (corr (ref))
+    (send conn [:references corr (self) uri lang text line char])
+    (receive ([:lsp-references ~corr locs] locs) (after timeout '()))))
+
+(defn lsp-hover-sync (conn uri lang text line char &optional (timeout *lsp-timeout-ms*))
+  "Ask `conn` for hover docs at `(line, char)`, blocking up to `timeout` ms (then `\"\"`).
+Returns the hover text (`lsp-hover-text`)."
+  (let (corr (ref))
+    (send conn [:hover corr (self) uri lang text line char])
+    (receive ([:lsp-hover ~corr text] text) (after timeout ""))))
+
+(defn lsp-format-sync (conn uri lang text &optional (timeout *lsp-symbol-timeout-ms*))
+  "Ask `conn` to format the whole document, blocking up to `timeout` ms (then `()`).
+Returns the `TextEdit` list (`lsp-text-edits`)."
+  (let (corr (ref))
+    (send conn [:formatting corr (self) uri lang text])
+    (receive ([:lsp-text-edits ~corr edits] edits) (after timeout '()))))
+
+(defn lsp-rename-sync (conn uri lang text line char new-name &optional (timeout *lsp-symbol-timeout-ms*))
+  "Ask `conn` to rename the symbol at `(line, char)` to `new-name`, blocking up to `timeout`
+ms (then `{}`). Returns the workspace edit as `{path -> [edit …]}` (`lsp-workspace-edit`)."
+  (let (corr (ref))
+    (send conn [:rename corr (self) uri lang text line char new-name])
+    (receive ([:lsp-workspace-edit ~corr wsedit] wsedit) (after timeout {}))))
 
 ;; ---- the completion source --------------------------------------------------
 
