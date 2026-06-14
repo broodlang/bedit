@@ -1,0 +1,114 @@
+(defmodule gitdiff
+  "diff-hl-style change gutter: per-line indicators (added / modified / deleted vs git
+HEAD), painted as a coloured bar in the left of the line-number gutter. The per-line status
+is computed by diffing the buffer's text against the HEAD blob (`std/diff`) and cached on the
+buffer under `:git-line-status` (a `{0-based-line -> :added|:modified|:deleted}` map), so the
+gutter cell — which sees only the buffer — can paint it without the model. The model-level
+lazy recompute (on first view, re-armed after a save) lives in `commands/ed-annotate-git`.
+
+`gitdiff--head-text` / `gitdiff--status-map` are pure-ish (one is a subprocess, the other a
+fold over the line diff) and unit-tested without the editor (tests/gitdiff_test.blsp)."
+  (:use editor/buffer)  ; buffer-file / buffer-text
+  (:use theme)          ; *green* / *yellow* / *red*
+  (:use diff))          ; diff-lines
+
+;; ---- faces + glyphs ---------------------------------------------------------
+
+(def face-diff-added    {:fg *green*})
+(def face-diff-modified {:fg *yellow*})
+(def face-diff-deleted  {:fg *red*})
+
+(defn bar-glyph (status)
+  "The 1-char gutter bar for a line's git `status`: a solid bar for a present change, a thin
+underbar where lines were deleted, a space for an unchanged line."
+  (cond (= status :deleted) "▁" (nil? status) " " :else "▌"))
+
+(defn bar-face (status)
+  "The face for a line's git `status` bar, or nil for an unchanged line."
+  (cond
+    (= status :added) face-diff-added
+    (= status :modified) face-diff-modified
+    (= status :deleted) face-diff-deleted
+    :else nil))
+
+;; ---- HEAD blob --------------------------------------------------------------
+
+(defn gitdiff--basename (path)
+  (let (i (string-last-index-of path "/"))
+    (if (< i 0) path (substring path (+ i 1) (string-length path)))))
+
+(defn gitdiff--head-text (path)
+  "The HEAD version of the file at `path` as text, or nil when it isn't a tracked file (a
+new/untracked file, or not in a git repo). `git -C <dir> show HEAD:./<name>` resolves the
+blob relative to the file's own directory, so it works at any repo depth."
+  (let (dir (parent-dir path)
+        r (%os-cmd "git" ["-C" dir "show" (str "HEAD:./" (gitdiff--basename path))]))
+    (if (= (get r :exit) 0) (get r :stdout) nil)))
+
+;; ---- the line diff → per-line status map ------------------------------------
+
+(defn gitdiff--strip-nl (s)
+  "`s` without a single trailing newline (so head and buffer align — `git show` always ends
+in one; the buffer may not)."
+  (if (and (> (string-length s) 0) (= (substring s (dec (string-length s)) (string-length s)) "\n"))
+    (substring s 0 (dec (string-length s)))
+    s))
+
+(defn gitdiff--flush (acc dels ins-lines)
+  "Resolve one diff *run* (a maximal stretch of deletes/inserts between kept lines) into
+`acc`: the first `min(dels, n)` inserted lines are `:modified` (they replace deleted ones),
+the rest `:added`; a run that only deletes marks the kept line after it (`line`, threaded by
+the caller via the empty-`ins-lines` branch) `:deleted`."
+  (if (empty? ins-lines)
+    acc  ; pure-deletion runs are marked by the caller on the following kept line
+    (let (n (count ins-lines)
+          nmod (min dels n))
+      (second
+        (fold (fn (st bl)
+                (let (i (first st) a (second st))
+                  [(inc i) (assoc a bl (if (< i nmod) :modified :added))]))
+          [0 acc] ins-lines)))))
+
+(defn gitdiff--status-map (head buf-text)
+  "A `{0-based-buffer-line -> :added|:modified|:deleted}` map from a line diff of `head` vs
+`buf-text`. Buffer lines advance on `:keep`/`:insert` (a line present in the buffer), never on
+`:delete` (present only in HEAD); a delete run with no matching insert marks the kept line
+that follows it `:deleted`."
+  (let (ops (diff/diff-lines (gitdiff--strip-nl head) (gitdiff--strip-nl buf-text))
+        step (fn (st op)
+               (let (kind (first op)
+                     line (get st :line)
+                     dels (get st :dels)
+                     ins (get st :ins)
+                     acc (get st :acc))
+                 (cond
+                   (= kind :keep)
+                   (let (acc1 (gitdiff--flush acc dels ins)
+                         ;; a kept line right after a pure deletion gets the deletion marker
+                         acc2 (if (and (empty? ins) (> dels 0)) (assoc acc1 line :deleted) acc1))
+                     {:line (inc line) :dels 0 :ins '() :acc acc2})
+                   (= kind :insert)
+                   {:line (inc line) :dels dels :ins (concat ins (list line)) :acc acc}
+                   (= kind :delete)
+                   {:line line :dels (inc dels) :ins ins :acc acc}
+                   :else st)))
+        final (fold step {:line 0 :dels 0 :ins '() :acc {}} ops))
+    ;; flush a trailing run (deletes/inserts at end of file)
+    (let (acc (gitdiff--flush (get final :acc) (get final :dels) (get final :ins)))
+      (if (and (empty? (get final :ins)) (> (get final :dels) 0))
+        (assoc acc (get final :line) :deleted)  ; deletion at EOF → mark the (one-past) line
+        acc))))
+
+;; ---- annotate a buffer ------------------------------------------------------
+
+(defn gitdiff-annotate (buf)
+  "Return `buf` with `:git-line-status` set to its per-line diff vs HEAD — an empty map when
+the file isn't tracked / not in a repo (so the gutter shows the bar column but no colours).
+A fileless buffer is returned unchanged (no status key — never gets a diff gutter)."
+  (let (path (buffer-file buf))
+    (if (nil? path)
+      buf
+      (let (head (gitdiff--head-text path))
+        (if (nil? head)
+          (assoc buf :git-line-status {})
+          (assoc buf :git-line-status (gitdiff--status-map head (buffer-text buf))))))))

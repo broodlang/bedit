@@ -1,0 +1,255 @@
+(defmodule magit
+  "A magit-style git porcelain: `C-x g` opens a read-only `*git-status*` buffer listing the
+branch and the Staged / Unstaged / Untracked sections (from `git status --porcelain`), with
+single-key actions — s/u/k stage/unstage/discard the file under point, c commit (an editable
+`*git-commit*` buffer; C-c C-c commits), RET show its diff, g refresh, q quit, P/F push/pull,
+l log. The dired pattern: a `:git-status` mode layer over a generated buffer, with the per-row
+file kept on the model (`:git-rows`, parallel to the buffer's lines) so a command reads the
+line under point without re-parsing text. Git runs synchronously via `%os-cmd` in the repo
+root (`:git-root`). Parsing/rendering are pure (tests/magit_test.blsp)."
+  (:use model)         ; ed-current-buf / ed-set-buf / message / ed-read-char / ed-apply
+  (:use commands)      ; ed-show-named / ed--default-dir / ed--goto-line / cmd-kill-buffer
+  (:use interactive)   ; defcommand
+  (:use editor/buffer))  ; buffer-current-line / buffer-text
+
+;; ---- running git ------------------------------------------------------------
+
+(defn magit--git (root args)
+  "Run git in `root` with `args` (a vector); `{:exit :stdout :stderr}`."
+  (%os-cmd "git" (into ["-C" root] args)))
+
+(defn magit--toplevel (dir)
+  "The git work-tree root containing `dir`, or nil when `dir` isn't in a repo."
+  (let (r (%os-cmd "git" ["-C" dir "rev-parse" "--show-toplevel"]))
+    (if (= (get r :exit) 0) (trim (get r :stdout)) nil)))
+
+(defn magit--branch (root)
+  "The current branch name (or a short hash when detached), `?` on error."
+  (let (r (magit--git root ["rev-parse" "--abbrev-ref" "HEAD"]))
+    (if (= (get r :exit) 0) (trim (get r :stdout)) "?")))
+
+;; ---- pure: parse `git status --porcelain` -----------------------------------
+
+(defn magit--parse-entry (line)
+  "Parse one porcelain line `XY path` into `{:x :y :path}` (a rename's `old -> new` keeps
+`new`), or nil for a too-short line."
+  (if (< (string-length line) 4)
+    nil
+    (let (x (substring line 0 1)
+          y (substring line 1 2)
+          rest (substring line 3 (string-length line))
+          arrow (string-index-of rest " -> ")
+          path (if (< arrow 0) rest (substring rest (+ arrow 4) (string-length rest))))
+      {:x x :y y :path path})))
+
+(defn magit--entries (porcelain)
+  "Parse `git status --porcelain` text into a list of `{:x :y :path}`."
+  (fold (fn (acc l) (let (e (magit--parse-entry l)) (if (nil? e) acc (concat acc (list e)))))
+    '() (filter (fn (l) (not (= l ""))) (string-split porcelain "\n"))))
+
+(defn magit--untracked? (e) (and (= (get e :x) "?") (= (get e :y) "?")))
+(defn magit--staged? (e) (and (not (= (get e :x) " ")) (not (= (get e :x) "?"))))
+(defn magit--unstaged? (e) (and (not (= (get e :y) " ")) (not (magit--untracked? e))))
+
+;; ---- pure: render the status buffer (text + parallel per-line rows) ---------
+
+(defn magit--row (e staged?)
+  "The actionable row data for an entry in a section: `{:path :staged? :untracked?}`."
+  {:path (get e :path) :staged? staged? :untracked? (magit--untracked? e)})
+
+(defn magit--section-pairs (title entries staged?)
+  "`[line row]` pairs for one section (empty when no entries): a `[title nil]` header, an
+`[\"  XY path\" row]` per entry, then a `[\"\" nil]` blank."
+  (if (empty? entries)
+    '()
+    (concat
+      (list [title nil])
+      (map (fn (e) [(str "  " (get e :x) (get e :y) " " (get e :path)) (magit--row e staged?)]) entries)
+      (list ["" nil]))))
+
+(defn magit--render (branch entries)
+  "`{:text :rows}` for the status buffer. `:rows` is a vector parallel to the buffer's lines
+— nil on a header/blank line, else the `{:path :staged? :untracked?}` for an actionable row."
+  (let (pairs (concat
+                (list [(str "Head: " branch) nil] ["" nil])
+                (magit--section-pairs "Staged changes:" (filter magit--staged? entries) true)
+                (magit--section-pairs "Unstaged changes:" (filter magit--unstaged? entries) false)
+                (magit--section-pairs "Untracked files:" (filter magit--untracked? entries) false)
+                (if (empty? entries) (list ["nothing to commit, working tree clean" nil]) '())))
+    {:text (join "\n" (map first pairs)) :rows (into [] (map second pairs))}))
+
+;; ---- the status buffer + the per-row reader ---------------------------------
+
+(defn magit--show-status (m root &optional (line nil))
+  "Build/refresh `*git-status*` for repo `root`, recording `:git-root`/`:git-rows`, point on
+1-based `line` (default the first file row if any, else the top)."
+  (let (porcelain (get (magit--git root ["status" "--porcelain"]) :stdout "")
+        entries (magit--entries porcelain)
+        r (magit--render (magit--branch root) entries)
+        rows (get r :rows)
+        first-row (magit--first-row-line rows)
+        m1 (ed-show-named (assoc m :git-root root :git-rows rows)
+             "*git-status*" (get r :text) :git-status))
+    (ed-apply m1 (fn (b) (commands/ed--goto-line b (or line first-row))))))
+
+(defn magit--first-row-line (rows)
+  "The 1-based line of the first actionable row in `rows`, or 1 if none."
+  (let (i (index-where (fn (x) (not (nil? x))) rows))
+    (if (< i 0) 1 (inc i))))
+
+(defn magit--row-at (m)
+  "The `{:path :staged? :untracked?}` on the current `*git-status*` line, or nil on a
+header/blank."
+  (let (rows (get m :git-rows)
+        i (buffer-current-line (ed-current-buf m)))
+    (if (and rows (>= i 0) (< i (count rows))) (nth rows i) nil)))
+
+(defn magit--refresh (m)
+  "Refresh `*git-status*` in place, keeping point on the current line."
+  (magit--show-status m (get m :git-root) (inc (buffer-current-line (ed-current-buf m)))))
+
+;; ---- commands: open / navigate / stage / unstage / discard / refresh / quit -
+
+(defcommand cmd-git-status
+  (m key)
+  "Open the git status buffer for the current project (C-x g)."
+  (let (root (magit--toplevel (commands/ed--default-dir m)))
+    (if (nil? root) (message m "not in a git repository") (magit--show-status m root))))
+
+(defcommand cmd-git-stage
+  (m key)
+  "Stage the file on the current line (s)."
+  (let (row (magit--row-at m) root (get m :git-root))
+    (if (nil? row)
+      (message m "not on a file")
+      (let (r (magit--git root ["add" "--" (get row :path)]))
+        (if (= (get r :exit) 0)
+          (magit--refresh m)
+          (message m (str "stage failed: " (one-line (get r :stderr)))))))))
+
+(defcommand cmd-git-unstage
+  (m key)
+  "Unstage the file on the current line (u)."
+  (let (row (magit--row-at m) root (get m :git-root))
+    (if (nil? row)
+      (message m "not on a file")
+      (let (r (magit--git root ["reset" "-q" "HEAD" "--" (get row :path)]))
+        (magit--refresh m)))))
+
+(defcommand cmd-git-discard
+  (m key)
+  "Discard the working-tree changes to the file on the current line (k) — irreversible, so
+it asks first. A tracked file is reverted to HEAD; an untracked file is left (remove it from
+a shell)."
+  (let (row (magit--row-at m) root (get m :git-root))
+    (cond
+      (nil? row) (message m "not on a file")
+      (get row :untracked?) (message m "untracked file — remove it from a shell, not here")
+      :else
+      (ed-read-char m (str "Discard changes to " (get row :path) "? (y/n) ")
+        (fn (mm c)
+          (if (or (= c "y") (= c "Y"))
+            (let (r (magit--git root ["checkout" "--" (get row :path)]))
+              (magit--refresh mm))
+            (message mm "discard cancelled")))))))
+
+(defcommand cmd-git-refresh
+  (m key)
+  "Re-read git status (g)."
+  (magit--refresh m))
+
+(defcommand cmd-git-quit
+  (m key)
+  "Bury the git status buffer (q)."
+  (cmd-kill-buffer m key))
+
+;; ---- a read-only report buffer (diff / log) ---------------------------------
+
+(defn magit--show-report (m name text type)
+  "Show `text` in a read-only report buffer `name` of `type` (e.g. *git-diff*, *git-log*),
+point at the top. Keeps `:git-root` for follow-up commands."
+  (ed-apply (ed-show-named m name (if (= text "") "(empty)" text) type)
+    (fn (b) (commands/ed--goto-line b 1))))
+
+(defcommand cmd-git-diff
+  (m key)
+  "Show the diff of the file on the current line in *git-diff* (RET) — the staged diff for a
+staged row, else the working-tree diff."
+  (let (row (magit--row-at m) root (get m :git-root))
+    (if (nil? row)
+      (message m "not on a file")
+      (let (args (if (get row :staged?)
+                   ["diff" "--cached" "--" (get row :path)]
+                   ["diff" "--" (get row :path)])
+            r (magit--git root args))
+        (magit--show-report (assoc m :git-root root) "*git-diff*" (get r :stdout "") :git-diff)))))
+
+(defcommand cmd-git-log
+  (m key)
+  "Show the recent commit log in *git-log* (l)."
+  (let (root (or (get m :git-root) (magit--toplevel (commands/ed--default-dir m))))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let (r (magit--git root ["log" "--oneline" "--decorate" "-30"]))
+        (magit--show-report (assoc m :git-root root) "*git-log*" (get r :stdout "") :git-log)))))
+
+;; ---- push / pull (synchronous; report in the echo area) ---------------------
+
+(defn magit--report-cmd (m verb r)
+  "Echo the result of a push/pull `r` (`verb` names it), preferring stderr (where git writes
+progress) then stdout."
+  (let (out (one-line (let (e (trim (get r :stderr ""))) (if (= e "") (trim (get r :stdout "")) e))))
+    (message m (str verb (if (= (get r :exit) 0) ": " " failed: ") out))))
+
+(defcommand cmd-git-push
+  (m key)
+  "Push the current branch (P)."
+  (let (root (or (get m :git-root) (magit--toplevel (commands/ed--default-dir m))))
+    (if (nil? root) (message m "not in a git repository")
+      (magit--report-cmd m "push" (magit--git root ["push"])))))
+
+(defcommand cmd-git-pull
+  (m key)
+  "Pull the current branch, then refresh status (F)."
+  (let (root (or (get m :git-root) (magit--toplevel (commands/ed--default-dir m))))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let (r (magit--git root ["pull" "--ff-only"]))
+        (magit--report-cmd (if (nil? (get m :git-rows)) m (magit--show-status m root)) "pull" r)))))
+
+;; ---- commit (an editable message buffer; C-c C-c / C-c C-k) -----------------
+
+(defn magit--commit-message (text)
+  "The commit message from the *git-commit* buffer text — comment lines (leading `#`) dropped
+and the rest trimmed."
+  (trim (join "\n" (filter (fn (l) (not (starts-with? (triml l) "#"))) (string-split text "\n")))))
+
+(defcommand cmd-git-commit
+  (m key)
+  "Open an editable *git-commit* buffer; C-c C-c commits the staged changes, C-c C-k aborts (c)."
+  (let (root (or (get m :git-root) (magit--toplevel (commands/ed--default-dir m))))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (ed-show-named (assoc m :git-root root) "*git-commit*"
+        "\n# Enter a commit message above. C-c C-c to commit, C-c C-k to cancel.\n# Lines starting with # are ignored."
+        :git-commit))))
+
+(defcommand cmd-git-commit-finish
+  (m key)
+  "Commit the staged changes with this buffer's message (C-c C-c), then show status."
+  (let (root (get m :git-root)
+        msg (magit--commit-message (buffer-text (ed-current-buf m))))
+    (cond
+      (nil? root) (message m "no git repo")
+      (= msg "") (message m "empty commit message — aborted")
+      :else
+      (let (r (magit--git root ["commit" "-m" msg])
+            m1 (cmd-kill-buffer m key))  ; close *git-commit*
+        (if (= (get r :exit) 0)
+          (message (magit--show-status m1 root) (str "committed: " (one-line (get r :stdout))))
+          (message m1 (str "commit failed: " (one-line (str (get r :stdout) " " (get r :stderr))))))))))
+
+(defcommand cmd-git-commit-abort
+  (m key)
+  "Abort the commit and close the message buffer (C-c C-k)."
+  (message (cmd-kill-buffer m key) "commit aborted"))
