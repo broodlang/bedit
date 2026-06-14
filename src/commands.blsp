@@ -1359,6 +1359,14 @@ then show the first line of its docstring in the echo area."
   (let (target (max 0 (min (dec n) (dec (buffer-line-count b)))))
     (fold (fn (bb _) (forward-line bb)) (beginning-of-buffer b) (range target))))
 
+(defn ed--goto-line-col (b line0 col)
+  "Move point to 0-based `line0` / `col` (LSP coordinates), clamped to the buffer. Used by
+imenu/xref jumps, which land on a symbol's start position."
+  (let (rope (buffer-rope b)
+        ln (max 0 (min line0 (dec (buffer-line-count b))))
+        bol (rope-line->char rope ln))
+    (goto-char b (min (+ bol (max 0 col)) (buffer-length b)))))
+
 (defcommand cmd-goto-line
   (m key)
   "Prompt for a line number and jump to it (M-g g)."
@@ -2422,6 +2430,79 @@ The `lsp-complete-source` stays registered but no-ops with no connection on the 
     (if (nil? conn)
       (message m "lsp: not connected")
       (do (lsp-shutdown conn) (message (dissoc m :lsp) "lsp: disconnected")))))
+
+;; ---- imenu: jump to a symbol in the buffer via LSP documentSymbol (M-g i) ----
+
+(defn ed--lsp-ensure (m)
+  "Ensure a language server is connected for the current buffer's file. Returns
+`[m2 ready?]`: `ready?` is true when `:lsp` is already connected; false when a server was
+just started (the caller should ask the user to retry once it initialises) or none is
+configured / the buffer has no file — with an explanatory message already on `m2`."
+  (let (buf (ed-current-buf m)
+        file (buffer-file buf))
+    (cond
+      (not (nil? (get m :lsp))) [m true]
+      (nil? file) [(message m "imenu: the buffer has no file") false]
+      :else
+      (let (srv (lsp-server-for file))
+        (if (nil? srv)
+          [(message m (str "imenu: no LSP server configured for ." (lsp/lsp--extension file))) false]
+          (let ([cmd args] srv
+                root (project-root (parent-dir file))
+                conn (lsp-connect cmd args (lsp/lsp--path->uri root)))
+            (complete/complete-add-source! 'lsp/lsp-complete-source)
+            [(message (assoc m :lsp conn) "imenu: starting LSP — run M-g i again in a moment") false]))))))
+
+(defn ed--imenu-label (s)
+  "The imenu candidate text for a symbol `{:name :kind …}` — its (qualified) name with a
+short kind tag, e.g. `Foo.bar  (method)`."
+  (str (get s :name) "  (" (lsp/lsp-symbol-kind-name (get s :kind)) ")"))
+
+(defn ed--imenu-find (labeled t)
+  "The symbol whose label is `t` in the `[label sym]` pairs `labeled`, or nil."
+  (let (hit (first (filter (fn (p) (= (first p) t)) labeled)))
+    (if (nil? hit) nil (second hit))))
+
+(defn ed--imenu-jump (m s)
+  "Move point to symbol `s`'s position in the current buffer."
+  (ed-apply m (fn (b) (ed--goto-line-col b (get s :line) (get s :char)))))
+
+(defn ed--imenu-prompt (m syms)
+  "A Vertico minibuffer over the buffer's symbols `syms` (`{:name :kind :line :char}`).
+Moving the selection **previews** — point jumps to that symbol live (`:on-preview`);
+accepting keeps it; cancelling restores the point and scroll the prompt opened from
+(`:on-abort`), so an aborted imenu leaves you exactly where you were."
+  (let (labeled (map (fn (s) [(ed--imenu-label s) s]) syms)
+        labels (map first labeled)
+        origin {:point (buffer-point (ed-current-buf m)) :top (ed-current-top m)})
+    (assoc m :minibuffer
+      (assoc
+        (ed-name-prompt "Imenu: " labels
+          (fn (mm t)
+            (let (s (ed--imenu-find labeled t))
+              (if (nil? s) (message mm (str "imenu: no such symbol: " t)) (ed--imenu-jump mm s)))))
+        :on-preview (fn (mm t)
+                      (let (s (ed--imenu-find labeled t))
+                        (if (nil? s) mm (ed--imenu-jump mm s))))
+        :on-abort (fn (mm)
+                    (ed-set-top (ed-apply mm (fn (b) (goto-char b (get origin :point))))
+                      (get origin :top)))))))
+
+(defcommand cmd-imenu
+  (m key)
+  "Jump to a symbol in the current buffer, picked from the language server's
+`documentSymbol` list (M-g i). Starts the server on first use if one is configured for the
+file type; symbols are nested-name-qualified (Emacs-style `Class.method`)."
+  (let ([m2 ready?] (ed--lsp-ensure m))
+    (if (not ready?)
+      m2
+      (let (buf (ed-current-buf m2)
+            file (buffer-file buf)
+            syms (lsp/lsp-document-symbols-sync (get m2 :lsp) (lsp/lsp--path->uri file)
+                   (lsp/lsp--language-id file) (buffer-text buf)))
+        (if (empty? syms)
+          (message m2 "imenu: no symbols (is the server ready?)")
+          (ed--imenu-prompt m2 syms))))))
 
 ;; ---- major-mode commands (M-x text-mode / brood-mode) ----------------------
 ;; Like Emacs: each major mode is an interactive command that activates it on the
