@@ -42,11 +42,13 @@ document sync (no incremental edits)."
 ;; ---- tunables (redefine live) -----------------------------------------------
 
 (def *lsp-timeout-ms* 1000)  ; how long a Tab waits for the server before giving up
+(def *lsp-symbol-timeout-ms* 3000)  ; how long M-g i (imenu) waits — symbols can index slower
 
 (def *lsp-servers*
   ;; file extension → [server-command arg-vector]. The `M-x lsp-connect` command looks
   ;; the buffer's extension up here. Extend live to add a language/server.
-  {"rs" ["rust-analyzer" []]
+  {"blsp" ["brood-lsp" []]
+    "rs" ["rust-analyzer" []]
     "rb" ["ruby-lsp" []]
     "ex" ["elixir-ls" []] "exs" ["elixir-ls" []]
     "py" ["pylsp" []]
@@ -125,6 +127,51 @@ either a `CompletionItem[]` (a vector) or a `{:items [...] :isIncomplete b}` obj
     (filter (fn (l) (not (nil? l)))
       (map (fn (it) (get it :label)) items))))
 
+;; ---- pure protocol: documentSymbol shapes (imenu, M-g i) --------------------
+;; `textDocument/documentSymbol` returns either a flat `SymbolInformation[]` (each with a
+;; `:location {:range …}`) or a hierarchical `DocumentSymbol[]` (each with `:range` +
+;; `:selectionRange` and nested `:children`). We flatten both to a list of
+;; `{:name :kind :line :char}`, qualifying a child's name with its parent's (Emacs-style
+;; `Class.method`) so the imenu list is unique and readable. Positions are 0-based
+;; (LSP units); the command converts them to a buffer offset.
+
+(def *lsp-symbol-kinds*
+  ;; LSP SymbolKind (integer) → short display tag. Unmapped kinds show "?".
+  {1 "file" 2 "module" 3 "namespace" 4 "package" 5 "class" 6 "method" 7 "property"
+    8 "field" 9 "ctor" 10 "enum" 11 "interface" 12 "fn" 13 "var" 14 "const"
+    15 "string" 16 "number" 17 "bool" 18 "array" 19 "object" 20 "key" 21 "null"
+    22 "enum-member" 23 "struct" 24 "event" 25 "operator" 26 "type-param"})
+
+(defn lsp-symbol-kind-name (kind)
+  "The short display tag for an LSP SymbolKind integer (`*lsp-symbol-kinds*`), or \"?\"."
+  (get *lsp-symbol-kinds* kind "?"))
+
+(defn lsp--symbol-pos (sym)
+  "The 0-based `[line char]` to jump to for `sym` — its `:selectionRange` start (a
+hierarchical DocumentSymbol), else its `:range` start, else its `:location`'s range start
+(a flat SymbolInformation). `[0 0]` if none is present."
+  (let (rng (or (get sym :selectionRange) (get sym :range) (get (get sym :location) :range))
+        start (if (nil? rng) nil (get rng :start)))
+    [(get start :line 0) (get start :character 0)]))
+
+(defn lsp--flatten-symbols (syms prefix acc)
+  "Fold `syms` (a DocumentSymbol/SymbolInformation vector) into `acc` as `{:name :kind
+:line :char}` entries, depth-first, qualifying each child's name with `prefix` (its parent
+chain). `acc` is built reversed."
+  (fold
+    (fn (a sym)
+      (let ([line char] (lsp--symbol-pos sym)
+            qname (if (= prefix "") (get sym :name) (str prefix "." (get sym :name)))
+            entry {:name qname :kind (get sym :kind) :line line :char char})
+        (lsp--flatten-symbols (get sym :children []) qname (cons entry a))))
+    acc syms))
+
+(defn lsp-document-symbols (result)
+  "The `textDocument/documentSymbol` `result` (a vector of DocumentSymbol or
+SymbolInformation, or nil) flattened to a list of `{:name :kind :line :char}`, parents
+before children, in document order."
+  (if (nil? result) '() (reverse (lsp--flatten-symbols result "" '()))))
+
 ;; ---- pure connection logic (state -> [state effects]) -----------------------
 ;; The connection process's state:
 ;;   {:proc handle :buf "" :next-id N :pending {jsonrpc-id -> [reply-to corr]}
@@ -147,6 +194,9 @@ either a `CompletionItem[]` (a vector) or a `{:items [...] :isIncomplete b}` obj
     {:textDocument {:uri uri}
       :position {:line line :character char}}))
 
+(defn lsp--document-symbol-request (id uri)
+  (lsp-request id "textDocument/documentSymbol" {:textDocument {:uri uri}}))
+
 (defn lsp--request-complete (state corr reply-to uri lang text line char)
   "Pure: the frames to send for a completion at `(uri, line, char)` and the next state.
 Syncs the document first (`didOpen` the first time a uri is seen — tagged with `lang`,
@@ -165,19 +215,43 @@ Returns `[state' frames]`."
                  :pending (assoc (get state :pending) id [reply-to corr])))
     [state2 [sync-frame (lsp--completion-request id uri line char)]]))
 
+(defn lsp--request-symbols (state corr reply-to uri lang text)
+  "Pure: the frames to send for a `textDocument/documentSymbol` on `uri` and the next
+state. Syncs the document first (`didOpen`/`didChange`, exactly as completion does), then
+the documentSymbol request; records `[reply-to corr :symbols]` under its id so the response
+is shaped as symbols (not completion labels). Returns `[state' frames]`."
+  (let (id (get state :next-id)
+        opened (get state :opened)
+        version (get state :version)
+        seen? (get opened uri)
+        sync-frame (if seen? (lsp--did-change uri version text) (lsp--did-open uri lang text))
+        state2 (assoc state
+                 :next-id (+ id 1)
+                 :version (+ version 1)
+                 :opened (assoc opened uri true)
+                 :pending (assoc (get state :pending) id [reply-to corr :symbols])))
+    [state2 [sync-frame (lsp--document-symbol-request id uri)]]))
+
 (defn lsp--dispatch (acc msg)
   ;; Fold step: route one decoded message. A response whose `:id` is pending becomes a
-  ;; `[reply-to [:lsp-completion corr labels]]` reply; anything else (a notification
-  ;; like publishDiagnostics, or an unmatched id) is ignored.
+  ;; reply to its waiter — `[:lsp-symbols corr syms]` when the request was tagged `:symbols`
+  ;; in `:pending`, else `[:lsp-completion corr labels]` (an absent tag = completion, so the
+  ;; original 2-element `[reply-to corr]` entries still route as before). A notification
+  ;; (publishDiagnostics) or an unmatched id is ignored.
   (let ([state replies] acc
         id (get msg :id)
         entry (if (nil? id) nil (get (get state :pending) id)))
     (if (nil? entry)
       [state replies]
-      (let ([reply-to corr] entry
-            labels (lsp-completion-labels (get msg :result)))
+      (let (reply-to (first entry)
+            corr (second entry)
+            kind (if (>= (count entry) 3) (nth entry 2) nil)
+            result (get msg :result)
+            reply (if (= kind :symbols)
+                    [:lsp-symbols corr (lsp-document-symbols result)]
+                    [:lsp-completion corr (lsp-completion-labels result)]))
         [(assoc state :pending (dissoc (get state :pending) id))
-          (cons [reply-to [:lsp-completion corr labels]] replies)]))))
+          (cons [reply-to reply] replies)]))))
 
 (defn lsp--ingest (state chunk)
   "Pure: fold a stdout `chunk` into the connection. Appends it to the frame buffer,
@@ -223,13 +297,18 @@ server; `:shutdown` or the server dying stops it."
       (let ([st2 frames] (lsp--request-complete state corr reply-to uri lang text line char))
         (lsp--send-all (get st2 :proc) frames)
         (lsp--loop st2)))
+    ([:document-symbols corr reply-to uri lang text]
+      (let ([st2 frames] (lsp--request-symbols state corr reply-to uri lang text))
+        (lsp--send-all (get st2 :proc) frames)
+        (lsp--loop st2)))
     ([:shutdown] (do (proc-close (get state :proc)) :lsp-stopped))))
 
 (defn lsp--init-params (root-uri)
   {:processId nil
     :rootUri root-uri
     :clientInfo {:name "myedit"}
-    :capabilities {:textDocument {:completion {:completionItem {:snippetSupport false}}}}})
+    :capabilities {:textDocument {:completion {:completionItem {:snippetSupport false}}
+                                   :documentSymbol {:hierarchicalDocumentSymbolSupport true}}}})
 
 (defn lsp--run (cmd cmd-args root-uri)
   "The connection process body: spawn the server, do the `initialize`/`initialized`
@@ -262,6 +341,17 @@ only on an explicit trigger, not per keystroke."
       ([:lsp-completion ~corr labels] labels)
       (after timeout '()))))
 
+(defn lsp-document-symbols-sync (conn uri lang text &optional (timeout *lsp-symbol-timeout-ms*))
+  "Ask `conn` for `uri`'s symbols with the buffer `text` (LSP languageId `lang`), blocking
+up to `timeout` ms for the reply (default `*lsp-symbol-timeout-ms*`, then `()`). Returns a
+flattened list of `{:name :kind :line :char}` (see `lsp-document-symbols`). The synchronous
+round-trip the `imenu` command (M-g i) rides on — fine on an explicit trigger."
+  (let (corr (ref))
+    (send conn [:document-symbols corr (self) uri lang text])
+    (receive
+      ([:lsp-symbols ~corr syms] syms)
+      (after timeout '()))))
+
 ;; ---- the completion source --------------------------------------------------
 
 (defn lsp--word-char? (c)
@@ -279,7 +369,8 @@ only on an explicit trigger, not per keystroke."
 (def *lsp-language-ids*
   ;; file extension → LSP languageId. Servers key document handling off this, so it
   ;; must be the id the server expects (e.g. rust-analyzer wants "rust"). Extend live.
-  {"rs" "rust" "rb" "ruby" "ex" "elixir" "exs" "elixir" "py" "python"
+  {"blsp" "brood"
+    "rs" "rust" "rb" "ruby" "ex" "elixir" "exs" "elixir" "py" "python"
     "ts" "typescript" "js" "javascript" "go" "go" "c" "c" "h" "c"})
 
 (defn lsp--extension (path)
