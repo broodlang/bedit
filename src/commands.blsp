@@ -35,6 +35,7 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
 
 (require 'theme)     ; face-dired-* — the dired listing colours (qualified refs)
 (require 'datetime)  ; epoch-ms->dt / dt-format — the dired mtime column
+(require 'config)    ; init-config / apply-to-model — M-x reload-config
 
 ;; ---- applying buffer ops to the current buffer ------------------------------
 
@@ -659,28 +660,23 @@ separation after it."
 
 (defcommand cmd-write-file
   (m key)
-  "Write the buffer to a path read in the minibuffer (C-x C-w); the buffer is then
-backed by that path (future C-x C-s save there). Same path completion as find-file."
+  "Write the buffer to a path read in the minibuffer (C-x C-w); the buffer is then backed
+by that path (future C-x C-s saves there). Uses the same shared path prompt as find-file /
+dired (`ed--path-prompt`) — prefilled with the current file's path (else the current dir)."
   (assoc m
     :minibuffer
-    {:edit (assoc (ed-mb-edit "Write file: " (or (buffer-file (ed-current-buf m)) (str (cwd) "/")))
-             :word-mode
-             :path)
-     :on-complete (fn (mm t)
-                    (let (path (path-absolute t))
-                      (try
-                        (let (b (assoc (ed-current-buf mm)
-                                  :file
-                                  path
-                                  :name
-                                  (file-display-name path (ed-project-root mm))))
-                          (save-buffer b)
-                          (message (ed-set-buf mm b) (str "wrote " path)))
-                        (catch e (message mm (str "write failed: " (error-message e)))))))
-     :complete-fn (fn (t) (ed-complete-path t))
-     :candidates-fn (fn (t) (take 12 (ed-path-candidates t)))
-     :label-fn path-label
-     :accept-selection true}))
+    (ed--path-prompt "Write file: "
+      (or (buffer-file (ed-current-buf m)) (str (ed--default-dir m) "/"))
+      (if (get m :recent-files) (recent-files) [])
+      (fn (mm t)
+        (let (path (path-absolute t))
+          (try
+            (let (b (assoc (ed-current-buf mm)
+                      :file path
+                      :name (file-display-name path (ed-project-root mm))))
+              (save-buffer b)
+              (message (ed-set-buf mm b) (str "wrote " path)))
+            (catch e (message mm (str "write failed: " (error-message e))))))))))
 
 (defcommand cmd-revert-buffer
   (m key)
@@ -879,6 +875,24 @@ rows (1-based source line numbers, which `cmd-occur-jump` parses back)."
       else (ed-apply (ed-select m (ed-buffer-index-by-name m src))
              (fn (b) (ed--goto-line b ln))))))
 
+;; ---- reload the user config (M-x reload-config) -----------------------------
+;; `~/.config/brood-edit/init.blsp` is read as DATA at startup (config/init-config),
+;; not eval'd — so eval-buffer on it reports "unbound symbol: config" (the `(config …)`
+;; form is a DSL, not a call). This command is the live way to apply edits to it without
+;; restarting: re-read the file and re-seed the model-level settings via the same
+;; `config/apply-to-model` `main` uses, surfacing any value typo in the echo area.
+
+(defcommand cmd-reload-config
+  (m key)
+  "Re-read ~/.config/brood-edit/init.blsp and apply it to the running editor (M-x
+reload-config). The live alternative to restarting — init.blsp is data (read, not eval'd),
+so it can't be applied with eval-buffer."
+  (let (cfg (config/init-config)
+        warns (config/config-warnings cfg)
+        m1 (config/apply-to-model m cfg))
+    (message m1
+      (if (empty? warns) "config reloaded" (str "config reloaded (" (first warns) ")")))))
+
 ;; ---- dired (a directory browser, C-x C-d) -----------------------------------
 ;; The same generated-read-only-buffer pattern as occur/process-menu: a listing of a
 ;; directory, navigated and operated by single keys (see modes/dired-keymap). State
@@ -924,23 +938,8 @@ regular (or unreadable). Symlink wins over dir so a linked directory reads as `l
     (get st :exec?) "x"
     :else "-"))
 
-(defn ed--rwx (n)
-  "The `rwx`/`-` triad for a 3-bit permission group `n` (0–7)."
-  (str (if (>= (rem (quot n 4) 2) 1) "r" "-")
-    (if (>= (rem (quot n 2) 2) 1) "w" "-")
-    (if (>= (rem n 2) 1) "x" "-")))
-
-(defn ed--perms-string (st)
-  "The 10-char `ls -l` permission string for stat `st`: a type char (`d`/`l`/`-`) then
-the owner/group/other rwx triads from `:mode`. `----------` for an unreadable entry."
-  (if (nil? st)
-    "----------"
-    (let (mode (or (get st :mode) 0)
-          type (cond (get st :symlink?) "l" (get st :dir?) "d" :else "-"))
-      (str type
-        (ed--rwx (quot (rem mode 512) 64))   ; owner triad (bits 6–8)
-        (ed--rwx (quot (rem mode 64) 8))     ; group triad (bits 3–5)
-        (ed--rwx (rem mode 8))))))           ; other triad (bits 0–2)
+;; The `ls -l` permission string is shared with the completion marginalia (the `:file`
+;; annotator) — one home for it, in `completion` (`perms-string`/`rwx`, imported via `:use`).
 
 (defn ed--dired-date (mtime)
   "The mtime column `Mon DD HH:MM` (UTC, `ls`-style), or `ed--dired-date-w` spaces when
@@ -986,7 +985,7 @@ nlink / owner / group / size fields across `entries`."
   "One `ls -l` row: `<mark><perms> <nlink> <owner> <group> <size> <date> <name>`, each
 field padded to `cols`' widths so the columns line up."
   (str (if marked? "*" " ")
-    (ed--perms-string st)
+    (perms-string st)
     " " (pad-left (ed--stat-field-str st :nlink "1") (get cols :nlink-w))
     " " (pad-right (ed--stat-field-str st :owner "?") (get cols :owner-w))
     " " (pad-right (ed--stat-field-str st :group "?") (get cols :group-w))
@@ -1020,9 +1019,12 @@ Marks (`:dired-marks`) persist across a same-dir refresh and reset on a director
         m1 (ed-show-named (assoc m :dired-dir dir :dired-names names :dired-marks marks)
              dir
              (ed-dired-text dir entries marks)
-             :dired))
+             :dired)
+        ;; the Dired buffer's default-directory IS the dir it lists (every buffer carries
+        ;; `:dir`; this is where find-file / C-x p f resolve from when you're in Dired).
+        m2 (ed-set-buf m1 (assoc (ed-current-buf m1) :dir dir)))
     ;; land point ON the filename (not the leading mark column), Emacs dired-style
-    (ed-apply m1 (fn (b) (ed--dired-move-to-filename (ed--goto-line b (or line (inc ed--dired-header-lines))))))))
+    (ed-apply m2 (fn (b) (ed--dired-move-to-filename (ed--goto-line b (or line (inc ed--dired-header-lines))))))))
 
 (defn ed--dired-name-at (m)
   "The entry name on the current line of the dired buffer, or nil on the header / a
@@ -1158,19 +1160,22 @@ leading mark column) — a no-op on the header line."
 (defcommand cmd-dired
   (m key)
   "Open a directory browser (dired) on a prompted directory (C-x C-d), defaulting to the
-current buffer's directory (else the working dir)."
-  (let (f (buffer-file (ed-current-buf m))
-        default (str (if (nil? f) (cwd) (parent-dir f)) "/"))
-    (assoc m
-      :minibuffer
-      {:edit (ed-mb-edit "Dired: " default)
-       :on-complete (fn (mm t)
-                      (if (blank? t)
-                        (message mm "(no directory)")
-                        (let (dir (path-absolute t))
-                          (if (dir? dir)
-                            (ed-show-dired mm dir)
-                            (message mm (str "not a directory: " dir))))))})))
+current buffer's directory (else the working dir). Uses the **same** path-completing
+prompt as find-file (`ed--path-prompt`): a Plume candidate list, Tab-expand, C-w to walk
+up — opening dired on the chosen directory."
+  (assoc m
+    :minibuffer
+    (ed--path-prompt "Dired: " (str (ed--default-dir m) "/")
+      (if (get m :recent-files) (recent-files) [])
+      (fn (mm t)
+        (if (blank? t)
+          (message mm "(no directory)")
+          ;; a directory → browse it; a FILE (or a path inside one) → browse its directory
+          (let (path (path-absolute t)
+                dir (if (dir? path) path (parent-dir path)))
+            (if (dir? dir)
+              (ed-show-dired mm dir)
+              (message mm (str "no such directory: " dir)))))))))
 
 (defcommand cmd-dired-open
   (m key)
@@ -1705,14 +1710,14 @@ the region are left untouched, so Copy/Cut act on the current selection)."
 
 (defn ed-menu-hit (m cols rows row col)
   "The menu item index under screen cell `[row col]`, or nil when the click is outside
-the open menu's box (so the caller dismisses it). Uses the *same* clamped box rect the
-renderer draws (`completion-box-rect`), and accounts for the top border row — so an item
-is at box row `mr+1+i`, the box `w+4` cells wide."
+the open menu's card (so the caller dismisses it). Uses the *same* clamped card rect the
+renderer draws (`completion-box-rect`): the frameless card has item `i` at box row `mr+i`,
+the card `w+2` cells wide."
   (let (menu (get m :menu)
         labels (map (fn (it) (get it :label)) (get menu :items))
         [mr mc w n] (completion-box-rect (get menu :row) (get menu :col) labels cols rows))
-    (if (and (>= row (+ mr 1)) (< row (+ mr 1 n)) (>= col mc) (< col (+ mc w 4)))
-      (- row (+ mr 1))
+    (if (and (>= row mr) (< row (+ mr n)) (>= col mc) (< col (+ mc w 2)))
+      (- row mr)
       nil)))
 
 (defn ed-menu-click (m cols rows row col)
@@ -1778,8 +1783,15 @@ re-pointed; indices above it shift down."
             (message (ed--remap (assoc m :buffers bufs) killed-idx (count removed)) label)))))))
 
 (defn ed-open-buffer (m buf)
-  "Add `buf` to the pool (mode-stamped) and show it in the selected pane."
-  (let (bufs (into (get m :buffers) [(ed-stamp buf)]))
+  "Add `buf` to the pool (mode-stamped, and carrying a `:dir`) and show it in the selected
+pane. A buffer with no `:dir` of its own — a fileless one (scratch, *Occur*, …) — inherits
+the **current** buffer's `:dir`, so it opens 'in' the directory/project you were in (Emacs
+`default-directory` inheritance)."
+  (let (stamped (ed-stamp buf)
+        with-dir (if (nil? (get stamped :dir))
+                   (assoc stamped :dir (get (ed-current-buf m) :dir))
+                   stamped)
+        bufs (into (get m :buffers) [with-dir]))
     (ed-select (assoc m :buffers bufs) (dec (count bufs)))))
 
 (defn ed-show-named (m nm text &optional (type nil))
@@ -1793,8 +1805,12 @@ buffers (*Process List*, and later *Kill Ring* etc.)."
         raw (make-buffer text nm)
         buf (if (nil? type) raw (editor/layers/set-buffer-type raw type)))
     (if (nil? idx)
-      (ed-open-buffer m buf)
-      (ed-select (assoc m :buffers (assoc (get m :buffers) idx (ed-stamp buf))) idx))))
+      (ed-open-buffer m buf)  ; new: inherits the current buffer's :dir
+      ;; re-show: keep the existing buffer's :dir (else inherit current), so a refresh of a
+      ;; generated buffer (*Occur*, …) doesn't lose its default-directory.
+      (ed-select (assoc m :buffers (assoc (get m :buffers) idx
+                          (assoc (ed-stamp buf) :dir (or (get (nth (get m :buffers) idx) :dir)
+                                                       (get (ed-current-buf m) :dir))))) idx))))
 
 (defn ed-switch-to-named (m nm)
   "Switch to the buffer named `nm`, or report there's no such buffer."
@@ -1820,6 +1836,10 @@ buffer's `:file`, dedup, and project-relative name all key off a canonical path.
           resolved (project-root (parent-dir path))  ; the visited file's real project, or nil
           root (or resolved (get m :project-root))
           _ (when (and resolved (get m :recent-files)) (remember-project! resolved))
+          ;; record the visit in the project's per-project recent list (the "last access"
+          ;; the default project-file sort orders by) — relative to the project root
+          _ (when (and resolved (get m :recent-files) (starts-with? path (str resolved "/")))
+              (remember-project-file! resolved (substring path (string-length (str resolved "/")))))
           m (if (nil? root) m (assoc m :project-root root))
           idx (ed-buffer-index-by-file m path))
       (if (not (nil? idx))
@@ -1883,24 +1903,40 @@ the open buffers."
       :minibuffer
       (ed-name-prompt "Switch to buffer: " names (fn (mm t) (ed-switch-to-named mm t))))))
 
-(defn ed--find-file-prompt (initial recent)
-  "The find-file minibuffer spec, prefilled with `initial` (an absolute directory path,
-so deleting back through it — `C-w`/`M-DEL`, one path component at a time via `:word-mode
-:path` — **traverses up the tree** like Emacs, no `../` to type). The Vertico list is
-ordered last-used-first then by name (`ed-sort-candidates` over `recent`, the recently
-opened files), and shows each entry's basename (`:label-fn`) while the candidate value
-stays the full path; **selecting a directory re-opens the prompt inside it** (descend,
-carrying the same `recent`); a typed path with no candidate still submits, so new files work."
-  {:edit (assoc (ed-mb-edit "Find file: " initial) :word-mode :path)  ; M-b/M-f/C-w by folder
-   :on-complete (fn (mm t)
-                  (if (ends-with? t "/")
-                    ; a directory candidate → descend into it
-                    (assoc mm :minibuffer (ed--find-file-prompt t recent))
-                    (ed-find-file mm t)))
+(defn ed--default-dir (m)
+  "The current buffer's directory (Emacs `default-directory`) — its **`:dir`**: every buffer
+carries one (a file's folder via `ed-stamp`, a Dired listing's dir, a shell's root, or
+inherited by a fileless buffer from the one it was created in). Falls back to a visited
+file's folder, then the working dir. The one place find-file, Dired, and `ed-project-root`
+read — so every path/project input starts from where you *are*, uniformly across buffers."
+  (let (b (ed-current-buf m))
+    (or (get b :dir)
+      (let (f (buffer-file b)) (if (nil? f) (cwd) (parent-dir f))))))
+
+(defn ed--path-prompt (prompt initial recent on-complete)
+  "The shared path-completing minibuffer spec — the ONE shape every file/folder input uses
+(find-file, dired): prefilled with `initial` (an absolute dir; `:word-mode :path` so
+`C-w`/`M-DEL` walks **up** a component at a time, no `../`), a Plume candidate list of the
+entries completing the typed path (recentf floated to the top via `recent`, basename
+labels, perms/size/time marginalia), `Tab` to expand. `on-complete` is `(model text) ->
+model` — what to do with the chosen path. Consistent across the board."
+  {:edit (assoc (ed-mb-edit prompt initial) :word-mode :path)
    :complete-fn (fn (t) (ed-complete-path t))
    :candidates-fn (fn (t) (take 12 (ed-sort-candidates (ed-path-candidates t) recent)))
    :label-fn path-label  ; show basenames in the list, not the full absolute path
-   :accept-selection true})
+   :category :file        ; marginalia: perms/size/mtime per row
+   :accept-selection true
+   :on-complete on-complete})
+
+(defn ed--find-file-prompt (initial recent)
+  "The find-file prompt over `ed--path-prompt`: **selecting a directory re-opens the prompt
+inside it** (descend, carrying the same `recent`); a file (or a typed path with no
+candidate) opens/creates it (`ed-find-file`)."
+  (ed--path-prompt "Find file: " initial recent
+    (fn (mm t)
+      (if (ends-with? t "/")
+        (assoc mm :minibuffer (ed--find-file-prompt t recent))  ; a directory → descend
+        (ed-find-file mm t)))))
 
 (defcommand cmd-find-file
   (m key)
@@ -1911,67 +1947,94 @@ or descends into a selected directory; deleting back (C-w) walks **up** the tree
 Emacs — no `../` needed. Last-used files (recentf) sort to the top, then by name."
   (assoc m
     :minibuffer
-    (ed--find-file-prompt (str (cwd) "/")
+    (ed--find-file-prompt (str (ed--default-dir m) "/")   ; the current buffer's dir, not the launch cwd
       (if (get m :recent-files) (recent-files) []))))  ; recency only in the live editor
 
 (defn ed-project-root (m)
-  "The current project's root: the value `main` cached on the model at startup
-(`:project-root`), falling back to resolving it from the working dir (nearest
-ancestor holding a `*project-markers*` entry) for a model built without one — e.g.
-in tests. Nil when there's no project."
-  (or (get m :project-root) (project-root (cwd))))
+  "The current project's root — resolved **live from the current buffer's directory**
+(Emacs `project-current`/`default-directory`): the nearest ancestor of the buffer's file
+holding a `*project-markers*` entry. So every project command (C-x p e/f/p/d) and Dired
+acts on the project you're *visiting*, not where the editor launched. Falls back to the
+model's cached `:project-root` (for a fileless buffer like *scratch*/*bshell*), then the
+working dir. Nil when there's no project anywhere."
+  (or (project-root (ed--default-dir m))
+      (get m :project-root)
+      (project-root (cwd))))
+
+(defn ed-find-file-in-project (m root)
+  "Open the find-file-in-project minibuffer over the files under `root` (recursive,
+root-relative; Tab narrows, Enter opens the first match). The shared core of `C-x p f`
+(root = the *current* project) and `C-x p p` (root = the *chosen* project) — so a switch
+lists the files of the project it switched to, not wherever the current buffer sits."
+  (if (nil? root)
+    (message m "not in a project (no project.blsp found)")
+    (let (_ (remember-project! root)  ; discovered → record it for C-x p p
+          files (project-files root))
+      (assoc m
+        :minibuffer
+        {:edit (assoc (ed-mb-edit "Find file in project: " "") :word-mode :path)  ; M-b/M-f by folder
+         :on-complete (fn (mm t)
+                        ;; a Vertico selection is a real project file → open it; a
+                        ;; typed string with no selection falls back to a prefix match.
+                        (if (includes? files t)
+                          (ed-find-file mm (path-join root t))
+                          (let (ms (project-matches t files))
+                            (if (empty? ms)
+                              (message mm (str "no project file matching \"" t "\""))
+                              (ed-find-file mm (path-join root (first ms)))))))
+         ;; Tab completes the typed path one component at a time — the identical
+         ;; `complete-prefix` action as find-file's Tab, over the project files that
+         ;; start with what's typed (prefix, so Tab only ever extends, never shrinks).
+         :complete-fn (fn (t) (complete-prefix t (project-matches t files)))
+         ;; default order: most-recently-visited (per project) first, then by last-written
+         :rank-source (sort-project-files root files)  ; narrowed incrementally as you type
+         :rank-cap 20
+         :category :file       ; marginalia per row …
+         :anno-base root       ; … the candidate is project-root-relative, so resolve from here
+         :accept-selection true}))))
 
 (defcommand cmd-project-find-file
   (m key)
-  "Find a file anywhere in the current project (C-x p f): a minibuffer completing
-over every file under the project root (recursive, root-relative). Tab narrows to
-the common prefix; Enter opens the first match. Reports when not in a project."
-  (let (root (ed-project-root m))
-    (if (nil? root)
-      (message m "not in a project (no project.blsp found)")
-      (let (_ (remember-project! root)  ; discovered → record it for C-c p p
-            files (project-files root))
-        (assoc m
-          :minibuffer
-          {:edit (assoc (ed-mb-edit "Find file in project: " "") :word-mode :path)  ; M-b/M-f by folder
-           :on-complete (fn (mm t)
-                          ;; a Vertico selection is a real project file → open it; a
-                          ;; typed string with no selection falls back to a prefix match.
-                          (if (includes? files t)
-                            (ed-find-file mm (path-join root t))
-                            (let (ms (project-matches t files))
-                              (if (empty? ms)
-                                (message mm (str "no project file matching \"" t "\""))
-                                (ed-find-file mm (path-join root (first ms)))))))
-           ;; Tab completes the typed path one component at a time — the identical
-           ;; `complete-prefix` action as find-file's Tab, over the project files that
-           ;; start with what's typed (prefix, so Tab only ever extends, never shrinks).
-           :complete-fn (fn (t) (complete-prefix t (project-matches t files)))
-           :rank-source files  ; the whole project's files — narrowed incrementally as you type
-           :rank-cap 20
-           :accept-selection true})))))
+  "Find a file anywhere in the current project (C-x p f): a minibuffer completing over every
+file under the project you're in. Reports when not in a project."
+  (ed-find-file-in-project m (ed-project-root m)))
+
+(defn ed--projects-to-switch (current projs)
+  "`projs` minus the `current` project — the switch-project candidates. You're already in
+the current project, so `C-x p p` never offers it as a target."
+  (filter (fn (p) (not (= p current))) projs))
 
 (defcommand cmd-project-switch
   (m key)
   "Switch to a known project (C-x p p): pick from the remembered project roots (a Vertico
 list, most-recently-used first), then find a file in it — Emacs `project-switch-project`.
 Projects are discovered by using `C-x p f` / opening one; reports when none are known."
-  (let (projs (known-projects))
+  (let (projs (ed--projects-to-switch (ed-project-root m) (known-projects)))
     (if (empty? projs)
-      (message m "no known projects yet — open one with C-x p f first")
+      (message m "no other known projects — open one with C-x p f first")
       (assoc m
         :minibuffer
         {:edit (assoc (ed-mb-edit "Switch to project: " "") :word-mode :path)
          :on-complete (fn (mm root)
                         (if (dir? root)
-                          ;; make it current (and bump it to front of the cache), then find a file in it
-                          (cmd-project-find-file (assoc mm :project-root (remember-project! root))
-                            nil)
+                          ;; make it current (and bump it to front of the cache), then find a file
+                          ;; in *that* project — pass the chosen root explicitly, since the current
+                          ;; buffer still sits in the old project (ed-project-root resolves live).
+                          (ed-find-file-in-project (assoc mm :project-root (remember-project! root)) root)
                           (message mm (str "no such project: " root))))
          :complete-fn (fn (t) (ed-complete-name t projs))
          :rank-source projs
          :rank-cap 20
          :accept-selection true}))))
+
+(defcommand cmd-project-dired
+  (m key)
+  "Open Dired on the current project's root (C-x p d, Emacs `project-dired`). The project
+is the one the current buffer is in (`ed-project-root`), not where the editor launched."
+  (let (root (ed-project-root m))
+    (if (nil? root)
+      (message m "not in a project (no project.blsp found)")
+      (ed-show-dired m root))))
 
 ;; ---- M-x: run any interactive command by name -------------------------------
 

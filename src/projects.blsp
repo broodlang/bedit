@@ -14,19 +14,33 @@ std `project` to avoid the clash.")
   ;; (a file), since `file-exists?` is true for either. Edit this list to taste.
   (list "project.blsp" ".git"))
 
+(def *project-search-depth* 64)
+;; How many ancestor levels `project-root` climbs before giving up (the file's own
+;; directory is level 0). Bounds the walk so a file deep under a non-project tree doesn't
+;; stat its way to `/` every visit — and guards against a pathological/looping path. 64 is
+;; far deeper than any real source tree; lower it (or redefine live) to taste.
+
+(def *project-files-max* 50000)
+;; A hard cap on how many directory entries `project-files` will visit. The file walk
+;; follows directories naively, and a **symlink cycle** (e.g. `a/loop -> ..`) or a root
+;; that's accidentally huge (a remembered `$HOME`, `/`, …) would otherwise walk forever and
+;; hang/OOM the editor. Past this many entries the walk stops with what it has — far more
+;; than any real project, so legitimate trees are unaffected.
+
 (defn project--marked? (dir)
   "True if `dir` holds any `*project-markers*` entry — i.e. is a project root."
   (not (empty? (filter (fn (marker) (file-exists? (path-join dir marker))) *project-markers*))))
 
-(defn project-root (dir)
-  "The project root for `dir`: the nearest ancestor (including `dir` itself) that is
-a project root (holds a `*project-markers*` entry — `project.blsp` or `.git`), or nil
-if there is none up to the filesystem top. Tail-recursive (the `:else` self-call is
-in tail position)."
+(defn project-root (dir &optional (limit *project-search-depth*))
+  "The project root for `dir`: the nearest ancestor (including `dir` itself) that holds a
+`*project-markers*` entry (`project.blsp` or `.git`), found by walking **backwards** up the
+tree. `nil` if there's none within `limit` ancestor levels, or up to the filesystem top.
+Tail-recursive (the `:else` self-call is in tail position)."
   (cond
     (project--marked? dir) dir
-    (= dir (parent-dir dir)) nil
-    :else (project-root (parent-dir dir))))
+    (<= limit 0) nil                       ; give up — too far up
+    (= dir (parent-dir dir)) nil           ; reached the filesystem top
+    :else (project-root (parent-dir dir) (dec limit))))
 
 (defn file-display-name (path &optional root)
   "The buffer label to show for file `path`: its path **relative to the project**
@@ -63,26 +77,54 @@ policy for opened files — used by the CLI arg, C-x C-f, and project find-file 
       (dir? (path-join abs name)) [(cons childrel subdirs) files]
       :else [subdirs (cons childrel files)])))
 
-(defn project--walk (root pending acc)
+(defn project--walk (root pending acc seen max)
   "Tail-recursive worklist walk: `pending` is a list of root-relative dir paths still
 to visit (\"\" = the root); collect root-relative file paths into `acc`. O(1) stack
 regardless of tree depth. A directory that can't be listed is treated as empty. Each
 step prepends this dir's subdirs/files (the *small* lists) onto `pending`/`acc` rather
 than appending the growing accumulator — O(1) per item, so the whole walk is O(files)
 not O(files²). Traversal becomes depth-first and `acc` ends unordered; the final `sort`
-fixes the order, so neither matters."
-  (if (empty? pending)
+fixes the order, so neither matters. `seen` counts directory entries processed so far;
+once it reaches `max` the walk stops between directories — a hard bound against a symlink
+cycle (which would loop forever) or an accidentally enormous root (which would OOM)."
+  (if (or (empty? pending) (>= seen max))
     (sort acc)
     (let (rel (first pending)
           abs (if (= rel "") root (path-join root rel))
           entries (try (list-dir abs) (catch e ()))
           step (fold (fn (st name) (project--classify abs rel st name)) [() ()] entries))
-      (project--walk root (append (first step) (rest pending)) (append (second step) acc)))))
+      ;; `append-two` (copy the *small* head, share the growing tail) is O(head); the
+      ;; variadic `append` copies its later args, which would make this O(files²) — a 26s
+      ;; hang on a ~12k-file project (the `C-x p p` freeze). Order is irrelevant: the final
+      ;; `sort` fixes it.
+      (project--walk root (append-two (first step) (rest pending)) (append-two (second step) acc)
+        (+ seen (count entries)) max))))
 
-(defn project-files (root)
-  "Every file under `root` as sorted root-relative paths (VCS/build dirs skipped);
-`()` when `root` is nil."
-  (if (nil? root) '() (project--walk root (list "") '())))
+(defn project--git-files (root)
+  "Project files via `git ls-files` — tracked + untracked-but-not-`.gitignore`d, as sorted
+root-relative paths. Fast (git does the walk in C) and correct (honours `.gitignore`, nested
+ignores, and the global excludes via `--exclude-standard`), so a repo's build/coverage/vendor
+output never floods find-file. `nil` when `root` isn't a git repo, or git is missing/errors —
+then the caller falls back to the manual walk. (Emacs `project.el` lists git projects the
+same way.)"
+  (if (not (file-exists? (path-join root ".git")))
+    nil
+    (try
+      (let (r (%os-cmd "git" ["-C" root "ls-files" "--cached" "--others" "--exclude-standard"]))
+        (if (= (get r :exit) 0)
+          (sort (filter (fn (l) (not (= l ""))) (string-split (get r :stdout "") "\n")))
+          nil))
+      (catch e nil))))
+
+(defn project-files (root &optional (max *project-files-max*))
+  "Every project file as sorted root-relative paths; `()` when `root` is nil. A **git repo**
+is listed with `git ls-files` (honouring `.gitignore` — `project--git-files`); otherwise a
+manual recursive walk skipping VCS/build dirs, bounded by `max` entries (default
+`*project-files-max*`) so a symlink cycle or huge root can't hang the editor."
+  (if (nil? root)
+    '()
+    (or (project--git-files root)
+      (project--walk root (list "") '() 0 max))))
 
 (defn project-matches (prefix files)
   "The `files` whose root-relative path starts with `prefix` — the live find-file
@@ -94,63 +136,102 @@ candidate set."
 or `\"\"` when `root` is nil."
   (if (nil? root) "" (last (string-split root "/"))))
 
-;; ---- known projects (a persisted cache, kept out of the user's files) -------
-;; Discovered project roots are remembered in ~/.cache/brood/projects.blsp (XDG cache,
-;; honouring $XDG_CACHE_HOME) so `C-c p p` can switch between them. This is a *cache* —
-;; auto-discovered, regenerable, most-recently-used first — deliberately under the cache
-;; dir, separate from the user's own config/files. The read/write are path-parameterised
-;; (`projects--read` / `projects--write!` / `projects--remember`) so the policy is
-;; testable without touching the real cache; the public `known-projects` /
-;; `remember-project!` close over the default path.
+;; ---- the editor's auto-generated state (one brood-edit folder) --------------
+;; ALL of the editor's generated data — known projects, recent files, per-project recency,
+;; bookmarks — lives under one dedicated folder, `~/.config/brood-edit/state/` (honouring
+;; $XDG_CONFIG_HOME), kept separate from the user's hand-edited `init.blsp` and never under
+;; the Brood language's own `brood` dirs. Regenerable, most-recently-used first. The
+;; read/write helpers are path-parameterised (`projects--read` / `projects--write!` /
+;; `projects--remember`) so the policy is testable without touching the real state; the
+;; public `known-projects` / `remember-project!` close over the default path.
+
+(defn editor-state-dir ()
+  "The editor's auto-generated state folder — `$XDG_CONFIG_HOME/brood-edit/state` (else
+`~/.config/brood-edit/state`). The single home for every generated file (known projects,
+recent files, per-project recency, bookmarks), never loose beside the user's `init.blsp`."
+  (path-join
+    (path-join (or (getenv "XDG_CONFIG_HOME") (path-join (getenv "HOME") ".config")) "brood-edit")
+    "state"))
 
 (defn projects--cache-dir ()
-  "The editor's cache directory: `$XDG_CACHE_HOME/brood` or `~/.cache/brood`."
-  (str (or (getenv "XDG_CACHE_HOME") (str (getenv "HOME") "/.cache")) "/brood"))
+  "Alias for `editor-state-dir` — the dir the project/recentf/bookmark caches live in."
+  (editor-state-dir))
 
 (defn projects-file ()
   "Path of the known-projects cache file."
   (path-join (projects--cache-dir) "projects.blsp"))
 
-(defn projects--read (file)
-  "The project roots stored in `file` (a vector of paths), or `[]` when it's missing /
-unreadable / not a vector — never throws."
+;; ---- the shared persistence layer (one read / write / MRU for ALL generated state) ----
+;; Every persisted file in the editor — known projects, recent files, per-project recency,
+;; bookmarks, the bshell history — is a single re-readable Brood literal. These three helpers
+;; are the *only* code that touches such a file, so the policy lives in exactly one place:
+;; tolerant reads (a corrupt file → `[]`, never a crash) and **atomic** writes (so a partial
+;; write can never silently truncate the cache). Path-parameterised, so each caller closes
+;; over its own file and the policy stays testable without the real state dir.
+
+(defn persist-read (file)
+  "The value stored in `file` (a vector), or `[]` when it's missing / unreadable / not a
+vector — never throws. A corrupt or half-written file reads as `[]` instead of crashing."
   (if (file-exists? file)
     (try (let (v (read-string (slurp file))) (if (vector? v) v [])) (catch e []))
     []))
 
-(defn projects--write! (file roots)
-  "Write `roots` (a vector of paths) to `file` as a re-readable literal, creating its
-directory. Best-effort: a write failure is swallowed. Returns `roots`."
-  (try (do (make-dir (parent-dir file)) (spit file (pr-str roots))) (catch e nil))
-  roots)
+(defn persist-write! (file value)
+  "Write `value` to `file` as a re-readable literal, **atomically**: write a sibling `.tmp`
+then `rename-file` over the target, so a crash or partial write can never leave a truncated
+file that the next `persist-read` would silently lose (then clobber). Creates the directory.
+Best-effort — a failure is swallowed. Returns `value`."
+  (try
+    (let (tmp (str file ".tmp"))
+      (make-dir (parent-dir file))
+      (spit tmp (pr-str value))
+      (rename-file tmp file))
+    (catch e nil))
+  value)
 
-(defn projects--mru (file entry same? &optional (cap nil))
-  "Write `entry` to the front of `file`'s list, dropping any existing entry `same?` (a
-predicate) matches (dedup), capped to `cap` items (nil = unbounded). Returns the new
-vector. The shared most-recently-used cache write behind known projects, recentf, and
-bookmarks."
-  (let (kept (into [entry] (filter (fn (x) (not (same? x))) (projects--read file))))
-    (projects--write! file (if (nil? cap) kept (into [] (take cap kept))))))
+(defn persist-mru (file entry same? &optional (cap nil))
+  "Write `entry` to the front of `file`'s vector, dropping any existing entry `same?` (a
+predicate) matches (dedup), capped to `cap` items (nil = unbounded). Returns the new vector.
+The most-recently-used write behind known projects, recentf, bookmarks, and bshell history."
+  (let (kept (into [entry] (filter (fn (x) (not (same? x))) (persist-read file))))
+    (persist-write! file (if (nil? cap) kept (into [] (take cap kept))))))
+
+;; Historic names for the shared layer — kept so existing call sites and tests still bind.
+(def projects--read persist-read)
+(def projects--write! persist-write!)
+(def projects--mru persist-mru)
 
 (defn projects--remember (file root)
   "Move `root` to the front of `file`'s project list (dedup), write it back, and return
 the updated vector — most-recently-used first."
   (projects--mru file root (fn (p) (= p root))))
 
+(def *known-projects-max* 50)
+
 (defn known-projects ()
   "The remembered project roots that still exist (most-recently-used first), or `[]`."
-  (filter (fn (p) (dir? p)) (projects--read (projects-file))))
+  (filter (fn (p) (dir? p)) (persist-read (projects-file))))
+
+(defn projects--remember-live! (file root)
+  "Move `root` to the front of `file`'s project list, dropping it elsewhere (dedup) **and**
+dropping any entry whose directory no longer exists (self-healing), capped at
+`*known-projects-max*`. Write it back; return the new vector. Path-parameterised so the
+prune/cap policy is testable without the real cache."
+  (let (live (filter (fn (p) (and (not (= p root)) (dir? p))) (persist-read file)))
+    (persist-write! file (into [] (take *known-projects-max* (into [root] live))))))
 
 (defn remember-project! (root)
-  "Record project `root` as known (most-recently-used), persisting it. Best-effort; a
-nil/blank root is ignored. Returns `root`."
-  (when (and (string? root) (not (= root ""))) (projects--remember (projects-file) root))
+  "Record project `root` as known (most-recently-used), persisting it. Prunes entries whose
+directory no longer exists (the cache self-heals) and caps the list at `*known-projects-max*`,
+so it can't accumulate dead paths forever. Best-effort; a nil/blank root is ignored. Returns
+`root`."
+  (when (and (string? root) (not (= root ""))) (projects--remember-live! (projects-file) root))
   root)
 
 ;; ---- recent files (recentf — the same cache mechanism as known projects) ----
-;; Opened files are remembered most-recently-first in ~/.cache/brood/recent-files.blsp
-;; (capped), so find-file can float the last-used entries to the top of a directory
-;; listing. Reuses `projects--read`/`--write!`; capped so the cache can't grow forever.
+;; Opened files are remembered most-recently-first under the state dir (capped), so find-file
+;; can float the last-used entries to the top of a directory listing. Reuses the shared
+;; `persist-*` layer; capped so the cache can't grow forever.
 
 (def *recent-files-max* 200)
 
@@ -164,8 +245,10 @@ nil/blank root is ignored. Returns `root`."
   (projects--mru file path (fn (p) (= p path)) *recent-files-max*))
 
 (defn recent-files ()
-  "The remembered recently-opened file paths (most-recent first), or `[]`."
-  (projects--read (recent-files-file)))
+  "The remembered recently-opened file paths that still exist (most-recent first), or `[]`
+— deleted files are filtered out, so they never resurface in find-file (mirrors how
+`known-projects` drops vanished roots)."
+  (filter (fn (p) (file-exists? p)) (persist-read (recent-files-file))))
 
 (defn remember-file! (path)
   "Record `path` as recently opened (most-recent first), persisting it. Best-effort; a
@@ -173,10 +256,56 @@ nil/blank path is ignored. Returns `path`."
   (when (and (string? path) (not (= path ""))) (recent--remember (recent-files-file) path))
   path)
 
+;; ---- per-project recency + the default project-file sort --------------------
+;; "Last access" is the EDITOR's own per-project history (filesystem atime is unreliable —
+;; `noatime`/`relatime` mounts don't update it), persisted one file per project under a
+;; dedicated **auto-generated** folder, kept separate from the user's hand-edited
+;; `init.blsp`. `sort-project-files` is the default find-file-in-project order: the files
+;; you've visited most recently (per project) first, then everything else by last-written
+;; time (mtime). `ed-find-file` records each visit.
+
+(def *project-recent-max* 100)
+
+(defn project-recent--file (root)
+  "The path of project `root`'s recent-file list: one file per project under the state
+folder's `recent/` dir, named by the root with slashes encoded (`/` → `%`) so each
+project keeps its own list."
+  (path-join (path-join (editor-state-dir) "recent") (str (replace root "/" "%") ".blsp")))
+
+(defn project-recent (root)
+  "The project's recently-visited files (root-relative paths, most-recent first), or `[]`."
+  (if (nil? root) [] (projects--read (project-recent--file root))))
+
+(defn remember-project-file! (root rel)
+  "Record root-relative file `rel` as the most-recently-visited file of project `root`
+(dedup, capped, persisted). Best-effort; a nil/blank root or file is ignored. Returns `rel`."
+  (when (and (string? root) (string? rel) (not (= rel "")))
+    (projects--mru (project-recent--file root) rel (fn (p) (= p rel)) *project-recent-max*))
+  rel)
+
+(defn project-files--order (recent files mtime-of)
+  "Pure: order `files` (root-relative) by `recent` (recency, still-present) first, then the
+rest by `mtime-of` (a `rel -> epoch-ms` fn) descending. The orderable core of
+`sort-project-files`, so it's unit-testable without the filesystem."
+  (let (present (filter (fn (p) (includes? files p)) recent)
+        rest (filter (fn (f) (not (includes? present f))) files)
+        decorated (map (fn (f) [f (mtime-of f)]) rest))
+    (concat present (map first (sort (fn (a b) (> (second a) (second b))) decorated)))))
+
+(defn sort-project-files (root files)
+  "Project `files` (root-relative) in find-file order: the editor's recorded **recency** per
+project first (`project-recent` — the files you've actually visited), then the rest in path
+order (already sorted by `project-files`). No per-file mtime stat — that was one `file-stat`
+syscall *per file* (≈90ms on a 700-file project, ~1.8s on 12k) paid on every find-file open,
+just to order the list before you type. Recency is the signal that matters; you narrow by
+typing anyway. (`project-files--order` keeps the mtime-orderable core for callers that want it.)"
+  (let (recent (project-recent root)
+        present (filter (fn (p) (includes? files p)) recent))
+    (concat present (filter (fn (f) (not (includes? present f))) files))))
+
 ;; ---- bookmarks (named file positions, persisted — like recentf) -------------
-;; A bookmark is `{:name :file :pos}`; the set is a vector kept in
-;; ~/.cache/brood/bookmarks.blsp (most-recent first, deduped by name). Read/write are
-;; path-parameterised (`bookmarks--read` / `--set`) for testing without the real cache.
+;; A bookmark is `{:name :file :pos}`; the set is a vector kept in the state dir's
+;; bookmarks.blsp (most-recent first, deduped by name), via the shared `persist-*` layer.
 
 (defn bookmarks-file ()
   "Path of the bookmarks cache file."

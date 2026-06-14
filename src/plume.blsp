@@ -1,0 +1,131 @@
+(defmodule plume
+  "**Plume** — the editor's minibuffer completion UI. One layer where Emacs needs three
+packages: it's *Vertico* (the vertical candidate list), *Marginalia* (the per-row
+annotations — a file's permission/size/mtime 'plumage') and the *N/M* counter, all owned
+here and built on the shared primitives in `completion` (ranking + the floating card the
+in-buffer `complete` popup also uses). The prompt drives it by declaring a `:category`
+(`:file`, `:buffer`, `:command`, …) on its minibuffer; `view` renders the list with this
+module's annotations + counter.
+
+**The override seam (ricing, like the rest of the editor).** Annotators are kept in
+`*plume-annotators*` as **quoted symbols** resolved with `eval` at render time (late
+binding — the keymap pattern), so redefining a single annotator (`(defn plume/plume-file-
+annotation …)`) or swapping a registry entry re-skins a *running* editor on its next
+frame. Faces are `theme/face-plume-*`; the column formatters are plain `defn`s. Redefine
+any of them live with `C-x C-e`. No package soup, no per-package config — one named layer."
+  (:use completion)  ; the shared card renderer / faces / `perms-string` Plume builds on
+  (:use theme)  ; face-plume-annotation — the dim marginalia colour (src/theme.blsp)
+  (:use editor/display))  ; the `text` / `rect` render ops
+
+;; ---- look (redefine to rice Plume) ------------------------------------------
+
+(def *plume-row-face* face-plume-row)  ; an unselected candidate row (fg only — flat list)
+(def *plume-annotation-face* face-plume-annotation)  ; marginalia on an unselected row
+
+;; ---- the annotator registry (the override seam) -----------------------------
+
+(def *plume-annotators*
+  ;; completion category -> a `(value mb) -> annotation-string|nil` fn, as a quoted symbol.
+  ;; Add/replace an entry (or redefine the named fn) live to change a category's marginalia.
+  {:file 'plume/plume-file-annotation})
+
+(defn plume-annotation (mb value)
+  "The marginalia annotation for candidate `value` in minibuffer `mb` (keyed by its
+`:category` through `*plume-annotators*`), or nil when the category has no annotator or
+the annotator declines. `mb` is threaded through so an annotator can read prompt context
+(e.g. `:anno-base`, the directory a relative candidate is resolved against)."
+  (let (sym (get *plume-annotators* (get mb :category)))
+    (if (nil? sym) nil ((eval sym) value mb))))
+
+;; ---- the :file annotator's column formatters --------------------------------
+
+(defn plume-hsize (n div suffix)
+  "Round `n/div` to one decimal — or a bare integer at ≥ 10 units — with `suffix`
+(`1456/1024` → `1.4k`, `12·1024` → `12k`). Pure integer math, no float formatting."
+  (let (tenths (quot (+ (* n 10) (quot div 2)) div))
+    (if (>= tenths 100)
+      (str (quot tenths 10) suffix)
+      (str (quot tenths 10) "." (rem tenths 10) suffix))))
+
+(defn plume-human-size (n)
+  "A short human-readable byte count (`ls -h` style, lowercase units): bytes under 1k,
+else k/m/g to one decimal (`1456` → `1.4k`); `?` when unknown."
+  (cond
+    (nil? n) "?"
+    (< n 1024) (str n)
+    (< n 1048576) (plume-hsize n 1024 "k")
+    (< n 1073741824) (plume-hsize n 1048576 "m")
+    :else (plume-hsize n 1073741824 "g")))
+
+(defn plume-reltime (ms now-ms)
+  "A short relative time — `1h 41m ago` / `27m 11s ago` / `3d ago` — from epoch-ms `ms`
+to `now-ms`; `\"\"` when `ms` is nil."
+  (if (nil? ms)
+    ""
+    (let (s (quot (max 0 (- now-ms ms)) 1000))
+      (cond
+        (< s 60) (str s "s ago")
+        (< s 3600) (str (quot s 60) "m " (rem s 60) "s ago")
+        (< s 86400) (str (quot s 3600) "h " (quot (rem s 3600) 60) "m ago")
+        (< s 2592000) (str (quot s 86400) "d ago")
+        :else (str (quot s 2592000) "mo ago")))))
+
+(defn plume-file-annotation (value mb)
+  "The `:file` category annotator: `<perms>  <size>  <relative-mtime>` for candidate
+`value`, via one `file-stat` (the perms column shared with dired through
+`completion/perms-string`). `value` is resolved to a path against the prompt's
+`:anno-base` (a relative candidate's directory) when it isn't absolute; a trailing `/`
+(a directory marker) is dropped. `\"\"` when the file is gone. Redefine this (or swap the
+`:file` entry of `*plume-annotators*`) to change the columns — the marginalia seam."
+  (let (raw (if (ends-with? value "/") (substring value 0 (dec (string-length value))) value)
+        base (get mb :anno-base)
+        path (cond (starts-with? raw "/") raw
+               (nil? base) raw
+               :else (str base "/" raw))
+        st (file-stat path))
+    (if (nil? st)
+      ""
+      (str (perms-string st) "  " (pad-left (plume-human-size (get st :size)) 6) "  "
+        (plume-reltime (get st :mtime) (now))))))
+
+;; ---- the annotated row renderer + the counter -------------------------------
+
+(defn plume-annot-width (annots)
+  "The marginalia column width: the widest annotation, clamped to [0, 40] (0 ⇒ no column)."
+  (min 40 (fold (fn (w s) (max w (string-length s))) 0 annots)))
+
+(defn plume--clip (s w)
+  "Clip `s` to width `w`, keeping the **tail** behind a leading `…` (a long path keeps its
+filename, not just the directory prefix). Unchanged when it already fits."
+  (if (> (string-length s) w)
+    (str "…" (substring s (- (+ (string-length s) 1) w) (string-length s)))
+    s))
+
+(defn plume-menu-ops (window annots wstart selected row0 cols aw)
+  "Plume's flat, **full-width** candidate list (Emacs vertico + marginalia): one screen row
+per visible candidate from `row0` down, spanning all `cols`. The label is left-aligned and
+the marginalia (`aw` wide) flush-right. The `selected` row is a full-width highlight band
+(`face-popup-selected`); unselected rows sit on the buffer background with the annotation
+dimmed (`*plume-annotation-face*`). `aw` 0 ⇒ no marginalia column (e.g. M-x)."
+  (let (annot-col (if (= aw 0) cols (- cols aw 1))  ; where the right-aligned marginalia starts
+        lab-w (max 1 (- annot-col 2)))              ; label fits before it (1 lead + 1 gap)
+    (mapcat (fn (i)
+              (let (sel? (= (+ wstart i) selected)
+                    label (plume--clip (nth window i) lab-w)
+                    annot (nth annots i)
+                    row (+ row0 i))
+                (if sel?
+                  ;; one full-width op: " label …pad… annot " painted in the selected face
+                  [(text row 0
+                     (pad-right (str (pad-right (str " " label) annot-col) annot) cols)
+                     *completion-selected-face*)]
+                  (if (= aw 0)
+                    [(text row 1 label *plume-row-face*)]
+                    [(text row 1 label *plume-row-face*)
+                     (text row annot-col annot *plume-annotation-face*)]))))
+      (range (count window)))))
+
+(defn plume-count-label (sel total)
+  "The `N/M` candidate counter for the prompt line (1-based `sel`); `\"\"` when there are no
+candidates."
+  (if (= total 0) "" (str (inc sel) "/" total " ")))

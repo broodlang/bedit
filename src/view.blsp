@@ -15,7 +15,8 @@ old full-screen one (mode line at `rows-2`, echo at `rows-1`)."
   (:use model)  ; current-buffer accessors, pane buffer + mode name
   (:use panes)  ; ed-body-layout — the :layout tree -> pane rects + divider rects
   (:use complete)  ; the completion popup overlay
-  (:use completion)  ; the shared vertical-menu renderer (Vertico-style minibuffer list)
+  (:use completion)  ; the shared vertical-menu renderer + faces
+  (:use plume)  ; the minibuffer completion UI — marginalia annotations + the N/M counter
   (:use projects)  ; project-name — the bracketed project label on the mode line
   (:use editor/highlight)  ; fontify-runs — the shared span+overlay -> [substring face] tiler
   (:use theme)  ; the curated palette + semantic chrome faces (src/theme.blsp)
@@ -410,41 +411,51 @@ hint (the current buffer mode's signature for point, e.g. `(map f coll)`, refres
 else the latest `message` — or, when idle, the current mode's eldoc hint. A Vertico
 prompt shows its candidates as the vertical list above (`ed-mb-candidates-ops`); a
 plain prompt (find-file) keeps the inline ` {a b c}` here."
+  ;; The prompt sits just below the mode line, at the top of the minibuffer region; the
+  ;; Plume candidate list (if any) fills the rows below it (`ed-mb-candidates-ops`). With no
+  ;; list the region is one row, so this lands on the last row as before.
   (let (mb (get m :minibuffer))
-    (text (dec rows)
+    (text (- rows (ed-echo-rows m rows))
       0
       (ed-fit (if (nil? mb)
                 (ed-echo-or-eldoc m)
-                (str (mb-prompt mb)
-                  (mb-text mb)
-                  (if (get mb :accept-selection) "" (ed-mb-candidates mb))))
+                (let (sel? (get mb :accept-selection)
+                      ;; a Plume prompt leads with the `N/M` candidate counter
+                      counter (if sel? (plume-count-label (mb-sel mb) (count (mb-candidates mb))) ""))
+                  (str counter
+                    (mb-prompt mb)
+                    (mb-text mb)
+                    (if sel? "" (ed-mb-candidates mb)))))
         cols))))
 
 (defn ed-mb-candidates-ops (m cols rows)
-  "The Vertico-style vertical candidate list for a minibuffer with `:accept-selection`:
-the fuzzy candidates drawn in the rows just above the prompt, the `:sel` row
-highlighted. `[]` for no minibuffer, a plain prompt, or no candidates."
+  "Plume's vertical candidate list for a minibuffer with `:accept-selection`: the fuzzy
+candidates drawn in the rows just above the prompt, the `:sel` row highlighted, each row
+carrying its category's marginalia (`plume-annotation`) when the prompt declares one. `[]`
+for no minibuffer, a plain prompt, or no candidates."
   (let (mb (get m :minibuffer))
     (if (or (nil? mb) (not (get mb :accept-selection)))
       []
       (let (cands (mb-candidates mb))
         (if (empty? cands)
           []
-          (let (sel (mb-sel mb)
+          (let (vis (dec (ed-echo-rows m rows))  ; reserved rows minus the prompt
+                sel (mb-sel mb)
                 total (count cands)
-                ;; leave the mode line (rows-2) and the prompt (rows-1) visible: the
-                ;; list fills the `vis` rows just ABOVE the mode line.
-                vis (max 1 (min *completion-max* total (- rows 4)))  ; -2 for the box frame
                 wstart (completion-window-start total sel vis)
                 ;; the selected candidate's *value* indexes into `cands` (what accept
                 ;; opens); a prompt may supply `:label-fn` to show each candidate
                 ;; differently (find-file shows a path's basename, not its full path).
                 labelf (or (get mb :label-fn) (fn (c) c))
-                window (map labelf (take vis (drop wstart cands)))
-                w (completion-menu-width window)
-                ;; the (vis+2)-tall box sits just above the mode line (rows-2)
-                row0 (max 0 (- (- rows 2) (+ vis 2))))
-            (completion-menu-ops window wstart sel row0 0 w)))))))
+                values (take vis (drop wstart cands))
+                window (map labelf values)
+                ;; Plume marginalia: a per-category annotation for each visible candidate
+                ;; value; all-empty (aw 0) when the prompt's category has no annotator.
+                annots (map (fn (v) (or (plume-annotation mb v) "")) values)
+                aw (plume-annot-width annots)
+                ;; the list fills the bottom `vis` rows, full width, just below the prompt
+                row0 (- rows vis))
+            (plume-menu-ops window annots wstart sel row0 cols aw)))))))
 
 ;; `ed-selected-pane` lives in `panes` (this module `(:use panes)`).
 
@@ -521,10 +532,17 @@ cell's left edge — display.blsp; Vim insert always bar, normal/visual always b
         (cursor (+ y (* (- (buffer-current-line buf) top) s))
           (+ x (* (+ gw (max 0 (min (dec tw) (ed-visual-column-from buf hscroll)))) s))
           (ed--cursor-style m)))
-      (cursor (dec rows)
-        ;; prompt width + the line editor's point
-        (min (dec cols) (+ (string-length (mb-prompt mb)) (mb-point mb)))
-        :bar))))
+      ;; The prompt is the first row of the echo area (just below the mode line), not the
+      ;; last screen row — the Plume list fills the rows below it. The caret sits after the
+      ;; `N/M ` counter (when a selection prompt) + the prompt + the line editor's point.
+      (let (counter (if (get mb :accept-selection)
+                      (string-length (plume-count-label (mb-sel mb) (count (mb-candidates mb))))
+                      0))
+        ;; the minibuffer caret is the SAME shape as every buffer (`ed--cursor-style`):
+        ;; the configurable block by default, not a special-case bar.
+        (cursor (- rows (ed-echo-rows m rows))
+          (min (dec cols) (+ counter (string-length (mb-prompt mb)) (mb-point mb)))
+          (ed--cursor-style m))))))
 
 (defn ed--which-key-rows (km)
   "Sorted `\"<key>   <command>\"` rows for the entries of pending sub-keymap `km`."
@@ -533,20 +551,20 @@ cell's left edge — display.blsp; Vim insert always bar, normal/visual always b
 
 (defn ed-which-key-ops (m cols rows)
   "When a prefix chord has been pending past the which-key delay (`:which-key` set by
-`model/ed-which-key-reveal`) and no minibuffer/menu is open, a bottom bordered panel
-listing the available next keys and the command each runs (Emacs which-key). `[]`
-otherwise — so a fast chord (C-x C-f) completes before the panel ever shows."
+`model/ed-which-key-reveal`) and no minibuffer/menu is open, the bottom echo area shows
+the available next keys and the command each runs (Emacs which-key) — a flat, full-width
+list below the mode line + the pending-chord echo row, the same shape as Plume's candidate
+list. `[]` otherwise, so a fast chord (C-x C-f) completes before the panel ever shows."
   (let (km (get m :pending))
     (if (or (nil? km) (not (get m :which-key)) (get m :minibuffer) (get m :menu))
       []
-      (let (labels (ed--which-key-rows km))
-        (if (empty? labels)
+      (let (vis (dec (ed-echo-rows m rows))  ; reserved rows minus the echo row
+            window (take vis (ed--which-key-rows km))
+            row0 (- rows vis))               ; fills the bottom rows, below the echo row
+        (if (empty? window)
           []
-          (let (vis (max 1 (min (count labels) (- rows 4)))
-                window (take vis labels)
-                w (completion-menu-width labels)
-                row0 (max 0 (- (- rows 2) (+ vis 2))))
-            (completion-menu-ops window 0 -1 row0 0 w)))))))  ; selected = -1 → no highlight
+          ;; no selection (selected = -1 → no highlight band); no marginalia column (aw 0)
+          (plume-menu-ops window (map (fn (_) "") window) 0 -1 row0 cols 0))))))  ; selected = -1 → no highlight
 
 (defn ed-view (m cols rows)
   "ui-run view (pure): lay the pane tree into the body (everything above the echo
@@ -571,9 +589,11 @@ layout."
           (complete-popup-ops m cols rows)  ; overlays the buffer body when open
           (ed-menu-ops m cols rows)  ; the right-click Copy/Cut/Paste menu, on top
           ;; The caret blinks (ADR-102): the idle `:cursor-blink` timer toggles `:blink-on?`,
-          ;; and dropping the op on the off-phase hides it. Kept solid while a minibuffer is
-          ;; open or a key is repeating (point is actively moving — Emacs does the same).
-          (if (or (get m :blink-on?) (get m :minibuffer) (get m :held-key))
+          ;; and dropping the op on the off-phase hides it — in the minibuffer too, so the
+          ;; caret is consistent everywhere (typing resets it solid via `ed-real-input?`,
+          ;; then it blinks at rest). Kept solid only while a key is repeating (the point is
+          ;; actively moving, so blinking would strobe).
+          (if (or (get m :blink-on?) (get m :held-key))
             [(ed-cursor m panes cols rows)]
             []))))
     (catch e
