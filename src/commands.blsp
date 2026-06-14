@@ -2504,6 +2504,170 @@ file type; symbols are nested-name-qualified (Emacs-style `Class.method`)."
           (message m2 "imenu: no symbols (is the server ready?)")
           (ed--imenu-prompt m2 syms))))))
 
+;; ---- LSP navigation + edits: goto-def / back / references / hover / rename / format ----
+;; All ride the same request/response round-trip as completion + imenu. `ed--lsp-here`
+;; packages the current buffer's (conn, uri, lang, text, line, char) for a request at point;
+;; `ed--lsp-ensure` auto-starts the server on first use. Cross-file jumps open the target
+;; with `ed-find-file` and push a marker (`:lsp-markers`) so M-, returns.
+
+(defn ed--lsp-here (m)
+  "The LSP request context for the current buffer at point:
+`{:conn :uri :lang :text :line :char}` (0-based line/char, LSP units)."
+  (let (buf (ed-current-buf m)
+        file (buffer-file buf))
+    {:conn (get m :lsp)
+     :uri (lsp/lsp--path->uri file) :lang (lsp/lsp--language-id file)
+     :text (buffer-text buf) :line (buffer-current-line buf) :char (buffer-column buf)}))
+
+(defn ed--lsp-push-marker (m)
+  "Push the current location onto the LSP jump stack (`:lsp-markers`), so M-, can return."
+  (let (b (ed-current-buf m))
+    (assoc m :lsp-markers
+      (cons {:buffer (buffer-name b) :point (buffer-point b)} (get m :lsp-markers '())))))
+
+(defn ed--lsp-goto-loc (m loc)
+  "Jump to LSP location `loc` (`{:path :line :char}`), opening its file if needed; pushes a
+marker first so M-, returns to where the jump started."
+  (let (m1 (ed--lsp-push-marker m)
+        m2 (ed-find-file m1 (get loc :path)))
+    (ed-apply m2 (fn (b) (ed--goto-line-col b (get loc :line) (get loc :char))))))
+
+(defn ed--lsp-loc-label (m loc)
+  "A `relpath:line` label for a location (project-relative when possible) for the
+references/definition picker."
+  (let (root (get m :project-root)
+        p (get loc :path)
+        rel (if (and root (starts-with? p (str root "/"))) (substring p (string-length (str root "/"))) p))
+    (str rel ":" (+ 1 (get loc :line)))))
+
+(defn ed--lsp-locations-prompt (m prompt locs)
+  "A Vertico minibuffer over LSP `locs`; the chosen one opens its file and jumps (M-, returns)."
+  (let (labeled (map (fn (l) [(ed--lsp-loc-label m l) l]) locs)
+        labels (map first labeled))
+    (assoc m :minibuffer
+      (ed-name-prompt prompt labels
+        (fn (mm t)
+          (let (hit (first (filter (fn (p) (= (first p) t)) labeled)))
+            (if (nil? hit) (message mm "lsp: location gone") (ed--lsp-goto-loc mm (second hit)))))))))
+
+(defcommand cmd-goto-definition
+  (m key)
+  "Jump to the definition of the symbol at point (M-.); M-, returns. Picks among several
+definitions via a minibuffer. Auto-starts the server on first use."
+  (let ([m2 ready?] (ed--lsp-ensure m))
+    (if (not ready?)
+      m2
+      (let (cx (ed--lsp-here m2)
+            locs (lsp/lsp-definition-sync (get cx :conn) (get cx :uri) (get cx :lang)
+                   (get cx :text) (get cx :line) (get cx :char)))
+        (cond
+          (empty? locs) (message m2 "no definition found")
+          (= (count locs) 1) (ed--lsp-goto-loc m2 (first locs))
+          :else (ed--lsp-locations-prompt m2 "Definition: " locs))))))
+
+(defcommand cmd-lsp-pop-marker
+  (m key)
+  "Return to the location before the last LSP jump (M-,)."
+  (let (stack (get m :lsp-markers '()))
+    (if (empty? stack)
+      (message m "no LSP jump to return from")
+      (let (mk (first stack)
+            m1 (assoc m :lsp-markers (rest stack))
+            idx (ed-buffer-index-by-name m1 (get mk :buffer)))
+        (if (nil? idx)
+          (message m1 (str "lsp: buffer gone: " (get mk :buffer)))
+          (ed-apply (ed-select m1 idx)
+            (fn (b) (goto-char b (min (get mk :point) (buffer-length b))))))))))
+
+(defcommand cmd-find-references
+  (m key)
+  "List every reference to the symbol at point and jump to the chosen one (M-?)."
+  (let ([m2 ready?] (ed--lsp-ensure m))
+    (if (not ready?)
+      m2
+      (let (cx (ed--lsp-here m2)
+            locs (lsp/lsp-references-sync (get cx :conn) (get cx :uri) (get cx :lang)
+                   (get cx :text) (get cx :line) (get cx :char)))
+        (if (empty? locs)
+          (message m2 "no references found")
+          (ed--lsp-locations-prompt m2 "References: " locs))))))
+
+(defcommand cmd-lsp-hover
+  (m key)
+  "Show the type / signature / docs of the symbol at point in the echo area (C-c C-d)."
+  (let ([m2 ready?] (ed--lsp-ensure m))
+    (if (not ready?)
+      m2
+      (let (cx (ed--lsp-here m2)
+            text (lsp/lsp-hover-sync (get cx :conn) (get cx :uri) (get cx :lang)
+                   (get cx :text) (get cx :line) (get cx :char)))
+        (if (blank? text) (message m2 "no hover info") (message m2 text))))))
+
+(defn ed--edit-offsets (b e)
+  "The char-offset form `{:start :end :text}` of normalised LSP edit `e` in buffer `b`
+(offsets computed against the original buffer, clamped to its length)."
+  (let (rope (buffer-rope b)
+        len (buffer-length b)
+        s (+ (rope-line->char rope (get e :start-line)) (get e :start-char))
+        en (+ (rope-line->char rope (get e :end-line)) (get e :end-char)))
+    {:start (min s len) :end (min en len) :text (get e :text)}))
+
+(defn ed--apply-text-edits (b edits)
+  "Apply LSP `edits` to buffer `b`. Offsets are resolved against the original buffer, then
+applied last-position-first so each replace can't shift the offsets of edits still to come."
+  (let (os (map (fn (e) (ed--edit-offsets b e)) edits)
+        sorted (sort (fn (a c) (> (get a :start) (get c :start))) os)
+        out (fold (fn (bb e) (replace-region bb (get e :start) (get e :end) (get e :text))) b sorted))
+    (goto-char out (min (buffer-point b) (buffer-length out)))))
+
+(defcommand cmd-lsp-format-buffer
+  (m key)
+  "Format the current buffer via the language server (C-c C-f)."
+  (let ([m2 ready?] (ed--lsp-ensure m))
+    (if (not ready?)
+      m2
+      (let (cx (ed--lsp-here m2)
+            edits (lsp/lsp-format-sync (get cx :conn) (get cx :uri) (get cx :lang) (get cx :text)))
+        (if (empty? edits)
+          (message m2 "lsp: no formatting changes")
+          (message (ed-apply m2 (fn (b) (ed--apply-text-edits b edits))) "formatted"))))))
+
+(defn ed--lsp-apply-file-edits (m path edits)
+  "Open `path` and apply `edits` to its buffer (left modified for the user to save)."
+  (ed-apply (ed-find-file m path) (fn (b) (ed--apply-text-edits b edits))))
+
+(defn ed--lsp-do-rename (m new-name)
+  "Run the rename round-trip for the symbol at point → `new-name`, then apply the resulting
+workspace edit across every affected file, returning to the buffer the rename started in."
+  (let (cx (ed--lsp-here m)
+        orig-name (buffer-name (ed-current-buf m))
+        orig-point (buffer-point (ed-current-buf m))
+        wsedit (lsp/lsp-rename-sync (get cx :conn) (get cx :uri) (get cx :lang)
+                 (get cx :text) (get cx :line) (get cx :char) new-name))
+    (if (empty? wsedit)
+      (message m "lsp: rename produced no changes")
+      (let (paths (keys wsedit)
+            m2 (fold (fn (mm path) (ed--lsp-apply-file-edits mm path (get wsedit path))) m paths)
+            idx (ed-buffer-index-by-name m2 orig-name)
+            m3 (if (nil? idx) m2
+                 (ed-apply (ed-select m2 idx)
+                   (fn (b) (goto-char b (min orig-point (buffer-length b)))))))
+        (message m3 (str "renamed in " (count paths) " file(s)"))))))
+
+(defcommand cmd-lsp-rename
+  (m key)
+  "Rename the symbol at point across the workspace (C-c C-r); prompts for the new name and
+applies the edits to every affected file (left modified for you to save)."
+  (let ([m2 ready?] (ed--lsp-ensure m))
+    (if (not ready?)
+      m2
+      (assoc m2 :minibuffer
+        {:edit (ed-mb-edit "Rename to: " "")
+         :on-complete (fn (mm new-name)
+                        (if (blank? new-name)
+                          (message mm "rename cancelled")
+                          (ed--lsp-do-rename mm new-name)))}))))
+
 ;; ---- major-mode commands (M-x text-mode / brood-mode) ----------------------
 ;; Like Emacs: each major mode is an interactive command that activates it on the
 ;; current buffer. `replace-base-layer` (via `ed-set-mode`) swaps the base layer
