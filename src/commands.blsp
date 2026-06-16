@@ -36,7 +36,6 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
 (require 'theme)     ; face-dired-* — the dired listing colours (qualified refs)
 (require 'datetime)  ; epoch-ms->dt / dt-format — the dired mtime column
 (require 'config)    ; init-config / apply-to-model — M-x reload-config
-(require 'gitdiff)   ; gitdiff-annotate — the diff-hl change gutter (ed-annotate-git)
 
 ;; ---- applying buffer ops to the current buffer ------------------------------
 
@@ -44,18 +43,6 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
   "Apply a pure `buffer -> buffer` op `f` to the current buffer (movement/undo:
 no status change)."
   (ed-set-buf m (f (ed-current-buf m))))
-
-(defn ed-annotate-git (m)
-  "Lazily refresh the current buffer's diff-hl gutter: when diff-hl is on (`:diff-hl?`,
-default true) and the buffer is a file buffer with no cached `:git-line-status` yet — its
-first view, or after a save dropped it — compute the diff vs HEAD (one `git show`) and cache
-it on the buffer. A cheap no-op otherwise, so it's safe to run after every event."
-  (if (not (get m :diff-hl? true))
-    m
-    (let (b (ed-current-buf m))
-      (if (or (nil? (buffer-file b)) (not (nil? (get b :git-line-status))))
-        m
-        (ed-set-buf m (gitdiff/gitdiff-annotate b))))))
 
 (defn ed-edit (m f)
   "Apply a pure `buffer -> buffer` op `f` to the current buffer, marking it
@@ -2316,10 +2303,13 @@ area. A no-op-with-message if the buffer has no backing file."
     (if (nil? (buffer-file buf))
       (message m "no file to save (C-x C-f to open one, or run: nest run -- <path>)")
       (try
-        ;; drop the cached diff annotation so `ed-annotate-git` recomputes the gutter after
-        ;; the save (the working tree changed; HEAD didn't, but the diff did).
+        ;; The diff-hl gutter is NOT recomputed here: a save writes the working tree but
+        ;; touches neither the buffer text nor HEAD, so the buffer-vs-HEAD diff is unchanged
+        ;; (and any prior edit already refreshed it via the rope-keyed idle recompute). Leaving
+        ;; the cached `:git-line-status` in place keeps the bars steady — dropping it made them
+        ;; blink off and back on each save.
         (do (save-buffer buf)
-          (message (ed-set-buf m (dissoc buf :git-line-status)) (str "saved " (buffer-file buf))))
+          (message m (str "saved " (buffer-file buf))))
         (catch e (message m (str "save failed: " (error-message e))))))))
 
 ;; ---- eval-in-buffer (the C-x C-e family, via std/eval-command) --------------
@@ -2364,14 +2354,34 @@ poll; the eval runs in its own process while the editor stays live.)"
   (m key)
   "C-g / ESC (`keyboard-quit`): the universal cancel. Deactivates the region (clears the
 mark), drops a half-typed chord (`:pending`) and any numeric prefix argument, and
-interrupts a running evaluation if one is in flight. `cancel-task` hard-kills the eval's
-worker — a runaway loop dies even parked; if it had already finished, that's a harmless
-no-op (no reply is delivered)."
-  (let (p (get m :eval-proc)
-        m1 (dissoc (ed-set-buf m (clear-mark (ed-current-buf m))) :pending :prefix-arg))
-    (if (nil? p)
-      (message m1 "quit")
-      (do (cancel-task p) (message (dissoc m1 :eval-proc) "eval interrupted")))))
+**cancels every background worker in flight** — a running evaluation (C-x C-e), the
+advisory diagnostics check, and the diff-hl annotation. `cancel-task` hard-kills each
+worker process (`std/task`), so even a runaway loop or a pathologically slow diff dies;
+an already-finished task is a harmless no-op (its reply is dropped because the handle is
+cleared). This is the editor's guarantee that no background work can wedge it: slow work
+runs off the loop (never on the per-key path), and this key kills it.
+
+A cancelled diff-hl annotation also stamps the current rope onto `:git-status-rope`, so the
+idle beat treats the gutter as current and doesn't immediately relaunch the diff we just
+killed; it re-arms on the next edit. Diagnostics, by contrast, recompute once typing settles."
+  (let (eval-p (get m :eval-proc)
+        diag-p (get m :diag-proc)
+        gd-p (get m :gitdiff-proc)
+        procs (filter (fn (p) (not (nil? p))) (list eval-p diag-p gd-p))
+        b (ed-current-buf m)
+        ;; a cancelled diff-hl recompute: stamp :git-status-rope = the current rope so the
+        ;; idle beat treats the gutter as current and won't relaunch the diff we just killed
+        ;; (keep any existing bars; show none if there were none). It re-arms on the next edit.
+        b1 (if gd-p
+             (assoc b
+               :git-status-rope (buffer-rope b)
+               :git-status-lines (buffer-line-count b)
+               :git-line-status (or (get b :git-line-status) {}))
+             b)
+        m1 (dissoc (ed-set-buf m (clear-mark b1))
+             :pending :prefix-arg :eval-proc :diag-proc :diag-checking :gitdiff-proc :gitdiff-checking)
+        _ (doseq (p procs) (cancel-task p)))
+    (message m1 (if (empty? procs) "quit" "quit — interrupted background work"))))
 
 (defcommand cmd-eval-last-sexp
   (m key)

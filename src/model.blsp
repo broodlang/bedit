@@ -38,6 +38,7 @@ pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
   (:use task))  ; task — run the advisory diagnostics check off the loop (async recheck)
 
 (require 'editor/lineedit)  ; the minibuffer reuses the REPL line editor's pure core
+(require 'gitdiff)  ; gitdiff-status / gitdiff-annotate — the diff-hl gutter, launched off the loop
 
 (def *blink-ms* 530)
 ;; The cursor-blink half-period (Emacs `blink-cursor-interval` ≈ 0.5s): an idle
@@ -51,11 +52,15 @@ pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
 ;; — so a large project stays responsive while typing. Small sources (M-x, buffer/project
 ;; lists, small find-file) re-rank synchronously per keystroke — instant, no lag.
 
-(def *diag-debounce-ms* 250)
-;; The tick beat armed after a *settled* edit left diagnostics stale: a `:tick`
-;; fires this long after you stop typing and runs the (deferred) type-check —
-;; Emacs's idle-timer model. While a key auto-repeats, the typematic delay
-;; (*repeat-delay-ms*) already serves as the debounce, so no separate beat is set.
+(def *diag-debounce-ms* 120)
+;; The idle beat (`:idle-recompute`) armed after activity settles — Emacs's idle-timer
+;; model. It drives everything deferred off the per-key path: the eldoc hint, the advisory
+;; type-check, the **minibuffer completion re-rank** for a large source (find-file / M-x —
+;; this is the delay you feel narrowing a big list), the diff-hl launch, and the web-mirror
+;; push. Kept short so narrowing/eldoc feel responsive; the type-check and diff it also
+;; fires are async (spawned tasks) and rope-gated, so a short beat doesn't thrash them.
+;; While a key auto-repeats, the typematic delay (*repeat-delay-ms*) already serves as the
+;; debounce, so no separate beat is set.
 
 (def *which-key-delay-ms* 500)
 ;; How long a prefix chord (e.g. C-x) must sit pending before the which-key panel
@@ -251,6 +256,69 @@ re-fires iff the buffer moved on while the check ran, so the next idle tick rela
     :diag-checking
     nil))
 
+;; ---- diff-hl annotation, off the loop (mirrors the diagnostics pair) ---------
+;; Diffing a buffer against its HEAD blob is `std/diff` over the whole file. On a large
+;; file that is seconds of work — far too slow for the per-event loop (it once wedged the
+;; whole editor on a 3000-line file: the single ui-run process never returned, so no key,
+;; not even C-g, could be processed). So the diff runs in a spawned task, exactly like the
+;; advisory diagnostics check: launch on the idle beat, fold the result back on its reply.
+
+(defn ed-gitdiff-stale? (m)
+  "True when the current buffer wants a diff-hl recompute: diff-hl is on (`:diff-hl?`,
+default true), it's a file buffer, and its **rope differs from the one the cached gutter
+was computed for** (`:git-status-rope`) — its first view (no cache), or any edit since.
+An O(1) rope-handle compare (like `ed-diag-stale?`), so plain motion costs nothing but a
+text change re-arms the diff, so the change bars follow edits instead of freezing at their
+old lines until a save (the 'bars drift the further down you scroll' symptom)."
+  (and (get m :diff-hl? true)
+    (let (b (ed-current-buf m))
+      (and (not (nil? (buffer-file b)))
+        (not (= (buffer-rope b) (get b :git-status-rope)))))))
+
+(defn ed-launch-gitdiff (m)
+  "Start the deferred diff-hl annotation. A no-op when nothing is stale or a diff is
+already in flight (`:gitdiff-proc`). With a live `:editor` process, compute the
+`{line -> status}` map in a spawned task (std/task) over **plain data** — the file path
+and the buffer's text string (the rope is process-local, so the worker can't read it) —
+recording its handle on `:gitdiff-proc` and the rope it diffed on `:gitdiff-checking`, so
+a stale reply can't clobber a buffer that has since changed. Headless (no `:editor`) →
+synchronous (`gitdiff/gitdiff-annotate`)."
+  (cond
+    (not (ed-gitdiff-stale? m)) m
+    (get m :gitdiff-proc) m
+    (nil? (whereis :editor)) (let (b (ed-current-buf m))
+                               (ed-set-buf m (assoc (gitdiff/gitdiff-annotate b)
+                                               :git-status-rope (buffer-rope b)
+                                               :git-status-lines (buffer-line-count b))))
+    :else (let (b (ed-current-buf m)
+                path (buffer-file b)
+                text (buffer-text b)
+                job (task (fn () (gitdiff/gitdiff-status path text))))
+            (assoc m :gitdiff-proc job :gitdiff-checking (buffer-rope b)))))
+
+(defn ed-apply-gitdiff (m status)
+  "Fold a finished diff-hl task's `status` map onto the buffer it was computed for: the
+current buffer, but only if its rope is unchanged since launch (`:gitdiff-checking`) — if
+you edited or switched away while it ran, drop the result as stale (its `:git-status-rope`
+stays behind, so the next idle beat relaunches for the new text). Stamps `:git-status-rope`
+with the rope the diff was computed for, so `ed-gitdiff-stale?` knows the gutter is current.
+Clears the in-flight handle either way."
+  (let (rope (get m :gitdiff-checking)
+        m1 (dissoc m :gitdiff-proc :gitdiff-checking)
+        b (ed-current-buf m1))
+    (if (= (buffer-rope b) rope)
+      (ed-set-buf m1 (assoc b
+                       :git-line-status (or status {})
+                       :git-status-rope rope
+                       :git-status-lines (buffer-line-count b)))  ; positional-staleness key (diff-hl)
+      m1)))
+
+(defn ed-web-dirty? (m)
+  "True when a web mirror is running (`:server`) and has an unpublished edit/move
+(`:web-dirty`) — so the idle beat should push a fresh snapshot. Set on real input by
+`ed-post-step`, cleared by the publish in `input/ed--timer-fire`."
+  (and (get m :server) (get m :web-dirty)))
+
 ;; ---- the post-event step: cached eldoc + debounced diagnostics --------------
 ;; Both the eldoc hint and the advisory type-check are too costly to recompute on the
 ;; render path (eldoc, every frame) or on every keystroke (the whole-buffer check).
@@ -340,7 +408,12 @@ flag once no prefix is pending (what `ed--which-key-arm` used to do)."
         idle (if (get m :held-key)
                {}
                (merge
-                 (if (or (ed-eldoc-stale? m) (ed-diag-stale? m) (mb-cands-stale? m))
+                 (if (or (ed-eldoc-stale? m) (ed-diag-stale? m) (mb-cands-stale? m)
+                       ;; a fresh file buffer wants its diff-hl gutter (launched off the
+                       ;; loop — only arm to *launch*, not while a diff is already running)
+                       (and (ed-gitdiff-stale? m) (nil? (get m :gitdiff-proc)))
+                       ;; a running web server has an unpublished edit/move to mirror
+                       (ed-web-dirty? m))
                    {:idle-recompute {:after *diag-debounce-ms* :idle? true}} {})
                  (if (and (get m :pending) (not (get m :which-key)))
                    {:which-key {:after *which-key-delay-ms* :idle? true}} {})
@@ -429,7 +502,15 @@ boundary when each is due — and the timers' firing (in `input/ed--timer-fire`)
 work. A real keystroke/click also forces the caret solid (`ed-real-input?`), so it only
 blinks at rest. Finally refreshes the open minibuffer's memoized candidate list
 (`ed-cache-mb-candidates`) so the view/input read it cheaply."
-  (let (m2 (ed-sync-timers (if (ed-real-input? input) (assoc m :blink-on? true) m))
+  (let (real (ed-real-input? input)
+        ;; a real keystroke/click forces the caret solid AND, while a web mirror is
+        ;; running, marks the snapshot dirty so the idle beat republishes it once (debounced
+        ;; off the hot key path — `ed-sync-timers` arms `:idle-recompute`, `web-publish!`
+        ;; fires there). Timer/blink/system events don't dirty it, so the mirror only
+        ;; refreshes after actual edits/moves.
+        m0 (if real (assoc m :blink-on? true) m)
+        m1 (if (and real (get m :server)) (assoc m0 :web-dirty true) m0)
+        m2 (ed-sync-timers m1)
         mb (get m2 :minibuffer))
     ;; Refresh the memoized candidate list. A small source re-ranks every keystroke (snappy).
     ;; A large source (`mb--debounce?`) re-ranks only its *initial* list here and defers later

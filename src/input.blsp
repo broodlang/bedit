@@ -558,8 +558,12 @@ group); `:cursor-blink` toggles the caret. An unknown name is a no-op."
                                                  textcols
                                                  {:every *repeat-rate-ms*})
                            else (ed--repeat-clear m))
-    ;; the idle debounce: eldoc + diagnostics + a large completion source's candidate re-rank
-    (= name :idle-recompute) (ed-cache-mb-candidates (ed-run-diag (ed-cache-eldoc m)))
+    ;; the idle debounce: eldoc + diagnostics + a large completion source's candidate re-rank,
+    ;; plus the off-the-loop diff-hl launch and the debounced web-mirror push — all the work
+    ;; too costly for the per-key path, run once activity settles.
+    (= name :idle-recompute)
+    (let (m1 (ed-launch-gitdiff (ed-cache-mb-candidates (ed-run-diag (ed-cache-eldoc m)))))
+      (if (ed-web-dirty? m1) (web-publish! (dissoc m1 :web-dirty)) m1))
     (= name :which-key) (ed-which-key-reveal m)
     (= name :undo-pause) (ed-break-undo-run m)
     (= name :cursor-blink) (assoc m :blink-on? (not (get m :blink-on?)))
@@ -591,12 +595,14 @@ never floods the echo area."
 (defn ed--ev-task-reply (m input textrows cols rows)
   "A spawned task's reply (`:task-done` / `:task-error` / `:task-timeout`): route by which
 in-flight handle it matches. The async diagnostics check (`:diag-proc`) folds its result
-into the `:diagnostics` cache; the C-x C-e eval (`:eval-proc`) shows its message in the
-echo area. A handle matching neither is a stale/cancelled reply and is dropped, so it
+into the `:diagnostics` cache; the diff-hl annotation (`:gitdiff-proc`) folds its
+`{line -> status}` map onto the buffer; the C-x C-e eval (`:eval-proc`) shows its message
+in the echo area. A handle matching none is a stale/cancelled reply and is dropped, so it
 can't clobber a newer one."
   (let (h (nth input 1))
     (cond
       (= (get m :diag-proc) h) (ed-apply-diag m (if (= (first input) :task-done) (nth input 2) '()))
+      (= (get m :gitdiff-proc) h) (ed-apply-gitdiff m (if (= (first input) :task-done) (nth input 2) {}))
       (= (get m :eval-proc) h) (message (dissoc m :eval-proc)
                                  (if (= (first input) :task-timeout)
                                    (str "eval timed out after " *eval-timeout-ms* "ms")
@@ -736,11 +742,11 @@ owns it, else through the keymap (`ed-dispatch`)."
       ;; diagnostics check (off the per-key path — see model.blsp); `ed-refresh-spans`
       ;; refreshes the fontify span cache for the new viewport (a no-op when nothing
       ;; scrolled or changed — see panes.blsp), so the pure `view` re-lexes nothing on
-      ;; plain motion; then, if a web server is running, push the resulting buffer
-      ;; snapshot to it (so the browser mirror tracks edits *and* cursor motion live).
-      (let (result (web-publish!
-                     (ed-annotate-git
-                       (ed-refresh-spans
+      ;; Note: the diff-hl git annotation and the web-mirror snapshot push are NOT done
+      ;; here on the per-event path — both can be slow (a full-file diff; a fontify), and
+      ;; doing them per keystroke once wedged the whole loop on a large file. They run
+      ;; debounced on the idle beat instead (`ed--timer-fire :idle-recompute`).
+      (let (result (ed-refresh-spans
                          (ed-post-step
                          (cond
                            ;; a named timer fired (ADR-102): key-repeat / debounce / which-key / undo /
@@ -785,7 +791,7 @@ owns it, else through the keymap (`ed-dispatch`)."
                                     {:after *repeat-delay-ms*})))
                          input)
                        cols
-                       rows))))
+                       rows))
         ;; C-x e (cmd-execute-kbd-macro) set `:run-macro`: replay the recorded macro by
         ;; re-feeding its events through `ed-update` (recording is off, so they aren't
         ;; re-captured). Done here, where cols/rows are in scope.
