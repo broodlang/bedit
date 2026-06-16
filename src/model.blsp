@@ -276,42 +276,23 @@ old lines until a save (the 'bars drift the further down you scroll' symptom)."
         (not (= (buffer-rope b) (get b :git-status-rope)))))))
 
 (defn ed-launch-gitdiff (m)
-  "Start the deferred diff-hl annotation. A no-op when nothing is stale or a diff is
-already in flight (`:gitdiff-proc`). With a live `:editor` process, compute the
-`{line -> status}` map in a spawned task (std/task) over **plain data** — the file path
-and the buffer's text string (the rope is process-local, so the worker can't read it) —
-recording its handle on `:gitdiff-proc` and the rope it diffed on `:gitdiff-checking`, so
-a stale reply can't clobber a buffer that has since changed. Headless (no `:editor`) →
-synchronous (`gitdiff/gitdiff-annotate`)."
-  (cond
-    (not (ed-gitdiff-stale? m)) m
-    (get m :gitdiff-proc) m
-    (nil? (whereis :editor)) (let (b (ed-current-buf m))
-                               (ed-set-buf m (assoc (gitdiff/gitdiff-annotate b)
-                                               :git-status-rope (buffer-rope b)
-                                               :git-status-lines (buffer-line-count b))))
-    :else (let (b (ed-current-buf m)
-                path (buffer-file b)
-                text (buffer-text b)
-                job (task (fn () (gitdiff/gitdiff-status path text))))
-            (assoc m :gitdiff-proc job :gitdiff-checking (buffer-rope b)))))
+  "Recompute the current buffer's diff-hl gutter when it's stale (its rope differs from the
+one the cached gutter was computed for). Runs `git diff` **synchronously** here, stamping the
+result + the rope + the line count on the buffer. It's safe to run inline because (a) git's C
+diff is fast (~tens of ms even on a large file) and (b) this fires only on the **idle beat**
+(`input/ed--timer-fire :idle-recompute`), debounced off the per-key path — so it never blocks
+typing yet updates reliably on every settled edit.
 
-(defn ed-apply-gitdiff (m status)
-  "Fold a finished diff-hl task's `status` map onto the buffer it was computed for: the
-current buffer, but only if its rope is unchanged since launch (`:gitdiff-checking`) — if
-you edited or switched away while it ran, drop the result as stale (its `:git-status-rope`
-stays behind, so the next idle beat relaunches for the new text). Stamps `:git-status-rope`
-with the rope the diff was computed for, so `ed-gitdiff-stale?` knows the gutter is current.
-Clears the in-flight handle either way."
-  (let (rope (get m :gitdiff-checking)
-        m1 (dissoc m :gitdiff-proc :gitdiff-checking)
-        b (ed-current-buf m1))
-    (if (= (buffer-rope b) rope)
-      (ed-set-buf m1 (assoc b
-                       :git-line-status (or status {})
-                       :git-status-rope rope
-                       :git-status-lines (buffer-line-count b)))  ; positional-staleness key (diff-hl)
-      m1)))
+(It replaced a spawned-task version: the async reply that was meant to fold the result back
+didn't land reliably in the ui-run loop, so the gutter froze at the open-time diff and never
+followed edits. Synchronous removes that whole reply round-trip — the recompute *is* the
+update.)"
+  (if (not (ed-gitdiff-stale? m))
+    m
+    (let (b (ed-current-buf m))
+      (ed-set-buf m (assoc (gitdiff/gitdiff-annotate b)
+                      :git-status-rope (buffer-rope b)
+                      :git-status-lines (buffer-line-count b))))))
 
 (defn ed-web-dirty? (m)
   "True when a web mirror is running (`:server`) and has an unpublished edit/move
@@ -409,9 +390,9 @@ flag once no prefix is pending (what `ed--which-key-arm` used to do)."
                {}
                (merge
                  (if (or (ed-eldoc-stale? m) (ed-diag-stale? m) (mb-cands-stale? m)
-                       ;; a fresh file buffer wants its diff-hl gutter (launched off the
-                       ;; loop — only arm to *launch*, not while a diff is already running)
-                       (and (ed-gitdiff-stale? m) (nil? (get m :gitdiff-proc)))
+                       ;; a file buffer whose text changed since its diff-hl gutter was
+                       ;; computed — recompute it (synchronously) on the idle beat
+                       (ed-gitdiff-stale? m)
                        ;; a running web server has an unpublished edit/move to mirror
                        (ed-web-dirty? m))
                    {:idle-recompute {:after *diag-debounce-ms* :idle? true}} {})
