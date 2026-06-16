@@ -1,0 +1,118 @@
+;; Diff-hl runs OFF the loop (model/ed-launch-gitdiff + ed-apply-gitdiff) and C-g
+;; (commands/cmd-keyboard-quit) cancels every background worker — the fix for the editor
+;; wedging on a large file's full-buffer diff. These cover the pure model-side staleness,
+;; the rope-guarded result fold, and the universal cancel; the spawned-task path and the
+;; live gutter are exercised by hand against a real repo.
+(defmodule main-test
+  (:use model)
+  (:use input)
+  (:use commands)
+  (:use editor/buffer)
+  (:use test))
+
+;; A parked process stands in for an in-flight task handle: cmd-keyboard-quit's
+;; `cancel-task` just `send`s it a cancel message (a harmless no-op here).
+(defn gd--handle () (spawn (receive (:never nil))))
+(defn gd--file-model (text) (ed-init (make-buffer text "f.txt" "/tmp/f.txt")))
+
+(describe "diff-hl staleness (ed-gitdiff-stale?)"
+  (test "a fresh file buffer with no cached rope is stale"
+    (is (ed-gitdiff-stale? (gd--file-model "a\nb\nc"))))
+  (test "a fileless buffer is never stale"
+    (is (not (ed-gitdiff-stale? (ed-init (make-buffer "a\nb\nc"))))))
+  (test "a buffer whose :git-status-rope matches the current rope is not stale"
+    (let (m (gd--file-model "a\nb\nc")
+          b (ed-current-buf m)
+          m1 (ed-set-buf m (assoc b :git-line-status {} :git-status-rope (buffer-rope b))))
+      (is (not (ed-gitdiff-stale? m1)))))
+  (test "an edit (new rope) re-arms a previously-current gutter — the drift fix"
+    (let (m (gd--file-model "a\nb\nc")
+          b (ed-current-buf m)
+          current (ed-set-buf m (assoc b :git-line-status {} :git-status-rope (buffer-rope b)))
+          edited (ed-set-buf current (insert (ed-current-buf current) "X")))
+      (is (not (ed-gitdiff-stale? current)))  ; current text → no recompute
+      (is (ed-gitdiff-stale? edited))))        ; text changed → recompute due, bars follow
+  (test "diff-hl turned off makes nothing stale"
+    (is (not (ed-gitdiff-stale? (assoc (gd--file-model "a\nb\nc") :diff-hl? false))))))
+
+(describe "diff-hl gutter width is stable (no save/open shrink-then-expand)"
+  (test "a file buffer reserves the change-bar column whether or not the diff has landed"
+    (let (b0 (make-buffer "a\nb\nc" "f.txt" "/tmp/f.txt")
+          ;; width must be identical before the async diff lands (nil status) and after
+          before (modes/line-number-width b0)
+          after (modes/line-number-width (assoc b0 :git-line-status {0 :modified})))
+      (assert= before after)))
+  (test "a fileless buffer reserves no change-bar column (one narrower)"
+    (let (file (modes/line-number-width (make-buffer "a\nb" "f" "/tmp/f"))
+          fileless (modes/line-number-width (make-buffer "a\nb")))
+      (assert= 1 (- file fileless)))))
+
+(describe "diff-hl bars hide while positionally stale (never drawn on the wrong line)"
+  (test "the change bar shows when the line count matches the computed diff"
+    (let (b (assoc (make-buffer "a\nb\nc" "f.txt" "/tmp/f.txt")
+              :git-line-status {0 :modified} :git-status-lines 3)
+          cell (modes/line-number-cell b 0 (modes/line-number-width b)))
+      (assert= "▌" (nth (first cell) 0))))   ; [bar face] is the first chunk
+  (test "the bar blanks when a line was inserted/deleted since the diff (count differs)"
+    (let (b (assoc (make-buffer "a\nb\nc\nd" "f.txt" "/tmp/f.txt")  ; 4 lines now
+              :git-line-status {0 :modified} :git-status-lines 3)   ; diff computed at 3 lines
+          cell (modes/line-number-cell b 0 (modes/line-number-width b)))
+      (assert= " " (nth (first cell) 0)))))   ; blank, not a stale-positioned bar
+
+(describe "diff-hl result fold (ed-apply-gitdiff)"
+  (test "a reply for the unchanged buffer is applied to its :git-line-status"
+    (let (m (gd--file-model "a\nb\nc")
+          rope (buffer-rope (ed-current-buf m))
+          m1 (assoc m :gitdiff-proc (gd--handle) :gitdiff-checking rope)
+          m2 (ed-apply-gitdiff m1 {0 :added 2 :modified}))
+      (assert= {0 :added 2 :modified} (get (ed-current-buf m2) :git-line-status))
+      (assert= rope (get (ed-current-buf m2) :git-status-rope))  ; stamped current → not stale
+      (assert= 3 (get (ed-current-buf m2) :git-status-lines))    ; line count at compute (positional key)
+      (is (not (ed-gitdiff-stale? m2)))
+      (is (nil? (get m2 :gitdiff-proc)))
+      (is (nil? (get m2 :gitdiff-checking)))))
+  (test "a reply for a buffer that changed since launch is dropped (stale rope)"
+    (let (m (gd--file-model "a\nb\nc")
+          m1 (assoc m :gitdiff-proc (gd--handle) :gitdiff-checking :a-stale-rope)
+          m2 (ed-apply-gitdiff m1 {0 :added}))
+      ;; the status stays nil, so the next idle beat relaunches — but the handle is cleared
+      (is (nil? (get (ed-current-buf m2) :git-line-status)))
+      (is (nil? (get m2 :gitdiff-proc)))
+      (is (nil? (get m2 :gitdiff-checking)))))
+  (test "a nil result folds to an empty map (untracked / non-repo file)"
+    (let (m (gd--file-model "a\nb\nc")
+          rope (buffer-rope (ed-current-buf m))
+          m1 (assoc m :gitdiff-proc (gd--handle) :gitdiff-checking rope)
+          m2 (ed-apply-gitdiff m1 nil))
+      (assert= {} (get (ed-current-buf m2) :git-line-status)))))
+
+(describe "keyboard-quit cancels all background workers"
+  (test "C-g clears the eval / diagnostics / diff-hl handles and their checking ropes"
+    (let (m (gd--file-model "a\nb\nc")
+          m1 (assoc m
+               :eval-proc (gd--handle)
+               :diag-proc (gd--handle)
+               :gitdiff-proc (gd--handle)
+               :diag-checking :r
+               :gitdiff-checking :r
+               :pending {:x 1}
+               :prefix-arg {:count 4 :raw true})
+          m2 (cmd-keyboard-quit m1 :ctrl-g))
+      (is (nil? (get m2 :eval-proc)))
+      (is (nil? (get m2 :diag-proc)))
+      (is (nil? (get m2 :gitdiff-proc)))
+      (is (nil? (get m2 :diag-checking)))
+      (is (nil? (get m2 :gitdiff-checking)))
+      (is (nil? (get m2 :pending)))
+      (is (nil? (get m2 :prefix-arg)))
+      (assert= "quit — interrupted background work" (get m2 :echo))))
+  (test "a cancelled diff-hl gets an empty status so it doesn't immediately relaunch"
+    (let (m (gd--file-model "a\nb\nc")
+          m1 (assoc m :gitdiff-proc (gd--handle) :gitdiff-checking (buffer-rope (ed-current-buf m)))
+          m2 (cmd-keyboard-quit m1 :ctrl-g))
+      (assert= {} (get (ed-current-buf m2) :git-line-status))
+      (is (not (ed-gitdiff-stale? m2)))))
+  (test "C-g with nothing in flight just quits (region cleared, plain message)"
+    (let (m2 (cmd-keyboard-quit (gd--file-model "a\nb\nc") :ctrl-g))
+      (assert= "quit" (get m2 :echo))
+      (is (nil? (get m2 :eval-proc))))))
