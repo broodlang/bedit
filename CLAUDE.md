@@ -90,8 +90,10 @@ src/isearch.blsp            incremental search + query-replace (C-s/C-r/M-%) mod
 src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
 src/projects.blsp           project root + file walk (find-file-in-project)
 src/web.blsp                live HTTP mirror of the selected buffer (C-x w)
+src/git.blsp                git porcelain: C-x g status buffer, diff/log/commit, C-x v = vc-diff
 tests/main_test.blsp        pure update/view tests (no window needed)
 tests/eval_command_test.blsp  tests for the eval-command module
+tests/git_test.blsp         pure tests for the git porcelain (parse + render + fontify)
 project.blsp                the nest manifest (:name "myedit")
 ```
 
