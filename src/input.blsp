@@ -25,6 +25,7 @@ self-editing editor)."
   (:use editor/ui)  ; overlay-route — the shared modal-overlay dispatch fallthrough
   (:use web)  ; web-publish! (per-event snapshot push) + the [:web-port] reply
   (:use bshell)  ; the project shell (C-x p e): its [:bshell-output]/[:bshell-done] handlers
+  (:use compile)  ; M-x compile + C-x ` next-error: its [:compile-output]/[:compile-done] handlers
   (:use keymaps)  ; ed-ensure-profile — seed the model-scope keybinding profile (emacs/vim)
   (:use editor/layers))  ; scope-keymap (compose buffer + model layers) + init-buffer-layers
 
@@ -213,7 +214,8 @@ chord completes); a prefix-consuming command (set-mark) runs once and reads the 
   ;; C-x o then `o o o` cycles panes; C-x → then `→ → →` cycles buffers.
   (list 'commands/cmd-other-pane
     'commands/cmd-next-buffer
-    'commands/cmd-previous-buffer))
+    'commands/cmd-previous-buffer
+    'commands/cmd-repeat-complex-command))
 
 (defn ed--arm-repeat-mode (m input)
   "After `ed--dispatch-key`, arm `:repeat` (repeat-mode) when this step actually ran a
@@ -562,8 +564,9 @@ group); `:cursor-blink` toggles the caret. An unknown name is a no-op."
     ;; plus the off-the-loop diff-hl launch and the debounced web-mirror push — all the work
     ;; too costly for the per-key path, run once activity settles.
     (= name :idle-recompute)
-    (let (m1 (ed-launch-gitdiff (ed-cache-mb-candidates (ed-run-diag (ed-cache-eldoc m)))))
-      (if (ed-web-dirty? m1) (web-publish! (dissoc m1 :web-dirty)) m1))
+    (let (m1 (ed-launch-gitdiff (ed-cache-mb-candidates (ed-run-diag (ed-cache-eldoc m))))
+          m2 (ed-auto-save! m1))
+      (if (ed-web-dirty? m2) (web-publish! (dissoc m2 :web-dirty)) m2))
     (= name :which-key) (ed-which-key-reveal m)
     (= name :undo-pause) (ed-break-undo-run m)
     ;; The blink tick fires reliably whenever the editor is idle — it is NOT gated by the
@@ -684,7 +687,9 @@ the repeat. Other releases just keep the flag set."
    :mouse ed--ev-mouse
    :web-port ed--ev-web-port
    :bshell-output bshell/ed--ev-bshell-output
-   :bshell-done bshell/ed--ev-bshell-done})
+   :bshell-done bshell/ed--ev-bshell-done
+   :compile-output compile/ed--ev-compile-output
+   :compile-done compile/ed--ev-compile-done})
 
 (defn ed-system-event? (input)
   "Whether `input` is an inbound `[:tag …]` event with a registered handler."
@@ -730,10 +735,8 @@ clamping uses the *selected pane's* height (`ed-selected-text-rows`), so it's co
 inside a split. Any non-system input is a key, routed by `ed-route-transient`: to the
 open transient overlay (minibuffer / completion / isearch / query-replace) if one
 owns it, else through the keymap (`ed-dispatch`)."
-  (let (textrows (ed-selected-text-rows m cols rows)
-        ; selected pane height (split-aware)
-        textcols (ed-selected-text-cols m cols rows)
-        ; selected pane text width (for horizontal scroll)
+  (let ([textrows textcols] (ed-viewport m cols rows)
+        ; both pane dimensions in one layout call
         m0 (ed--macro-record (assoc m :view-rows textrows) input))
     ; capture the key if recording
     ; so page commands know the viewport
@@ -741,7 +744,7 @@ owns it, else through the keymap (`ed-dispatch`)."
     ;; surfaces in the echo area and the editor keeps running: a crash must never take
     ;; down the whole editor (ui-run would otherwise restore the screen and re-raise,
     ;; exiting). The model `m0` (pre-dispatch) is kept so editing can continue.
-    (try
+    (let (result (try
       ;; After folding the event in, `ed-post-step` schedules the debounced eldoc +
       ;; diagnostics check (off the per-key path — see model.blsp); `ed-refresh-spans`
       ;; refreshes the fontify span cache for the new viewport (a no-op when nothing
@@ -804,4 +807,11 @@ owns it, else through the keymap (`ed-dispatch`)."
             (dissoc result :run-macro)
             (or (get result :macro-last) '()))
           result))
-      (catch e (message m0 (str "error: " (error-message e)))))))
+      (catch e (message m0 (str "error: " (error-message e)))))
+      ;; Update the OS title bar from the result model every event (cheap: a string set).
+      win (get result :window)
+      title (ed-window-title result))
+      (do
+        (when (and win (not (= title (get result :window-title))))
+          (try (gui-title! win title) (catch e nil)))
+        (assoc result :window-title title)))))

@@ -52,7 +52,8 @@ guard surface as a raw `error:`. Movement (`ed-apply`) is never blocked — a re
 buffer stays navigable."
   (if (read-only? (ed-current-buf m))
     (message m "buffer is read-only")
-    (assoc (ed-set-buf m (f (ed-current-buf m))) :status "modified")))
+    (let (nb (assoc (f (ed-current-buf m)) :modified true))
+      (assoc (ed-set-buf m nb) :status "modified"))))
 
 (defn ed-name-prompt (prompt names on-complete &optional (limit 20))
   "A Vertico minibuffer spec that completes input against a fixed `names` list — Tab to
@@ -669,13 +670,20 @@ dired (`ed--path-prompt`) — prefilled with the current file's path (else the c
       (or (buffer-file (ed-current-buf m)) (str (ed--default-dir m) "/"))
       (if (get m :recent-files) (recent-files) [])
       (fn (mm t)
-        (let (path (path-absolute t))
+        (let (path (path-absolute t)
+              old-file (buffer-file (ed-current-buf mm)))
           (try
             (let (b (assoc (ed-current-buf mm)
                       :file path
                       :name (file-display-name path (ed-project-root mm))))
-              (save-buffer b)
-              (message (ed-set-buf mm b) (str "wrote " path)))
+              (do
+                (save-buffer b)
+                (let (b2 (dissoc b :modified)
+                      as-path (when old-file (ed-auto-save-path old-file))
+                      m2 (dissoc (ed-set-buf mm b2) :status))
+                  (when (and as-path (file-exists? as-path))
+                    (try (delete-file as-path) (catch e nil)))
+                  (message m2 (str "wrote " path)))))
             (catch e (message mm (str "write failed: " (error-message e))))))))))
 
 (defcommand cmd-revert-buffer
@@ -1518,6 +1526,17 @@ to break the chain and undo again — that undoes your undos (redo). No state is
 break. Repeated M-/ keeps redoing."
   (ed--undo-step m 'commands/cmd-redo "No further redo" "redo"))
 
+(defcommand cmd-repeat-complex-command
+  (m key)
+  "Re-run the last command (C-x z). After the first C-x z, tap `z` to keep repeating
+— repeat-mode keeps the last-command pointing at the original command, not this one,
+so `z` re-invokes the original rather than recursing."
+  (let (to-repeat (get m :last-command))
+    (if (or (nil? to-repeat) (= to-repeat 'commands/cmd-repeat-complex-command))
+      (message m "No previous command to repeat")
+      (let (result ((eval to-repeat) m key))
+        (assoc result :this-command to-repeat)))))
+
 ;; ---- region / kill ring (C-SPC set mark · C-w kill · M-w copy · C-y yank) ----
 
 (defcommand cmd-universal-argument
@@ -2052,22 +2071,31 @@ is the one the current buffer is in (`ed-project-root`), not where the editor la
 
 ;; ---- M-x: run any interactive command by name -------------------------------
 
+(defn ed--mx-record (m name)
+  "Prepend `name` to `:mx-history` (most-recent first, deduped, capped at 20)."
+  (assoc m :mx-history
+    (take 20 (cons name (remove (fn (x) (= x name)) (or (get m :mx-history) []))))))
+
 (defcommand cmd-execute-extended-command
   (m key)
   "Prompt for an interactive command name and run it (M-x). Completes against the
 commands relevant to the current buffer's active layers: global commands plus any
-mode-specific ones the active layers expose via their `:commands` facet."
+mode-specific ones the active layers expose via their `:commands` facet. Recently-used
+commands appear first (most-recent at the top), then the alphabetical remainder."
   (let (buf (ed-current-buf m)
         active-cmds (apply concat (ed-active-mode-commands buf))
         owned (ed-all-layer-commands)
-        names (sort (concat (remove (fn (n) (includes? owned n)) (interactive/command-names))
-                      active-cmds)))
+        all-names (sort (concat (remove (fn (n) (includes? owned n)) (interactive/command-names))
+                          active-cmds))
+        hist (filter (fn (n) (includes? all-names n)) (or (get m :mx-history) []))
+        names (concat hist (remove (fn (n) (includes? hist n)) all-names)))
     (assoc m
       :minibuffer
       (ed-name-prompt "M-x "
         names
         (fn (mm t)
-          (interactive/run-command mm t (fn (mmm nm) (message mmm (str "no command: " nm)))))
+          (interactive/run-command (ed--mx-record mm t) t
+            (fn (mmm nm) (message mmm (str "no command: " nm)))))
         15))))
 
 ;; ---- fuzzy in-buffer line search (M-s) --------------------------------------
@@ -2303,7 +2331,8 @@ and handled by `ui-run` itself — not bound here. ESC is *not* quit (it's
 (defcommand cmd-save
   (m key)
   "Write the current buffer to its file (C-x C-s); report the outcome in the echo
-area. A no-op-with-message if the buffer has no backing file."
+area. Clears the buffer's `:modified` flag and deletes the `#filename#` auto-save
+sidecar on success. A no-op-with-message if the buffer has no backing file."
   (let (buf (ed-current-buf m))
     (if (nil? (buffer-file buf))
       (message m "no file to save (C-x C-f to open one, or run: nest run -- <path>)")
@@ -2313,8 +2342,14 @@ area. A no-op-with-message if the buffer has no backing file."
         ;; (and any prior edit already refreshed it via the rope-keyed idle recompute). Leaving
         ;; the cached `:git-line-status` in place keeps the bars steady — dropping it made them
         ;; blink off and back on each save.
-        (do (save-buffer buf)
-          (message m (str "saved " (buffer-file buf))))
+        (do
+          (save-buffer buf)
+          (let (f (buffer-file buf)
+                as-path (ed-auto-save-path f)
+                saved (dissoc buf :modified)
+                m2 (dissoc (ed-set-buf m saved) :status))
+            (when (file-exists? as-path) (try (delete-file as-path) (catch e nil)))
+            (message m2 (str "saved " f))))
         (catch e (message m (str "save failed: " (error-message e))))))))
 
 ;; ---- eval-in-buffer (the C-x C-e family, via std/eval-command) --------------
