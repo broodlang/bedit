@@ -82,4 +82,13 @@ that clean primitive — don't hack the missing capability into myedit as a
 one-off. A self-editing Emacs clone is only possible if its abstractions live in
 a language expressive enough to host them. See [`CLAUDE.md`](CLAUDE.md) for the
 full working guide (conventions, how to write a plan, the prime directive in
-detail) and the design notes in [`docs/`](docs/).
+detail). Design notes for where the editor is headed live in [`docs/`](docs/):
+[`configurability.md`](docs/configurability.md) (a settings registry + the
+customization surface), [`packages.md`](docs/packages.md) (an extension ecosystem
+— packages as Brood nests), and
+[`actor-architecture.md`](docs/actor-architecture.md) (buffers as processes).
+
+## License
+
+Licensed under the GNU Affero General Public License v3.0 (`AGPL-3.0-only`); see
+[`LICENSE`](LICENSE). Copyright © 2026 Wilhelm Kirschbaum.
