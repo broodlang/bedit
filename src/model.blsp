@@ -128,9 +128,26 @@ minibuffer/prefix."
    :timers {:cursor-blink {:every *blink-ms* :idle? true}}})
 
 ;; ---- the selected pane + its buffer ---------------------------------------
+;; A pane's payload is `{:buffer <pool index> :top <scroll> :point <window-local cursor>
+;; :mark <window-local mark>}`. Content (the rope, undo, name, file) lives on the pooled
+;; buffer and is shared by every pane showing it; **point/mark are per-pane** (Emacs
+;; window-point), so two views of the same buffer/file keep independent cursors. `:point`
+;; nil means "use the buffer's own point" (a fresh/just-switched pane).
+
+(defn ed-with-window-point (buf point mark)
+  "`buf` with its cursor made **window-local**: pane `point`/`mark` override the pooled buffer's
+(nil `point` keeps the buffer's own), clamped into range so a stale offset — left by an edit in
+another view of the same buffer — can't index past EOF and crash the renderer. The one seam that
+decouples the cursor from the shared buffer."
+  (if (nil? point)
+    buf
+    (let (n (buffer-length buf))
+      (assoc buf
+        :point (max 0 (min point n))
+        :mark (if (nil? mark) nil (max 0 (min mark n)))))))
 
 (defn ed-current-pane (m)
-  "The selected pane's payload `{:buffer <pool index> :top <scroll>}`."
+  "The selected pane's payload `{:buffer <pool index> :top <scroll> :point :mark}`."
   (pane-selected-payload (get m :layout)))
 
 (defn ed-current-index (m)
@@ -138,8 +155,12 @@ minibuffer/prefix."
   (get (ed-current-pane m) :buffer))
 
 (defn ed-current-buf (m)
-  "The buffer being edited — the selected pane's buffer, from the pool."
-  (nth (get m :buffers) (ed-current-index m)))
+  "The buffer being edited — the selected pane's pooled buffer, carrying that pane's
+**window-local** cursor (`ed-with-window-point`) so each view of a shared buffer keeps its own
+point/mark."
+  (let (pane (ed-current-pane m))
+    (ed-with-window-point (nth (get m :buffers) (get pane :buffer))
+      (get pane :point) (get pane :mark))))
 
 (defn ed-current-top (m)
   "The selected pane's scroll offset (first visible line)."
@@ -302,6 +323,27 @@ update.)"
       (ed-set-buf m (assoc (gitdiff/gitdiff-annotate b)
                       :git-status-rope (buffer-rope b)
                       :git-status-lines (buffer-line-count b))))))
+
+(defn ed-cache-git-branch (m)
+  "Refresh the cached `:git-branch` (the current repo branch — shown on the status bar) when the
+project root has changed since it was last computed. Keyed on `:project-root` (recorded as
+`:git-branch-root`), so it costs one `git` call on a project switch, not one per idle beat. Run
+on the idle beat next to the diff-hl recompute."
+  (if (= (get m :project-root) (get m :git-branch-root))
+    m
+    (assoc m :git-branch (projects/git-branch (get m :project-root))
+      :git-branch-root (get m :project-root))))
+
+(defn ed-layer-modeline-segments (m buf)
+  "The status-bar segments `buf`'s active layers contribute via a `:modeline` service — each a
+`(model buf) -> string|nil` (resolved late, like every mode service). The seam a mode / layer
+uses to put its own info on the status bar (the git layer, a REPL connection, …); blanks and
+nils are dropped. The view appends these (and the global git branch) on the selected pane."
+  (keep (fn (svc)
+          (let (f (if (symbol? svc) (eval svc) svc)
+                s (f m buf))
+            (if (or (nil? s) (= "" s)) nil s)))
+    (layer-collect buf :modeline)))
 
 (defn ed-web-dirty? (m)
   "True when a web mirror is running (`:server`) and has an unpublished edit/move
@@ -667,9 +709,13 @@ source, or unchanged text."
           (assoc mb :cand-cache {:for (mb-text mb) :ranked ranked :cands cands}))))))
 
 (defn ed-set-buf (m buf)
-  "The model with the selected pane's buffer replaced by `buf` in the POOL — so
-every pane showing that buffer sees the edit. Scroll (per-pane) is untouched."
-  (update m :buffers assoc (ed-current-index m) buf))
+  "The model with `buf` written back to the selected pane's POOL slot (so every view sees a
+content edit) **and** `buf`'s point/mark cached as the selected pane's **window-local** cursor
+— so other panes on the same buffer keep their own. Scroll (per-pane) is untouched."
+  (assoc m
+    :buffers (assoc (get m :buffers) (ed-current-index m) buf)
+    :layout (pane-update-selected (get m :layout)
+              (fn (w) (assoc w :point (get buf :point) :mark (get buf :mark))))))
 
 (defn ed-set-top (m n)
   "The model with the *selected pane's* scroll offset set to `n` (per-pane, so
@@ -679,9 +725,12 @@ scrollbar (`ed-scrollbar-wake`)."
     (if (= n (ed-current-top m)) m2 (ed-scrollbar-wake m2))))
 
 (defn ed-show-index (m i)
-  "The model with the selected pane showing pool buffer `i`, scrolled to the top
-(the pane-layer primitive behind buffer switching)."
-  (assoc m :layout (pane-update-selected (get m :layout) (fn (w) (assoc w :buffer i :top 0)))))
+  "The model with the selected pane showing pool buffer `i`, scrolled to the top and with its
+window-local cursor **cleared** — so the buffer opens at its own stored point (not the pane's
+previous buffer's), and this pane then tracks independently. The pane-layer primitive behind
+buffer switching."
+  (assoc m :layout (pane-update-selected (get m :layout)
+                     (fn (w) (assoc w :buffer i :top 0 :point nil :mark nil)))))
 
 (defn ed-map-panes (m f)
   "The model with `f` applied to every pane's payload — for re-pointing

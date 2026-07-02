@@ -30,13 +30,13 @@
 
 ;; ---- the mode in the mode line ----------------------------------------------
 (defn mode-line-text (m)
-  "The mode-line op's text (the `face-modeline` bar carrying the buffer name)."
-  (nth (find (fn (op)
-               (and (= (first op) :text)
-                 (= (nth op 4 nil) theme/face-modeline)
-                 (string-contains? (nth op 3 "") (buffer-name (cur m)))))
-         (ed-view m 80 24))
-    3))
+  "The selected pane's mode-line text: the bar is now a `face-modeline` **fill rect** plus one
+`text` op per status-bar segment, so join every text op on the bar's row (left to right, the
+order they're emitted) to recover the whole line."
+  (let (ops (ed-view m 80 24)
+        barrow (nth (find (fn (op) (and (= (first op) :rect) (= (nth op 5 nil) theme/face-modeline))) ops) 1))
+    (join "" (map (fn (op) (nth op 3))
+                (filter (fn (op) (and (= (first op) :text) (= (nth op 1) barrow))) ops)))))
 
 (describe "editor context menu (right-click Copy / Cut / Paste)"
   (test "a right-press opens the menu at the pointer; Esc closes it"
@@ -505,7 +505,51 @@
                          (and z (last z)))))
       (assert= (zone-shape [:ctrl-x "3"]) :col-resize)
       (assert= (zone-shape [:ctrl-x "2"]) :row-resize)
-      (is (nil? (zone-shape []))))))  ; a lone pane has no divider, so no zone
+      (is (nil? (zone-shape [])))))  ; a lone pane has no divider, so no zone
+  (test "a split's divider is never │/─ box-drawing glyphs (terminal: a solid rect bar)"
+    ;; the fix for 'the split looks like ASCII art'. Terminal (no :gui): a filled rect,
+    ;; never a stack of │ glyphs.
+    (let (ops (ed-view (press (m-of "x") [:ctrl-x "3"]) 80 24)
+          bar (find (fn (op) (and (= (first op) :rect) (>= (nth op 4) 20))) ops)  ; tall filled bar
+          pipe (find (fn (op) (and (= (first op) :text) (string-contains? (nth op 3 "") "│"))) ops))
+      (is (not (nil? bar)))
+      (is (nil? pipe))))
+  (test "in the GUI the divider is a tall, thin hairline frect (not a full-cell block)"
+    (let (ops (ed-view (assoc (press (m-of "x") [:ctrl-x "3"]) :gui true) 80 24)
+          ;; frect = [:frect x y w h …]; the divider is the tall (h≥20) very-narrow (w<0.3) one
+          hair (find (fn (op) (and (= (first op) :frect) (< (nth op 3) 0.3) (>= (nth op 4) 20))) ops))
+      (is (not (nil? hair)))))
+  (test "the status bar is framed by top + bottom hairlines in the GUI (no 'hanging')"
+    (let (thin-rules (fn (ops) (filter (fn (op) (and (= (first op) :frect) (< (nth op 4) 0.3))) ops))
+          gui-ops (ed-view (assoc (m-of "x") :gui true) 80 24)
+          flat-ops (ed-view (m-of "x") 80 24))
+      ;; one pane → the bar's own top and bottom rules = two thin frects
+      (assert= (count (thin-rules gui-ops)) 2)
+      (is (empty? (thin-rules flat-ops))))))  ; terminal: none (surface step alone)
+
+(describe "status bar git branch"
+  ;; A helper: the concatenated text of every :text op in a frame (the mode-line label lives here).
+  (defn frame-text (ops)
+    (join "\n" (map (fn (op) (nth op 3 "")) (filter (fn (op) (= (first op) :text)) ops))))
+  (test "projects/git-branch reads this repo's current branch"
+    (is (= "main" (projects/git-branch (cwd)))))  ; the suite runs inside the myedit repo
+  (test "git-branch is nil outside a repo"
+    (is (nil? (projects/git-branch (temp-dir "myedit-nogit-")))))
+  (test "the cached git segments show on the selected pane's status bar"
+    ;; the idle beat caches git segments on `:git-segments` (built by git/git-statusbar-segments);
+    ;; the view lays them out on the selected pane. Here we seed one branch segment directly.
+    (let (segs (list (statusbar/seg :git-branch "⎇ feature-x" {:sep "  —  "}))
+          ops (ed-view (assoc (m-of "x") :git-segments segs) 80 24))
+      (is (string-contains? (frame-text ops) "feature-x"))))
+  (test "no branch segment when :git-segments is unset"
+    (is (not (string-contains? (frame-text (ed-view (m-of "x") 80 24)) "⎇"))))
+  (test "a layer's :modeline service contributes a status-bar segment (the general seam)"
+    ;; a buffer carrying a layer with a :modeline service → its string appears on the bar
+    (let (base (cur (m-of "x"))
+          buf (assoc base :layers (cons {:name 'demo :modeline (fn (m b) "SEG!")}
+                                    (or (get base :layers) '())))
+          ops (ed-view (ed-set-buf (m-of "x") buf) 80 24))
+      (is (string-contains? (frame-text ops) "SEG!")))))
 
 ;; ---- projects: find-file-in-project (C-x p f) -------------------------------
 ;; The suite runs *in* the myedit project, so (cwd) is the real repo root — these
@@ -811,3 +855,38 @@
       (assert= (ed-current-index m2) 0)                            ; still on the list
       (let (idx (ed-buffer-index-by-name m2 "*preview*"))
         (assert= (buffer-text (nth (get m2 :buffers) idx)) "second")))))  ; content refreshed
+
+;; ---- status bar: segment hover + click hit-testing --------------------------
+(defn tb-click-cmd (m key) (assoc m :tb-clicked key))  ; a stand-in :on-click command
+
+(describe "status bar segment hover + click"
+  (let (segs (list (statusbar/seg :branchx "BRANCHX"
+                     {:sep "  " :on-click 'main-test/tb-click-cmd :tooltip ["hi there"]}))
+        m (assoc (m-of "hello") :git-segments segs)
+        ops (ed-view m 80 24)
+        brop (find (fn (op) (and (= (first op) :text) (string-contains? (nth op 3 "") "BRANCHX"))) ops)
+        brow (nth brop 1)
+        bcol (nth brop 2))
+
+    (test "the segment is found under its own glyphs on the mode-line row"
+      (assert= (get (ed-modeline-segment-at m 80 24 bcol brow) :id) :branchx))
+    (test "a non-interactive segment (the buffer name at col 0) is not a hit"
+      (is (nil? (ed-modeline-segment-at m 80 24 0 brow))))
+
+    (test "hovering the segment records :hover; moving off it clears it"
+      (assert= (get (ed-modeline-hover m 80 24 bcol brow) :hover) {:id :branchx :col bcol :row brow})
+      (is (nil? (get (ed-modeline-hover (assoc m :hover {:id :branchx :col bcol :row brow}) 80 24 0 brow) :hover))))
+
+    (test "a left-press on the segment runs its :on-click command"
+      (assert= (get (ed-modeline-click m 80 24 bcol brow) :tb-clicked) :mouse))
+
+    (test "the hovered segment's tooltip renders as a card above the bar"
+      (let (hops (ed-modeline-tooltip-ops (assoc m :hover {:id :branchx :col bcol :row brow}) 80 24))
+        (is (not (empty? hops)))
+        (is (member? :text (map first hops)))))
+
+    ;; end-to-end through ed-update (the real mouse path):
+    (test "a :move event over the segment folds into :hover"
+      (assert= (get-in (ed-update m [:mouse :move :none brow bcol []] 80 24) [:hover :id]) :branchx))
+    (test "a left-press event over the segment runs its command (point untouched)"
+      (assert= (get (ed-update m [:mouse :press :left brow bcol []] 80 24) :tb-clicked) :mouse))))
