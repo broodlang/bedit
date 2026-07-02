@@ -11,6 +11,7 @@ root (`:git-root`). Parsing/rendering are pure (tests/git_test.blsp)."
   (:use model)         ; ed-current-buf / ed-set-buf / message / ed-read-char / ed-apply
   (:use commands)      ; ed-show-named / ed--default-dir / ed--goto-line / cmd-kill-buffer
   (:use interactive)   ; defcommand
+  (:use statusbar)     ; `seg` — build the branch + working-tree status-bar segments
   (:use editor/buffer))  ; buffer-current-line / buffer-text
 
 (require 'theme)  ; loads theme for its *green*/*red*/*blue*/*yellow*/*subtext* dynamic-var colours (bare globals)
@@ -29,6 +30,16 @@ root (`:git-root`). Parsing/rendering are pure (tests/git_test.blsp)."
 (def git-face-section {:fg *blue* :bold true}) ; a *git-status* section header
 (def git-face-note {:fg *subtext* :italic true})
 (def git-face-hash {:fg *yellow*})             ; a commit hash in the log
+
+;; the status-bar segment faces (branch + colour-coded working-tree indicator): staged reads
+;; green, unstaged yellow, untracked dim; a clean/staged tree dot is green. Built from the
+;; theme colour tokens (via `require`), like the diff faces above — kept here, not in theme,
+;; because git reaches the palette through `require` (dynamic-var colours only).
+(def git-face-branch    {:fg *subtext*})   ; the ⎇ branch label (quiet, secondary)
+(def git-face-clean     {:fg *green*})     ; the state dot when the tree is clean / staged
+(def git-face-staged    {:fg *green*})     ; the +N staged-change count (ready to commit)
+(def git-face-unstaged  {:fg *yellow*})    ; the ~N unstaged-change count (modified, dirty)
+(def git-face-untracked {:fg *overlay0*})  ; the ?N untracked-file count (dim)
 
 (defn git--diff-line-face (line)
   "The face for a unified-diff line (leading indent ignored), or nil for a context line."
@@ -136,6 +147,110 @@ a trailing field) into a list of `{:x :y :path}`."
 (defn git--untracked? (e) (and (= (get e :x) "?") (= (get e :y) "?")))
 (defn git--staged? (e) (and (not (= (get e :x) " ")) (not (= (get e :x) "?"))))
 (defn git--unstaged? (e) (and (not (= (get e :y) " ")) (not (git--untracked? e))))
+
+;; ---- the status-bar segments (branch + working-tree indicator) --------------
+;; The branch and a colour-coded working-tree indicator on the status bar, for **every**
+;; buffer in a repo (not just *git-status*). Built off the render path: the idle beat calls
+;; `git-cache-status` to recompute the summary + segments and cache them on the model as
+;; `:git-segments` (see `input`), which the view lays out (`view/ed-statusbar-segments`).
+;; Both segments are clickable (→ `C-x g`) and carry a hover tooltip.
+
+(def *git-branch-glyph* "⎇ ")  ; the branch marker; set to "git:" if your font lacks ⎇
+(def *git-state-glyph* "●")    ; the working-tree state dot
+
+(defn git--upstream (root)
+  "The upstream ref (e.g. `origin/main`) of the current branch, or nil when it has none."
+  (let (r (git--git root ["rev-parse" "--abbrev-ref" "--symbolic-full-name" "@{u}"]))
+    (if (= (get r :exit) 0) (trim (get r :stdout)) nil)))
+
+(defn git--ahead-behind (root)
+  "`{:ahead :behind}` commit counts (as strings — tooltip-only) vs the upstream, or nil when
+there is no upstream. `--left-right` counts the upstream side (behind) and the HEAD side (ahead)."
+  (let (r (git--git root ["rev-list" "--left-right" "--count" "@{u}...HEAD"]))
+    (if (not (= (get r :exit) 0))
+      nil
+      (let (parts (remove empty? (string-split (trim (get r :stdout)) "\t")))
+        (if (= (count parts) 2) {:behind (first parts) :ahead (second parts)} nil)))))
+
+(defn git-summary (root)
+  "A working-tree summary for the status bar, or nil outside a repo: `{:root :branch :upstream
+:ahead :behind :staged :unstaged :untracked}`. Counts come from `git status --porcelain`;
+ahead/behind are best-effort strings vs the upstream. A few `git` calls, so it runs off the
+render path (the idle beat — `git-cache-status`)."
+  (if (nil? root)
+    nil
+    (let (entries (git--entries (get (git--git root ["status" "--porcelain" "-z"]) :stdout))
+          ab (git--ahead-behind root))
+      {:root root
+       :branch (git--branch root)
+       :upstream (git--upstream root)
+       :ahead (and ab (get ab :ahead))
+       :behind (and ab (get ab :behind))
+       :staged (count (filter git--staged? entries))
+       :unstaged (count (filter git--unstaged? entries))
+       :untracked (count (filter git--untracked? entries))})))
+
+(defn git--basename (path)
+  "The last path component of `path` (the repo directory name), tolerating a trailing slash."
+  (let (parts (remove empty? (string-split path "/")))
+    (if (empty? parts) path (last parts))))
+
+(defn git--dot-face (summary)
+  "The state-dot colour: yellow when there are unstaged changes (a dirty tree), green when
+only staged (ready to commit) or clean."
+  (cond
+    (> (get summary :unstaged) 0) git-face-unstaged
+    (> (get summary :staged) 0) git-face-staged
+    :else git-face-clean))
+
+(defn git--repo-tooltip (summary)
+  "The branch segment's hover tooltip: repo name, branch, upstream, and ahead/behind."
+  (concat
+    [(str "Repo:   " (git--basename (get summary :root)))
+     (str "Branch: " (get summary :branch))]
+    (if (get summary :upstream)
+      [(str "Upstream: " (get summary :upstream))
+       (str "↑ " (or (get summary :ahead) "0") " ahead    ↓ " (or (get summary :behind) "0") " behind")]
+      ["(no upstream)"])))
+
+(defn git--tree-tooltip (summary)
+  "The state-dot segment's hover tooltip: the working-tree counts, or 'clean'."
+  (if (and (= (get summary :staged) 0) (= (get summary :unstaged) 0) (= (get summary :untracked) 0))
+    ["Working tree clean"]
+    [(str "Staged:    " (get summary :staged))
+     (str "Unstaged:  " (get summary :unstaged))
+     (str "Untracked: " (get summary :untracked))]))
+
+(defn git--count-seg (id prefix n face)
+  "A colour-coded count segment (e.g. `+3`), or nil when the count is 0 (so it vanishes)."
+  (if (= n 0) nil (seg id (str prefix n) {:sep "  " :face face})))
+
+(defn git-statusbar-segments (summary)
+  "The git status-bar segments from `summary` (nil ⇒ `()`): a clickable **branch** segment
+(tooltip: repo / upstream / ahead-behind; click: `C-x g`), a **state dot** coloured by the
+working tree (tooltip: the counts; click: `C-x g`), then colour-coded **+staged ~unstaged
+?untracked** counts, each shown only when non-zero. Pure — built from the cached summary."
+  (if (nil? summary)
+    '()
+    (filter (fn (s) (not (nil? s)))
+      (list
+        (seg :git-branch (str *git-branch-glyph* (get summary :branch))
+          {:sep "  —  " :face git-face-branch :on-click 'git/cmd-git-status
+           :tooltip (git--repo-tooltip summary)})
+        (seg :git-dot *git-state-glyph*
+          {:sep "   " :face (git--dot-face summary) :on-click 'git/cmd-git-status
+           :tooltip (git--tree-tooltip summary)})
+        (git--count-seg :git-staged "+" (get summary :staged) git-face-staged)
+        (git--count-seg :git-unstaged "~" (get summary :unstaged) git-face-unstaged)
+        (git--count-seg :git-untracked "?" (get summary :untracked) git-face-untracked)))))
+
+(defn git-cache-status (m)
+  "Recompute the cached git status-bar segments (`:git-segments`) + summary (`:git-summary`)
+off the loop: resolve the repo root, and in a repo rebuild the summary + segments, else clear
+them. Called on the idle beat (`input`), so the branch + working-tree indicator track edits
+and git actions a beat after they settle. Outside a repo the segments are `()` (nothing shows)."
+  (let (summary (git-summary (git--resolve-root m)))
+    (assoc m :git-summary summary :git-segments (git-statusbar-segments summary))))
 
 ;; ---- pure: render the status buffer (text + parallel per-line rows) ---------
 

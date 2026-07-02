@@ -20,7 +20,8 @@ old full-screen one (mode line at `rows-2`, echo at `rows-1`)."
   (:use projects)  ; project-name — the bracketed project label on the mode line
   (:use editor/highlight)  ; fontify-runs — the shared span+overlay -> [substring face] tiler
   (:use theme)  ; the curated palette + semantic chrome faces (src/theme.blsp)
-  (:use editor/display))  ; clear / text / cursor / frame render ops
+  (:use statusbar)  ; the status-bar segment model + layout + zones + hover tooltip
+  (:use editor/display))  ; clear / text / cursor / frame / zone-at render ops
 
 (defn ed-fit (s w)
   "Clip string `s` to `w` columns (long lines don't wrap — v1 has no h-scroll)."
@@ -280,31 +281,121 @@ lines scrolled above the window."
     (>= (+ top vrows) linecount) "Bot"
     :else (str (quot (* 100 top) (max 1 (- linecount vrows))) "%")))
 
-(defn ed-pane-modeline (m pane buf)
-  "A pane's mode line — a solid bar on the bottom row of its rect: ` name (mode)  —
-SCROLL%  line:col`; the selected pane also shows the model status and the diagnostic
-count. The selected pane's bar is `face-modeline` (a raised surface), an unselected
-pane's the dimmer `face-modeline-inactive` — solid panels rather than the old
-reverse-video, so a split reads which pane is active at a glance. The scroll indicator
-(Top/Bot/All/NN%) tracks the pane's `:top` against its height, like Emacs."
-  (let ([x y w h] (get pane :rect)
-        sel (get pane :selected)
+(defn ed--layer-segments (m buf)
+  "The buffer's layer `:modeline` contributions (`model/ed-layer-modeline-segments`) lifted
+into segments via `statusbar/normalize-seg` — a layer may return a `seg` map or a bare string
+(auto id + a `—` separator), so per-buffer mode chrome keeps working alongside the git
+segments. `map` over the contributions with their index gives each string a stable id."
+  (let (raw (ed-layer-modeline-segments m buf))
+    (map (fn (i) (normalize-seg (nth raw i) i)) (range (count raw)))))
+
+(defn ed-statusbar-segments (m pane buf)
+  "The ordered status-bar segments for `pane`: an always-on left group (buffer name, mode,
+scroll %, line:col), then — on the **selected** pane only — the model status, the modal edit
+state, the project, the diagnostic count, the cached git segments (`:git-segments`, built off
+the loop by the idle beat), and the buffer's layer segments. The one list both
+`ed-pane-modeline` (render) and `ed-modeline-segment-at` (mouse hit-test) build from, so a
+segment is clickable/hoverable exactly where it's drawn."
+  (let (sel (get pane :selected)
+        h (nth (get pane :rect) 3)
         pos (str (inc (buffer-current-line buf)) ":" (buffer-column buf))
         pct (ed-scroll-pct (ed-pane-top pane buf) (max 1 (dec h)) (buffer-line-count buf))
-        label (str " "
-                (if (read-only? buf) "RO " "")
-                (buffer-name buf)
-                "  ("
-                (ed-buf-mode-name buf)
-                ")  —  "
-                pct
-                "  "
-                pos
-                (if sel (str "  —  " (get m :status)) "")
-                (if sel (ed--edit-state-label m) "")
-                (if sel (ed--project-label m) "")
-                (if sel (ed--diag-label m) "")))
-    (text (+ y (dec h)) x (ed-fit-pad label w) (if sel face-modeline face-modeline-inactive))))
+        core (list
+               (seg :name (str "  " (if (read-only? buf) "RO " "") (buffer-name buf)))  ; leading pad
+               (seg :mode (str "(" (ed-buf-mode-name buf) ")") {:sep "  "})
+               (seg :scroll pct {:sep "  —  "})
+               (seg :pos pos {:sep "  "}))
+        ;; the non-interactive extras reuse the existing label helpers (which bake their own
+        ;; leading separator), so they need no `:sep`; empty ones are dropped.
+        extras (filter (fn (s) (not (= "" (get s :text))))
+                 (list (seg :status (if (= "" (get m :status)) "" (str "  —  " (get m :status))))
+                       (seg :edit-state (ed--edit-state-label m))
+                       (seg :project (ed--project-label m))
+                       (seg :diag (ed--diag-label m)))))
+    (if sel
+      (concat core extras (or (get m :git-segments) '()) (ed--layer-segments m buf))
+      core)))
+
+(defn ed-pane-modeline (m pane buf)
+  "A pane's mode line as render ops: a solid bar on the bottom row of its rect, laid out from
+its **segments** (`ed-statusbar-segments`) by `statusbar/statusbar-layout` — buffer name ·
+mode · scroll% · line:col, plus the selected pane's status / diagnostics / git. The selected
+pane's bar is `face-modeline` (a raised surface), an unselected pane's the dimmer
+`face-modeline-inactive`; on the selected pane the segment under the pointer (`:hover`) gets a
+subtle hover pill. Thin **top + bottom hairlines** (`face-border`, GUI only) rule the bar off
+as a distinct band — dark-UI chrome is anchored by a 1px border, not a shadow (docs/ui-chrome.md)."
+  (let ([x y w h] (get pane :rect)
+        sel (get pane :selected)
+        row (+ y (dec h))
+        base (if sel face-modeline face-modeline-inactive)
+        hovered-id (if sel (get-in m [:hover :id]) nil)
+        laid (statusbar-layout (ed-statusbar-segments m pane buf) x row w base hovered-id (get m :gui)))
+    (concat
+      (get laid :ops)
+      ;; top + bottom hairlines frame the bar as a distinct band (GUI only); both sit flush
+      ;; on the row's edges — not over the text — so the labels keep their full height.
+      (if (get m :gui)
+        [(frect (* 1.0 x) (* 1.0 row) (* 1.0 w) *modeline-hairline* face-border)                       ; top edge
+         (frect (* 1.0 x) (- (* 1.0 (inc row)) *modeline-hairline*) (* 1.0 w) *modeline-hairline* face-border)]  ; bottom edge
+        []))))
+
+;; ---- status-bar hit-testing + hover tooltip (the mouse side) ----------------
+;; The mouse handler recomputes the *selected* pane's segment layout — the same one the view
+;; drew — and hit-tests the pointer against its zones, exactly as `ed-menu-hit` recomputes the
+;; menu card's rect. So a segment is hoverable / clickable precisely where its glyphs are.
+
+(defn ed-modeline-segment-at (m cols rows col row)
+  "The status-bar segment under screen cell `[col row]` on the **selected** pane's mode line,
+or nil (a different row, or a gap between segments). What hover (`:move`) and click hit-test
+against — the caller reads the returned segment's `:on-click` / `:tooltip`."
+  (let (panes (get (ed-body-layout m cols rows) :panes)
+        pane (ed-selected-pane panes)
+        [x y w ph] (get pane :rect)
+        mrow (+ y (dec ph)))
+    (if (not (= row mrow))
+      nil
+      (let (buf (ed-pane-buf m pane)
+            segs (ed-statusbar-segments m pane buf)
+            laid (statusbar-layout segs x mrow w face-modeline nil (get m :gui))
+            z (zone-at (get laid :zones) col row))
+        (if (nil? z) nil (seg-by-id segs (get z :id)))))))
+
+(defn ed-modeline-click (m cols rows col row)
+  "If a status-bar segment with an `:on-click` command sits under press `[col row]`, run that
+command (resolved late via `eval`, like a keymap binding — `(m key) -> m`) and return the new
+model; else nil. The mouse handler tries this before its normal left-press handling, so a
+click on the branch / git indicator opens `*git-status*` instead of moving point."
+  (let (s (ed-modeline-segment-at m cols rows col row))
+    (if (and s (get s :on-click))
+      ((eval (get s :on-click)) (dissoc m :hover) :mouse)  ; dismiss the tooltip as the click fires
+      nil)))
+
+(defn ed-modeline-hover (m cols rows col row)
+  "Fold a bare pointer move over the status bar into `:hover` (`{:id :col :row}`, read by the
+renderer to draw the hover pill + tooltip): set it to the segment under `[col row]`, or clear
+it when the pointer is off any segment. Never touches scroll — a hover must not snap the view
+back to point (the GUI emits a `:move` per cell crossed)."
+  (let (s (ed-modeline-segment-at m cols rows col row))
+    (cond
+      (and s (seg-interactive? s)) (assoc m :hover {:id (get s :id) :col col :row row})
+      (get m :hover) (dissoc m :hover)
+      :else m)))
+
+(defn ed-modeline-tooltip-ops (m cols rows)
+  "The hovered status-bar segment's tooltip as render ops, or `()` — a small bordered card
+floated just above the selected pane's mode line at the hover column. Reads `:hover`
+(`{:id :col :row}`, set by the mouse handler); resolves the segment's `:tooltip` against `m`."
+  (let (hover (get m :hover))
+    (if (nil? hover)
+      '()
+      (let (panes (get (ed-body-layout m cols rows) :panes)
+            pane (ed-selected-pane panes)
+            [x y w ph] (get pane :rect)
+            mrow (+ y (dec ph))
+            buf (ed-pane-buf m pane)
+            segs (ed-statusbar-segments m pane buf)
+            ops (statusbar-tooltip-ops segs (get hover :id) m (get hover :col) mrow cols rows (get m :gui)))
+        (or ops '())))))
 
 (defn ed--scale-op (op x y s)
   "Re-anchor a virtual-coords (origin 0,0) `text` op into a pane at screen `(x, y)`,
@@ -419,25 +510,37 @@ chrome mode line wrap it the same way at every scale."
                     (concat (ed-bracket-overrides buf) (ed-diagnostic-overrides m buf))
                     '())
         hl-ranges (ed-hl-ranges m buf (get pane :selected)))
-    (concat (ed--hl-line-band m pane buf top x y w text-h s)  ; full-width band, behind the text
+    (concat
+      ;; the line-number gutter gets its own recessed surface (no border, just a bg step) —
+      ;; a `rect` over the gutter columns for the full text height, drawn on top of the
+      ;; full-width hl-line band so the current-line highlight stays in the text area only.
+      (ed--hl-line-band m pane buf top x y w text-h s)  ; full-width band, behind the text
+      (if (> gw 0) [(rect y x (* gw s) text-h face-gutter-bg)] [])  ; recessed gutter surface
       (ed--region-eol-bands buf top text-h x y w gw s hscroll) ; fill empty/short lines in the region
       (ed--pane-body-ops buf top text-h x y w gw s hl-ranges spans overrides hscroll)
       (ed-scrollbar-ops buf top text-h (+ x (dec w)) y (ed-scrollbar-opacity m))
-      [(ed-pane-modeline m pane buf)])))
+      (ed-pane-modeline m pane buf))))
 
 ;; ---- dividers (the 1-cell lines between panes) ------------------------------
 
-(defn ed-divider-ops (d)
-  "Render ops drawing divider `d`: a vertical `│` column for a `:col` split, a
-horizontal `─` row for a `:row` split, plus a `cursor-zone` over it so the GUI shows
-a resize cursor on hover/drag (`:col-resize` ↔ / `:row-resize` ↕; the terminal
-ignores the zone). ADR-080."
+(def *hairline* 0.05)  ; chrome border thickness in cells (a crisp sub-px hairline) — docs/ui-chrome.md
+(def *modeline-hairline* 0.035)  ; the status-bar rules — a hair finer than a pane divider (two of them, so lighter)
+
+(defn ed-divider-ops (d gui?)
+  "Render ops drawing divider `d`: a **hairline** border (thin `frect` centred in the reserved
+1-cell seam) in the GUI — a crisp ≈1px line, not a stack of `│`/`─` box-drawing glyphs (ASCII
+art) nor a heavy full-cell block; the terminal (no sub-cell `frect`) falls back to a solid
+`rect` bar. Plus a `cursor-zone` over the seam so the GUI shows a resize cursor on hover/drag
+(`:col-resize` ↔ / `:row-resize` ↕; the terminal ignores the zone). ADR-080."
   (let ([x y w h] (get d :rect)
         col? (= (get d :dir) :col)
-        line (if col?
-               (map (fn (r) (text (+ y r) x "│")) (range h))
-               [(text y x (apply str (map (fn (i) "─") (range w))))]))
-    (concat line [(cursor-zone x y w h (if col? :col-resize :row-resize))])))
+        off (- 0.5 (/ *hairline* 2)))  ; centre the hairline in the 1-cell seam
+    [(if gui?
+       (if col?
+         (frect (+ x off) (* 1.0 y) *hairline* (* 1.0 h) face-border)
+         (frect (* 1.0 x) (+ y off) (* 1.0 w) *hairline* face-border))
+       (rect y x w h face-border))
+     (cursor-zone x y w h (if col? :col-resize :row-resize))]))
 
 ;; ---- the minibuffer / echo area + the cursor --------------------------------
 
@@ -562,7 +665,7 @@ shared completion menu renderer."
             ;; same rect the click hit-test (commands/ed-menu-hit) uses, so they agree
             [mr mc w n] (completion-box-rect (get menu :row) (get menu :col) labels cols rows)
             sel (get menu :sel))
-        (completion-menu-ops labels 0 sel mr mc w)))))
+        (completion-menu-ops labels 0 sel mr mc w (get m :gui))))))
 
 (defn ed--cursor-style (m)
   "The caret shape. Vim insert mode is always a thin `:bar` (it signals you're inserting);
@@ -652,12 +755,13 @@ layout."
       (apply frame
         (concat [(clear)]
           (mapcat (fn (p) (ed-pane-ops m p)) panes)
-          (mapcat (fn (d) (ed-divider-ops d)) (get layout :dividers))
+          (mapcat (fn (d) (ed-divider-ops d (get m :gui))) (get layout :dividers))
           [(ed-echo-line m cols rows)]
           (ed-mb-candidates-ops m cols rows)  ; the Vertico minibuffer list (above the prompt)
           (ed-which-key-ops m cols rows)  ; the which-key panel while a prefix chord is pending
           (complete-popup-ops m cols rows)  ; overlays the buffer body when open
           (ed-menu-ops m cols rows)  ; the right-click Copy/Cut/Paste menu, on top
+          (ed-modeline-tooltip-ops m cols rows)  ; the hovered status-bar segment's tooltip
           ;; The caret blinks (ADR-102): the idle `:cursor-blink` timer toggles `:blink-on?`,
           ;; and dropping the op on the off-phase hides it — in the minibuffer too, so the
           ;; caret is consistent everywhere (typing resets it solid via `ed-real-input?`,

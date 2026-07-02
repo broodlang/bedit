@@ -1,0 +1,145 @@
+(defmodule statusbar
+  "The status bar (mode line) as an **abstraction layers can extend**, not a hand-built
+string. A bar is a list of **segments** — each a small map `{:id :text :face :on-click
+:tooltip}` — laid out by `statusbar-layout` into render ops **and** interaction zones. That
+one function is called by both the view (to draw the bar) and the mouse handler (to hit-test
+hover / click), so a segment is clickable and hoverable *exactly* where it is drawn — the
+same discipline `completion-box-rect` uses for the popup card.
+
+Layers put their own info on the bar through the buffer's `:modeline` service (see
+`model/ed-layer-modeline-segments`): a service returns a segment (built with `seg`), or a
+bare string, which `normalize-seg` lifts into one — so the old string contributions keep
+working. The git layer, say, contributes a clickable branch segment and a colour-coded
+working-tree indicator, each with a hover tooltip.
+
+The look follows `docs/ui-chrome.md`: a hovered interactive segment lightens one surface
+step (a rounded pill in the GUI, a flat band in the terminal) — surfaces + hairlines, never
+a shadow. Every `def` is live-redefinable (ricing)."
+  (:use editor/display)   ; text / rect / zone / card-pill / tooltip
+  (:use theme))           ; the bar + hover + tooltip faces
+
+;; ---- a segment --------------------------------------------------------------
+
+(defn seg (id text &optional (opts {}))
+  "A status-bar segment. `id` is a keyword (stable, so hover/hit can name it); `text` is
+what shows on the bar. `opts`:
+  `:sep`      — a separator string drawn *before* the segment, outside its clickable zone
+                (e.g. `\"  \"` or `\"  —  \"`). Default `\"\"`.
+  `:face`     — a face for the text (`{:fg …}`; the `:bg` is inherited from the bar). nil.
+  `:on-click` — a command **symbol**, resolved late like a keymap binding (`(m key) -> m`),
+                run when the segment is clicked. nil ⇒ not clickable.
+  `:tooltip`  — a hover hint: a string, a vector of lines, or a fn `(m) -> lines`. nil.
+  `:cursor`   — a pointer shape while hovered (a `cursor-zone` shape). nil."
+  {:id id :text text
+   :sep (get opts :sep "")
+   :face (get opts :face)
+   :on-click (get opts :on-click)
+   :tooltip (get opts :tooltip)
+   :cursor (get opts :cursor)})
+
+(defn normalize-seg (x i)
+  "Coerce a layer's `:modeline` contribution into a segment map: a bare string becomes a
+segment (auto id `:seg/<i>`, a leading `\"  —  \"` separator, matching the old string bar); a
+map is returned unchanged (assumed built with `seg`). `i` gives the string case a stable id."
+  (if (string? x)
+    (seg (keyword (str "seg/" i)) x {:sep "  —  "})
+    x))
+
+(defn seg-interactive? (s)
+  "Whether segment `s` reacts to the pointer — it has a click command or a tooltip."
+  (or (get s :on-click) (get s :tooltip)))
+
+(defn seg-tooltip-lines (s m)
+  "The tooltip for segment `s` as a vector of lines: a fn `:tooltip` is called with the model
+`m`, a string is a single line, a vector is used as-is; nil ⇒ `nil` (no tooltip)."
+  (let (tt (get s :tooltip))
+    (cond
+      (nil? tt) nil
+      (fn? tt) (tt m)
+      (string? tt) [tt]
+      :else tt)))
+
+;; ---- layout: segments -> render ops + interaction zones ---------------------
+
+(defn sb--clip (s n)
+  "`s` truncated to at most `n` characters (never negative)."
+  (if (> (string-length s) n) (substring s 0 (max 0 n)) s))
+
+;; The hover block's geometry (cell units). Inset within the bar so a bordered block floats
+;; with breathing room instead of filling the whole cell edge-to-edge.
+(def *sb-hover-vinset* 0.16)   ; vertical margin top+bottom inside the bar row
+(def *sb-hover-pad*    0.55)   ; horizontal padding each side of the text, inside the border
+(def *sb-hover-radius* 0.28)   ; a hair of corner rounding — a bordered block, not a pill
+(def *sb-hover-border* 0.06)   ; the hairline border thickness
+
+(defn sb--hover-block (tcol row tw)
+  "A bordered, inset hover **block** behind a `tw`-cell segment text at (`tcol`, `row`): a
+border-coloured `frect` with the fill inset inside it, floated within the bar with vertical
+margin + horizontal padding — a crisp bordered button-hover (Emacs `mouse-face` with an edge).
+GUI-only; the terminal uses a flat bg band. Returns [border-frect fill-frect]."
+  (let (x (- tcol *sb-hover-pad*)
+        y (+ row *sb-hover-vinset*)
+        w (+ tw (* 2 *sb-hover-pad*))
+        h (- 1.0 (* 2 *sb-hover-vinset*))
+        b *sb-hover-border*)
+    [(frect (- x b) (- y b) (+ w (* 2 b)) (+ h (* 2 b)) face-modeline-hover-border 1.0 (+ *sb-hover-radius* b))
+     (frect x y w h face-modeline-hover 1.0 *sb-hover-radius*)]))
+
+(defn sb--seg-text-ops (label tcol row face hov? gui?)
+  "The highlight + text ops for one segment's `label` at column `tcol`, where `face` is the
+segment's fully-resolved face (the bar's face with the segment's own overrides merged in). A
+hovered segment gets a **bordered, inset block** behind it — Emacs `mouse-face` with a crisp
+edge (`sb--hover-block`, `docs/ui-chrome.md`). In the GUI the block is a bordered `frect` pair
+and the text draws **fg-only** over it (a square text bg would cover the block); in the
+terminal the text carries the highlight bg itself (no border — else the bar bg it inherited)."
+  (let (tw (string-length label))
+    (if gui?
+      (concat
+        (if hov? (sb--hover-block tcol row tw) [])
+        [(text row tcol label (dissoc face :bg))])
+      [(text row tcol label (if hov? (merge face face-modeline-hover) face))])))
+
+(defn statusbar-layout (segments x row w base-face hovered-id &optional (gui? false))
+  "Lay `segments` left-to-right from column `x` on `row`, across a `w`-wide bar filled in
+`base-face`. Returns `{:ops <render ops> :zones <interaction zones>}`: a full-width bar fill,
+then each segment (its `:sep`, then its `:text` in the segment's face), with the segment
+whose id is `hovered-id` — when interactive — sitting on a subtle hover highlight. Each
+interactive segment gets a `zone` over its text cells (id = the segment's id), so the mouse
+handler hit-tests hover/click against exactly the drawn glyphs. `gui?` picks the rounded pill
+over the flat terminal band. Text past the bar's right edge is clipped, never wrapped."
+  (let (acc (fold
+              (fn (a s)
+                (let (tcol (+ (get a :col) (string-length (get s :sep)))
+                      avail (max 0 (- (+ x w) tcol))
+                      label (sb--clip (get s :text) avail)
+                      face (merge base-face (or (get s :face) {}))  ; inherit the bar's fg+bg, then override
+                      hov? (and (= (get s :id) hovered-id) (seg-interactive? s))
+                      zone-ops (if (seg-interactive? s)
+                                 [(zone [tcol row (string-length label) 1] (get s :id) (get s :cursor))]
+                                 []))
+                  {:col (+ tcol (string-length label))
+                   :ops (concat (get a :ops)
+                          (sb--seg-text-ops label tcol row face hov? gui?))
+                   :zones (concat (get a :zones) zone-ops)}))
+              {:col x :ops [] :zones []}
+              segments))
+    {:ops (cons (rect row x w 1 base-face) (get acc :ops))
+     :zones (get acc :zones)}))
+
+;; ---- the hover tooltip ------------------------------------------------------
+
+(defn seg-by-id (segments id)
+  "The segment in `segments` with `:id` `id`, or nil."
+  (first (filter (fn (s) (= (get s :id) id)) segments)))
+
+(defn statusbar-tooltip-ops (segments hovered-id m anchor-col row cols rows gui?)
+  "Render ops for the hovered segment's tooltip, or `nil` — a small bordered card floated
+just above bar `row` at `anchor-col` (the pointer column), clamped on-screen. Resolves the
+hovered segment's `:tooltip` against the model `m` (`seg-tooltip-lines`); `nil` when there is
+no hovered segment or it has no tooltip. Drawn via `display/tooltip` — the one shared card."
+  (let (s (seg-by-id segments hovered-id)
+        lines (and s (seg-tooltip-lines s m)))
+    (if (or (nil? lines) (empty? lines))
+      nil
+      (tooltip row anchor-col lines face-tooltip face-tooltip-fg cols rows gui?
+        {:border face-tooltip-border}))))
