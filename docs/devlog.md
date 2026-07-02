@@ -10,6 +10,32 @@ Language-level changes live in the Brood repo's `docs/devlog.md` + `docs/decisio
 
 ---
 
+## 2026-06-15
+
+### design notes: the customization surface + a package ecosystem — (uncommitted)
+- **Why:** the editor is internally layered and hot-swappable, but the user can
+  configure almost none of it from `init.blsp`, and there's no way to load third-party
+  extensions. Captured the design-of-record for both before building, so the reasoning
+  isn't lost (the `docs/actor-architecture.md` pattern).
+- **What:** two design notes.
+  - **`docs/configurability.md`** — a `defsetting` settings registry as the keystone
+    (kills the 4-place coupling adding one config key costs today), off which `bind-key`,
+    `add-hook` / named hooks, selectable themes, and a `command-put`/`command-get`
+    property table all hang. Prime-directive split: Brood gets a `std/settings` registry
+    + `key-parse`/`key-describe` in `std/editor/keymap`; the editor rewrites `config.blsp`
+    as a fold + adds the user-facing forms.
+  - **`docs/packages.md`** — *an editor package is a Brood nest*; the user's
+    `~/.config/brood-edit/` is itself a nest whose `:dependencies` are the installed
+    packages, and **Brood's existing package manager** (ADR-037) is the package system. A
+    package registers through the same functions core uses. Live, restart-free install via
+    the runtime-mutable `*load-path*` + late binding. The one real language gap is ADR-070
+    package-rooted namespaces (gates third-party packages); a runtime `load-nest` is the
+    small one.
+- **Files:** `docs/configurability.md` (new), `docs/packages.md` (new), `ROADMAP.md`
+  (§F customization surface, §G packages). **Tests:** none — design notes, nothing built.
+- **Next:** start with the settings registry (§F.1) — pure-model, lands today, and is the
+  prerequisite for packages (§G).
+
 ## 2026-06-14
 
 ### view: region selection fills blank / short lines through end-of-line — `0b21cc0`

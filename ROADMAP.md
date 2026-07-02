@@ -160,6 +160,34 @@ consume that shape. So the whole feature is one Rust builtin + Brood policy.
   well today. Full reasoning, decomposition, hard-parts-and-answers, and a staged
   (non-big-bang) path: **`docs/actor-architecture.md`**.
 
+## F. The customization surface (deferred — design note)
+
+- ⬜ **A settings registry + a real config surface** — the editor is internally
+  layered and hot-swappable, but the user can configure almost none of it from
+  `init.blsp` (a closed 3-key DSL today). The keystone is a `defsetting` registry
+  (named/typed/defaulted/documented variables — Emacs `defcustom`), off which the rest
+  hang: `(setting …)` in init, `bind-key` + `M-x global-set-key`, `add-hook` / named
+  hooks, selectable themes (faces into one registry), and a `command-put`/`command-get`
+  property table that folds in the five scattered command-list `def`s. Brood-side gaps:
+  a `std/settings` registry, `key-parse`/`key-describe` in `std/editor/keymap` (the
+  `kbd` bijection). Decided direction, **not building yet** — full reasoning + the
+  prime-directive split + a staged path: **`docs/configurability.md`**. Prerequisite
+  for §G.
+
+## G. Packages — an extension ecosystem (deferred — design note)
+
+- ⬜ **Load editor packages, almost like Emacs** — *an editor package is a Brood nest*;
+  the user's `~/.config/brood-edit/` is itself a nest whose `:dependencies` are the
+  installed packages, and **Brood's existing package manager** (ADR-037: `:dependencies`,
+  `project.lock.blsp`, `_deps/`, `nest add/fetch`) is the package system. A package hooks
+  in by calling the same registration functions core uses (`register-type-layers`,
+  `bind-key`, `defsetting`, …) — the registries *are* the plugin API. Live, restart-free
+  install via the mutable `*load-path*` + late binding. Brood-side gaps: package-rooted
+  namespaces + `:exports` (ADR-070 — the one real language investment, gating third-party
+  packages) and a runtime `load-nest`. Editor-side: config-dir-as-nest startup loader,
+  `M-x package-install`, `autoload`, a `use-package`-style `(package …)` form. Decided
+  direction, **not building yet** — full design + staged path: **`docs/packages.md`**.
+
 ## A.2 Emacs-parity round 2 (done)
 
 A batch of everyday Emacs commands + discoverability, all on existing primitives
@@ -218,6 +246,40 @@ A batch of everyday Emacs commands + discoverability, all on existing primitives
   a Brood `stat`/`file-info` builtin + a `std/time` epoch→calendar formatter** — the next
   language additions that would upgrade dired (deferred, not built).
 - ✅ registers, bookmarks, keyboard macros, occur — see §A.2.
+
+---
+
+## H. Brood (upstream) — gaps the editor needs
+
+Prime-directive items: capabilities the editor wants that belong in **Brood** (`../brood`),
+not hacked in here. Recorded as suggestions; implement upstream.
+
+- ⬜ **Module cache for fast startup** (the big one). Cold start is **~680ms of module
+  load** — Brood re-reads, parses, macro-expands and evals the *entire* editor + `std`
+  source on every launch (there's no compiled-module cache). Measured 2026-06-16, ruling
+  out the likely suspects:
+  - **Not eval/alloc speed**: a pre- vs post-ADR-112/mimalloc binary evals 2000 `defn`s
+    identically (5ms) and loads a std graph identically (61ms). The 2026-06-15 brood perf
+    commits did **not** regress startup.
+  - **Not a few heavy modules**: lsp / web / magit / bshell cost **~0ms incrementally**
+    once the core is loaded (they only *look* heavy cold because they pull the shared
+    core). Lazy-loading them buys nothing — the cost is the mandatory core graph
+    (model + commands + view + input + their `std` deps).
+
+  The fix is a **Brood loader feature**, in increasing payoff/effort:
+  1. a **compiled-form cache** (`.pyc`/`.elc`-style): cache each module's macro-expanded /
+     bytecode form keyed by source hash; skip parse+macroexpand when the source is unchanged
+     (editor source rarely changes between launches → near-100% hit rate);
+  2. embed `std` **precompiled** in `nest` (it's embedded as *source* today, re-parsed each run);
+  3. an **image snapshot** / portable dump (restore the fully-loaded image — fastest, hardest).
+- ⬜ **Faster `std/diff`** (general, low priority). Stock `std/diff` is an O(n²) LCS table,
+  documented "a few hundred items". The editor's diff-hl no longer needs it — it shells out
+  to `git diff --no-index` (matching Emacs `diff-hl`) — but a Myers O(n·d) `std/diff` would
+  help any other consumer.
+
+(Other upstream gaps are noted inline above: narrow-to-region needs a `std/editor/buffer`
+restriction (§D); `stat`/`file-info` + a `std/time` formatter for richer dired (§D); regex
+ranges and `layers` extras (§D).)
 
 ---
 
