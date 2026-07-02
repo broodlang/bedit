@@ -4,9 +4,9 @@
 
 (defmodule git-test (:use test) (:use git))
 
-(describe "git: porcelain parse"
+(describe "git: porcelain parse (-z, NUL-separated)"
   (test "staged / unstaged / untracked classification"
-    (let (es (git/git--entries "M  staged.rb\n M unstaged.rb\n?? new.rb\nMM both.rb"))
+    (let (es (git/git--entries "M  staged.rb\u{0} M unstaged.rb\u{0}?? new.rb\u{0}MM both.rb"))
       (assert= (count es) 4)
       (is (git/git--staged? (first es)))            ; "M " → staged
       (is (not (git/git--unstaged? (first es))))
@@ -14,15 +14,21 @@
       (is (git/git--untracked? (nth es 2)))         ; "??" → untracked
       (is (git/git--staged? (nth es 3)))            ; "MM" → both
       (is (git/git--unstaged? (nth es 3)))))
-  (test "a rename keeps the new path"
-    (assert= (get (git/git--parse-entry "R  old.rb -> new.rb") :path) "new.rb"))
-  (test "a too-short / blank line is skipped"
-    (assert= (git/git--entries "\n  \nM  a") (list {:x "M" :y " " :path "a"}))))
+  (test "a rename keeps the new path and consumes the source token, then resyncs"
+    (let (es (git/git--entries "R  new name.rb\u{0}old name.rb\u{0} M after.rb"))
+      (assert= (count es) 2)                          ; the source path is not its own entry
+      (assert= (get (first es) :path) "new name.rb")
+      (assert= (get (nth es 1) :path) "after.rb")))   ; parsing realigns after the rename source
+  (test "a path with spaces is kept whole (no -z quoting)"
+    (assert= (get (first (git/git--entries " M a file with spaces.rb")) :path)
+      "a file with spaces.rb"))
+  (test "a too-short token is skipped"
+    (assert= (git/git--entries "\u{0}  \u{0}M  a") (list {:x "M" :y " " :path "a"}))))
 
 (describe "git: status render"
   (test "sections appear with their files; rows align to file lines"
     (let (r (git/git--render "main"
-              (git/git--entries "M  s.rb\n M u.rb\n?? n.rb"))
+              (git/git--entries "M  s.rb\u{0} M u.rb\u{0}?? n.rb"))
           rows (get r :rows)
           lines (string-split (get r :text) "\n"))
       ;; header line 0, blank line 1
@@ -41,17 +47,43 @@
         (is (get (get byp "s.rb") :staged?))
         (is (not (get (get byp "u.rb") :staged?)))
         (is (get (get byp "n.rb") :untracked?)))))
+  (test "the unstaged section renders above the staged section"
+    (let (text (get (git/git--render "main" (git/git--entries "M  s.rb\u{0} M u.rb")) :text))
+      (is (< (string-index-of text "Unstaged changes:")
+            (string-index-of text "Staged changes:")))))
+  (test "row-section / section-lines classify rows by section and keep buffer-line indices"
+    (let (rows (get (git/git--render "main" (git/git--entries "M  s.rb\u{0} M u.rb\u{0}?? n.rb")) :rows)
+          byp (fold (fn (a x) (if (nil? x) a (assoc a (get x :path) x))) {} rows))
+      ;; one file row per section, classified by row-section
+      (assert= (git/git--row-section (get byp "u.rb")) :unstaged)
+      (assert= (git/git--row-section (get byp "s.rb")) :staged)
+      (assert= (git/git--row-section (get byp "n.rb")) :untracked)
+      (is (nil? (git/git--row-section nil)))
+      ;; section-lines returns the (single) buffer line index of each section's file
+      (assert= (count (git/git--section-lines rows :unstaged)) 1)
+      (assert= (count (git/git--section-lines rows :staged)) 1)
+      (assert= (count (git/git--section-lines rows :untracked)) 1)
+      ;; new order: the unstaged file's line is above the staged file's line
+      (is (< (first (git/git--section-lines rows :unstaged))
+            (first (git/git--section-lines rows :staged))))
+      ;; the indices really point back at the right rows
+      (is (= (get (nth rows (first (git/git--section-lines rows :staged))) :path) "s.rb"))))
   (test "a clean tree renders the clean message and no rows"
     (let (r (git/git--render "main" '()))
       (is (includes? (get r :text) "working tree clean"))
       (is (empty? (remove nil? (get r :rows))))))
   (test "an expanded file shows its diff inline, indented, as non-actionable rows"
     (let (es (git/git--entries " M f.txt")
-          r (git/git--render "main" es (list "f.txt") {"f.txt" "@@ -1 +1 @@\n-old\n+new"})
+          r (git/git--render "main" es (list "f.txt") {"f.txt" {:unstaged "@@ -1 +1 @@\n-old\n+new"}})
           rows (get r :rows))
       (is (includes? (get r :text) "    @@ -1 +1 @@"))     ; indented hunk header
       (is (includes? (get r :text) "    +new"))            ; indented added line
       (assert= (count (remove nil? rows)) 1)))  ; only the file row is actionable
+  (test "a both-staged-and-unstaged file shows each section's own diff under its row"
+    (let (text (get (git/git--render "main" (git/git--entries "MM f.txt") (list "f.txt")
+                      {"f.txt" {:staged "+staged-side" :unstaged "+unstaged-side"}}) :text))
+      (is (includes? text "    +unstaged-side"))    ; under the unstaged row → working-tree diff
+      (is (includes? text "    +staged-side"))))    ; under the staged row → --cached diff
   (test "without expansion the diff is not shown"
     (let (r (git/git--render "main" (git/git--entries " M f.txt")))
       (is (not (includes? (get r :text) "@@"))))))
