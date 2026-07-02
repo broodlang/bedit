@@ -55,15 +55,17 @@ buffer stays navigable."
     (let (nb (assoc (f (ed-current-buf m)) :modified true))
       (assoc (ed-set-buf m nb) :status "modified"))))
 
-(defn ed-name-prompt (prompt names on-complete &optional (limit 20))
+(defn ed-name-prompt (prompt names on-complete &optional (limit 20) (recent []))
   "A Vertico minibuffer spec that completes input against a fixed `names` list — Tab to
 the common prefix, a fuzzy candidate list (top `limit`) — and runs `on-complete`
 (`(model text) -> model`) on the accepted entry. The shared shape behind M-x,
-switch-buffer, recentf, describe-function, and bookmark-jump."
+switch-buffer, recentf, describe-function, and bookmark-jump. `recent` (a most-recent-first
+list, default none) floats its entries to the top on empty input via the shared
+`projects/float-recent` — the same recency any completion opts into (see `recent-commands`)."
   {:edit (ed-mb-edit prompt "")
    :on-complete on-complete
    :complete-fn (fn (t) (ed-complete-name t names))
-   :rank-source names  ; fuzzy-ranked + capped to `limit` by the minibuffer, narrowed on typing
+   :rank-source (projects/float-recent names recent)  ; recents first, then fuzzy-narrowed on typing
    :rank-cap limit
    :accept-selection true})
 
@@ -1827,6 +1829,23 @@ the **current** buffer's `:dir`, so it opens 'in' the directory/project you were
         bufs (into (get m :buffers) [with-dir]))
     (ed-select (assoc m :buffers bufs) (dec (count bufs)))))
 
+(defn ed-upsert-named (m nm text &optional (type nil))
+  "Add or replace the pool buffer named `nm` holding `text` (stamped `type`, so a special mode
+and its read-only `:activate` hook apply) **without** touching the layout or selection. The
+pool-side half shared by `ed-show-named` (which then selects it) and `ed-show-named-aside`
+(which shows it in a side pane). Look the buffer's index up afterwards with
+`ed-buffer-index-by-name`. A fresh buffer inherits the current buffer's `:dir`; a re-show keeps
+the existing one's."
+  (let (idx (ed-buffer-index-by-name m nm)
+        raw (make-buffer text nm)
+        buf (if (nil? type) raw (editor/layers/set-buffer-type raw type)))
+    (if (nil? idx)
+      (assoc m :buffers (into (get m :buffers)
+                          [(assoc (ed-stamp buf) :dir (get (ed-current-buf m) :dir))]))
+      (assoc m :buffers (assoc (get m :buffers) idx
+                          (assoc (ed-stamp buf) :dir (or (get (nth (get m :buffers) idx) :dir)
+                                                       (get (ed-current-buf m) :dir))))))))
+
 (defn ed-show-named (m nm text &optional (type nil))
   "Show a report buffer named `nm` holding `text` in the selected pane — replacing its
 contents if a buffer of that name already exists, else opening a fresh one. With a
@@ -1834,16 +1853,29 @@ contents if a buffer of that name already exists, else opening a fresh one. With
 so a special mode (and its read-only `:activate` hook) applies — so a refresh
 (re-show) re-stamps and re-applies it. The reuse seam for generated/refreshable
 buffers (*Process List*, and later *Kill Ring* etc.)."
-  (let (idx (ed-buffer-index-by-name m nm)
-        raw (make-buffer text nm)
-        buf (if (nil? type) raw (editor/layers/set-buffer-type raw type)))
-    (if (nil? idx)
-      (ed-open-buffer m buf)  ; new: inherits the current buffer's :dir
-      ;; re-show: keep the existing buffer's :dir (else inherit current), so a refresh of a
-      ;; generated buffer (*Occur*, …) doesn't lose its default-directory.
-      (ed-select (assoc m :buffers (assoc (get m :buffers) idx
-                          (assoc (ed-stamp buf) :dir (or (get (nth (get m :buffers) idx) :dir)
-                                                       (get (ed-current-buf m) :dir))))) idx))))
+  (let (m1 (ed-upsert-named m nm text type))
+    (ed-select m1 (ed-buffer-index-by-name m1 nm))))
+
+(defn ed--other-pane-path (layout)
+  "The path of the pane `C-x o` would move to from the selected one (the next leaf in traversal
+order, wrapping) — where a side/preview buffer goes."
+  (let (paths (pane-leaf-paths layout)
+        i (index-of paths (pane-selected-path layout)))
+    (nth paths (mod (inc i) (count paths)))))
+
+(defn ed-show-named-aside (m nm text &optional (type nil))
+  "Show report buffer `nm`/`text`/`type` in the pane to the **right** of the selected one — a
+side / preview pane — splitting one off when the selected pane is alone, else reusing the next
+pane. Selection stays on the current buffer, so the caller's list keeps focus (press-to-preview).
+Upserts the named buffer like `ed-show-named`, so repeated calls refresh the side pane in place."
+  (let (m1 (ed-upsert-named m nm text type)
+        idx (ed-buffer-index-by-name m1 nm)
+        layout (get m1 :layout))
+    (assoc m1 :layout
+      (if (= (pane-count layout) 1)
+        (pane-split layout :col (ed-pane idx))
+        (pane-update-path layout (ed--other-pane-path layout)
+          (fn (w) (assoc w :buffer idx :top 0)))))))
 
 (defn ed-switch-to-named (m nm)
   "Switch to the buffer named `nm`, or report there's no such buffer."
@@ -2071,32 +2103,32 @@ is the one the current buffer is in (`ed-project-root`), not where the editor la
 
 ;; ---- M-x: run any interactive command by name -------------------------------
 
-(defn ed--mx-record (m name)
-  "Prepend `name` to `:mx-history` (most-recent first, deduped, capped at 20)."
-  (assoc m :mx-history
-    (take 20 (cons name (remove (fn (x) (= x name)) (or (get m :mx-history) []))))))
-
 (defcommand cmd-execute-extended-command
   (m key)
   "Prompt for an interactive command name and run it (M-x). Completes against the
 commands relevant to the current buffer's active layers: global commands plus any
-mode-specific ones the active layers expose via their `:commands` facet. Recently-used
-commands appear first (most-recent at the top), then the alphabetical remainder."
+mode-specific ones the active layers expose via their `:commands` facet. Recently-run
+commands appear first (most-recent at the top), then the alphabetical remainder — the
+history is **persisted across restarts** via the same recentf mechanism (`recent-commands`
+/ `remember-command!`), floated by the shared `projects/float-recent`."
   (let (buf (ed-current-buf m)
         active-cmds (apply concat (ed-active-mode-commands buf))
         owned (ed-all-layer-commands)
         all-names (sort (concat (remove (fn (n) (includes? owned n)) (interactive/command-names))
-                          active-cmds))
-        hist (filter (fn (n) (includes? all-names n)) (or (get m :mx-history) []))
-        names (concat hist (remove (fn (n) (includes? hist n)) all-names)))
+                          active-cmds)))
     (assoc m
       :minibuffer
       (ed-name-prompt "M-x "
-        names
+        all-names
         (fn (mm t)
-          (interactive/run-command (ed--mx-record mm t) t
+          (interactive/run-command
+            ;; persist real commands as recent — live editor only (`:recent-files`), so tests
+            ;; and headless runs never write the shared cache (mirrors recentf's guard)
+            (do (when (and (get mm :recent-files) (interactive/command-sym t)) (remember-command! t)) mm)
+            t
             (fn (mmm nm) (message mmm (str "no command: " nm)))))
-        15))))
+        15
+        (if (get m :recent-files) (recent-commands) [])))))  ; persisted M-x history, floated to the top
 
 ;; ---- fuzzy in-buffer line search (M-s) --------------------------------------
 ;; The same Vertico minibuffer the other completers use, ranking the buffer's own lines
@@ -2450,13 +2482,13 @@ the editor."
 
 ;; ---- serve the selected buffer over HTTP (the live web mirror, C-x w) -------
 
-(defcommand cmd-serve-buffer
+(defcommand cmd-buffer-server-start
   (m key)
   "Serve the selected pane's buffer over HTTP — a browser-viewable mirror that
-auto-refreshes as you type (C-x w · M-x serve-buffer). Tries port 5000, falling
+auto-refreshes as you type (C-x w · M-x buffer-server-start). Tries port 5000, falling
 back to an OS-assigned one; the URL appears in the echo area once the socket is
 bound. Re-running reports the running server's URL rather than starting a second.
-M-x stop-serving tears it down. (The push/render lives in `web`.)"
+M-x buffer-server-stop tears it down. (The push/render lives in `web`.)"
   (let (srv (get m :server))
     (if (nil? srv)
       (message (assoc m :server (web-start m 5000)) "starting web server…")
@@ -2999,9 +3031,9 @@ word) instead."
       (= (get lc :kind) :textobj) (ed--vim-word-object m0 (get lc :op) (get lc :around))
       :else m)))
 
-(defcommand cmd-stop-serving
+(defcommand cmd-buffer-server-stop
   (m key)
-  "Stop the buffer web server started by `serve-buffer` (M-x stop-serving)."
+  "Stop the buffer web server started by `buffer-server-start` (M-x buffer-server-stop)."
   (let (srv (get m :server))
     (if (nil? srv)
       (message m "no web server running")

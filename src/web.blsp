@@ -1,6 +1,6 @@
 (defmodule web
   "Serve the selected pane's buffer over HTTP — a **live** mirror of what you're
-editing, viewable in a browser (M-x serve-buffer, C-x w). The page opens an
+editing, viewable in a browser (M-x buffer-server-start, C-x w). The page opens an
 `EventSource('/events')` and the editor *pushes* every edit and cursor move down
 that stream (Server-Sent Events); a few lines of JavaScript swap the updated region
 into the DOM. No polling, no flicker.
@@ -172,14 +172,20 @@ to CSS, plain escaped text otherwise."
 `highlight/fontify-runs`; this only emits each resulting run's `<span>`."
   (join "" (map web--chunk-html (fontify-runs s base spans (web--region-ranges region)))))
 
+(defn web--gutter-chunk (chunk)
+  "One gutter `[text face]` chunk as a non-selectable `<span>`."
+  (let ([txt face] chunk)
+    (web--span txt "gutter" (web--face-style face))))
+
 (defn web--gutter-html (gutter idx)
-  "The materialised `:gutter` cell for 0-based line `idx` as a non-selectable `<span>`
-(its `[text face]` from the snapshot), or \"\" when there's no gutter. The cell text is
-already padded to the gutter width, so it tiles fixed-width inside the `<pre>`."
+  "The materialised `:gutter` cell for 0-based line `idx` as non-selectable `<span>`(s), or
+\"\" when there's no gutter. A cell is one or more `[text face]` chunks (a **file** buffer
+carries a diff-hl change bar chunk *and* the dim line number) — normalised via the shared
+`model/gutter-cell-chunks`, the same decoder the native view uses, so the two renderers stay in
+lock-step. The cell text is already padded, so it tiles fixed-width inside the `<pre>`."
   (if (nil? gutter)
     ""
-    (let ([txt face] (nth (get gutter :cells) idx))
-      (web--span txt "gutter" (web--face-style face)))))
+    (join "" (map web--gutter-chunk (gutter-cell-chunks (nth (get gutter :cells) idx))))))
 
 (defn web--line-html (line base idx spans region cur-line cur-col gutter)
   "One buffer line (first char at offset `base`, line number `idx`) as faced HTML: the
@@ -293,11 +299,23 @@ frames travel as messages: one writer per socket, no interleaved bytes."
   "An open SSE connection's pump. Writes each `[:frame snap]` the publisher fans out
 (this worker is the sole writer to its socket `c`); drops out on `[:tcp-closed]`
 (the browser left) or `[:close]` (the server is shutting down), unsubscribing first;
-sends a comment line when idle to hold the connection open. A failed write means a
-dead socket — unsubscribe and end the worker."
-  (receive ([:frame s] (if (try (do (sse-send c (web-render-app s)) true) (catch e false))
-                         (web--sse-loop c pub)
-                         (send pub [:unsubscribe (self)])))
+sends a comment line when idle to hold the connection open.
+
+Rendering is done **outside** the socket-write guard and its failure is treated
+differently from a write failure — this is the resilience lesson from the file-buffer
+gutter crash: a *rendering* bug must not masquerade as a dead socket. A throw from
+`web-render-app` is **logged and the frame skipped**, keeping the browser subscribed so it
+recovers on the next good frame; only a genuine `sse-send` *write* failure means the socket
+is dead — then unsubscribe and end the worker. (Previously any render throw was caught as a
+write failure and silently dropped the browser, freezing the mirror with no trace.)"
+  (receive ([:frame s]
+            (let (rendered (try [:html (web-render-app s)]
+                             (catch e (do (eprintln (str "web: skipped a frame, render failed: " (error-message e)))
+                                        :render-failed))))
+              (cond
+                (= rendered :render-failed) (web--sse-loop c pub)  ; render bug: log + skip, stay connected
+                (try (do (sse-send c (second rendered)) true) (catch e false)) (web--sse-loop c pub)
+                :else (send pub [:unsubscribe (self)]))))  ; dead socket: the browser is gone
     ([:tcp-closed ~c] (send pub [:unsubscribe (self)]))
     ([:tcp ~c d] (web--sse-loop c pub))
     ([:close] (tcp-close c))
@@ -365,9 +383,20 @@ Idempotent — `send`/`exit` no-op on dead pids."
 (defn web-publish! (m)
   "If a server is running, push the current snapshot to its publisher; return `m`
 unchanged. The per-event hook `ed-update` calls so the browser mirrors edits *and*
-cursor motion live. Send failures (e.g. a torn-down publisher) are swallowed so a
-publish can never disrupt editing."
+cursor motion live. A failure (a torn-down publisher, or a `web-snapshot` that throws on
+a corrupt buffer state) can never disrupt editing — but it is **logged**, not swallowed
+silently: a swallowed snapshot error would freeze the mirror on its last frame with no
+trace of why (the bug behind 'the page sticks on the old buffer when I switch'). The log
+carries the selected buffer's name/line-count/point so the offending state is diagnosable."
   (let (srv (get m :server))
     (when srv
-      (try (send (get srv :pub) [:put (web-snapshot m)]) (catch e nil)))
+      (try (send (get srv :pub) [:put (web-snapshot m)])
+        (catch e
+          ;; Log why the mirror couldn't update — guarded, so a corrupt buffer can't make the
+          ;; diagnostic itself throw out of the publish (which must never disrupt editing).
+          (eprintln (try (let (b (ed-current-buf m))
+                           (str "web-publish: mirror update skipped (buffer "
+                             (buffer-name b) ", lines=" (buffer-line-count b)
+                             ", point=" (buffer-point b) "): " (error-message e)))
+                      (catch e2 (str "web-publish: mirror update skipped: " (error-message e))))))))
     m))
