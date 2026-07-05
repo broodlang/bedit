@@ -508,10 +508,10 @@ lines, scaled by Ctrl+wheel zoom) is `ed--pane-body-ops`; the band, scrollbar an
 chrome mode line wrap it the same way at every scale.
 
 When a trackpad gesture is in progress, the pane carries a `:scroll-frac` ∈ [0, 1) from
-`ed-smooth-scroll-pane`. We emit `[:scroll-offset frac]` before the scrollable text-area
-ops (shifting them upward by `frac × cell_h` pixels), render one extra row to fill the
-gap at the bottom, and reset to `[:scroll-offset 0.0]` before the fixed chrome (scrollbar,
-mode line) so those never shift. ADR-114."
+`ed-smooth-scroll-pane`. We collect all scrollable ops (bands, gutter, body, cursor) into
+a `scroll-region` block — a scoped, self-resetting primitive (ADR-114). The scrollbar and
+mode line (fixed chrome) are emitted outside the region so they never shift. When frac = 0
+the ops are emitted flat (no region wrapper) for test-compatibility and zero overhead."
   (let ([x y w h] (get pane :rect)
         buf (ed-pane-buf m pane)
         top (ed-pane-top pane buf)
@@ -519,31 +519,43 @@ mode line) so those never shift. ADR-114."
         scroll-frac (ed-pane-scroll-frac pane)
         s (ed-pane-scale pane)
         gw (ed-gutter-width buf (ed-gutter-shown? buf pane))
+        vw (max 1 (quot w s))
+        tw (max 1 (- vw gw))
         text-h (max 0 (dec h))
         ;; render one extra row when smoothly scrolling so the partial-line gap at the
-        ;; bottom is filled (the mode line's rect, painted after the reset, covers overflow)
+        ;; bottom is filled (the mode line's rect, outside the scroll-region, covers overflow)
         render-h (if (> scroll-frac 0.001) (inc text-h) text-h)
         spans (ed-pane-spans m pane buf top (ed-pane-vrows pane))
         overrides (if (get pane :selected)
                     (concat (ed-bracket-overrides buf) (ed-diagnostic-overrides m buf))
                     '())
-        hl-ranges (ed-hl-ranges m buf (get pane :selected)))
+        hl-ranges (ed-hl-ranges m buf (get pane :selected))
+        ;; cursor op: only for the selected pane, only when no minibuffer is open, and
+        ;; only on the blink-on phase. Included inside the scroll-region so it shifts with
+        ;; the text rather than sitting above it at the unshifted cell position.
+        cursor-op (when (and (get pane :selected)
+                             (nil? (get m :minibuffer))
+                             (or (get m :blink-on?) (get m :held-key)))
+                    (cursor (+ y (* (- (buffer-current-line buf) top) s))
+                            (+ x (* (+ gw (max 0 (min (dec tw)
+                                                       (ed-visual-column-from buf hscroll)))) s))
+                            (ed--cursor-style m)))
+        ;; all ops that belong inside the scroll-region (shifted by frac × cell_h)
+        scrollable (into []
+                     (concat
+                       ;; the line-number gutter gets its own recessed surface
+                       (ed--hl-line-band m pane buf top x y w gw text-h s)
+                       (if (> gw 0) [(rect y x (* (max 0 (- gw *gutter-edit-margin*)) s) text-h face-gutter-bg)] [])
+                       (ed--region-eol-bands buf top text-h x y w gw s hscroll)
+                       (ed--pane-body-ops buf top render-h x y w gw s hl-ranges spans overrides hscroll)
+                       (if cursor-op [cursor-op] []))))
     (concat
-      ;; emit the scroll offset before the scrollable region so all text/rect/cursor ops
-      ;; within it are shifted up by frac × cell_h pixels (0.0 = no-op, a cheap reset)
-      [(scroll-offset scroll-frac)]
-      ;; the line-number gutter gets its own recessed surface (no border, just a bg step) —
-      ;; a `rect` over the gutter columns for the full text height. It stops
-      ;; `*gutter-edit-margin*` column(s) short of the text, so the gutter cell's trailing
-      ;; separator space sits on the *edit* background — a slight light gap between the number
-      ;; and the text, not a wide dark recessed band. The hl-line band starts at the text
-      ;; (past the whole gutter), so that margin gap reads the same on the current line too.
-      (ed--hl-line-band m pane buf top x y w gw text-h s)  ; text-area band, behind the text
-      (if (> gw 0) [(rect y x (* (max 0 (- gw *gutter-edit-margin*)) s) text-h face-gutter-bg)] [])  ; recessed gutter surface
-      (ed--region-eol-bands buf top text-h x y w gw s hscroll) ; fill empty/short lines in the region
-      (ed--pane-body-ops buf top render-h x y w gw s hl-ranges spans overrides hscroll)
-      ;; reset scroll offset before fixed chrome so scrollbar and mode line never shift
-      [(scroll-offset 0.0)]
+      ;; scrollable region: flat when frac ≈ 0 (no overhead, tests see top-level ops),
+      ;; wrapped in a scroll-region when frac > 0 (self-resetting, no sentinel needed)
+      (if (> scroll-frac 0.001)
+        [(scroll-region scroll-frac scrollable)]
+        scrollable)
+      ;; fixed chrome: scrollbar + mode line, always outside the scroll-region
       (ed-scrollbar-ops buf top text-h (+ x (dec w)) y (ed-scrollbar-opacity m))
       (ed-pane-modeline m pane buf))))
 
@@ -793,7 +805,9 @@ layout."
           ;; caret is consistent everywhere (typing resets it solid via `ed-real-input?`,
           ;; then it blinks at rest). Kept solid only while a key is repeating (the point is
           ;; actively moving, so blinking would strobe).
-          (if (or (get m :blink-on?) (get m :held-key))
+          ;; Buffer pane cursor is inside each pane's scroll-region (see ed-pane-ops).
+          ;; Only the minibuffer cursor is emitted here — it lives in the fixed echo row.
+          (if (and (get m :minibuffer) (or (get m :blink-on?) (get m :held-key)))
             [(ed-cursor m panes cols rows)]
             []))))
     (catch e
