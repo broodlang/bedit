@@ -1,13 +1,17 @@
 (defmodule git
-  "A git porcelain: `C-x g` opens a read-only `*git-status*` buffer listing the
-branch and the Unstaged / Staged / Untracked sections (from `git status --porcelain`), with
-single-key actions — s/u/k stage/unstage/discard the file under point, c commit (an editable
-`*git-commit*` buffer; C-c C-c commits), RET preview its diff in a read-only split to the right
-(TAB shows it inline instead), d the diff in the whole pane, g refresh, q quit, P/F push/pull,
-l log. The dired pattern: a `:git-status` mode layer over a generated buffer, with the per-row
-file kept on the model (`:git-rows`, parallel to the buffer's lines) so a command reads the
-line under point without re-parsing text. Git runs synchronously via `%os-cmd` in the repo
-root (`:git-root`). Parsing/rendering are pure (tests/git_test.blsp)."
+  "A git porcelain modelled on Magit: `C-x g` opens a read-only `*git-status*` buffer with
+Unstaged / Staged / Untracked / Unpushed / Unpulled sections. Single-key actions — s/u/k
+stage/unstage/discard the **file or hunk** under point, S stage-all, U unstage-all, c commit
+(a amend), b b checkout branch / b c create branch, n/p jump between actionable rows, TAB
+expand file hunks inline / collapse section, RET preview diff or show commit, d diff whole pane,
+g refresh, q quit, P/F push/pull, l log, z z/z p stash push/pop. Hunk-level staging: TAB expands
+a file showing each `@@` hunk as an actionable row; s/u/k on a hunk runs `git apply --cached`
+(or its reverse) piping the patch via stdin (`%os-cmd-stdin`). Section collapsing: TAB on a
+section header toggles it between expanded and collapsed (`:git-collapsed-sections` tracks which).
+The dired pattern: a `:git-status` mode layer over a generated buffer, with the per-row data (file,
+hunk, section-header, OR commit-log row) kept on the model (`:git-rows`, parallel to the buffer's
+lines) so commands read the current row without re-parsing text. Git runs synchronously via
+`%os-cmd` in the repo root (`:git-root`). Parsing/rendering are pure (tests/git_test.blsp)."
   (:use model)         ; ed-current-buf / ed-set-buf / message / ed-read-char / ed-apply
   (:use commands)      ; ed-show-named / ed--default-dir / ed--goto-line / cmd-kill-buffer
   (:use interactive)   ; defcommand
@@ -117,6 +121,61 @@ keeps non-ASCII paths literal (no octal escapes) in status / diff output."
   "The repo root: `:git-root` when already in a git buffer, else `git--toplevel` of the
 current file's directory. Returns nil when not in a git repository."
   (or (get m :git-root) (git--toplevel (commands/ed--default-dir m))))
+
+;; ---- hunk parsing + patch construction (for hunk-level staging) ------------
+;; Magit's defining feature: TAB on a file expands it into individual `@@` hunks, each
+;; an actionable row. `s`/`u`/`k` on a hunk row builds a minimal one-hunk patch and pipes
+;; it to `git apply --cached` (or its reverse) via `%os-cmd-stdin` — `git apply -` reads
+;; the patch from stdin, avoiding any temp file.
+
+(defn git--finish-hunk (acc)
+  "Flush the pending hunk (`{:header :lines}`) into `:hunks` and reset the accumulator."
+  (if (nil? (get acc :pending-header))
+    acc
+    (assoc acc
+      :pending-header nil
+      :pending-lines []
+      :hunks (concat (get acc :hunks)
+               (list {:header (get acc :pending-header)
+                      :lines  (get acc :pending-lines)})))))
+
+(defn git--parse-hunks (diff-text)
+  "Parse a unified diff into `{:headers [file-header-lines] :hunks [{:header @@-line :lines
+body-lines}]}`. Lines before the first `@@` are file headers (diff/index/---/+++ lines);
+each `@@`-prefixed line starts a new hunk whose body lines follow. Empty or nil input
+gives zero hunks."
+  (if (or (nil? diff-text) (= (trim diff-text) ""))
+    {:headers [] :hunks []}
+    (let (result (fold (fn (acc line)
+                         (cond
+                           (starts-with? (triml line) "@@")
+                           (assoc (git--finish-hunk acc)
+                             :pending-header line :pending-lines [])
+                           (nil? (get acc :pending-header))
+                           (assoc acc :headers (concat (get acc :headers) (list line)))
+                           :else
+                           (assoc acc :pending-lines (concat (get acc :pending-lines) (list line)))))
+                   {:headers [] :hunks [] :pending-header nil :pending-lines []}
+                   (string-split diff-text "\n")))
+      (let (final (git--finish-hunk result))
+        {:headers (get final :headers) :hunks (get final :hunks)}))))
+
+(defn git--hunk-patch (parsed hunk)
+  "A valid minimal patch for `hunk` alone: the diff file headers + this one hunk's lines,
+joined with newlines. Pass to `git apply --cached` (or `--reverse`) to stage/unstage just
+this hunk."
+  (join "\n" (concat (get parsed :headers) (list (get hunk :header)) (get hunk :lines))))
+
+(defn git--apply-hunk (root patch-text cached? reverse?)
+  "Pipe `patch-text` to `git apply -` (stdin). `cached?` adds `--cached` (index);
+`reverse?` adds `--reverse` (for unstage/discard). Returns `{:exit :stdout :stderr}`."
+  (%os-cmd-stdin "git"
+    (into ["-C" root "-c" "core.quotePath=false"
+           "apply" "--ignore-space-change"]
+      (concat (if cached?  ["--cached"]  [])
+              (if reverse? ["--reverse"] [])
+              ["-"]))
+    patch-text))
 
 ;; ---- pure: parse `git status --porcelain -z` --------------------------------
 ;; The NUL-separated form is robust to paths with spaces / quotes / newlines (no quoting, no
@@ -262,51 +321,134 @@ and git actions a beat after they settle. Outside a repo the segments are `()` (
 `:untracked`): `{:path :staged? :untracked?}`."
   {:path (get e :path) :staged? (= section :staged) :untracked? (= section :untracked)})
 
+(def git--label-width 9)  ; "untracked" is the widest label
+
+(defn git--entry-label (e section)
+  "A human-readable status label for `e` in `section`, matching Magit's file-status display."
+  (cond
+    (= section :untracked) "untracked"
+    (= section :staged)
+    (cond
+      (= (get e :x) "M") "modified"
+      (= (get e :x) "A") "new file"
+      (= (get e :x) "D") "deleted"
+      (= (get e :x) "R") "renamed"
+      (= (get e :x) "C") "copied"
+      :else              (str (get e :x) (get e :y)))
+    :else  ; unstaged
+    (cond
+      (= (get e :y) "M") "modified"
+      (= (get e :y) "D") "deleted"
+      (= (get e :y) "U") "conflict"
+      :else              (str (get e :x) (get e :y)))))
+
+(defn git--hunk-pairs (path section parsed)
+  "`[line row]` pairs for one expanded section's parsed diff: each `@@` hunk header becomes an
+actionable hunk row `{:path :section :hunk? true :hunk-patch}` so s/u/k operate on just that
+hunk; its body lines (context, +/- lines) are non-actionable `nil` rows."
+  (if (empty? (get parsed :hunks))
+    (list ["    (no diff)" nil])
+    (mapcat (fn (hunk)
+              (let (patch (git--hunk-patch parsed hunk)
+                    hrow  {:path path :section section :hunk? true :hunk-patch patch})
+                (concat
+                  (list [(str "    " (get hunk :header)) hrow])
+                  (map (fn (l) [(str "    " l) nil]) (get hunk :lines)))))
+      (get parsed :hunks))))
+
 (defn git--file-pairs (e section expanded diffs)
-  "`[line row]` pairs for one file in `section`: its `[\"  XY path\" row]` line, plus — when its
-path is in `expanded` — *that section's* diff (from `diffs`, `path → {section → text}`) as
-indented `[line nil]` lines below it (TAB toggles this). Keying the diff by section is what lets
-a file with both staged and unstaged changes show the right hunks under each of its rows."
+  "`[line row]` pairs for one file in `section`: its `[\"  label   path\" row]` line (with a
+human-readable status label rather than raw XY codes), plus — when the path is in `expanded`
+— that section's parsed hunks as indented hunk rows and body lines (TAB toggles). Hunk `@@`
+lines are actionable; body lines are nil."
   (let (path (get e :path)
-        head [(str "  " (get e :x) (get e :y) " " path) (git--row e section)]
+        label (git--entry-label e section)
+        head [(str "  " (pad-right label git--label-width) "  " path) (git--row e section)]
         body (if (includes? expanded path)
-               (let (d (or (get-in diffs [path section]) ""))
-                 (map (fn (l) [(str "    " l) nil])
-                   (string-split (if (= (trim d) "") "(no diff)" d) "\n")))
+               (let (parsed (get-in diffs [path section]))
+                 (if (nil? parsed)
+                   (list ["    (no diff)" nil])
+                   (git--hunk-pairs path section parsed)))
                '()))
     (concat (list head) body)))
 
-(defn git--section-pairs (title entries section expanded diffs)
-  "`[line row]` pairs for one section (empty when no entries): a `[title nil]` header, the
-file rows (each possibly with an expanded diff body), then a `[\"\" nil]` blank."
+(defn git--section-pairs (title entries section expanded diffs &optional (collapsed '()))
+  "`[line row]` pairs for one section (empty when no entries). The title line gets a
+`{:section-header section}` row so TAB can detect and collapse it. When `section` is in
+`collapsed`, only the header + a blank show (file rows are hidden)."
   (if (empty? entries)
     '()
     (concat
-      (list [title nil])
-      (mapcat (fn (e) (git--file-pairs e section expanded diffs)) entries)
+      (list [(str title " (" (count entries) "):") {:section-header section}])
+      (if (includes? collapsed section)
+        '()
+        (mapcat (fn (e) (git--file-pairs e section expanded diffs)) entries))
       (list ["" nil]))))
 
-(defn git--render (branch entries &optional (expanded '()) (diffs {}))
+(defn git--upstream-commits (root direction)
+  "Commits between HEAD and upstream in `direction` (`:unpushed` → commits ahead of upstream;
+`:unpulled` → commits upstream has that HEAD doesn't). Returns `({:hash :subject} ...)`,
+or `()` when there is no upstream or the command fails."
+  (let (range (if (= direction :unpushed) "@{u}..HEAD" "HEAD..@{u}")
+        r (git--git root ["log" range "--oneline"]))
+    (if (not (= (get r :exit) 0))
+      '()
+      (let (lines (remove empty? (string-split (trim (get r :stdout "")) "\n")))
+        (map (fn (line)
+               (let (i (string-index-of line " "))
+                 {:hash (if (< i 1) line (substring line 0 i))
+                  :subject (if (< i 1) "" (substring line (inc i) (string-length line)))}))
+          lines)))))
+
+(defn git--commit-pairs (title commits direction)
+  "`[line row]` pairs for an upstream-commit section (Unpushed / Unpulled). The header gets a
+`{:section-header direction}` row (TAB collapses); each commit gets a
+`{:hash :subject :commit-log? true}` row (RET → `cmd-git-show-diff` shows the full diff)."
+  (if (empty? commits)
+    '()
+    (concat
+      (list [(str title " (" (count commits) "):") {:section-header direction}])
+      (map (fn (c)
+             [(str "  " (get c :hash) "  " (get c :subject))
+              {:hash (get c :hash) :subject (get c :subject) :commit-log? true}])
+        commits)
+      (list ["" nil]))))
+
+(defn git--render (branch entries &optional (expanded '()) (diffs {}) (collapsed '()) (unpushed '()) (unpulled '()))
   "`{:text :rows}` for the status buffer. `:rows` is a vector parallel to the buffer's lines —
-nil on a header/blank/diff line, else `{:path :staged? :untracked?}` for an actionable file
-row. `expanded` is the set of paths whose diff is shown inline (from `diffs`, `path → {section →
-text}`)."
+nil on a blank/body line; `{:section-header section}` on a section title line (TAB collapses);
+`{:path :staged? :untracked?}` for a file row; `{:path :section :hunk? true :hunk-patch ...}` for
+an inline hunk row; `{:hash :subject :commit-log? true}` for an unpushed/unpulled commit row.
+`diffs` is `path → {section → parsed}` from `git--expanded-diffs`."
   (let (pairs (concat
                 (list [(str "Head: " branch) nil] ["" nil])
-                (git--section-pairs "Unstaged changes:" (filter git--unstaged? entries) :unstaged expanded diffs)
-                (git--section-pairs "Staged changes:" (filter git--staged? entries) :staged expanded diffs)
-                (git--section-pairs "Untracked files:" (filter git--untracked? entries) :untracked expanded diffs)
-                (if (empty? entries) (list ["nothing to commit, working tree clean" nil]) '())))
+                (git--section-pairs "Untracked files" (filter git--untracked? entries) :untracked expanded diffs collapsed)
+                (git--section-pairs "Unstaged changes" (filter git--unstaged? entries) :unstaged expanded diffs collapsed)
+                (git--section-pairs "Staged changes" (filter git--staged? entries) :staged expanded diffs collapsed)
+                (if (empty? entries) (list ["nothing to commit, working tree clean" nil]) '())
+                (git--commit-pairs "Unpushed to upstream" unpushed :unpushed)
+                (git--commit-pairs "Unpulled from upstream" unpulled :unpulled)))
     {:text (join "\n" (map first pairs)) :rows (into [] (map second pairs))}))
 
 (defn git--row-section (row)
   "Which section a status row belongs to — `:untracked` / `:staged` / `:unstaged` — or nil for
-a non-actionable (header / blank / inline-diff) row."
+section-header, commit-log, blank, and inline-diff rows. Hunk rows carry their section explicitly."
   (cond
     (nil? row) nil
+    (get row :section-header) nil
+    (get row :commit-log?) nil
+    (get row :hunk?) (get row :section)
     (get row :untracked?) :untracked
     (get row :staged?) :staged
     :else :unstaged))
+
+(defn git--file-row? (row)
+  "True for a plain file row (`{:path :staged? :untracked?}`), distinguishing it from section-header,
+hunk, commit-log, and nil rows."
+  (and (not (nil? row))
+       (nil? (get row :section-header))
+       (not (get row :hunk?))
+       (not (get row :commit-log?))))
 
 (defn git--section-lines (rows section)
   "The 0-based line indices of the file rows in `section`, top to bottom (parallel to the
@@ -339,15 +481,16 @@ diff, or — for an untracked file — its whole content as additions (`--no-ind
     :else                  ["diff" "--" path]))
 
 (defn git--expanded-diffs (root entries expanded)
-  "`{path -> {section -> diff-text}}` for each expanded file — one diff per section it appears
-in, so a staged row shows its `--cached` diff and an unstaged row its working-tree diff (rather
-than both rows showing the same combined `diff HEAD`). Each is fetched once."
+  "`{path → {section → parsed}}` for each expanded file, where `parsed` is the
+`{:headers :hunks}` map from `git--parse-hunks`. One diff per section (staged row shows its
+`--cached` diff, unstaged row the working-tree diff). Each fetch is done once."
   (fold (fn (acc e)
           (let (path (get e :path))
             (if (includes? expanded path)
               (fold (fn (a section)
                       (assoc-in a [path section]
-                        (get (git--git root (git--diff-args section path)) :stdout "")))
+                        (git--parse-hunks
+                          (get (git--git root (git--diff-args section path)) :stdout ""))))
                 acc (git--sections-of e))
               acc)))
     {} entries))
@@ -355,14 +498,18 @@ than both rows showing the same combined `diff HEAD`). Each is fetched once."
 (defn git--show-status (m root &optional (line nil))
   "Build/refresh `*git-status*` for repo `root`, recording `:git-root`/`:git-rows`. `line`
 places point: a 1-based number, nil (default — the first file row if any, else the top), or a
-function `(rows -> 1-based line)` resolved against the freshly-rendered rows (so a caller can
-keep point in a section across the refresh — see `git--stay-in-section`). Files in
-`:git-expanded` have their diff shown inline."
+function `(rows -> 1-based line)` resolved against the freshly-rendered rows (see
+`git--stay-in-section`). Respects `:git-expanded`, `:git-collapsed-sections`, and — when an
+upstream exists — fetches unpushed/unpulled commits to show at the bottom."
   (let (porcelain (get (git--git root ["status" "--porcelain" "-z"]) :stdout "")
         entries (git--entries porcelain)
         expanded (get m :git-expanded '())
+        collapsed (get m :git-collapsed-sections '())
         diffs (git--expanded-diffs root entries expanded)
-        r (git--render (git--branch root) entries expanded diffs)
+        upstream (git--upstream root)
+        unpushed (if upstream (git--upstream-commits root :unpushed) '())
+        unpulled (if upstream (git--upstream-commits root :unpulled) '())
+        r (git--render (git--branch root) entries expanded diffs collapsed unpushed unpulled)
         rows (get r :rows)
         target (cond (fn? line) (line rows)
                      (nil? line) (git--first-row-line rows)
@@ -372,8 +519,8 @@ keep point in a section across the refresh — see `git--stay-in-section`). File
     (ed-apply m1 (fn (b) (commands/ed--goto-line b target)))))
 
 (defn git--first-row-line (rows)
-  "The 1-based line of the first actionable row in `rows`, or 1 if none."
-  (let (i (index-where identity rows))
+  "The 1-based line of the first file row in `rows` (skipping section-header rows), or 1 if none."
+  (let (i (index-where git--file-row? rows))
     (if (< i 0) 1 (inc i))))
 
 (defn git--row-at (m)
@@ -412,6 +559,19 @@ on instead of chasing it into another section, while a plain refresh / expand st
   "Refresh `*git-status*` in place, keeping point in its section (`git--stay-in-section`)."
   (git--show-status m (get m :git-root) (git--stay-in-section m)))
 
+(defn git--scan-rows (rows j dir n)
+  "From 0-based position `j`, step `dir` (+1 or -1) `n` times, skipping nil (blank/diff-body)
+rows. Returns the clamped 1-based landing line. Section-header, file, hunk, and commit-log
+rows are all navigable; only nil rows are skipped."
+  (if (= n 0)
+    (inc j)
+    (let (j2 (+ j dir))
+      (cond
+        (< j2 0) (inc j)
+        (>= j2 (count rows)) (inc j)
+        (nil? (nth rows j2)) (git--scan-rows rows j2 dir n)
+        :else (git--scan-rows rows j2 dir (dec n))))))
+
 ;; ---- commands: open / navigate / stage / unstage / discard / refresh / quit -
 
 (defcommand cmd-git-status
@@ -420,37 +580,108 @@ on instead of chasing it into another section, while a plain refresh / expand st
   (let (root (git--toplevel (commands/ed--default-dir m)))
     (if (nil? root) (message m "not in a git repository") (git--show-status m root))))
 
+(defcommand cmd-git-next-item
+  (m key)
+  "Jump to the next actionable row — file, hunk, commit, or section header — skipping inline
+diff body lines (n). Falls back to line-by-line motion outside a status buffer."
+  (let (rows (get m :git-rows)
+        i (buffer-current-line (ed-current-buf m)))
+    (if (nil? rows)
+      (commands/cmd-next-line m key)
+      (ed-apply m (fn (b) (commands/ed--goto-line b (git--scan-rows rows i 1 1)))))))
+
+(defcommand cmd-git-prev-item
+  (m key)
+  "Jump to the previous actionable row — file, hunk, commit, or section header — skipping
+inline diff body lines (p)."
+  (let (rows (get m :git-rows)
+        i (buffer-current-line (ed-current-buf m)))
+    (if (nil? rows)
+      (commands/cmd-previous-line m key)
+      (ed-apply m (fn (b) (commands/ed--goto-line b (git--scan-rows rows i -1 1)))))))
+
 (defcommand cmd-git-stage
   (m key)
-  "Stage the file on the current line (s)."
+  "Stage the file or hunk on the current line (s). Hunk row: `git apply --cached` with just
+that hunk's patch. File row: `git add -- <path>`. Section header or commit row: no-op."
   (let (row (git--row-at m) root (get m :git-root))
-    (if (nil? row)
-      (message m "not on a file")
+    (cond
+      (nil? row) (message m "not on a file or hunk")
+      (get row :section-header) (message m "press S to stage all, or move to a specific file")
+      (get row :commit-log?) m
+      (get row :hunk?)
+      (let (r (git--apply-hunk root (get row :hunk-patch) true false))
+        (if (= (get r :exit) 0)
+          (git--refresh m)
+          (git--report-cmd m "stage hunk" r)))
+      :else
       (let (r (git--git root ["add" "--" (get row :path)]))
         (if (= (get r :exit) 0)
           (git--refresh m)
           (git--report-cmd m "stage" r))))))
 
+(defcommand cmd-git-stage-all
+  (m key)
+  "Stage all tracked modified files (S) — `git add -u`."
+  (let (root (get m :git-root))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let (r (git--git root ["add" "-u"]))
+        (if (= (get r :exit) 0)
+          (git--refresh m)
+          (git--report-cmd m "stage all" r))))))
+
 (defcommand cmd-git-unstage
   (m key)
-  "Unstage the file on the current line (u)."
+  "Unstage the file or hunk on the current line (u). Hunk row: `git apply --cached --reverse`
+with just that hunk. File row: `git reset HEAD -- <path>`. Section header or commit row: no-op."
   (let (row (git--row-at m) root (get m :git-root))
-    (if (nil? row)
-      (message m "not on a file")
+    (cond
+      (nil? row) (message m "not on a file or hunk")
+      (get row :section-header) (message m "press U to unstage all, or move to a specific file")
+      (get row :commit-log?) m
+      (get row :hunk?)
+      (let (r (git--apply-hunk root (get row :hunk-patch) true true))
+        (if (= (get r :exit) 0)
+          (git--refresh m)
+          (git--report-cmd m "unstage hunk" r)))
+      :else
       (let (r (git--git root ["reset" "-q" "HEAD" "--" (get row :path)]))
         (if (= (get r :exit) 0)
           (git--refresh m)
           (git--report-cmd m "unstage" r))))))
 
+(defcommand cmd-git-unstage-all
+  (m key)
+  "Unstage all staged changes (U) — `git reset HEAD`."
+  (let (root (get m :git-root))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let (r (git--git root ["reset" "HEAD"]))
+        (if (= (get r :exit) 0)
+          (git--refresh m)
+          (git--report-cmd m "unstage all" r))))))
+
 (defcommand cmd-git-discard
   (m key)
-  "Discard the working-tree changes to the file on the current line (k) — irreversible, so
-it asks first. A tracked file is reverted to HEAD; an untracked file is left (remove it from
-a shell)."
+  "Discard the working-tree changes to the file or hunk on the current line (k), after
+confirmation. Hunk row: `git apply --reverse`. File row: `git checkout -- <path>`.
+Section headers, commit rows, and untracked files are no-ops."
   (let (row (git--row-at m) root (get m :git-root))
     (cond
-      (nil? row) (message m "not on a file")
+      (nil? row) (message m "not on a file or hunk")
+      (get row :section-header) m
+      (get row :commit-log?) m
       (get row :untracked?) (message m "untracked file — remove it from a shell, not here")
+      (get row :hunk?)
+      (ed-read-char m "Discard hunk? (y/n) "
+        (fn (mm c)
+          (if (or (= c "y") (= c "Y"))
+            (let (r (git--apply-hunk root (get row :hunk-patch) false true))
+              (if (= (get r :exit) 0)
+                (git--refresh mm)
+                (git--report-cmd mm "discard hunk" r)))
+            (message mm "discard cancelled"))))
       :else
       (ed-read-char m (str "Discard changes to " (get row :path) "? (y/n) ")
         (fn (mm c)
@@ -468,10 +699,20 @@ a shell)."
 
 (defcommand cmd-git-expand
   (m key)
-  "Toggle showing the diff of the file on the current line inline, below it (TAB)."
+  "TAB: on a section header, toggle the section's collapse (`:git-collapsed-sections`); on a
+file row, toggle its inline diff. Hunk, commit-log, and blank rows are no-ops."
   (let (row (git--row-at m) root (get m :git-root))
-    (if (nil? row)
-      m
+    (cond
+      (nil? row) m
+      (get row :section-header)
+      (let (sec (get row :section-header)
+            cols (get m :git-collapsed-sections '())
+            cols2 (if (includes? cols sec)
+                    (remove (fn (s) (= s sec)) cols)
+                    (cons sec cols)))
+        (git--show-status (assoc m :git-collapsed-sections cols2) root (git--stay-in-section m)))
+      (or (get row :hunk?) (get row :commit-log?)) m
+      :else
       (let (path (get row :path)
             exp (get m :git-expanded '())
             exp2 (if (includes? exp path)
@@ -481,12 +722,14 @@ a shell)."
 
 (defcommand cmd-git-visit
   (m key)
-  "Visit (open) the file on the current line — bound to a mouse click and RET. A header /
-diff line is a no-op."
+  "Visit (open) the file on the current line — bound to a mouse click. Section headers,
+commit-log rows, and blank lines are no-ops."
   (let (row (git--row-at m) root (get m :git-root))
-    (if (nil? row)
-      m
-      (commands/ed-find-file m (path-join root (get row :path))))))
+    (cond
+      (nil? row) m
+      (get row :section-header) m
+      (get row :commit-log?) m
+      :else (commands/ed-find-file m (path-join root (get row :path))))))
 
 (defcommand cmd-git-quit
   (m key)
@@ -523,13 +766,20 @@ staged row's `--cached` diff, an unstaged row's working-tree diff, an untracked 
 
 (defcommand cmd-git-show-diff
   (m key)
-  "Preview the file on the current line's diff in a read-only *git-diff* buffer split to the
-**right** (RET): a staged row's `--cached` diff, an unstaged row's working-tree diff, an
-untracked/new file's contents. Selection stays on the status list, so RET previews file after
-file. A section header / blank line is a no-op."
+  "RET in `*git-status*`: on a commit-log row (unpushed / unpulled), run `git show <hash>` in
+`*git-show*`; on a file / hunk row, preview its diff in `*git-diff*` to the right. Section
+headers and blank lines are no-ops."
   (let (row (git--row-at m) root (get m :git-root))
-    (if (nil? row)
-      m
+    (cond
+      (nil? row) m
+      (get row :section-header) m
+      (get row :commit-log?)
+      (let (r (git--git root ["show" "--stat" "-p" (get row :hash)]))
+        (if (not (= (get r :exit) 0))
+          (git--report-cmd m "git show" r)
+          (git--show-report (assoc m :git-root root) "*git-show*"
+            (get r :stdout "") :git-diff)))
+      :else
       (let (r (git--git root (git--diff-args (git--row-section row) (get row :path)))
             out (get r :stdout ""))
         (if (>= (get r :exit) 2)
@@ -552,9 +802,32 @@ buffer, no need to open the status buffer first."
               (message m "no changes vs HEAD")
               (git--show-report (assoc m :git-root root) "*git-diff*" (get r :stdout "") :git-diff))))))))
 
+(defn git--log-line-hash (line)
+  "The abbreviated commit hash at the start of a `git log --oneline` line (up to the first
+space), or nil when the line is blank or not a commit line."
+  (let (i (string-index-of line " "))
+    (if (< i 1) nil (substring line 0 i))))
+
+(defcommand cmd-git-show-commit
+  (m key)
+  "Show the full diff of the commit on the current log line (RET in *git-log*)."
+  (let (root (get m :git-root)
+        buf (ed-current-buf m)
+        line-i (buffer-current-line buf)
+        lines (string-split (buffer-text buf) "\n")
+        hash (and (>= line-i 0) (< line-i (count lines))
+               (git--log-line-hash (nth lines line-i))))
+    (if (nil? hash)
+      (message m "not on a commit line")
+      (let (r (git--git root ["show" "--stat" "-p" hash]))
+        (if (not (= (get r :exit) 0))
+          (git--report-cmd m "git show" r)
+          (git--show-report (assoc m :git-root root) "*git-show*"
+            (get r :stdout "") :git-diff))))))
+
 (defcommand cmd-git-log
   (m key)
-  "Show the recent commit log in *git-log* (l)."
+  "Show the recent commit log in *git-log* (l). RET on a line shows that commit's diff."
   (let (root (git--resolve-root m))
     (if (nil? root)
       (message m "not in a git repository")
@@ -579,6 +852,66 @@ buffer, no need to open the status buffer first."
       (let (r (git--git root ["pull" "--ff-only"]))
         (git--report-cmd (if (nil? (get m :git-rows)) m (git--show-status m root)) "pull" r)))))
 
+;; ---- stash (z z / z p) -------------------------------------------------------
+
+(defcommand cmd-git-stash
+  (m key)
+  "Stash working-tree changes (z z) — `git stash push`. Refreshes status on success."
+  (let (root (git--resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let (r (git--git root ["stash" "push"]))
+        (git--report-cmd (if (nil? (get m :git-rows)) m (git--refresh m)) "stash" r)))))
+
+(defcommand cmd-git-stash-pop
+  (m key)
+  "Pop the latest stash onto the working tree (z p) — `git stash pop`. Refreshes on success."
+  (let (root (git--resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let (r (git--git root ["stash" "pop"]))
+        (git--report-cmd (if (nil? (get m :git-rows)) m (git--refresh m)) "stash pop" r)))))
+
+;; ---- branch checkout / create (b b / b c) -----------------------------------
+
+(defcommand cmd-git-checkout
+  (m key)
+  "Checkout a branch with minibuffer completion over all local and remote branches (b b)."
+  (let (root (git--resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let (r (git--git root ["branch" "-a" "--format=%(refname:short)"]))
+        (if (not (= (get r :exit) 0))
+          (git--report-cmd m "git branch" r)
+          (let (branches (remove empty? (string-split (trim (get r :stdout "")) "\n")))
+            (assoc m :minibuffer
+              (commands/ed-name-prompt "Checkout branch: " branches
+                (fn (mm branch)
+                  (let (r2 (git--git root ["checkout" branch]))
+                    (git--report-cmd
+                      (if (= (get r2 :exit) 0)
+                        (git--show-status mm root)
+                        mm)
+                      "checkout" r2)))))))))))
+
+(defcommand cmd-git-create-branch
+  (m key)
+  "Create and checkout a new branch, prompting for its name (b c)."
+  (let (root (git--resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (assoc m :minibuffer
+        (commands/ed-name-prompt "New branch name: " '()
+          (fn (mm name)
+            (if (= (trim name) "")
+              (message mm "branch name cannot be empty")
+              (let (r (git--git root ["checkout" "-b" (trim name)]))
+                (git--report-cmd
+                  (if (= (get r :exit) 0)
+                    (git--show-status mm root)
+                    mm)
+                  "create branch" r)))))))))
+
 ;; ---- commit (an editable message buffer; C-c C-c / C-c C-k) -----------------
 
 (defn git--commit-message (text)
@@ -592,26 +925,45 @@ and the rest trimmed."
   (let (root (git--resolve-root m))
     (if (nil? root)
       (message m "not in a git repository")
-      (ed-show-named (assoc m :git-root root) "*git-commit*"
+      (ed-show-named (assoc m :git-root root :git-amend? nil) "*git-commit*"
         "\n# Enter a commit message above. C-c C-c to commit, C-c C-k to cancel.\n# Lines starting with # are ignored."
         :git-commit))))
 
+(defcommand cmd-git-commit-amend
+  (m key)
+  "Open *git-commit* pre-populated with the last commit message for amending (a). C-c C-c
+runs `git commit --amend`; C-c C-k aborts."
+  (let (root (git--resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let (r (git--git root ["log" "-1" "--format=%B"]))
+        (if (not (= (get r :exit) 0))
+          (message m "no commits yet to amend")
+          (ed-show-named (assoc m :git-root root :git-amend? true) "*git-commit*"
+            (str (trim (get r :stdout))
+              "\n# Amending the last commit. C-c C-c to commit --amend, C-c C-k to cancel.\n# Lines starting with # are ignored.")
+            :git-commit))))))
+
 (defcommand cmd-git-commit-finish
   (m key)
-  "Commit the staged changes with this buffer's message (C-c C-c), then show status."
+  "Commit the staged changes with this buffer's message (C-c C-c). If `:git-amend?` is set,
+runs `git commit --amend` to rewrite the last commit."
   (let (root (get m :git-root)
-        msg (git--commit-message (buffer-text (ed-current-buf m))))
+        msg (git--commit-message (buffer-text (ed-current-buf m)))
+        amend? (get m :git-amend?))
     (cond
       (nil? root) (message m "no git repo")
       (= msg "") (message m "empty commit message — aborted")
       :else
-      (let (r (git--git root ["commit" "-m" msg])
-            m1 (cmd-kill-buffer m key))  ; close *git-commit*
+      (let (args (concat ["commit" "-m" msg] (if amend? ["--amend"] []))
+            r (git--git root args)
+            m1 (cmd-kill-buffer (assoc m :git-amend? nil) key))
         (if (= (get r :exit) 0)
-          (message (git--show-status m1 root) (str "committed: " (one-line (get r :stdout))))
+          (message (git--show-status m1 root)
+            (str (if amend? "amended: " "committed: ") (one-line (get r :stdout))))
           (message m1 (str "commit failed: " (one-line (str (get r :stdout) " " (get r :stderr))))))))))
 
 (defcommand cmd-git-commit-abort
   (m key)
   "Abort the commit and close the message buffer (C-c C-k)."
-  (message (cmd-kill-buffer m key) "commit aborted"))
+  (message (cmd-kill-buffer (assoc m :git-amend? nil) key) "commit aborted"))
