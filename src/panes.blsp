@@ -68,6 +68,12 @@ Emacs likewise pins scroll at the last line, so clamping here is the right behav
   "The pane's horizontal scroll offset (leftmost visible char column), 0 if unset."
   (max 0 (or (get-in pane [:payload :hscroll]) 0)))
 
+(defn ed-pane-scroll-frac (pane)
+  "The pane's sub-line smooth-scroll fractional offset ∈ [0, 1): 0 = snapped to a line
+boundary, > 0 = content is shifted up by `frac × cell_h` pixels (from trackpad scroll)."
+  (let (f (or (get-in pane [:payload :scroll-frac]) 0.0))
+    (if (and (>= f 0.0) (< f 1.0)) f 0.0)))
+
 (defn ed-selected-text-cols (m cols rows)
   "The text width (in columns) of the *selected* pane — its rect width less the gutter
 and the 1-col scrollbar, divided by the font scale. What horizontal scrolling keeps point
@@ -385,7 +391,8 @@ moving its `:top` — point is left alone (you can scroll freely past the cursor
 keystroke brings the cursor back into view via `input/ed--point-into-view`, so the view
 doesn't snap when you resume. Negative scrolls toward the top. Clamped at end-of-buffer
 (the last line at the bottom row, no scrolling into blank space past EOF — same bound as
-the keyboard `ed-scroll`)."
+the keyboard `ed-scroll`). Also resets `:scroll-frac` to 0.0 (whole-line jumps clear
+any accumulated sub-line fractional offset)."
   (let (buf (ed-pane-buf m pane)
         top (or (get-in pane [:payload :top]) 0)
         [px py pw ph] (or (get pane :rect) [0 0 80 24])
@@ -393,7 +400,29 @@ the keyboard `ed-scroll`)."
         new-top (max 0 (min maxtop (+ top delta)))
         m2 (assoc m
              :layout
-             (pane-update-path (get m :layout) (get pane :path) (fn (w) (assoc w :top new-top)))))
+             (pane-update-path (get m :layout) (get pane :path)
+               (fn (w) (assoc w :top new-top :scroll-frac 0.0)))))
+    (if (= new-top top) m2 (ed-scrollbar-wake m2))))
+
+(defn ed-smooth-scroll-pane (m pane dy-frac)
+  "Trackpad smooth scroll: accumulate the fractional line delta `dy-frac` (positive =
+down, i.e. content moves up) into the pane's `:scroll-frac`. When the accumulated
+value crosses a whole line, advance `:top` and keep the remainder. `:scroll-frac` ∈
+[0, 1) is passed to the view to emit `(scroll-offset frac)` for sub-cell rendering."
+  (let (buf (ed-pane-buf m pane)
+        [px py pw ph] (or (get pane :rect) [0 0 80 24])
+        top (or (get-in pane [:payload :top]) 0)
+        frac (or (get-in pane [:payload :scroll-frac]) 0.0)
+        new-frac-raw (+ frac dy-frac)
+        lines (floor new-frac-raw)
+        remainder (- new-frac-raw lines)
+        maxtop (ed-max-top buf (max 1 (dec ph)))
+        new-top (max 0 (min maxtop (+ top lines)))
+        new-frac (if (< remainder 0.0) 0.0 (if (>= remainder 1.0) 0.999 remainder))
+        m2 (assoc m
+             :layout
+             (pane-update-path (get m :layout) (get pane :path)
+               (fn (w) (assoc w :top new-top :scroll-frac new-frac)))))
     (if (= new-top top) m2 (ed-scrollbar-wake m2))))
 
 (defn ed-toggle-line-numbers (m)
@@ -458,6 +487,18 @@ break the match. A wheel notch off every pane is ignored."
       (nil? hovered) m
       (and (= action :scroll-up) (includes? mods :ctrl)) (ed-zoom-pane m hovered 1)
       (and (= action :scroll-down) (includes? mods :ctrl)) (ed-zoom-pane m hovered -1)
-      (= action :scroll-up) (ed-scroll-pane m hovered (- *wheel-lines*))
-      (= action :scroll-down) (ed-scroll-pane m hovered *wheel-lines*)
+      ;; 7th element: scroll delta in line units (float, from the Brood runtime). When
+      ;; present and < 1 it's a trackpad pixel delta (smooth path); >= 1 is a mouse-wheel
+      ;; notch (whole-line snap). Absent (old tests / terminal) → legacy *wheel-lines* snap.
+      (or (= action :scroll-up) (= action :scroll-down))
+      (let (dy-raw (nth input 6 nil)
+            up? (= action :scroll-up))
+        (cond
+          (nil? dy-raw)
+          (ed-scroll-pane m hovered (if up? (- *wheel-lines*) *wheel-lines*))
+          (< dy-raw 1.0)
+          (ed-smooth-scroll-pane m hovered (if up? (- dy-raw) dy-raw))
+          :else
+          (let (lines (floor (+ 0.5 dy-raw)))
+            (ed-scroll-pane m hovered (if up? (- lines) lines)))))
       else m)))
