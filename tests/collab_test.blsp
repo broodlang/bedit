@@ -1,0 +1,132 @@
+;; collab — a pooled buffer backed by a shared buffer PROCESS (independent cursors, shared edits).
+;; The pure `collab-splice` diff needs no process; the round-trip tests play BOTH clients in one
+;; test process (local pids send/receive exactly as a node link would) — an edit through one
+;; client's `collab-edit` is serialized by the process and folded back into every client's model
+;; via `ed-apply-buffer-update`, each keeping its own pane cursor. No node, no window.
+(defmodule collab-test
+  (:use collab)
+  (:use model)
+  (:use editor/buffer)
+  (:use test))
+
+;; Seed a model's selected-pane cursor to `pt` (window-local) so cursor-independence is testable.
+(defn ct-at (m pt)
+  (ed-set-buf m (goto-char (ed-current-buf m) pt)))
+
+(defn ct-text (m) (buffer-text (ed-current-buf m)))
+(defn ct-point (m) (get (ed-current-pane m) :point))
+
+;; Wait for the next `[:buffer-updated proc v text]` push and return `[v text]` (or :none).
+(defn ct-await (proc) (receive ([:buffer-updated ~proc v text] [v text]) (after 2000 :none)))
+
+;; Drain the seed push a fresh subscription always sends, so a test sees only real edits after.
+(defn ct-drain-seed (proc) (receive ([:buffer-updated ~proc _ _] nil) (after 2000 nil)))
+
+(describe "collab-splice — the single positional splice diff (pure)"
+  (test "equal strings splice to a no-op"
+    (is (collab-splice-noop? (collab-splice "hello" "hello"))))
+  (test "an append is the tail splice"
+    (assert= (collab-splice "hello" "helloXYZ") [5 5 "XYZ"]))
+  (test "an insertion in the middle is the minimal span"
+    (assert= (collab-splice "abc" "axbc") [1 1 "x"]))
+  (test "a deletion in the middle collapses the changed span"
+    (assert= (collab-splice "hello world" "hell world") [4 5 ""]))
+  (test "a mixed replace keeps only the differing span"
+    (assert= (collab-splice "hello world" "held world") [3 5 "d"]))
+  (test "a replacement is delete+insert in one span"
+    (assert= (collab-splice "cat" "cot") [1 2 "o"]))
+  (test "prefix and suffix never overlap (shrink to one char)"
+    (assert= (collab-splice "aa" "a") [1 2 ""])
+    (assert= (collab-splice "a" "aa") [1 1 "a"]))
+  (test "a splice, applied with replace-region, reproduces the target"
+    (let ([lo hi repl] (collab-splice "hello world" "held world"))
+      (assert= (buffer-text (replace-region (make-buffer "hello world") lo hi repl)) "held world"))))
+
+(describe "collab — shared buffer process, independent cursors" :isolated
+
+  (test "an edit through collab-edit is serialized by the process and folded into every client, each keeping its own point"
+    (let (proc (spawn-buffer (make-buffer "hello" "shared.txt"))
+          ;; client A subscribes (this test process) and sits at point 5; client B is another
+          ;; view of the same slot at point 0 (link only — one subscription feeds both here).
+          mA (ct-at (collab-share-slot (ed-init (make-buffer "hello" "shared.txt")) 0 proc) 5)
+          mB (ct-at (assoc-in (ed-init (make-buffer "hello" "shared.txt")) [:shared 0] {:proc proc :version -1}) 0))
+      (ct-drain-seed proc)
+      ;; A appends "XYZ" at its point (5, end of "hello")
+      (let (mA2 (collab-edit mA (fn (b) (insert (goto-char b 5) "XYZ"))))
+        (let ([v text] (ct-await proc))
+          (assert= text "helloXYZ")
+          ;; the push folds into BOTH clients' models — B sees A's edit
+          (let (mAf (ed-apply-buffer-update mA2 proc v text)
+                mBf (ed-apply-buffer-update mB proc v text))
+            (assert= (ct-text mAf) "helloXYZ")
+            (assert= (ct-text mBf) "helloXYZ")
+            ;; cursors stayed independent: B's is still at 0, A moved with its own insert
+            (assert= (ct-point mBf) 0)
+            (is (> (ct-point mAf) 0)))))
+      (stop-buffer proc)))
+
+  (test "a pure-movement command sends no edit (the splice is a no-op)"
+    (let (proc (spawn-buffer (make-buffer "hello" "m.txt"))
+          m (collab-share-slot (ed-init (make-buffer "hello" "m.txt")) 0 proc))
+      (ct-drain-seed proc)
+      (collab-edit m (fn (b) (goto-char b 2)))   ; move only — no text change
+      (assert= (ct-await proc) :none)            ; nothing pushed
+      (stop-buffer proc)))
+
+  (test "two participants' edits both survive when each round-trips before the next (v1 serialized)"
+    (let (proc (spawn-buffer (make-buffer "hello" "rt.txt"))
+          mA (collab-share-slot (ed-init (make-buffer "hello" "rt.txt")) 0 proc)
+          mB (assoc-in (ed-init (make-buffer "hello" "rt.txt")) [:shared 0] {:proc proc :version -1}))
+      (ct-drain-seed proc)
+      ;; A prepends "A" → "Ahello"; the push updates B's copy
+      (collab-edit mA (fn (b) (insert (goto-char b 0) "A")))
+      (let ([v1 t1] (ct-await proc)
+            mB1 (ed-apply-buffer-update mB proc v1 t1))
+        (assert= t1 "Ahello")
+        ;; B, now on the updated text, appends "Z" → "AhelloZ"
+        (collab-edit mB1 (fn (b) (insert (end-of-buffer b) "Z")))
+        (let ([v2 t2] (ct-await proc))
+          (assert= t2 "AhelloZ")                 ; both edits survived, correctly ordered
+          (assert= (buffer-query proc buffer-text) "AhelloZ")))
+      (stop-buffer proc)))
+
+  (test "ed-apply-buffer-update ignores a stale/duplicate version"
+    (let (proc (spawn-buffer (make-buffer "x" "s.txt"))
+          m (collab-share-slot (ed-init (make-buffer "x" "s.txt")) 0 proc))
+      (ct-drain-seed proc)
+      (let (m5 (ed-apply-buffer-update m proc 5 "five")
+            m3 (ed-apply-buffer-update m5 proc 3 "three"))   ; 3 <= 5 → ignored
+        (assert= (ct-text m5) "five")
+        (assert= (ct-text m3) "five"))
+      (stop-buffer proc)))
+
+  (test "collab-propagate pushes an ordinary command's text change to the process (command-agnostic)"
+    (let (proc (spawn-buffer (make-buffer "hello" "p.txt"))
+          m (collab-share-slot (ed-init (make-buffer "hello" "p.txt")) 0 proc))
+      (ct-drain-seed proc)
+      ;; a plain command edited the pooled buffer via ed-set-buf, unaware of sharing
+      (let (after (ed-set-buf m (insert (end-of-buffer (ed-current-buf m)) "!")))
+        (collab-propagate m after)
+        (assert= (ct-await proc) [1 "hello!"])
+        (assert= (buffer-query proc buffer-text) "hello!"))
+      (stop-buffer proc)))
+
+  (test "collab-propagate sends nothing when no shared slot's text changed"
+    (let (proc (spawn-buffer (make-buffer "hello" "p2.txt"))
+          m (collab-share-slot (ed-init (make-buffer "hello" "p2.txt")) 0 proc))
+      (ct-drain-seed proc)
+      (let (after (ed-set-buf m (goto-char (ed-current-buf m) 2)))   ; move only
+        (collab-propagate m after)
+        (assert= (ct-await proc) :none))
+      (stop-buffer proc)))
+
+  (test "collab-unshare stops the slot tracking further edits"
+    (let (proc (spawn-buffer (make-buffer "hi" "u.txt"))
+          m (collab-share-slot (ed-init (make-buffer "hi" "u.txt")) 0 proc))
+      (ct-drain-seed proc)
+      (let (m2 (collab-unshare m 0))
+        (is (not (collab-shared? m2)))
+        (receive (after 200 nil))                ; let the unsubscribe land
+        (buffer-edit proc (fn (b) (insert (end-of-buffer b) "!")))
+        (assert= (ct-await proc) :none))         ; no more pushes to us
+      (stop-buffer proc))))
