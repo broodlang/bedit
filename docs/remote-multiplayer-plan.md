@@ -150,8 +150,33 @@ describe):
   text (not the file on disk), and one participant's edit fans out to the other's frame, each
   keeping its own cursor.
 
-Marker-backed *remote cursor rendering* (drawing other participants' carets, §1.3 participant
-model) builds on the markers already shipped — that's the remaining Slice 2b work.
+**As built (2026-07-10) — presence: named remote carets (Slice 2b's visible half).**
+- **Brood first (two gaps):** (1) the attach protocol carried no identity — `attach` /
+  `attach-display` / `attach-display-local` now take an opts map (`{:name "alice"}`), sent as a
+  5-element `[:attach client cols rows opts]` (4-element still accepted) and queued to the
+  session as a `[:client-opts …]` event before any key; (2) the buffer process never noticed a
+  dead subscriber — `buffer--serve` now monitors every subscriber and, on `[:down …]`, prunes
+  the subscription **and deletes the marker keyed by the dead pid** (the convention for
+  transient per-subscriber state), pushing so survivors see the cursor vanish rather than a
+  ghost caret.
+- **Editor:** each collab session announces itself on join — a cursor **marker keyed by its
+  session pid** (edit-adjusted inside the process, so carets stay honest under others' edits)
+  plus its name under `:participants`. The subscription projection (`collab--proj`) pushes
+  `[text markers names]`; `ed-apply-buffer-update` stores other participants' cursors/names on
+  the slot (own pid excluded), echoes churn (\"mona joined\"/\"left\", seed-suppressed), and
+  skips the content rebuild on cursor-only pushes (cheap; local undo survives).
+  `collab-sync-point` (in `ed-update-collab`) moves the marker when point moves — a
+  version-guarded no-op otherwise. The view draws each remote caret as a coloured sub-cell bar
+  + a name tag on the row above (`ed--remote-cursor-ops`, colour stable per name). Identity
+  comes from `--as NAME` (default: the OS username) on both `--attach` and the host window.
+- Tests: presence announce / sync-point / churn echo / no-rebuild in `tests/collab_test.blsp`;
+  the live path (a named attach renders its tag in the other participant's frame) plus a pure
+  view render test in `tests/remote_test.blsp`; the std seams (identity handshake,
+  dead-subscriber marker cleanup) in `../brood`'s `serve_test` / `buffer_test`.
+
+Remaining for full §1.3: per-participant *selections* (marker pairs) and a modeline presence
+chip; then Part 1 §1.4's polish pair — origin-tagged edits (kill the fast-typing echo
+flicker) and delta pushes.
 
 ### 1.3 A participant model — presence as plain data
 
