@@ -20,12 +20,12 @@
 ;; The presence projection pushes `[text markers names]`; a bare string is the legacy shape.
 (defn ct-view-text (view) (if (vector? view) (nth view 0) view))
 (defn ct-await (proc)
-  (receive ([:buffer-updated ~proc v view] [v (ct-view-text view)]) (after 2000 :none)))
+  (receive ([:buffer-updated ~proc v view _] [v (ct-view-text view)]) (after 2000 :none)))
 
 ;; Drain until quiet: the seed push AND the join announce (`collab-share-slot` plants a
 ;; cursor marker + name right after subscribing), so a test sees only its own edits after.
 (defn ct-drain-seed (proc)
-  (receive ([:buffer-updated ~proc _ _] (ct-drain-seed proc)) (after 300 nil)))
+  (receive ([:buffer-updated ~proc _ _ _] (ct-drain-seed proc)) (after 300 nil)))
 
 (describe "collab-splice — the single positional splice diff (pure)"
   (test "equal strings splice to a no-op"
@@ -178,6 +178,53 @@
       (let (m2 (ed-apply-buffer-update m1 proc 2 ["doc" {me 0} {me "guest" :bob "bob"}]))
         (assert= (get-in m2 [:shared 0 :cursors]) {})
         (assert= (get m2 :echo) "bob left"))
+      (stop-buffer proc)))
+
+  (test "echo suppression: an own-origin push never rebuilds content (local text stays ahead)"
+    (let (proc (spawn-buffer (make-buffer "ab" "es.txt"))
+          m (collab-share-slot (ed-init (make-buffer "ab" "es.txt")) 0 proc)
+          me (get-in m [:shared 0 :me])
+          m0 (ed-apply-buffer-update m proc 0 ["ab" {me 0} {me "guest"}])
+          ;; locally we typed on: "abXY" — two keystrokes ahead of the round-trip
+          m1 (ed-set-buf m0 (insert (end-of-buffer (ed-current-buf m0)) "XY"))
+          ;; the first keystroke's echo returns (origin = me, text "abX" — OLDER than local)
+          m2 (ed-apply-buffer-update m1 proc 1 ["abX" {me 0} {me "guest"}] me))
+      ;; no clobber of the newer local text; the version still advances
+      (assert= (ct-text m2) "abXY")
+      (assert= (get-in m2 [:shared 0 :version]) 1)
+      ;; a FOREIGN-origin push still rebuilds (reconvergence stays intact)
+      (let (m3 (ed-apply-buffer-update m2 proc 2 ["abXY!" {me 0} {me "guest"}] :someone-else))
+        (assert= (ct-text m3) "abXY!"))
+      ;; and the wire really carries our origin: a collab-edit's push is tagged with me
+      (ct-drain-seed proc)
+      (collab-edit (ct-at m0 2) (fn (b) (insert (goto-char b 2) "z")))
+      (assert= (receive ([:buffer-updated ~proc _ _ o] o) (after 2000 :none)) me)
+      (stop-buffer proc)))
+
+  (test "follow: pushes move the follower's point; an own move or the leader leaving breaks it"
+    (let (proc (spawn-buffer (make-buffer "hello world" "f.txt"))
+          m (collab-share-slot (ed-init (make-buffer "hello world" "f.txt")) 0 proc)
+          me (get-in m [:shared 0 :me])
+          m0 (ed-apply-buffer-update m proc 0 ["hello world" {me 0} {me "guest"}])
+          m1 (ed-apply-buffer-update m0 proc 1 ["hello world" {me 0 :zoe 4} {me "guest" :zoe "zoe"}])
+          m2 (collab-follow m1 :zoe "zoe")
+          ;; zoe moves to 7 → the handler's jump puts our point there, view clamped
+          m3 (collab-follow-jump
+               (ed-apply-buffer-update m2 proc 2 ["hello world" {me 0 :zoe 7} {me "guest" :zoe "zoe"}])
+               20))
+      (assert= (buffer-point (ed-current-buf m3)) 7)
+      ;; a real key that moves point takes the wheel back
+      (let (m4 (ed-set-buf m3 (goto-char (ed-current-buf m3) 1))
+            m5 (collab-follow-step m3 m4 :left))
+        (is (nil? (get m5 :follow)))
+        (assert= (get m5 :echo) "stopped following zoe"))
+      ;; a push that doesn't move point (zoe still at 7) breaks nothing
+      (let (m4b (collab-follow-step m3 m3 [:buffer-updated proc 9 "x"]))
+        (is (not (nil? (get m4b :follow)))))
+      ;; zoe leaving unfollows, with the reason in the echo
+      (let (m6 (ed-apply-buffer-update m3 proc 3 ["hello world" {me 0} {me "guest" :zoe "zoe"}]))
+        (is (nil? (get m6 :follow)))
+        (assert= (get m6 :echo) "zoe left — stopped following"))
       (stop-buffer proc)))
 
   (test "presence: a cursor-only push leaves the buffer VALUE untouched (no rebuild)"
