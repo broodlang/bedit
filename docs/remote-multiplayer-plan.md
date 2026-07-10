@@ -174,9 +174,19 @@ describe):
   view render test in `tests/remote_test.blsp`; the std seams (identity handshake,
   dead-subscriber marker cleanup) in `../brood`'s `serve_test` / `buffer_test`.
 
-Remaining for full §1.3: per-participant *selections* (marker pairs) and a modeline presence
-chip; then Part 1 §1.4's polish pair — origin-tagged edits (kill the fast-typing echo
-flicker) and delta pushes.
+**As built (2026-07-10, second pass) — the whole slickness ladder.** One collaborative
+mode (`--shared`, alias `--collab`; the fan-one-cursor editor mode is gone — `follow`
+(C-x f) gives that experience per-person, broken by any move of your own);
+origin-tagged edits (echo suppression — your round-trip never flickers fast typing);
+`--listen [HOST:]PORT` (TCP, cookie-authenticated, loopback-verified — the runbook has
+the cross-machine recipe); structured deltas (`buffer-splice` / `buffer-marker-move`:
+O(change) pushes, in-place splice application with a `:pending` divergence guard that
+resyncs on the rare in-flight collision); per-participant selections (`[pid :mark]`
+markers, rendered as owner-coloured tints) and the modeline presence chip. Also fixed
+en route: pid identity across `node-start` (brood kernel — equality/hash normalize the
+local-node stamp), without which a served daemon silently dropped every push.
+
+Still open: kernel dual-listen (Unix + TCP at once), CRDT (v2, unchanged).
 
 ### 1.3 A participant model — presence as plain data
 
