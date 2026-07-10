@@ -127,12 +127,31 @@ per-pane (`model/ed-with-window-point`), now lifted across processes.
   stale-version guard, propagate hook, unshare). Full green: 15 collab tests, 769 myedit tests,
   no regressions.
 
-Still to do — the **live GUI wiring** (needs two real windows to verify, so held for a
-supervised run): a `--serve --collab` daemon that spawns the shared buffer process and links
-each client session's slot to it; an `ed-update` event case folding `[:buffer-updated …]` via
-`ed-apply-buffer-update`; and a `collab-propagate` call in the loop. Marker-backed *remote
-cursor rendering* (drawing other participants' carets, §1.3 participant model) builds on the
-markers already shipped.
+**As built (2026-07-10) — the live `--serve --collab` wiring.** The three pieces named above
+shipped, headless-tested end to end (`tests/remote_test.blsp`, the `:isolated` collab-serve
+describe):
+- **Brood first (the language gap):** a served session was *deaf to async events* — the
+  daemon-side displays' `:poll` (`remote-display`, `shared--display` in `std/editor/serve.blsp`)
+  selectively received only `[:key]`/`[:detach]`/`[:down]`, stranding every other mailbox
+  message, while the local `gui-display :poll` returns *any* message (the contract the editor's
+  whole event bus — task replies, buffer pushes, log lines — is built on). Fixed in std: both
+  polls now pass unrecognized messages through as app input; `serve_test` covers the pass-through
+  at the unit and end-to-end level for both `serve` and `serve-shared`.
+- **Editor:** `:buffer-updated` registered in `input`'s event registry (folds via
+  `collab/ed-apply-buffer-update`); `src/remote.blsp` gained `ed-serve-collab` — ONE
+  `spawn-buffer` process per daemon, a fresh session per client whose slot 0 is
+  `collab-share-slot`-linked (the subscribe runs in the session process, so pushes land on its
+  mailbox and arrive through the fixed poll) — and `ed-update-collab`, `ed-update` wrapped with
+  `collab-propagate`. The wrapper skips propagation when the folded event *is* a
+  `[:buffer-updated …]` push (propagating the process's own truth back would apply the edit
+  twice). CLI: `bedit --name ed --serve --collab [file]`; clients `bedit --attach ed`.
+- Tests prove: the seed push syncs a session through the real `ed-update`; no echo on a folded
+  push; and two live sessions — a typed key reaches the process, a late joiner seeds to the live
+  text (not the file on disk), and one participant's edit fans out to the other's frame, each
+  keeping its own cursor.
+
+Marker-backed *remote cursor rendering* (drawing other participants' carets, §1.3 participant
+model) builds on the markers already shipped — that's the remaining Slice 2b work.
 
 ### 1.3 A participant model — presence as plain data
 
