@@ -29,6 +29,7 @@ folded in by the loop's event registry (see `input`)."
   (:use editor/buffer)  ; buffer-text / -name / -current-line / -column / -file / -line-count / -region-bounds
   (:use editor/highlight)  ; fontify-runs — the shared span+overlay -> [substring face] tiler
   (:use net/sse)  ; sse-headers / sse-send — server-side event-stream framing
+  (:use json)  ; json-parse — decode the browser key-event POST body (/input)
   (:use net/http))  ; http-listen / serve-loop / router / stream-response / ok
 
 ;; ---- the snapshot (plain data — what crosses the process boundary) ----------
@@ -107,10 +108,14 @@ pre{margin:0;padding:.5rem 1rem;white-space:pre;tab-size:4}
 .cursor{display:inline-block;width:0;border-left:2px solid #f38ba8;height:1.2em;vertical-align:text-bottom;animation:blink 1s step-end infinite}
 @keyframes blink{50%{opacity:0}}")
 
-;; The page script: subscribe to the push stream and swap the live region in on
-;; each frame. EventSource reconnects on its own if the connection drops.
+;; The page script: subscribe to the push stream and swap the live region in on each
+;; frame (EventSource reconnects on its own if the connection drops), and capture every
+;; keystroke back to POST /input — so the browser is a read-write remote frontend, not
+;; just a viewer. Bare modifier presses are skipped; `preventDefault` keeps the browser's
+;; own chords (Ctrl-F find, Ctrl-S save, Space scroll) from stealing keys from the editor.
 (def *web-js*
-  "const es=new EventSource('/events');es.onmessage=e=>{document.getElementById('app').innerHTML=e.data};")
+  "const es=new EventSource('/events');es.onmessage=e=>{document.getElementById('app').innerHTML=e.data};
+addEventListener('keydown',e=>{const k=e.key;if(k==='Shift'||k==='Control'||k==='Alt'||k==='Meta')return;e.preventDefault();fetch('/input',{method:'POST',body:JSON.stringify({k:k,ctrl:e.ctrlKey,alt:e.altKey,shift:e.shiftKey})});});")
 
 (defn web--escape (s)
   "HTML-escape the three markup-significant characters in `s`."
@@ -331,12 +336,77 @@ browser disconnects. Owning `c`'s reader, its `web--sse-loop` sees `[:tcp-closed
   (send pub [:subscribe (self)])
   (web--sse-loop c pub))
 
+;; ---- remote input: a browser key event -> the editor's key token ------------
+;; The web page is a *frontend*, so it must produce the SAME key-token vocabulary the
+;; native GUI frontend does (`crates/lisp/src/gui.rs` `key_message` / `translate_key`).
+;; Then a remote key dispatches through the identical keymap as a local one, and nothing
+;; in `input`/`commands` needs to know it came over the wire. The page JS ships the raw
+;; browser fields (`{:k :ctrl :alt :shift}`); the mapping lives here, in Brood, so the
+;; vocabulary is unit-tested (tests/web_input_test.blsp) rather than buried in JavaScript.
+
+(def *web-named-keys*
+  ;; browser `KeyboardEvent.key` -> the editor's base named-key token (gui.rs `Named` arms)
+  {"Enter" "enter" "Escape" "escape" "Backspace" "backspace" "Tab" "tab"
+   "Delete" "delete" "Home" "home" "End" "end" "PageUp" "page-up" "PageDown" "page-down"
+   "ArrowUp" "up" "ArrowDown" "down" "ArrowLeft" "left" "ArrowRight" "right"})
+
+(defn web--named-token (base shift)
+  "A named key as its token keyword, encoding Shift the way the native frontend does:
+`shift-<motion>` on the arrows / Home / End, `back-tab` on Shift+Tab, else the bare name."
+  (keyword
+    (cond
+      (and shift (member? base ["up" "down" "left" "right" "home" "end"])) (str "shift-" base)
+      (and shift (= base "tab")) "back-tab"
+      :else base)))
+
+(defn web--chord-char (k ctrl alt shift)
+  "The base char of a Ctrl/Alt chord, cased as the native frontend cases it: Ctrl (and
+Ctrl+Alt) is case-INsensitive → lower; Meta (Alt) is case-sensitive → upper under Shift,
+else lower. Casing is a no-op on punctuation, so shifted glyphs (`>`/`{`/`%`) pass through."
+  (cond
+    ctrl (lower k)
+    (and alt shift) (upper k)
+    alt (lower k)
+    :else k))
+
+(defn web-key->token (k ctrl alt shift)
+  "Map a browser key event to the editor's key token: a 1-char string for a plain
+printable key (`\"a\"`, `\">\"`, `\" \"`), a `:ctrl-`/`:alt-`/`:ctrl-meta-` keyword for a
+chord, or a named-key keyword (`:enter`, `:up`, `:back-tab`). nil for a key we don't
+translate (a bare modifier, an F-key) so the caller drops it. Mirrors gui.rs so a web key
+dispatches exactly like a local one."
+  (let (named (get *web-named-keys* k))
+    (cond
+      (not (nil? named)) (web--named-token named shift)
+      (and (= 1 (string-length k)) (or ctrl alt))
+      (keyword (str (cond (and ctrl alt) "ctrl-meta-" ctrl "ctrl-" :else "alt-")
+                 (web--chord-char k ctrl alt shift)))
+      (= 1 (string-length k)) k
+      :else nil)))
+
+(defn web--handle-input (editor req)
+  "POST /input: decode the browser key event from the JSON body, translate it to the
+editor's key token, and — when it maps to one — `send` it to the `editor` process. The
+ui-run loop polls its mailbox for input (that's how `[:web-port]` already arrives), so a
+bare token dispatches through the keymap exactly as a locally-typed key, with no change to
+`input`/`commands`. Always replies 204 (the page ignores the body). A malformed body parses
+to nil and is ignored — a bad key can never disrupt the editor."
+  (let (body (utf8-bytes->string (or (get req :body) #b""))
+        ev (try (json-parse body) (catch e nil)))
+    (when (map? ev)
+      ;; json-parse keys objects by keyword (`:k`, not `"k"`) — see std/json.
+      (let (tok (web-key->token (get ev :k "") (get ev :ctrl) (get ev :alt) (get ev :shift)))
+        (when (not (nil? tok)) (send editor tok))))
+    (response 204 {} "")))
+
 ;; ---- the HTTP handler (routes the page + the event stream) ------------------
 
-(defn web-handler (pub)
-  "The server's handler: `/` renders the current snapshot as the full page;
-`/events` is the long-lived SSE stream the page subscribes to (a `stream-response`,
-so the socket stays open and `web--sse-serve` pumps it). Both close over `pub`."
+(defn web-handler (pub editor)
+  "The server's handler: `/` renders the current snapshot as the full page; `/events`
+is the long-lived SSE stream the page subscribes to (a `stream-response`, so the socket
+stays open and `web--sse-serve` pumps it); `/input` accepts a browser key event (POST)
+and forwards it to the `editor` process as a key token — the read-write half that makes
+the mirror a real remote frontend. All close over `pub`/`editor`."
   (router {"/" (fn (req)
                  (send pub [:get (self)])
                  (receive ([:snap s] (ok (web-render-page s)))
@@ -344,7 +414,8 @@ so the socket stays open and `web--sse-serve` pumps it). Both close over `pub`."
            "/events" (fn (req)
                        (stream-response 200
                          (sse-headers)
-                         (fn (c) (web--sse-serve c pub))))}))
+                         (fn (c) (web--sse-serve c pub))))
+           "/input" (fn (req) (web--handle-input editor req))}))
 
 ;; ---- the server process -----------------------------------------------------
 
@@ -356,7 +427,7 @@ the editor process — which is why the port comes back as a message."
   (let (ls (try (http-listen port) (catch e (http-listen 0)))
         bound (tcp-local-port ls))
     (send reply-to [:web-port bound])
-    (serve-loop ls (web-handler pub))))
+    (serve-loop ls (web-handler pub reply-to))))
 
 ;; ---- lifecycle (called from the commands, in the editor process) ------------
 
