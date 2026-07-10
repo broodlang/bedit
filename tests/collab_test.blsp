@@ -18,9 +18,14 @@
 
 ;; Wait for the next `[:buffer-updated proc v view]` push and return `[v text]` (or :none).
 ;; The presence projection pushes `[text markers names]`; a bare string is the legacy shape.
-(defn ct-view-text (view) (if (vector? view) (nth view 0) view))
+(defn ct-view-text (view)
+  (cond (map? view) (get view :splice) (vector? view) (nth view 0) :else view))
 (defn ct-await (proc)
   (receive ([:buffer-updated ~proc v view _] [v (ct-view-text view)]) (after 2000 :none)))
+
+;; The raw triple [v view origin] — for tests that fold the real push shapes.
+(defn ct-await* (proc)
+  (receive ([:buffer-updated ~proc v view o] [v view o]) (after 2000 :none)))
 
 ;; Drain until quiet: the seed push AND the join announce (`collab-share-slot` plants a
 ;; cursor marker + name right after subscribing), so a test sees only its own edits after.
@@ -56,15 +61,19 @@
           mA (ct-at (collab-share-slot (ed-init (make-buffer "hello" "shared.txt")) 0 proc) 5)
           mB (ct-at (assoc-in (ed-init (make-buffer "hello" "shared.txt")) [:shared 0] {:proc proc :version -1}) 0))
       (ct-drain-seed proc)
-      ;; A appends "XYZ" at its point (5, end of "hello")
+      ;; A appends "XYZ" at its point (5, end of "hello") — the wire carries the DELTA
       (let (mA2 (collab-edit mA (fn (b) (insert (goto-char b 5) "XYZ"))))
-        (let ([v text] (ct-await proc))
-          (assert= text "helloXYZ")
-          ;; the push folds into BOTH clients' models — B sees A's edit
-          (let (mAf (ed-apply-buffer-update mA2 proc v text)
-                mBf (ed-apply-buffer-update mB proc v text))
+        (let ([v view o] (ct-await* proc))
+          (assert= (get view :splice) [5 5 "XYZ"])   ; not the document
+          (assert= (buffer-query proc buffer-text) "helloXYZ")
+          ;; the push folds into BOTH clients' models — B applies the splice; A's own
+          ;; echo is suppressed (already applied locally by collab-edit)
+          (let (mAf (ed-apply-buffer-update mA2 proc v view o)
+                mBf (ed-apply-buffer-update mB proc v view o))
             (assert= (ct-text mAf) "helloXYZ")
             (assert= (ct-text mBf) "helloXYZ")
+            ;; A's in-flight count drained by its own echo
+            (assert= (get-in mAf [:shared 0 :pending]) 0)
             ;; cursors stayed independent: B's is still at 0, A moved with its own insert
             (assert= (ct-point mBf) 0)
             (is (> (ct-point mAf) 0)))))
@@ -83,15 +92,15 @@
           mA (collab-share-slot (ed-init (make-buffer "hello" "rt.txt")) 0 proc)
           mB (assoc-in (ed-init (make-buffer "hello" "rt.txt")) [:shared 0] {:proc proc :version -1}))
       (ct-drain-seed proc)
-      ;; A prepends "A" → "Ahello"; the push updates B's copy
+      ;; A prepends "A" → "Ahello"; the delta push updates B's copy
       (collab-edit mA (fn (b) (insert (goto-char b 0) "A")))
-      (let ([v1 t1] (ct-await proc)
-            mB1 (ed-apply-buffer-update mB proc v1 t1))
-        (assert= t1 "Ahello")
+      (let ([v1 view1 o1] (ct-await* proc)
+            mB1 (ed-apply-buffer-update mB proc v1 view1 o1))
+        (assert= (ct-text mB1) "Ahello")
         ;; B, now on the updated text, appends "Z" → "AhelloZ"
         (collab-edit mB1 (fn (b) (insert (end-of-buffer b) "Z")))
-        (let ([v2 t2] (ct-await proc))
-          (assert= t2 "AhelloZ")                 ; both edits survived, correctly ordered
+        (let ([_ view2 _] (ct-await* proc))
+          (assert= (get view2 :splice) [6 6 "Z"])
           (assert= (buffer-query proc buffer-text) "AhelloZ")))
       (stop-buffer proc)))
 
@@ -111,9 +120,10 @@
       (ct-drain-seed proc)
       ;; a plain command edited the pooled buffer via ed-set-buf, unaware of sharing
       (let (after (ed-set-buf m (insert (end-of-buffer (ed-current-buf m)) "!")))
-        (collab-propagate m after)
-        (let ([_ t] (ct-await proc))   ; version varies (the join announce bumped it)
-          (assert= t "hello!"))
+        (let (after2 (collab-propagate m after))
+          (assert= (get-in after2 [:shared 0 :pending]) 1))   ; one splice in flight
+        (let ([_ view _] (ct-await* proc))
+          (assert= (get view :splice) [5 5 "!"]))             ; the delta, not the doc
         (assert= (buffer-query proc buffer-text) "hello!"))
       (stop-buffer proc)))
 
@@ -225,6 +235,34 @@
       (let (m6 (ed-apply-buffer-update m3 proc 3 ["hello world" {me 0} {me "guest" :zoe "zoe"}]))
         (is (nil? (get m6 :follow)))
         (assert= (get m6 :echo) "zoe left — stopped following"))
+      (stop-buffer proc)))
+
+  (test "selections: an active region syncs the [me :mark] anchor; dropping it deletes it"
+    (let (proc (spawn-buffer (make-buffer "hello world" "sel.txt"))
+          m (collab-share-slot (ed-init (make-buffer "hello world" "sel.txt")) 0 proc)
+          me (get-in m [:shared 0 :me]))
+      (ct-drain-seed proc)
+      ;; region 2..6 active locally (mark 2, point 6) → the sync ships cursor AND anchor
+      (let (m1 (ed-set-buf m (assoc (goto-char (ed-current-buf m) 6) :mark 2))
+            m2 (collab-sync-point m1))
+        (receive (after 200 nil))
+        (assert= (buffer-query proc (fn (b) (buffer-marker b [me :mark]))) 2)
+        (assert= (buffer-query proc (fn (b) (buffer-marker b me))) 6)
+        ;; dropping the region deletes the anchor (cursor marker stays)
+        (let (m3 (ed-set-buf m2 (assoc (ed-current-buf m2) :mark nil))
+              _ (collab-sync-point m3))
+          (receive (after 200 nil))
+          (is (nil? (buffer-query proc (fn (b) (buffer-marker b [me :mark])))))))
+      (stop-buffer proc)))
+
+  (test "selections: a push's [pid :mark] anchors land as :marks (own excluded)"
+    (let (proc (spawn-buffer (make-buffer "hello world" "sm.txt"))
+          m (collab-share-slot (ed-init (make-buffer "hello world" "sm.txt")) 0 proc)
+          me (get-in m [:shared 0 :me])
+          raw (assoc {me 0 :zoe 9} [:zoe :mark] 4)
+          mf (ed-apply-buffer-update m proc 5 ["hello world" raw {me "guest" :zoe "zoe"}]))
+      (assert= (get-in mf [:shared 0 :marks :zoe]) 4)
+      (assert= (get-in mf [:shared 0 :cursors :zoe]) 9)   ; vector keys never leak into cursors
       (stop-buffer proc)))
 
   (test "presence: a cursor-only push leaves the buffer VALUE untouched (no rebuild)"
