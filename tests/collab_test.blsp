@@ -265,6 +265,78 @@
       (assert= (get-in mf [:shared 0 :cursors :zoe]) 9)   ; vector keys never leak into cursors
       (stop-buffer proc)))
 
+  (test "registry: one buffer process per file, whoever asks first wins the content"
+    (let (reg (collab-registry-start)
+          a (collab-registry-share reg "/tmp/cl-reg.txt" "hi" "f.txt")
+          b (collab-registry-share reg "/tmp/cl-reg.txt" "STALE" "f.txt")
+          c (collab-registry-share reg "/tmp/cl-reg2.txt" "yo" "g.txt"))
+      (is (= a b))
+      (is (not (= a c)))
+      (assert= (buffer-query b buffer-text) "hi")
+      (stop-buffer a)
+      (stop-buffer c)))
+
+  (test "autoshare: visiting a file buffer in a registry session links its slot"
+    (let (reg (collab-registry-start)
+          m (assoc (ed-init (make-buffer "hello" "n.txt" "/tmp/cl-auto.txt")) :collab-reg reg)
+          m1 (collab-autoshare m))
+      (is (collab-shared? m1 0))
+      ;; idempotent — a second pass changes nothing
+      (is (= (get-in m1 [:shared 0 :proc]) (get-in (collab-autoshare m1) [:shared 0 :proc])))
+      ;; a scratch (fileless) buffer is never shared
+      (is (nil? (get-in (collab-autoshare (assoc (ed-init (make-buffer "s")) :collab-reg reg))
+                  [:shared 0])))
+      (ct-drain-seed (get-in m1 [:shared 0 :proc]))
+      (stop-buffer (get-in m1 [:shared 0 :proc]))))
+
+  (test "presence migrates: switching buffers withdraws the markers from the buffer left"
+    (let (procA (spawn-buffer (make-buffer "aaa" "a.txt"))
+          procB (spawn-buffer (make-buffer "bbb" "b.txt"))
+          m0 (collab-share-slot (ed-init (make-buffer "aaa" "a.txt")) 0 procA)
+          me (get-in m0 [:shared 0 :me])
+          ;; a second pool buffer, shared with B, then sync while A is current
+          m1 (collab-share-slot (ed-append-named m0 "b.txt" "bbb") 1 procB)
+          m2 (collab-sync-point m1))
+      (receive (after 250 nil))
+      (is (not (nil? (buffer-query procA (fn (b) (buffer-marker b me))))))
+      ;; switch to buffer 1 and sync → presence leaves A, lands on B
+      (let (_ (collab-sync-point (ed-show-index m2 1)))
+        (receive (after 250 nil))
+        (is (nil? (buffer-query procA (fn (b) (buffer-marker b me)))))
+        (is (not (nil? (buffer-query procB (fn (b) (buffer-marker b me)))))))
+      (stop-buffer procA)
+      (stop-buffer procB)))
+
+  (test "share-follow crosses buffers; share-mirror adopts the leader's viewport"
+    ;; pure model state: zoe is IN the b.txt slot (cursor there, none in slot 0)
+    (let (m0 (ed-append-named (ed-init (make-buffer "aaa" "a.txt"))
+               "b.txt" "line0\nline1\nline2\nline3\nline4\nline5\nline6")
+          bi (ed-buffer-index-by-name m0 "b.txt")
+          m (assoc m0 :shared {0 {:proc :pa :version 1 :me :self :cursors {}}
+                               bi {:proc :pb :version 1 :me :self
+                                   :cursors {:zoe 14} :tops {:zoe 12}
+                                   :names {:zoe "zoe"}}})
+          mf (collab-follow m :zoe "zoe")
+          mj (collab-follow-jump mf 3))
+      (assert= (ed-current-index mj) bi)                         ; switched buffers with her
+      (assert= (buffer-point (ed-current-buf mj)) 14)            ; and sits on her caret
+      ;; mirror mode also adopts her top (offset 12 = line 2)
+      (let (mm (collab-follow-jump (collab-follow m :zoe "zoe" :mirror) 3))
+        (assert= (ed-current-top mm) 2))))
+
+  (test "name tags: a moved caret re-arms the tag ttl; the blink beat decays it"
+    (let (proc (spawn-buffer (make-buffer "doc" "tt.txt"))
+          m (collab-share-slot (ed-init (make-buffer "doc" "tt.txt")) 0 proc)
+          me (get-in m [:shared 0 :me])
+          m0 (ed-apply-buffer-update m proc 0 ["doc" {me 0} {me "guest"}])
+          m1 (ed-apply-buffer-update m0 proc 1 ["doc" {me 0 :zoe 1} {me "guest" :zoe "zoe"}]))
+      (is (> (get-in m1 [:shared 0 :tag-ttl :zoe]) 0))
+      ;; an unmoved caret in the next push does NOT re-arm; decay ticks it away
+      (let (m2 (ed-apply-buffer-update m1 proc 2 ["doc" {me 0 :zoe 1} {me "guest" :zoe "zoe"}])
+            m3 (fold (fn (acc _) (collab-decay-tags acc)) m2 (range 0 9)))
+        (is (nil? (get-in m3 [:shared 0 :tag-ttl :zoe]))))
+      (stop-buffer proc)))
+
   (test "presence: a cursor-only push leaves the buffer VALUE untouched (no rebuild)"
     (let (proc (spawn-buffer (make-buffer "doc" "nv.txt"))
           m (collab-share-slot (ed-init (make-buffer "doc" "nv.txt")) 0 proc)

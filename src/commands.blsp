@@ -24,6 +24,7 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
   (:use isearch)  ; incremental search + query-replace (the modal mini-loops)
   (:use mincomplete)  ; ed-complete-name / ed-complete-path — minibuffer prompt completion
   (:use collab)  ; follow / participants / unfollow — the shared-session commands (C-x f)
+  (:use editor/serve)  ; serve — M-x share-session turns THIS editor into a host
   (:use text)  ; text/fill — greedy word-wrap (the engine behind fill-paragraph / M-q)
   (:use projects)  ; project-root / project-files — find-file-in-project (C-x p f)
   (:use task)  ; task / cancel-task — the off-loop, cancellable, timeout-bounded async eval
@@ -3094,30 +3095,105 @@ word) instead."
 ;; The shared-session commands. `collab` is a hard :use (not deferred): the model
 ;; layer already loads it via `input`, so this adds no startup weight.
 
-(defcommand cmd-follow
-  (m key)
-  "Follow another participant on this shared buffer (M-x follow / C-x f): your point
-and view ride their caret live — the pairing mode — until you move yourself (any
-point-moving key takes the wheel back) or they leave. Already following? This stops
-it (a toggle). With exactly one other participant it follows them at once; with more
-it prompts, completing over who's here."
+(defn ed--share-track (m mode verb)
+  "The shared body of `share-follow` / `share-mirror`: toggle off if already tracking,
+follow the one other participant immediately, else prompt (completing over everyone
+present on any shared buffer)."
   (let (parts (collab/collab-participants m))
     (cond
       (get m :follow) (collab/collab-unfollow m)
-      (empty? parts) (message m "no one else is on this buffer")
+      (empty? parts) (message m "no one else is here")
       (= (count parts) 1)
       (let (kv (first (map-pairs parts)))
-        (collab/collab-follow m (first kv) (second kv)))
+        (collab/collab-follow m (first kv) (second kv) mode))
       :else
       (let (by-name (fold (fn (acc kv) (assoc acc (second kv) (first kv))) {} (map-pairs parts)))
         (assoc m
           :minibuffer
-          (ed-name-prompt "Follow: " (keys by-name)
+          (ed-name-prompt (str verb ": ") (keys by-name)
             (fn (mm nm)
               (let (pid (get by-name nm))
                 (if (nil? pid)
                   (message mm (str "no participant " nm))
-                  (collab/collab-follow mm pid nm))))))))))
+                  (collab/collab-follow mm pid nm mode))))))))))
+
+(defcommand cmd-share-follow
+  (m key)
+  "Follow another participant (M-x share-follow / C-x f): your point — and buffer,
+when they switch — rides their caret live, until you move yourself (any point-moving
+key takes the wheel back) or they leave. Already tracking? This stops it (a toggle).
+With exactly one other participant it follows them at once; with more it prompts,
+completing over who's here."
+  (ed--share-track m :follow "Follow"))
+
+(defcommand cmd-share-mirror
+  (m key)
+  "Mirror another participant (M-x share-mirror / C-x F): like `share-follow`, but
+your window also reproduces their VIEWPORT — buffer, caret, and scroll — so you see
+what they see, the old one-view shared experience, per-person and reversible. Any
+move of your own takes the wheel back; a toggle like share-follow."
+  (ed--share-track m :mirror "Mirror"))
+
+(def *share-session-welcome*
+  "myedit — a shared session.\n\nYou are attached to someone's live editor: open any file they have (C-x C-f)\nand you edit it together, each with your own caret. C-x f follows a participant;\nC-x F mirrors their view. C-x C-c detaches.\n")
+
+(defn ed--share-session-start (m)
+  "Turn THIS editor into a shared-session host: become a node (\"myedit\", if not
+already one), start the file registry, share the current buffer, and serve fresh
+sessions to attachers (each gets `:collab-reg`, so any file they visit is shared too).
+The serve manager pid rides `:collab-serving` for share-session-stop."
+  (do
+    (when (= (node-name) :nonode) (node-start :myedit))
+    (let (reg (collab/collab-registry-start)
+          m1 (collab/collab-autoshare (assoc m :collab-reg reg))
+          ;; attachers open the host's current file when it has one, else a welcome
+          file (buffer-file (ed-current-buf m1))
+          mk (fn () (collab/collab-share-slot
+                      (assoc (ed-init (if (nil? file)
+                                        (make-buffer *share-session-welcome*)
+                                        (find-file-buffer file)))
+                        :collab-reg reg)
+                      0
+                      (if (nil? file)
+                        (get-in m1 [:shared (ed-current-index m1) :proc] (spawn-buffer (make-buffer *share-session-welcome*)))
+                        (collab/collab-registry-share reg file (buffer-text (ed-current-buf m1)) (buffer-name (ed-current-buf m1))))))
+          ;; view/update resolved late (quoted symbols), as keymap dispatch does —
+          ;; commands must not :use view/input (they :use commands)
+          mgr (serve mk (eval 'view/ed-view) (eval 'input/ed-update)))
+      (message (assoc m1 :collab-serving mgr)
+        (str "sharing this editor — attach with: bedit --attach myedit --as NAME")))))
+
+(defcommand cmd-share-session
+  (m key)
+  "Share THIS editor (M-x share-session): become a host others attach to
+(`bedit --attach myedit --as NAME`) — every file buffer anyone visits is shared, with
+presence, follow, and mirror. Prompts for your display name when none is set (set
+`:share-name \"you\"` in init.blsp, or launch with --as, to skip the prompt).
+M-x share-session-stop ends it."
+  (cond
+    (get m :collab-serving) (message m "already sharing — M-x share-session-stop to end")
+    (nil? (get m :participant))
+    (assoc m :minibuffer
+      (ed-name-prompt "Your name: " '()
+        (fn (mm nm)
+          (if (= (trim nm) "")
+            (message mm "share-session needs a name")
+            (ed--share-session-start (collab/collab-set-name mm (trim nm)))))))
+    :else (ed--share-session-start m)))
+
+(defcommand cmd-share-session-stop
+  (m key)
+  "Stop sharing this editor (M-x share-session-stop): the serve manager is killed (no
+new attaches) and every shared slot is unshared — your buffers stop broadcasting and
+your presence withdraws. Participants still attached keep their own sessions until
+they detach."
+  (if (nil? (get m :collab-serving))
+    (message m "not sharing — M-x share-session starts")
+    (do
+      (exit (get m :collab-serving) :kill)
+      (let (m1 (fold (fn (acc kv) (collab/collab-unshare acc (first kv)))
+                 m (map-pairs (or (get m :shared) {}))))
+        (message (dissoc (dissoc m1 :collab-reg) :collab-serving) "stopped sharing")))))
 
 (defcommand cmd-collab-status
   (m key)

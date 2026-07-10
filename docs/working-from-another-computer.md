@@ -77,12 +77,20 @@ bedit --attach ed --as alice
   everyone else's caret renders live as a coloured bar with a name tag; joins/leaves are
   echoed; a detached/crashed participant's caret is cleaned up, never a ghost. Fast typing
   never flickers under its own round-trip (origin-tagged echo suppression).
-- **`follow` (`C-x f` / M-x follow)** — the pairing view: your point and viewport ride a
-  chosen participant's caret live (with one other person it follows them immediately; more
-  prompts by name). Any move of your own takes the wheel back; `C-x f` again also stops.
-  `M-x collab-status` echoes who's here and what you're following.
-- `--as NAME` names you for presence (both `--attach` and the host window); it defaults to
-  your OS username.
+- **Every file is shared.** Any file buffer any participant visits is auto-backed by one
+  shared process (the daemon's file registry) — so you can roam a whole project together,
+  not just the launch file.
+- **`share-follow` (`C-x f`)** — ride a participant's caret: your point AND buffer track
+  theirs (switching files with them). With one other person it follows immediately; with
+  more it prompts by name. Any move of your own takes the wheel back; `C-x f` again stops.
+- **`share-mirror` (`C-x F`)** — like share-follow, but your window also reproduces their
+  viewport (scroll), so you see exactly what they see — the classic one-view pairing.
+- **`M-x share-session` / `M-x share-session-stop`** — start/stop hosting from a NORMAL
+  running editor (no --serve needed): it becomes the daemon `bedit --attach myedit` reaches.
+- **Names**: `--as NAME` → `:share-name "you"` in `~/.config/brood-edit/init.blsp` → your
+  OS username; `share-session` prompts if none is set. Name tags show quietly — only for a
+  few seconds after that caret moves; the coloured bar stays.
+- `M-x collab-status` echoes who's here and what you're following.
 - Close the host window to stop serving (use `--headless` for a daemon that persists).
 
 ## Over the network — `--listen`

@@ -25,6 +25,7 @@ gives the ride-one-caret pairing view on demand. See `docs/remote-multiplayer-pl
   (:use view)           ; ed-view
   (:use input)          ; ed-update
   (:use collab)         ; collab-share-slot / collab-propagate — the shared-content seam
+  (:use config)         ; init-config — the :share-name participant default
   (:use system))        ; argv — the CLI dispatch reads it
 
 ;; ---- CLI dispatch (bedit --name ed --serve  /  bedit --attach ed) -----------
@@ -79,10 +80,14 @@ filename). nil if none."
   (or (remote--arg-after args "--name") "myedit"))
 
 (defn remote--participant (args)
-  "This user's display name for collab presence: `--as NAME`, else the OS username,
-else \"guest\". Carried to the daemon as the attach identity (`{:name …}`), where the
-session announces it on the shared buffer — name tags and join/leave echoes."
-  (or (remote--arg-after args "--as") (getenv "USER") "guest"))
+  "This user's display name for collab presence: `--as NAME`, else `:share-name` from
+the init file (~/.config/brood-edit/init.blsp), else the OS username, else \"guest\".
+Carried to the daemon as the attach identity (`{:name …}`), where the session announces
+it on the shared buffer — name tags and join/leave echoes."
+  (or (remote--arg-after args "--as")
+    (get (config/init-config) :share-name)
+    (getenv "USER")
+    "guest"))
 
 (defn remote--listen-addr (args)
   "The daemon's TCP listen address from `--listen [HOST:]PORT` (a bare port binds
@@ -193,9 +198,10 @@ must already be a node — launch with `bedit --name NAME --serve [file]`. Block
 ;; — which the session's `ed-update` folds via the registered handler (see
 ;; `input/ed--ev-buffer-updated`), reaching the loop because the daemon-side display's
 ;; `:poll` passes async mailbox messages through (the std/editor/serve event-bus
-;; pass-through). Outbound, `ed-update-collab` wraps `ed-update` with
-;; `collab-propagate`, so ordinary commands stay `model -> model` with no knowledge of
-;; sharing.
+;; pass-through). Outbound, the collab chain runs at the tail of `ed-update` itself
+;; (`collab-step` — a no-op on unshared models), so ordinary commands stay
+;; `model -> model` with no knowledge of sharing, and a LIVE editor can become a host
+;; mid-session (M-x share-session).
 
 (def *collab-welcome*
   "myedit — COLLAB session (shared content, your own cursor).\n\nEveryone attached edits this same buffer; each keeps their own cursor and panes.\nC-x C-c / the window close button detaches.\n")
@@ -208,29 +214,17 @@ to the process's current text, so a late joiner sees the live document, not the 
 on disk)."
   (if (nil? file) (make-buffer *collab-welcome* "*shared*") (find-file-buffer file)))
 
-(defn ed-serve-collab-model (file proc)
-  "The `make-model` thunk for one COLLAB session: a fresh editor model on the collab
+(defn ed-serve-collab-model (file proc &optional reg)
+  "The `make-model` thunk for one SHARED session: a fresh editor model on the collab
 buffer for `file`, with pool slot 0 backed by shared buffer process `proc`
 (`collab-share-slot` — runs in the session process, so the subscription's pushes land on
-the session's own mailbox). Each session is otherwise independent — its own cursor,
-panes, kill ring — which is the point: shared content, per-participant everything else."
-  (fn () (collab-share-slot (ed-init (ed--collab-buffer file)) 0 proc)))
-
-(defn ed-update-collab (m input cols rows)
-  "`ed-update` with the collab loop hooks: after the event folds, `collab-propagate`
-pushes any shared slot's text change to its buffer process (so ordinary commands need
-no knowledge of sharing), and `collab-sync-point` moves this participant's cursor
-marker when point moved (presence — others see the caret travel). Propagation is
-skipped when the event IS a `[:buffer-updated …]` push — that fold is the process's
-own truth arriving, and propagating it would echo the edit back as a fresh splice
-(applying it twice); the point sync is a version-guarded no-op there anyway."
-  (let (after (ed-update m input cols rows))
-    (collab-sync-point
-      (collab-follow-step m
-        (if (and (vector? input) (= (first input) :buffer-updated))
-          after
-          (collab-propagate m after))
-        input))))
+the session's own mailbox) and the daemon's file registry on `:collab-reg` (so every
+OTHER file this session visits is auto-shared too — `collab-autoshare`). Each session is
+otherwise independent — its own cursor, panes, kill ring — which is the point: shared
+content, per-participant everything else."
+  (fn () (collab-share-slot
+           (assoc (ed-init (ed--collab-buffer file)) :collab-reg reg)
+           0 proc)))
 
 (defn ed-serve-collab (&optional file)
   "Run myedit as the SHARED (collaborative) daemon: spawn ONE buffer process owning
@@ -246,8 +240,12 @@ see `src/collab.blsp`). Blocks."
     ;; stamp from birth — one less place for the pre-node-start `nonode` stamp
     ;; (now equality-normalized in the kernel, but why invite it) to appear
     (remote--ensure-node name)
-    (let (proc (spawn-buffer (ed--collab-buffer file)))
-      (serve (ed-serve-collab-model file proc) ed-view ed-update-collab)
+    (let (reg (collab-registry-start)
+          buf (ed--collab-buffer file)
+          proc (if (nil? (buffer-file buf))
+                 (spawn-buffer buf)   ; the scratch welcome — not registry-tracked
+                 (collab-registry-share reg (buffer-file buf) (buffer-text buf) (buffer-name buf))))
+      (serve (ed-serve-collab-model file proc reg) ed-view ed-update)
       (println (str "myedit daemon '" name "' serving"
                  (if (nil? file) "" (str " " file))
                  " (SHARED — one document, everyone their own caret)."))
