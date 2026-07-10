@@ -62,6 +62,9 @@ bedit --name ed --serve notes.txt
 # host: SHARED — every client edits ONE model, sees each other live (one shared cursor)
 bedit --name ed --serve --shared notes.txt
 
+# host: COLLAB — everyone edits the SAME buffer, each with their OWN cursor
+bedit --name ed --serve --collab notes.txt
+
 # host: headless — no local window, a pure background daemon (displayless server, or a
 #       daemon that should outlive your window). Ctrl-C to stop.
 bedit --name ed --serve --headless notes.txt
@@ -72,6 +75,9 @@ bedit --attach ed
 
 - `--serve` alone → each client gets its **own** buffer (independent sessions).
 - `--serve --shared` → clients share **one** model and **one** cursor.
+- `--serve --collab` → shared *content* (one buffer process serializes all edits), but each
+  client keeps its own cursor, panes, and minibuffer — the "everyone their own caret" mode.
+  A late joiner syncs to the live document, not the file on disk.
 - Close the host window to stop serving (use `--headless` for a daemon that persists).
 
 ## Over the network (not wired yet — the honest status)
@@ -98,13 +104,15 @@ is the next serve slice.
 | Capability | State |
 |---|---|
 | Remote attach, host window, shared-cursor `--serve --shared` | ✅ runnable (same machine) |
-| Shared edits with **independent** cursors (`src/collab.blsp`) | ✅ built + unit-tested; ⬜ not yet a live serve mode |
+| Shared edits with **independent** cursors (`--serve --collab`) | ✅ runnable (same machine) |
+| Per-participant cursors *drawn* in each other's windows | ⬜ next (markers shipped; needs the participant model) |
 | Cross-machine (TCP dual-listen) | ⬜ planned (`--listen`) |
 
-The independent-cursor collab layer (buffers-as-processes: a shared buffer process,
-positional-splice edits, per-pane cursors) is complete and headless-tested in
-`src/collab.blsp` / `tests/collab_test.blsp`; wiring it into a live `--serve --collab`
-mode is the remaining step (see `docs/remote-multiplayer-plan.md`).
+The independent-cursor collab layer (a shared buffer process, positional-splice edits,
+per-pane cursors — `src/collab.blsp`) is live as `--serve --collab`: each attaching client
+gets its own session whose buffer is backed by the daemon's one buffer process, so edits
+serialize with no CRDT while every cursor stays independent (see
+`docs/remote-multiplayer-plan.md`, Slice 2 as-built, for the wiring and its tests).
 
 ## Verify a setup is good
 

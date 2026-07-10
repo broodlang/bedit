@@ -13,15 +13,18 @@ The daemon's model is the pure `ed-init` model (no `gui-display`, no window id):
 rendered here and *painted on the client's* window, so a served session needs nothing GUI-local.
 It renders via `ed-view`'s frontend-agnostic path (`:gui` unset), which is correct on any client.
 
-Slice 1 gives each client an **independent** session (its own buffer) — the `serve` semantics.
-A *shared* model across clients (collaborative editing, live cursors) is Slice 2, which needs
-`std/buffer` markers + a participant model; see the plan doc."
+Slice 1 gives each client an **independent** session (its own buffer) — the `serve`
+semantics. Two collaborative modes build on it: `--shared` (ONE model + ONE cursor fanned
+to every client, `serve-shared`) and `--collab` (each client its OWN session and OWN
+cursor, with the *content* of the shared slot backed by one buffer process —
+`src/collab.blsp`, 'everyone their own caret'). See `docs/remote-multiplayer-plan.md`."
   (:use editor/ui)      ; gui-display — the native window a client attaches
   (:use editor/serve)   ; serve / attach-display — the daemon + client seam (ADR-090)
-  (:use editor/buffer)  ; make-buffer / find-file-buffer
+  (:use editor/buffer)  ; make-buffer / find-file-buffer / spawn-buffer
   (:use model)          ; ed-init — the pure editor model
   (:use view)           ; ed-view
   (:use input)          ; ed-update
+  (:use collab)         ; collab-share-slot / collab-propagate — the shared-content seam
   (:use system))        ; argv — the CLI dispatch reads it
 
 ;; ---- CLI dispatch (bedit --name ed --serve  /  bedit --attach ed) -----------
@@ -49,6 +52,12 @@ pair scan — no dependence on `index-of` semantics for vectors)."
 (defn remote-shared? (args)
   "Whether `args` modifies `--serve` to a SHARED (collaborative) session (`--shared`)."
   (member? "--shared" args))
+
+(defn remote-collab? (args)
+  "Whether `args` modifies `--serve` to a COLLAB session (`--collab`): every client edits
+the same shared buffer content, but each keeps its **own** cursor and window (vs `--shared`,
+one model and one cursor fanned to all)."
+  (member? "--collab" args))
 
 (defn remote-headless? (args)
   "Whether `args` requests a HEADLESS daemon (`--headless`): serve and park with no local
@@ -87,12 +96,13 @@ one. Idempotent — a no-op if `--name` already brought a node up."
 (defn remote-main (args)
   "Run the CLI-requested remote mode from `args`: `--attach NAME` opens a window attached to
 daemon NAME; `--serve [file]` runs this runtime as a daemon (add `--shared` for one
-collaborative model shared by all clients, else a private buffer per client). The optional
-file is the positional arg (`remote--positional`), so `--serve --shared notes.txt` opens
-notes.txt — the `--shared` flag is never mistaken for the filename. Precondition:
-`remote-main?` is true."
+collaborative model + one cursor shared by all clients; `--collab` for shared content with a
+cursor per client; else a private buffer per client). The optional file is the positional arg
+(`remote--positional`), so `--serve --shared notes.txt` opens notes.txt — a flag is never
+mistaken for the filename. Precondition: `remote-main?` is true."
   (cond
     (remote-attach? args) (ed-attach (remote--arg-after args "--attach"))
+    (remote-collab? args) (ed-serve-collab (remote--positional args))
     (remote-shared? args) (ed-serve-shared (remote--positional args))
     :else (ed-serve (remote--positional args))))
 
@@ -154,6 +164,66 @@ need `std/buffer` markers + point-off-buffer; see `docs/remote-multiplayer-plan.
       (error "ed-serve-shared: this nest's std lacks serve-shared — rebuild Brood (cd ../brood && ./configure --with-gui && make install)"))
     (println (str "myedit daemon '" name "' serving"
                (if (nil? file) "" (str " " file)) " (SHARED — all clients edit one model)."))
+    (println (str "  attach from another terminal:  bedit --attach " name))
+    (ed-serve--run name)))
+
+;; ---- --serve --collab: shared content, a cursor per client (src/collab.blsp) -----
+;; The third serve mode. `serve` = private everything; `serve-shared` = ONE model, ONE
+;; cursor; collab = each client its OWN session model (own cursor, panes, minibuffer…)
+;; while the served buffer's CONTENT is authoritative in one buffer process. Each
+;; session subscribes (`collab-share-slot`), so every edit anyone makes is serialized by
+;; the process and pushed back as `[:buffer-updated …]` — which the session's `ed-update`
+;; folds via the registered handler (see `input/ed--ev-buffer-updated`), reaching the
+;; loop because the daemon-side display's `:poll` passes async mailbox messages through
+;; (the std/editor/serve event-bus pass-through). Outbound, `ed-update-collab` wraps
+;; `ed-update` with `collab-propagate`, so ordinary commands stay `model -> model` with
+;; no knowledge of sharing.
+
+(def *collab-welcome*
+  "myedit — COLLAB session (shared content, your own cursor).\n\nEveryone attached edits this same buffer; each keeps their own cursor and panes.\nC-x C-c / the window close button detaches.\n")
+
+(defn ed--collab-buffer (file)
+  "The buffer a collab daemon/session starts from: `file` opened (created on save if
+absent), or the collab welcome scratch. Called on both sides — once to seed the shared
+buffer process, and once per attaching session (whose content the seed push then syncs
+to the process's current text, so a late joiner sees the live document, not the file
+on disk)."
+  (if (nil? file) (make-buffer *collab-welcome* "*shared*") (find-file-buffer file)))
+
+(defn ed-serve-collab-model (file proc)
+  "The `make-model` thunk for one COLLAB session: a fresh editor model on the collab
+buffer for `file`, with pool slot 0 backed by shared buffer process `proc`
+(`collab-share-slot` — runs in the session process, so the subscription's pushes land on
+the session's own mailbox). Each session is otherwise independent — its own cursor,
+panes, kill ring — which is the point: shared content, per-participant everything else."
+  (fn () (collab-share-slot (ed-init (ed--collab-buffer file)) 0 proc)))
+
+(defn ed-update-collab (m input cols rows)
+  "`ed-update` with the collab loop hook: after the event folds, `collab-propagate`
+pushes any shared slot's text change to its buffer process (so ordinary commands need
+no knowledge of sharing). Skipped when the event IS a `[:buffer-updated …]` push —
+that fold is the process's own truth arriving, and propagating it would echo the edit
+back as a fresh splice (applying it twice)."
+  (let (after (ed-update m input cols rows))
+    (if (and (vector? input) (= (first input) :buffer-updated))
+      after
+      (collab-propagate m after))))
+
+(defn ed-serve-collab (&optional file)
+  "Run myedit as a COLLAB daemon: spawn ONE buffer process owning `file`'s content (or a
+shared scratch), then serve a fresh session per attaching client whose slot 0 is backed
+by it — everyone edits the same document and sees each other's edits live, each with
+their **own** cursor (vs `ed-serve-shared`, one fanned cursor). Launch as
+`bedit --name ed --serve --collab [file]`; clients attach with `bedit --attach ed`. The
+host gets its own window too (`--headless` to opt out). Undo history and markers are
+per-session and transient on the shared buffer (v1 — see `src/collab.blsp`). Blocks."
+  (let (name (remote--node-name (argv))
+        proc (spawn-buffer (ed--collab-buffer file)))
+    (remote--ensure-node name)
+    (serve (ed-serve-collab-model file proc) ed-view ed-update-collab)
+    (println (str "myedit daemon '" name "' serving"
+               (if (nil? file) "" (str " " file))
+               " (COLLAB — shared content, a cursor per client)."))
     (println (str "  attach from another terminal:  bedit --attach " name))
     (ed-serve--run name)))
 
