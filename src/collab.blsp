@@ -1,0 +1,152 @@
+(defmodule collab
+  "Back a POOL buffer with a shared buffer PROCESS — the seam that lets remote participants
+see each other's edits while each keeps their **own** cursor (the 'everyone their own caret'
+mode, vs `editor/serve/serve-shared`, which fans ONE model + ONE cursor to all clients).
+
+The editor already gives two *local* panes on one pooled buffer this exact split: content
+lives on the pooled buffer value (`model/ed-set-buf` writes it back so every view sees the
+edit) while point/mark are per-pane (`model/ed-with-window-point`). This module lifts that one
+level — the pooled buffer's *content* is made authoritative in a **buffer process**
+(`std/editor/buffer` spawn/subscribe/push) — so panes in *different runtimes* (remote clients)
+share it too. Point stays per-pane, so cursors stay independent.
+
+Per client model:
+
+  :shared  {pool-index {:proc <pid> :version N}}   ; which pooled slots are process-backed
+
+Each client `subscribe-buffer`s the process, so every edit anyone makes is serialized by the
+process and pushed back as `[:buffer-updated proc version text]`, folded via
+`ed-apply-buffer-update` into that slot's CONTENT — leaving every pane's window-local point
+alone (cursors stay independent). Local edits go through `collab-edit`, which expresses the
+change as a **positional splice** (`replace-region` at absolute offsets) sent to the process:
+it applies at the right place regardless of where other participants' points sit, and — in the
+v1 serialized regime (each keystroke round-trips before the next; see
+`docs/remote-multiplayer-plan.md` §1.4) — two participants' edits both survive with no CRDT.
+
+v1 limitations, on purpose: a push rebuilds the client's buffer from text, so undo history and
+client-side markers are transient on a shared buffer (the process is the source of truth).
+Simultaneous edits computed against the same base (true concurrency, not round-tripped) need
+OT/CRDT — deferred to v2."
+  (:use editor/buffer)  ; spawn/subscribe/buffer-edit/replace-region/make-buffer/buffer-text …
+  (:use model))         ; ed-init / ed-current-buf / ed-set-buf / ed-buf-at / ed-stamp …
+
+;; ---- the single positional splice diff (candidate for std/string; see module doc) ----
+
+(defn collab--prefix-len (a b i)
+  "The length of the common prefix of strings `a` and `b`, scanning from index `i`."
+  (if (and (< i (string-length a)) (< i (string-length b))
+        (= (char-at a i) (char-at b i)))
+    (collab--prefix-len a b (inc i))
+    i))
+
+(defn collab--suffix-len (a b limit k)
+  "The length of the common suffix of `a` and `b`, capped at `limit` (so it never overlaps a
+prefix already counted). Scans inward from the end, `k` chars matched so far."
+  (if (and (< k limit)
+        (= (char-at a (- (string-length a) 1 k))
+          (char-at b (- (string-length b) 1 k))))
+    (collab--suffix-len a b limit (inc k))
+    k))
+
+(defn collab-splice (old new)
+  "The single positional splice `[lo hi repl]` that turns string `old` into `new`: replace
+`old[lo, hi)` with `repl`. `lo`/`hi` bound the minimal changed span (shared prefix + suffix
+trimmed off), so `(replace-region buf lo hi repl)` reproduces `new`. Equal strings give a
+no-op `[n n \"\"]`. This is the whole edit expressed positionally, so it lands correctly at the
+process no matter where other participants' points are."
+  (let (lo (collab--prefix-len old new 0)
+        maxsuf (min (- (string-length old) lo) (- (string-length new) lo))
+        suf (collab--suffix-len old new maxsuf 0)
+        hi (- (string-length old) suf))
+    [lo hi (substring new lo (- (string-length new) suf))]))
+
+(defn collab-splice-noop? (splice)
+  "True when `splice` (`[lo hi repl]`) changes nothing — an empty range and empty replacement.
+A pure-movement command (point moved, text unchanged) yields this, so no edit is sent."
+  (let ([lo hi repl] splice)
+    (and (= lo hi) (= repl ""))))
+
+;; ---- the model <-> shared-process link --------------------------------------
+
+(defn collab-shared? (m &optional i)
+  "Whether pool slot `i` (default the current buffer's) is backed by a shared buffer process."
+  (let (idx (or i (ed-current-index m)))
+    (not (nil? (get-in m [:shared idx])))))
+
+(defn collab-share-slot (m i proc)
+  "Back pool slot `i` with buffer process `proc`: `subscribe-buffer` this model's process for
+pushes and record the link (version -1, so the seed push — version 0 — always applies and syncs
+the slot to the process's current text). Returns the model."
+  (do (subscribe-buffer proc buffer-text)
+    (assoc-in m [:shared i] {:proc proc :version -1})))
+
+(defn collab-slot-for-proc (m proc)
+  "The pool index whose shared link points at buffer process `proc`, or nil if none does."
+  (let (hit (find (fn (kv) (= (get (second kv) :proc) proc))
+              (map-pairs (or (get m :shared) {}))))
+    (if hit (first hit) nil)))
+
+(defn ed-apply-buffer-update (m proc version text)
+  "Fold a `[:buffer-updated proc version text]` push into the model: rebuild the pool slot
+linked to `proc` from `text` (re-stamped for its mode, keeping its name/file) and advance the
+recorded version. Every pane's window-local point is untouched — it lives on the pane, not the
+buffer — so cursors stay independent and simply clamp into the new text on render. Ignores a
+stale/duplicate `version`; a no-op when no slot links to `proc`."
+  (let (i (collab-slot-for-proc m proc))
+    (if (or (nil? i) (<= version (or (get-in m [:shared i :version]) -1)))
+      m
+      (let (old (ed-buf-at m i)
+            nb (ed-stamp (make-buffer text (buffer-name old) (buffer-file old))))
+        (assoc (assoc-in m [:shared i :version] version)
+          :buffers (assoc (get m :buffers) i nb))))))
+
+(defn collab-edit (m op)
+  "Apply edit `op` (a `buffer -> buffer` transform, as commands produce) to the current buffer.
+When the buffer is process-backed, express the change as a positional splice (`collab-splice`)
+and send it to the process (`buffer-edit` + `replace-region`); the process serializes it and
+pushes the result to every subscriber (including us), so all clients — each with their own
+cursor — converge. The local pane is updated at once (the caret responds without a round-trip;
+the push then reconciles the content). When the buffer isn't shared, this is exactly
+`ed-set-buf` with `op` applied — so a command may call `collab-edit` unconditionally."
+  (let (buf (ed-current-buf m)
+        nb (op buf))
+    (if (collab-shared? m)
+      (let (proc (get-in m [:shared (ed-current-index m) :proc])
+            splice (collab-splice (buffer-text buf) (buffer-text nb))
+            [lo hi repl] splice)
+        (do (when (not (collab-splice-noop? splice))
+              (buffer-edit proc (fn (b) (replace-region b lo hi repl))))
+          (ed-set-buf m nb)))
+      (ed-set-buf m nb))))
+
+(defn collab-propagate (before after)
+  "The command-agnostic counterpart to `collab-edit`: after a command folds an event in, push
+each shared slot's text change to its process so other participants see it. For every
+process-backed slot whose text differs between `before` and `after`, send the positional splice
+(`collab-splice`) to its process; the process serializes it and pushes it back to all
+subscribers (this client's own copy is already up to date, having been written by the command).
+Returns `after` unchanged. This lets the ordinary editing commands stay `model -> model` with no
+knowledge of sharing — the `ui-run` loop calls this once per event. (Use *either* this loop-level
+hook *or* explicit `collab-edit` call sites, not both on the same edit, or the splice sends
+twice.)"
+  (do
+    (doseq (kv (map-pairs (or (get after :shared) {})))
+      (let (i (first kv)
+            proc (get (second kv) :proc))
+        (when (and (< i (count (get before :buffers))) (< i (count (get after :buffers))))
+          (let (splice (collab-splice (buffer-text (ed-buf-at before i))
+                         (buffer-text (ed-buf-at after i))))
+            (when (not (collab-splice-noop? splice))
+              (let ([lo hi repl] splice)
+                (buffer-edit proc (fn (b) (replace-region b lo hi repl)))))))))
+    after))
+
+(defn collab-unshare (m i)
+  "Drop the shared link on pool slot `i` and unsubscribe this model's process from its buffer
+process (its content stops tracking; the local copy is kept as an ordinary buffer). A no-op
+when the slot isn't shared."
+  (let (proc (get-in m [:shared i :proc]))
+    (if (nil? proc)
+      m
+      (do (unsubscribe-buffer proc)
+        (assoc m :shared (dissoc (get m :shared) i))))))
