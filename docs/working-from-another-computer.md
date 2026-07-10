@@ -116,8 +116,10 @@ bedit --attach ed@HOST:7457 --as alice
 | `follow` (C-x f): ride a participant's caret — the pairing view | ✅ |
 | Echo suppression (own round-trip never flickers fast typing) | ✅ |
 | Cross-machine over TCP (`--listen`, cookie-authenticated) | ✅ (loopback-verified; try your second machine) |
+| Delta pushes (splices/marker moves on the wire — the document never ships) | ✅ |
+| Shared selections (everyone's region, tinted in their colour) | ✅ |
+| Modeline presence chip (`shared: alice, bob → alice`) | ✅ |
 | Kernel dual-listen (Unix socket *and* TCP at once) | ⬜ deferred |
-| Delta pushes (splices over the wire, not whole text) | ⬜ next |
 
 The independent-cursor collab layer (a shared buffer process, positional-splice edits,
 per-pane cursors — `src/collab.blsp`) is live as `--serve --collab`: each attaching client
