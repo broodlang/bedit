@@ -105,7 +105,8 @@ current text). Returns the model."
         name (or (get m :participant) "guest"))
     (do (subscribe-buffer proc collab--proj)
       (buffer-edit proc (fn (b) (assoc (buffer-marker-set b me 0)
-                                  :participants (assoc (get b :participants {}) me name))))
+                                  :participants (assoc (get b :participants {}) me name)))
+        me)
       (assoc-in m [:shared i] {:proc proc :version -1 :me me}))))
 
 (defn collab-set-name (m name)
@@ -122,7 +123,8 @@ name instead of \"guest\". A no-op for a nil/empty name."
               me (get sh :me))
           (when me
             (buffer-edit proc (fn (b) (assoc b :participants
-                                        (assoc (get b :participants {}) me name)))))))
+                                        (assoc (get b :participants {}) me name)))
+              me))))
       (assoc m :participant name))))
 
 (defn collab-sync-point (m)
@@ -139,8 +141,61 @@ unshared buffers and unmoved points, so the every-event path pays nothing."
             pt (buffer-point (ed-current-buf m)))
         (if (or (nil? me) (= pt (get sh :sent-point)))
           m
-          (do (buffer-edit (get sh :proc) (fn (b) (buffer-marker-set b me pt)))
+          (do (buffer-edit (get sh :proc) (fn (b) (buffer-marker-set b me pt)) me)
             (assoc-in m [:shared i :sent-point] pt)))))))
+
+;; ---- follow: ride another participant's caret (the pairing mode) -------------
+;; `collab-follow` pins your point (and view) to another participant's cursor: every
+;; push that moves their marker moves you too — the old one-cursor `--shared`
+;; experience, but opt-in, per-person, and reversible. Any point-moving input of your
+;; OWN breaks it (you took the wheel); the followed participant leaving breaks it too.
+
+(defn collab-participants (m &optional i)
+  "The OTHER participants on slot `i` (default: the current buffer's): `{pid name}`
+for every remote cursor, named from the registry (\"guest\" when unnamed)."
+  (let (idx (or i (ed-current-index m))
+        sh (get-in m [:shared idx])
+        names (or (get sh :names) {}))
+    (fold (fn (acc kv) (assoc acc (first kv) (get names (first kv) "guest")))
+      {} (map-pairs (or (get sh :cursors) {})))))
+
+(defn collab-follow (m pid name)
+  "Start following participant `pid`/`name`: point and view ride their caret from the
+next push on (see `collab-follow-jump`)."
+  (message (assoc m :follow {:pid pid :name name})
+    (str "following " name " — any move of your own stops")))
+
+(defn collab-unfollow (m &optional reason)
+  "Stop following (a no-op when not). `reason` overrides the default echo."
+  (if (nil? (get m :follow))
+    m
+    (message (dissoc m :follow)
+      (or reason (str "stopped following " (get-in m [:follow :name]))))))
+
+(defn collab-follow-jump (m textrows)
+  "While following: put point on the followed participant's cursor and keep it on
+screen (called from the `:buffer-updated` handler, where the viewport height is known).
+A no-op when not following, when their cursor isn't on the current slot, or when point
+is already there."
+  (let (f (get m :follow))
+    (if (nil? f)
+      m
+      (let (i (ed-current-index m)
+            pos (get-in m [:shared i :cursors (get f :pid)]))
+        (cond
+          (nil? pos) m
+          (= pos (buffer-point (ed-current-buf m))) m
+          :else (ed-scroll (ed-set-buf m (goto-char (ed-current-buf m) pos)) textrows))))))
+
+(defn collab-follow-step (before after input)
+  "Break the follow when the USER moved point — a real key/mouse (`ed-real-input?`)
+that changed it means they took the wheel. Movement caused by pushes / the follow jump
+/ timers never breaks it. The `ed-update-collab` loop hook."
+  (if (and (get after :follow)
+        (ed-real-input? input)
+        (not (= (buffer-point (ed-current-buf before)) (buffer-point (ed-current-buf after)))))
+    (collab-unfollow after)
+    after))
 
 (defn collab--presence-echo (m old-cursors cursors names)
   "Echo presence churn between two pushes: a participant key newly in `cursors`
@@ -160,16 +215,23 @@ beyond that is vanishingly rare. Unchanged sets echo nothing."
               (map-pairs (or (get m :shared) {}))))
     (if hit (first hit) nil)))
 
-(defn ed-apply-buffer-update (m proc version view)
-  "Fold a `[:buffer-updated proc version view]` push into the model. `view` is the
-presence triple `[text cursors names]` (or a bare text string — see
+(defn ed-apply-buffer-update (m proc version view &optional origin)
+  "Fold a `[:buffer-updated proc version view origin]` push into the model. `view` is
+the presence triple `[text cursors names]` (or a bare text string — see
 `collab--view-parts`): the slot's content is rebuilt from `text` when it actually
 changed (a cursor-only push touches no buffer — cheap, and local undo state survives),
 other participants' cursors/names land on the slot (`:cursors`, `:names` — own pid
 excluded), presence churn is echoed (`collab--presence-echo`, suppressed on the seed:
-finding people already here isn't news the same way), and the version advances. Every
-pane's window-local point is untouched — it lives on the pane, not the buffer — so
-cursors stay independent and simply clamp into the new text on render. Ignores a
+finding people already here isn't news the same way), and the version advances.
+
+**Echo suppression**: a push whose `origin` is OUR OWN pid is our edit coming back —
+the local model already applied it (and may be ahead of it, mid-fast-typing), so the
+content is never rebuilt from it: just the version bump + cursors. Without this, your
+own round-trip briefly clobbers newer local keystrokes (a visible flicker) before the
+next push reconverges.
+
+Every pane's window-local point is untouched — it lives on the pane, not the buffer —
+so cursors stay independent and simply clamp into the new text on render. Ignores a
 stale/duplicate `version`; a no-op when no slot links to `proc`."
   (let (i (collab-slot-for-proc m proc))
     (if (or (nil? i) (<= version (or (get-in m [:shared i :version]) -1)))
@@ -177,14 +239,21 @@ stale/duplicate `version`; a no-op when no slot links to `proc`."
       (let ([text cursors names] (collab--view-parts view)
             sh (get-in m [:shared i])
             me (get sh :me)
+            own? (and (not (nil? origin)) (= origin me))
             others (if (nil? me) cursors (dissoc cursors me))
             seed? (= (or (get sh :version) -1) -1)
             m1 (if seed? m (collab--presence-echo m (or (get sh :cursors) {}) others
                              (merge (or (get sh :names) {}) names)))
-            m2 (assoc m1 :shared (assoc (get m1 :shared) i
-                                   (merge sh {:version version :cursors others :names names})))
+            ;; the participant we were following left → stop (their caret is gone)
+            m1b (let (f (get m1 :follow))
+                  (if (and f (contains? (or (get sh :cursors) {}) (get f :pid))
+                        (not (contains? others (get f :pid))))
+                    (collab-unfollow m1 (str (get f :name) " left — stopped following"))
+                    m1))
+            m2 (assoc m1b :shared (assoc (get m1b :shared) i
+                                    (merge sh {:version version :cursors others :names names})))
             old (ed-buf-at m2 i))
-        (if (= text (buffer-text old))
+        (if (or own? (= text (buffer-text old)))
           m2
           (assoc m2 :buffers (assoc (get m2 :buffers) i
                                (ed-stamp (make-buffer text (buffer-name old) (buffer-file old))))))))))
@@ -200,11 +269,12 @@ the push then reconciles the content). When the buffer isn't shared, this is exa
   (let (buf (ed-current-buf m)
         nb (op buf))
     (if (collab-shared? m)
-      (let (proc (get-in m [:shared (ed-current-index m) :proc])
+      (let (sh (get-in m [:shared (ed-current-index m)])
+            proc (get sh :proc)
             splice (collab-splice (buffer-text buf) (buffer-text nb))
             [lo hi repl] splice)
         (do (when (not (collab-splice-noop? splice))
-              (buffer-edit proc (fn (b) (replace-region b lo hi repl))))
+              (buffer-edit proc (fn (b) (replace-region b lo hi repl)) (get sh :me)))
           (ed-set-buf m nb)))
       (ed-set-buf m nb))))
 
@@ -221,13 +291,14 @@ twice.)"
   (do
     (doseq (kv (map-pairs (or (get after :shared) {})))
       (let (i (first kv)
-            proc (get (second kv) :proc))
+            proc (get (second kv) :proc)
+            me (get (second kv) :me))
         (when (and (< i (count (get before :buffers))) (< i (count (get after :buffers))))
           (let (splice (collab-splice (buffer-text (ed-buf-at before i))
                          (buffer-text (ed-buf-at after i))))
             (when (not (collab-splice-noop? splice))
               (let ([lo hi repl] splice)
-                (buffer-edit proc (fn (b) (replace-region b lo hi repl)))))))))
+                (buffer-edit proc (fn (b) (replace-region b lo hi repl)) me)))))))
     after))
 
 (defn collab-unshare (m i)
@@ -242,6 +313,7 @@ an ordinary buffer). A no-op when the slot isn't shared."
       m
       (do (when me
             (buffer-edit proc (fn (b) (assoc (buffer-marker-delete b me)
-                                        :participants (dissoc (get b :participants {}) me)))))
+                                        :participants (dissoc (get b :participants {}) me)))
+              me))
         (unsubscribe-buffer proc)
         (assoc m :shared (dissoc (get m :shared) i))))))

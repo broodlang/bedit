@@ -14,10 +14,10 @@ rendered here and *painted on the client's* window, so a served session needs no
 It renders via `ed-view`'s frontend-agnostic path (`:gui` unset), which is correct on any client.
 
 Slice 1 gives each client an **independent** session (its own buffer) — the `serve`
-semantics. Two collaborative modes build on it: `--shared` (ONE model + ONE cursor fanned
-to every client, `serve-shared`) and `--collab` (each client its OWN session and OWN
-cursor, with the *content* of the shared slot backed by one buffer process —
-`src/collab.blsp`, 'everyone their own caret'). See `docs/remote-multiplayer-plan.md`."
+semantics. `--shared` (alias `--collab`) builds the collaborative mode on it: each client
+its OWN session and OWN cursor, with the *content* of the shared slot backed by one buffer
+process ('everyone their own caret' + presence — `src/collab.blsp`); the `follow` command
+gives the ride-one-caret pairing view on demand. See `docs/remote-multiplayer-plan.md`."
   (:use editor/ui)      ; gui-display — the native window a client attaches
   (:use editor/serve)   ; serve / attach-display — the daemon + client seam (ADR-090)
   (:use editor/buffer)  ; make-buffer / find-file-buffer / spawn-buffer
@@ -50,14 +50,11 @@ pair scan — no dependence on `index-of` semantics for vectors)."
   (member? "--attach" args))
 
 (defn remote-shared? (args)
-  "Whether `args` modifies `--serve` to a SHARED (collaborative) session (`--shared`)."
-  (member? "--shared" args))
-
-(defn remote-collab? (args)
-  "Whether `args` modifies `--serve` to a COLLAB session (`--collab`): every client edits
-the same shared buffer content, but each keeps its **own** cursor and window (vs `--shared`,
-one model and one cursor fanned to all)."
-  (member? "--collab" args))
+  "Whether `args` modifies `--serve` to a SHARED session: everyone edits the same
+buffer, each with their **own** cursor and presence (`--shared`, or its alias
+`--collab` — one collaborative mode; use the `follow` command to ride someone's
+caret when you want the single-view pairing experience)."
+  (or (member? "--shared" args) (member? "--collab" args)))
 
 (defn remote-headless? (args)
   "Whether `args` requests a HEADLESS daemon (`--headless`): serve and park with no local
@@ -67,13 +64,13 @@ background daemon). Without it, `--serve` also opens the host's own window (see 
 
 (defn remote--positional (args)
   "The first positional argument (a file path) in `args` — skipping flags (`--x`) AND the
-value token of a value-taking flag (`--name NAME` / `--attach NAME` / `--as NAME`). So
+value token of a value-taking flag (`--name` / `--attach` / `--as` / `--listen`). So
 `--serve --shared` and `--serve --shared notes.txt` both parse correctly: nil and
 \"notes.txt\" respectively (a bare `--serve` never swallows the following `--shared` as a
 filename). nil if none."
   (cond
     (empty? args) nil
-    (member? (first args) ["--name" "--attach" "--as"]) (remote--positional (rest (rest args)))
+    (member? (first args) ["--name" "--attach" "--as" "--listen"]) (remote--positional (rest (rest args)))
     (starts-with? (first args) "--") (remote--positional (rest args))
     :else (first args)))
 
@@ -87,13 +84,40 @@ else \"guest\". Carried to the daemon as the attach identity (`{:name …}`), wh
 session announces it on the shared buffer — name tags and join/leave echoes."
   (or (remote--arg-after args "--as") (getenv "USER") "guest"))
 
+(defn remote--listen-addr (args)
+  "The daemon's TCP listen address from `--listen [HOST:]PORT` (a bare port binds
+0.0.0.0 — every interface), or nil for the default per-user Unix socket (same machine
+only). With `--listen`, machines elsewhere attach as `bedit --attach NAME@HOST:PORT`
+(the shared cookie in ~/.config/brood/cookie must match on both ends). Note: the node
+then listens on TCP *instead of* the Unix socket, so local attaches also use the
+@HOST:PORT form — dual-listen is the deferred kernel feature."
+  (let (v (remote--arg-after args "--listen"))
+    (cond
+      (nil? v) nil
+      (string-contains? v ":") v
+      :else (str "0.0.0.0:" v))))
+
 (defn remote--ensure-node (name)
   "Ensure this runtime is a Brood node called `name` so clients can attach to it. `nest run
 --name NAME` brings the node up for you, but the standalone `bedit` does not (it passes
 `--name` straight through as a program arg), so start the node here whenever we're not yet
-one. Idempotent — a no-op if `--name` already brought a node up."
+one. With `--listen [HOST:]PORT` the node binds TCP (reachable from other machines, cookie
+authenticated) instead of the per-user Unix socket. Idempotent — a no-op if `--name`
+already brought a node up."
   (when (= (node-name) :nonode)
-    (node-start (keyword name))))
+    (let (addr (remote--listen-addr (argv)))
+      (if (nil? addr)
+        (node-start (keyword name))
+        (node-start (keyword name) addr (node-cookie))))))
+
+(defn remote--attach-hint (name)
+  "The attach command clients should run: plain NAME over the local Unix socket, or
+NAME@HOST:PORT when the daemon listens on TCP (`--listen`; a 0.0.0.0 bind means 'use
+this machine's reachable address' — substitute it on the other end)."
+  (let (addr (remote--listen-addr (argv)))
+    (if (nil? addr)
+      (str "bedit --attach " name)
+      (str "bedit --attach " name "@" addr))))
 
 (defn remote-main? (args)
   "True when `args` (the CLI tokens `main` received) requested daemon (`--serve`) or client
@@ -102,15 +126,14 @@ one. Idempotent — a no-op if `--name` already brought a node up."
 
 (defn remote-main (args)
   "Run the CLI-requested remote mode from `args`: `--attach NAME` opens a window attached to
-daemon NAME; `--serve [file]` runs this runtime as a daemon (add `--shared` for one
-collaborative model + one cursor shared by all clients; `--collab` for shared content with a
-cursor per client; else a private buffer per client). The optional file is the positional arg
-(`remote--positional`), so `--serve --shared notes.txt` opens notes.txt — a flag is never
-mistaken for the filename. Precondition: `remote-main?` is true."
+daemon NAME; `--serve [file]` runs this runtime as a daemon (add `--shared` — or its alias
+`--collab` — for the collaborative session: shared content, a cursor per client; else a
+private buffer per client). The optional file is the positional arg (`remote--positional`),
+so `--serve --shared notes.txt` opens notes.txt — a flag is never mistaken for the filename.
+Precondition: `remote-main?` is true."
   (cond
     (remote-attach? args) (ed-attach (remote--arg-after args "--attach"))
-    (remote-collab? args) (ed-serve-collab (remote--positional args))
-    (remote-shared? args) (ed-serve-shared (remote--positional args))
+    (remote-shared? args) (ed-serve-collab (remote--positional args))
     :else (ed-serve (remote--positional args))))
 
 (def *served-welcome*
@@ -156,37 +179,23 @@ must already be a node — launch with `bedit --name NAME --serve [file]`. Block
     (serve (ed-serve-model file) ed-view ed-update)
     (println (str "myedit daemon '" name "' serving"
                (if (nil? file) "" (str " " file)) " (private buffer per client)."))
-    (println (str "  attach from another terminal:  bedit --attach " name))
+    (println (str "  attach from another terminal:  " (remote--attach-hint name)))
     (ed-serve--run name)))
 
-(defn ed-serve-shared (&optional file)
-  "Run myedit as a SHARED daemon: every attaching client edits ONE model and sees the
-others' edits live (collaborative), vs `ed-serve` (a private buffer per client). Builds a
-single editor model and serves it via `serve-shared`, then parks. Launch as
-`bedit --name ed --serve --shared [file]`; clients attach with `bedit --attach ed`. All
-clients share ONE cursor this slice — distinct per-participant cursors are deferred (they
-need `std/buffer` markers + point-off-buffer; see `docs/remote-multiplayer-plan.md`)."
-  (let (name (remote--node-name (argv)))
-    (remote--ensure-node name)
-    (if (bound? 'editor/serve/serve-shared)
-      (editor/serve/serve-shared ((ed-serve-model file)) ed-view ed-update)
-      (error "ed-serve-shared: this nest's std lacks serve-shared — rebuild Brood (cd ../brood && ./configure --with-gui && make install)"))
-    (println (str "myedit daemon '" name "' serving"
-               (if (nil? file) "" (str " " file)) " (SHARED — all clients edit one model)."))
-    (println (str "  attach from another terminal:  bedit --attach " name))
-    (ed-serve--run name)))
-
-;; ---- --serve --collab: shared content, a cursor per client (src/collab.blsp) -----
-;; The third serve mode. `serve` = private everything; `serve-shared` = ONE model, ONE
-;; cursor; collab = each client its OWN session model (own cursor, panes, minibuffer…)
-;; while the served buffer's CONTENT is authoritative in one buffer process. Each
-;; session subscribes (`collab-share-slot`), so every edit anyone makes is serialized by
-;; the process and pushed back as `[:buffer-updated …]` — which the session's `ed-update`
-;; folds via the registered handler (see `input/ed--ev-buffer-updated`), reaching the
-;; loop because the daemon-side display's `:poll` passes async mailbox messages through
-;; (the std/editor/serve event-bus pass-through). Outbound, `ed-update-collab` wraps
-;; `ed-update` with `collab-propagate`, so ordinary commands stay `model -> model` with
-;; no knowledge of sharing.
+;; ---- --serve --shared: shared content, a cursor per client (src/collab.blsp) -----
+;; THE collaborative mode (`--collab` is an alias; the old fan-ONE-model/one-cursor
+;; `std/editor/serve/serve-shared` seam still exists in Brood for other apps, but the
+;; editor's answer to \"watch one screen together\" is now the `follow` command).
+;; `serve` = private everything; shared = each client its OWN session model (own
+;; cursor, panes, minibuffer…) while the served buffer's CONTENT is authoritative in
+;; one buffer process. Each session subscribes (`collab-share-slot`), so every edit
+;; anyone makes is serialized by the process and pushed back as `[:buffer-updated …]`
+;; — which the session's `ed-update` folds via the registered handler (see
+;; `input/ed--ev-buffer-updated`), reaching the loop because the daemon-side display's
+;; `:poll` passes async mailbox messages through (the std/editor/serve event-bus
+;; pass-through). Outbound, `ed-update-collab` wraps `ed-update` with
+;; `collab-propagate`, so ordinary commands stay `model -> model` with no knowledge of
+;; sharing.
 
 (def *collab-welcome*
   "myedit — COLLAB session (shared content, your own cursor).\n\nEveryone attached edits this same buffer; each keeps their own cursor and panes.\nC-x C-c / the window close button detaches.\n")
@@ -217,18 +226,21 @@ own truth arriving, and propagating it would echo the edit back as a fresh splic
 (applying it twice); the point sync is a version-guarded no-op there anyway."
   (let (after (ed-update m input cols rows))
     (collab-sync-point
-      (if (and (vector? input) (= (first input) :buffer-updated))
-        after
-        (collab-propagate m after)))))
+      (collab-follow-step m
+        (if (and (vector? input) (= (first input) :buffer-updated))
+          after
+          (collab-propagate m after))
+        input))))
 
 (defn ed-serve-collab (&optional file)
-  "Run myedit as a COLLAB daemon: spawn ONE buffer process owning `file`'s content (or a
-shared scratch), then serve a fresh session per attaching client whose slot 0 is backed
-by it — everyone edits the same document and sees each other's edits live, each with
-their **own** cursor (vs `ed-serve-shared`, one fanned cursor). Launch as
-`bedit --name ed --serve --collab [file]`; clients attach with `bedit --attach ed`. The
-host gets its own window too (`--headless` to opt out). Undo history and markers are
-per-session and transient on the shared buffer (v1 — see `src/collab.blsp`). Blocks."
+  "Run myedit as the SHARED (collaborative) daemon: spawn ONE buffer process owning
+`file`'s content (or a shared scratch), then serve a fresh session per attaching client
+whose slot 0 is backed by it — everyone edits the same document and sees each other's
+edits and named carets live, each with their **own** cursor (`follow` rides someone
+else's). Launch as `bedit --name ed --serve --shared [file]`; clients attach with
+`bedit --attach ed --as NAME`. The host gets its own window too (`--headless` to opt
+out). Undo history and markers are per-session and transient on the shared buffer (v1 —
+see `src/collab.blsp`). Blocks."
   (let (name (remote--node-name (argv)))
     ;; the node comes up FIRST, so the buffer process's pid carries the node's
     ;; stamp from birth — one less place for the pre-node-start `nonode` stamp
@@ -238,8 +250,8 @@ per-session and transient on the shared buffer (v1 — see `src/collab.blsp`). B
       (serve (ed-serve-collab-model file proc) ed-view ed-update-collab)
       (println (str "myedit daemon '" name "' serving"
                  (if (nil? file) "" (str " " file))
-                 " (COLLAB — shared content, a cursor per client)."))
-      (println (str "  attach from another terminal:  bedit --attach " name " [--as NAME]"))
+                 " (SHARED — one document, everyone their own caret)."))
+      (println (str "  attach:  " (remote--attach-hint name) " [--as NAME]"))
       (ed-serve--run name))))
 
 (defn ed-attach (spec)

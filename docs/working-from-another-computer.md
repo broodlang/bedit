@@ -59,11 +59,8 @@ host's own window* by default, so serving isn't blind.
 # host: serve AND open your own window (others can attach)
 bedit --name ed --serve notes.txt
 
-# host: SHARED — every client edits ONE model, sees each other live (one shared cursor)
-bedit --name ed --serve --shared notes.txt
-
-# host: COLLAB — everyone edits the SAME buffer, each with their OWN cursor
-bedit --name ed --serve --collab --as wilhelm notes.txt
+# host: SHARED — everyone edits the SAME document, each with their OWN cursor
+bedit --name ed --serve --shared --as wilhelm notes.txt
 
 # host: headless — no local window, a pure background daemon (displayless server, or a
 #       daemon that should outlive your window). Ctrl-C to stop.
@@ -74,43 +71,53 @@ bedit --attach ed --as alice
 ```
 
 - `--serve` alone → each client gets its **own** buffer (independent sessions).
-- `--serve --shared` → clients share **one** model and **one** cursor.
-- `--serve --collab` → shared *content* (one buffer process serializes all edits), but each
-  client keeps its own cursor, panes, and minibuffer — the "everyone their own caret" mode.
-  A late joiner syncs to the live document, not the file on disk. **Presence**: everyone
-  else's caret renders live as a coloured bar with a name tag; joins and leaves are echoed
-  ("alice joined"); a detached/crashed participant's caret is cleaned up, never a ghost.
+- `--serve --shared` (alias `--collab`) → THE collaborative mode: shared *content* (one
+  buffer process serializes all edits) while each client keeps its own cursor, panes, and
+  minibuffer. A late joiner syncs to the live document, not the file on disk. **Presence**:
+  everyone else's caret renders live as a coloured bar with a name tag; joins/leaves are
+  echoed; a detached/crashed participant's caret is cleaned up, never a ghost. Fast typing
+  never flickers under its own round-trip (origin-tagged echo suppression).
+- **`follow` (`C-x f` / M-x follow)** — the pairing view: your point and viewport ride a
+  chosen participant's caret live (with one other person it follows them immediately; more
+  prompts by name). Any move of your own takes the wheel back; `C-x f` again also stops.
+  `M-x collab-status` echoes who's here and what you're following.
 - `--as NAME` names you for presence (both `--attach` and the host window); it defaults to
   your OS username.
 - Close the host window to stop serving (use `--headless` for a daemon that persists).
 
-## Over the network (not wired yet — the honest status)
+## Over the network — `--listen`
 
-The architecture is fully network-capable: every attach is a Brood **node link**, and
-node links run over TCP (`connect "name@host:port"` dials TCP — "the network is just a
-longer copy"). **But** the daemon today calls `node-start` with no address, so it binds
-only a per-user **Unix-domain socket** → *same machine only*. `bedit --attach ed` works
-locally; nothing crosses machines yet.
+Every attach is a Brood **node link**, and node links run over TCP. `--listen
+[HOST:]PORT` makes the daemon bind TCP instead of the per-user Unix socket:
 
-To reach a daemon from another machine we need **dual-listen** (`node-also-listen`: keep
-the local Unix socket *and* add a TCP listener), a chosen port, and a matching node
-cookie (`~/.config/brood/cookie`) on both ends. That's a small, planned addition
-(`--listen [--host H] [--port N]`, then `bedit --attach ed@host:port`) — deferred until
-it can be verified against a real second machine, because "works over the network"
-should be a tested claim. See `docs/remote-multiplayer-plan.md`.
+```bash
+# host machine (copy ~/.config/brood/cookie to the other machine first — it authenticates)
+bedit --name ed --serve --shared --listen 7457 --as wilhelm notes.txt
 
-**So: to work from another computer today**, pull + build there and run your own editor
-(and, on one machine, serve locally to extra terminals). True cross-machine collaboration
-is the next serve slice.
+# any machine that can reach it:
+bedit --attach ed@HOST:7457 --as alice
+```
+
+- A bare port binds `0.0.0.0` (every interface); give `HOST:PORT` to bind one.
+- The **cookie** (`~/.config/brood/cookie`) must match on both ends — that's the auth.
+- While listening on TCP the node does **not** also hold the Unix socket, so local
+  attaches on the host use the `@127.0.0.1:PORT` form too (kernel dual-listen is the
+  deferred refinement).
+- Verified over a real TCP link (loopback: two runtimes, full presence + edit fan-out);
+  cross-machine is the same code path — try it from the second machine.
 
 ## Collaboration status (what's built vs runnable)
 
 | Capability | State |
 |---|---|
-| Remote attach, host window, shared-cursor `--serve --shared` | ✅ runnable (same machine) |
-| Shared edits with **independent** cursors (`--serve --collab`) | ✅ runnable (same machine) |
-| Presence: named, coloured remote carets + join/leave echoes (`--as`) | ✅ runnable (same machine) |
-| Cross-machine (TCP dual-listen) | ⬜ planned (`--listen`) |
+| Remote attach + host window (`--serve`, private session per client) | ✅ |
+| Shared editing, own cursor each (`--serve --shared`, alias `--collab`) | ✅ |
+| Presence: named, coloured remote carets + join/leave echoes (`--as`) | ✅ |
+| `follow` (C-x f): ride a participant's caret — the pairing view | ✅ |
+| Echo suppression (own round-trip never flickers fast typing) | ✅ |
+| Cross-machine over TCP (`--listen`, cookie-authenticated) | ✅ (loopback-verified; try your second machine) |
+| Kernel dual-listen (Unix socket *and* TCP at once) | ⬜ deferred |
+| Delta pushes (splices over the wire, not whole text) | ⬜ next |
 
 The independent-cursor collab layer (a shared buffer process, positional-splice edits,
 per-pane cursors — `src/collab.blsp`) is live as `--serve --collab`: each attaching client
