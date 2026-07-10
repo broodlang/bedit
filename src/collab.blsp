@@ -135,36 +135,107 @@ name instead of \"guest\". A no-op for a nil/empty name."
               me))))
       (assoc m :participant name))))
 
-(defn collab-sync-point (m)
-  "After an event folds: if the CURRENT buffer is shared and its point moved since the
-last sync, move this participant's cursor marker in the shared process (between syncs
-the marker is edit-adjusted there, so it stays honest under others' edits); likewise
-the SELECTION anchor — while a region is active our mark rides along as the
-`[me :mark]` marker (deleted when the region drops), so others render our selection in
-our colour. Marker moves are structured deltas (`buffer-marker-move` — no text on the
-wire). A no-op on unshared buffers and unmoved point/mark, so the every-event path
-pays nothing."
-  (let (i (ed-current-index m)
-        sh (get-in m [:shared i]))
-    (if (nil? sh)
+(defn collab--withdraw-presence (m j)
+  "Remove our presence markers (cursor, selection anchor, viewport top) from slot
+`j`'s process — we moved to another buffer, and presence lives only where you ARE
+(that's also how `share-follow` finds you: your cursor marker exists in exactly one
+buffer). The subscription stays (content keeps tracking); the sent-* stamps reset so
+re-entering the buffer re-announces."
+  (let (sh (get-in m [:shared j])
+        me (get sh :me))
+    (if (or (nil? sh) (nil? me))
       m
+      (do (buffer-edit (get sh :proc)
+            (fn (b) (buffer-marker-delete
+                      (buffer-marker-delete (buffer-marker-delete b me) [me :mark])
+                      [me :top]))
+            me)
+        (assoc m :shared (assoc (get m :shared) j
+                           (merge sh {:sent-point nil :sent-mark nil :sent-top nil})))))))
+
+(defn collab-sync-point (m)
+  "After an event folds: keep this participant's presence honest on the buffer they're
+IN — the cursor marker when point moved, the `[me :mark]` selection anchor while a
+region is active (deleted when it drops), and the `[me :top]` viewport marker (the
+top line's char offset — edit-adjusted like any marker) when the view scrolled, which
+is what a `share-mirror` reproduces. Switching buffers first withdraws presence from
+the buffer left behind (`collab--withdraw-presence`). Marker moves are structured
+deltas — no text on the wire. A no-op on unshared buffers and unmoved state, so the
+every-event path pays nothing."
+  (let (i (ed-current-index m)
+        prev (get m :collab-active)
+        m0 (assoc (if (and prev (not (= prev i))) (collab--withdraw-presence m prev) m)
+             :collab-active i)
+        sh (get-in m0 [:shared i]))
+    (if (nil? sh)
+      m0
       (let (me (get sh :me)
-            buf (ed-current-buf m)
+            buf (ed-current-buf m0)
             pt (buffer-point buf)
             mk (buffer-mark buf)
+            topline (min (ed-current-top m0) (dec (buffer-line-count buf)))
+            top-off (rope-line->char (buffer-rope buf) (max 0 topline))
             m1 (if (or (nil? me) (= pt (get sh :sent-point)))
-                 m
+                 m0
                  (do (buffer-marker-move (get sh :proc) me pt me)
-                   (assoc-in m [:shared i :sent-point] pt))))
-        (cond
-          (nil? me) m1
-          (= mk (get-in m1 [:shared i :sent-mark])) m1
-          (nil? mk)
-          (do (buffer-edit (get sh :proc) (fn (b) (buffer-marker-delete b [me :mark])) me)
-            (assoc-in m1 [:shared i :sent-mark] nil))
-          :else
-          (do (buffer-marker-move (get sh :proc) [me :mark] mk me)
-            (assoc-in m1 [:shared i :sent-mark] mk)))))))
+                   (assoc-in m0 [:shared i :sent-point] pt)))
+            m2 (cond
+                 (nil? me) m1
+                 (= mk (get-in m1 [:shared i :sent-mark])) m1
+                 (nil? mk)
+                 (do (buffer-edit (get sh :proc) (fn (b) (buffer-marker-delete b [me :mark])) me)
+                   (assoc-in m1 [:shared i :sent-mark] nil))
+                 :else
+                 (do (buffer-marker-move (get sh :proc) [me :mark] mk me)
+                   (assoc-in m1 [:shared i :sent-mark] mk))))
+        (if (or (nil? me) (= top-off (get-in m2 [:shared i :sent-top])))
+          m2
+          (do (buffer-marker-move (get sh :proc) [me :top] top-off me)
+            (assoc-in m2 [:shared i :sent-top] top-off)))))))
+
+;; ---- the shared-buffer registry: every file, one process ---------------------
+;; One registry process per collab daemon: the first session to open a file spawns
+;; its buffer process; everyone after gets the same pid. So EVERY file buffer anyone
+;; visits is collaborative — not just the file the daemon was launched on — which is
+;; what lets `share-follow` track a participant across buffers.
+
+(defn collab--registry-loop (procs)
+  (receive
+    ([:share path text name from r]
+      (let (existing (get procs path))
+        (if existing
+          (do (send from [:reply r existing]) (collab--registry-loop procs))
+          (let (bp (spawn-buffer (make-buffer text name path)))
+            (send from [:reply r bp])
+            (collab--registry-loop (assoc procs path bp))))))
+    (_ (collab--registry-loop procs))))
+
+(defn collab-registry-start ()
+  "Spawn the daemon's file → buffer-process registry; its pid rides every session
+model as `:collab-reg`."
+  (spawn (collab--registry-loop {})))
+
+(defn collab-registry-share (reg path text name)
+  "The ONE buffer process for `path` — spawned from `text`/`name` on the first ask;
+later askers get the existing process (their local copy then syncs from its seed
+push). Synchronous; nil if the registry doesn't answer."
+  (let (r (ref))
+    (send reg [:share path text name (self) r])
+    (receive ([:reply ~r bp] bp) (after 2000 nil))))
+
+(defn collab-autoshare (m)
+  "Share the CURRENT buffer the moment it's visited: when this session belongs to a
+collab daemon (`:collab-reg`), the buffer is a file buffer, and its slot isn't
+process-backed yet, ask the registry for the file's one process and link the slot.
+The `ed-update-collab` loop hook that makes every open file collaborative; ordinary
+editors (no `:collab-reg`) never do anything here."
+  (let (reg (get m :collab-reg)
+        i (ed-current-index m)
+        buf (ed-current-buf m))
+    (if (or (nil? reg) (not (nil? (get-in m [:shared i]))) (nil? (buffer-file buf)))
+      m
+      (let (bp (collab-registry-share reg (buffer-file buf) (buffer-text buf) (buffer-name buf)))
+        (if (nil? bp) m (collab-share-slot m i bp))))))
 
 ;; ---- follow: ride another participant's caret (the pairing mode) -------------
 ;; `collab-follow` pins your point (and view) to another participant's cursor: every
@@ -172,20 +243,33 @@ pays nothing."
 ;; experience, but opt-in, per-person, and reversible. Any point-moving input of your
 ;; OWN breaks it (you took the wheel); the followed participant leaving breaks it too.
 
-(defn collab-participants (m &optional i)
-  "The OTHER participants on slot `i` (default: the current buffer's): `{pid name}`
-for every remote cursor, named from the registry (\"guest\" when unnamed)."
-  (let (idx (or i (ed-current-index m))
-        sh (get-in m [:shared idx])
-        names (or (get sh :names) {}))
-    (fold (fn (acc kv) (assoc acc (first kv) (get names (first kv) "guest")))
-      {} (map-pairs (or (get sh :cursors) {})))))
+(defn collab-participants (m)
+  "Every OTHER participant across ALL shared slots: `{pid name}` (a participant's
+cursor marker lives in exactly the buffer they're in, so the union over slots is
+everyone present anywhere). Named from the registries (\"guest\" when unnamed)."
+  (fold
+    (fn (acc skv)
+      (let (sh (second skv)
+            names (or (get sh :names) {}))
+        (fold (fn (a kv) (assoc a (first kv) (get names (first kv) "guest")))
+          acc (map-pairs (or (get sh :cursors) {})))))
+    {} (map-pairs (or (get m :shared) {}))))
 
-(defn collab-follow (m pid name)
-  "Start following participant `pid`/`name`: point and view ride their caret from the
-next push on (see `collab-follow-jump`)."
-  (message (assoc m :follow {:pid pid :name name})
-    (str "following " name " — any move of your own stops")))
+(defn collab--slot-of (m pid)
+  "The pool index of the slot whose `:cursors` contains `pid` — the buffer that
+participant is IN — or nil when they're nowhere (gone, or on an unshared buffer)."
+  (let (hit (find (fn (kv) (contains? (or (get (second kv) :cursors) {}) pid))
+              (map-pairs (or (get m :shared) {}))))
+    (if hit (first hit) nil)))
+
+(defn collab-follow (m pid name &optional (mode :follow))
+  "Start following participant `pid`/`name`: point (and buffer — the jump switches
+slots with them) ride their caret from the next push on. `mode` `:mirror` also
+reproduces their VIEWPORT (scroll top), so your window shows what theirs shows —
+the `share-mirror` experience."
+  (message (assoc m :follow {:pid pid :name name :mode mode})
+    (str (if (= mode :mirror) "mirroring " "following ") name
+      " — any move of your own stops")))
 
 (defn collab-unfollow (m &optional reason)
   "Stop following (a no-op when not). `reason` overrides the default echo."
@@ -195,19 +279,68 @@ next push on (see `collab-follow-jump`)."
       (or reason (str "stopped following " (get-in m [:follow :name]))))))
 
 (defn collab-follow-jump (m textrows)
-  "While following: put point on the followed participant's cursor and keep it on
-screen (called from the `:buffer-updated` handler, where the viewport height is known).
-A no-op when not following, when their cursor isn't on the current slot, or when point
-is already there."
+  "While following: put point on the followed participant's cursor — SWITCHING to
+their buffer first when they moved to another shared slot — and keep it on screen.
+In `:mirror` mode also adopt their viewport top (their `[pid :top]` marker), so the
+window scrolls exactly as theirs does. Called from the `:buffer-updated` handler,
+where the viewport height is known. A no-op when not following or their cursor is
+nowhere to be seen."
   (let (f (get m :follow))
     (if (nil? f)
       m
-      (let (i (ed-current-index m)
-            pos (get-in m [:shared i :cursors (get f :pid)]))
-        (cond
-          (nil? pos) m
-          (= pos (buffer-point (ed-current-buf m))) m
-          :else (ed-scroll (ed-set-buf m (goto-char (ed-current-buf m) pos)) textrows))))))
+      (let (pid (get f :pid)
+            j (collab--slot-of m pid))
+        (if (nil? j)
+          m
+          (let (m1 (if (= j (ed-current-index m)) m (ed-show-index m j))
+                pos (get-in m1 [:shared j :cursors pid])
+                m2 (if (= pos (buffer-point (ed-current-buf m1)))
+                     m1
+                     (ed-scroll (ed-set-buf m1 (goto-char (ed-current-buf m1) pos)) textrows)))
+            (if (not (= (get f :mode) :mirror))
+              m2
+              (let (top-off (get-in m2 [:shared j :tops pid]))
+                (if (nil? top-off)
+                  m2
+                  (ed-set-top m2 (rope-char->line (buffer-rope (ed-current-buf m2))
+                                   (min top-off (buffer-length (ed-current-buf m2))))))))))))))
+
+(defn collab-step (before after input)
+  "The whole per-event collab chain, in order: auto-share a newly visited file
+(`collab-autoshare`), propagate this event's text change to the shared processes
+(`collab-propagate` — skipped when the event IS a `[:buffer-updated …]` push: that's
+the process's own truth arriving, and echoing it back would apply it twice), break a
+follow the user steered out of (`collab-follow-step`), and sync our presence markers
+(`collab-sync-point`). Runs at the tail of EVERY `ed-update` — a no-op costing two map
+lookups on a model with neither a registry nor shared slots, so ordinary editing pays
+nothing; this is what lets a live editor start sharing mid-session (`share-session`)
+without swapping its update function."
+  (if (and (nil? (get after :collab-reg)) (nil? (get after :shared)))
+    after
+    (collab-sync-point
+      (collab-follow-step before
+        (if (and (vector? input) (= (first input) :buffer-updated))
+          after
+          (collab-propagate before (collab-autoshare after)))
+        input))))
+
+(defn collab-decay-tags (m)
+  "Tick every participant name-tag's time-to-live down one (the `:cursor-blink` beat
+calls this): a tag shows for a few beats after that caret MOVED, then fades to just
+the coloured bar — presence without shouting. Cheap when nothing is shared."
+  (if (nil? (get m :shared))
+    m
+    (assoc m :shared
+      (fold (fn (acc kv)
+              (let (sh (second kv)
+                    ttl (or (get sh :tag-ttl) {}))
+                (assoc acc (first kv)
+                  (if (empty? ttl)
+                    sh
+                    (assoc sh :tag-ttl
+                      (fold (fn (a t) (if (> (second t) 1) (assoc a (first t) (dec (second t))) a))
+                        {} (map-pairs ttl)))))))
+        {} (map-pairs (get m :shared))))))
 
 (defn collab-follow-step (before after input)
   "Break the follow when the USER moved point — a real key/mouse (`ed-real-input?`)
@@ -272,7 +405,7 @@ stale/duplicate `version`; a no-op when no slot links to `proc`."
             names (get vp :names)
             sh (get-in m [:shared i])
             me (get sh :me)
-            ;; plain pid keys are cursors; [pid :mark] vector keys are selection anchors
+            ;; plain pid keys are cursors; [pid :mark] anchors; [pid :top] viewport tops
             cursors (fold (fn (acc kv) (if (vector? (first kv)) acc (assoc acc (first kv) (second kv))))
                       {} (map-pairs raw))
             marks (fold (fn (acc kv)
@@ -281,25 +414,42 @@ stale/duplicate `version`; a no-op when no slot links to `proc`."
                               (assoc acc (first k) (second kv))
                               acc)))
                     {} (map-pairs raw))
+            tops (fold (fn (acc kv)
+                         (let (k (first kv))
+                           (if (and (vector? k) (= (nth k 1 nil) :top) (not (= (first k) me)))
+                             (assoc acc (first k) (second kv))
+                             acc)))
+                   {} (map-pairs raw))
             own? (and (not (nil? origin)) (= origin me))
             pending (or (get sh :pending) 0)
             others (if (nil? me) cursors (dissoc cursors me))
             seed? (= (or (get sh :version) -1) -1)
-            m1 (if seed? m (collab--presence-echo m (or (get sh :cursors) {}) others
+            old-cursors (or (get sh :cursors) {})
+            ;; a caret that appeared or moved re-arms its owner's name tag for a few
+            ;; blink beats (`collab-decay-tags` ticks them down) — quiet presence
+            ttl (fold (fn (acc kv)
+                        (if (= (get old-cursors (first kv)) (second kv))
+                          acc
+                          (assoc acc (first kv) 6)))
+                  (or (get sh :tag-ttl) {}) (map-pairs others))
+            m1 (if seed? m (collab--presence-echo m old-cursors others
                              (merge (or (get sh :names) {}) names)))
-            ;; the participant we were following left → stop (their caret is gone)
-            m1b (let (f (get m1 :follow))
-                  (if (and f (contains? (or (get sh :cursors) {}) (get f :pid))
-                        (not (contains? others (get f :pid))))
-                    (collab-unfollow m1 (str (get f :name) " left — stopped following"))
-                    m1))
-            m2 (assoc m1b :shared (assoc (get m1b :shared) i
-                                    (merge sh {:version version
-                                               :cursors others
-                                               :marks marks
-                                               :names names
-                                               ;; our own splice came home — one less in flight
-                                               :pending (if (and own? splice) (max 0 (dec pending)) pending)})))
+            m2 (assoc m1 :shared (assoc (get m1 :shared) i
+                                   (merge sh {:version version
+                                              :cursors others
+                                              :marks marks
+                                              :tops tops
+                                              :tag-ttl ttl
+                                              :names names
+                                              ;; our own splice came home — one less in flight
+                                              :pending (if (and own? splice) (max 0 (dec pending)) pending)})))
+            ;; the one we were following vanished from EVERY shared buffer → they're
+            ;; gone (a buffer switch just moves their marker to another slot — kept)
+            m2 (let (f (get m2 :follow))
+                 (if (and f (contains? old-cursors (get f :pid))
+                       (nil? (collab--slot-of m2 (get f :pid))))
+                   (collab-unfollow m2 (str (get f :name) " left — stopped following"))
+                   m2))
             old (ed-buf-at m2 i))
         (cond
           ;; our own edit coming back — the local model already applied it (echo suppression)
