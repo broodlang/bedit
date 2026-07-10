@@ -63,21 +63,25 @@ bedit --name ed --serve notes.txt
 bedit --name ed --serve --shared notes.txt
 
 # host: COLLAB — everyone edits the SAME buffer, each with their OWN cursor
-bedit --name ed --serve --collab notes.txt
+bedit --name ed --serve --collab --as wilhelm notes.txt
 
 # host: headless — no local window, a pure background daemon (displayless server, or a
 #       daemon that should outlive your window). Ctrl-C to stop.
 bedit --name ed --serve --headless notes.txt
 
 # another terminal on the SAME machine: open a window attached to the daemon
-bedit --attach ed
+bedit --attach ed --as alice
 ```
 
 - `--serve` alone → each client gets its **own** buffer (independent sessions).
 - `--serve --shared` → clients share **one** model and **one** cursor.
 - `--serve --collab` → shared *content* (one buffer process serializes all edits), but each
   client keeps its own cursor, panes, and minibuffer — the "everyone their own caret" mode.
-  A late joiner syncs to the live document, not the file on disk.
+  A late joiner syncs to the live document, not the file on disk. **Presence**: everyone
+  else's caret renders live as a coloured bar with a name tag; joins and leaves are echoed
+  ("alice joined"); a detached/crashed participant's caret is cleaned up, never a ghost.
+- `--as NAME` names you for presence (both `--attach` and the host window); it defaults to
+  your OS username.
 - Close the host window to stop serving (use `--headless` for a daemon that persists).
 
 ## Over the network (not wired yet — the honest status)
@@ -105,7 +109,7 @@ is the next serve slice.
 |---|---|
 | Remote attach, host window, shared-cursor `--serve --shared` | ✅ runnable (same machine) |
 | Shared edits with **independent** cursors (`--serve --collab`) | ✅ runnable (same machine) |
-| Per-participant cursors *drawn* in each other's windows | ⬜ next (markers shipped; needs the participant model) |
+| Presence: named, coloured remote carets + join/leave echoes (`--as`) | ✅ runnable (same machine) |
 | Cross-machine (TCP dual-listen) | ⬜ planned (`--listen`) |
 
 The independent-cursor collab layer (a shared buffer process, positional-splice edits,
