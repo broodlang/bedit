@@ -10,6 +10,12 @@ design-of-record in the brood repo: `docs/layers.md`).
 
 Legend: ✅ done · 🟡 in progress · ⬜ not started
 
+**Strategic direction — competing with Neovim/Emacs/VSCode:** the honest standing
+vs the big three and the three tracks that would make someone *choose* myedit over
+them are in **`docs/competitive-tracks.md`**. The flagship (Track 1 — remote &
+multiplayer editing, the payoff of §E below) has its full two-part plan in
+**`docs/remote-multiplayer-plan.md`**.
+
 ---
 
 ## ✅ Done — the current editor
@@ -158,7 +164,12 @@ consume that shape. So the whole feature is one Rust builtin + Brood policy.
   supervision/restart, and near-free collaboration (a buffer process on another node).
   Decided direction, **not building yet** — the single-process pure model serves us
   well today. Full reasoning, decomposition, hard-parts-and-answers, and a staged
-  (non-big-bang) path: **`docs/actor-architecture.md`**.
+  (non-big-bang) path: **`docs/actor-architecture.md`**. Its collaboration payoff —
+  remote attach (the `emacsclient`/daemon model) and multiplayer presence — is
+  Track 1 of the strategic direction; the staged, buildable two-part plan (Slice 0:
+  read-write web mirror, no Brood change → Slice 1: native remote attach → Slice 2:
+  presence & multi-cursor → Slice 3: this actor endgame) is in
+  **`docs/remote-multiplayer-plan.md`**.
 
 ## F. The customization surface (deferred — design note)
 
