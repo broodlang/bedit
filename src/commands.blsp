@@ -3105,7 +3105,9 @@ present on any shared buffer)."
       (empty? parts) (message m "no one else is here")
       (= (count parts) 1)
       (let (kv (first (map-pairs parts)))
-        (collab/collab-follow m (first kv) (second kv) mode))
+        (collab/collab-follow-jump
+          (collab/collab-follow m (first kv) (second kv) mode)
+          (or (get m :view-rows) 24)))   ; engage NOW, not on their next move
       :else
       (let (by-name (fold (fn (acc kv) (assoc acc (second kv) (first kv))) {} (map-pairs parts)))
         (assoc m
@@ -3115,7 +3117,9 @@ present on any shared buffer)."
               (let (pid (get by-name nm))
                 (if (nil? pid)
                   (message mm (str "no participant " nm))
-                  (collab/collab-follow mm pid nm mode))))))))))
+                  (collab/collab-follow-jump
+                    (collab/collab-follow mm pid nm mode)
+                    (or (get mm :view-rows) 24)))))))))))
 
 (defcommand cmd-share-follow
   (m key)
@@ -3141,22 +3145,31 @@ move of your own takes the wheel back; a toggle like share-follow."
   "Turn THIS editor into a shared-session host: become a node (\"myedit\", if not
 already one), start the file registry, share the current buffer, and serve fresh
 sessions to attachers (each gets `:collab-reg`, so any file they visit is shared too).
-The serve manager pid rides `:collab-serving` for share-session-stop."
+The serve manager pid rides `:collab-serving` for share-session-stop. The `make-model`
+closure must capture only plain values (strings, pids) — it crosses process boundaries
+(manager → session spawns), and a captured MODEL would smuggle rope handles across,
+which cannot cross (ADR-033)."
   (do
     (when (= (node-name) :nonode) (node-start :myedit))
     (let (reg (collab/collab-registry-start)
           m1 (collab/collab-autoshare (assoc m :collab-reg reg))
-          ;; attachers open the host's current file when it has one, else a welcome
+          ;; attachers open the host's current file when it has one, else ONE shared
+          ;; welcome (spawned here, once — not per attacher)
           file (buffer-file (ed-current-buf m1))
+          proc (if (nil? file)
+                 (spawn-buffer (make-buffer *share-session-welcome* "*shared*"))
+                 ;; autoshare just linked it; the registry fallback covers a slot that
+                 ;; somehow didn't link (e.g. a slow registry) — same pid either way
+                 (or (get-in m1 [:shared (ed-current-index m1) :proc])
+                   (collab/collab-registry-share reg file
+                     (buffer-text (ed-current-buf m1)) (buffer-name (ed-current-buf m1)))))
           mk (fn () (collab/collab-share-slot
                       (assoc (ed-init (if (nil? file)
-                                        (make-buffer *share-session-welcome*)
+                                        (make-buffer *share-session-welcome* "*shared*")
                                         (find-file-buffer file)))
                         :collab-reg reg)
                       0
-                      (if (nil? file)
-                        (get-in m1 [:shared (ed-current-index m1) :proc] (spawn-buffer (make-buffer *share-session-welcome*)))
-                        (collab/collab-registry-share reg file (buffer-text (ed-current-buf m1)) (buffer-name (ed-current-buf m1))))))
+                      proc))
           ;; view/update resolved late (quoted symbols), as keymap dispatch does —
           ;; commands must not :use view/input (they :use commands)
           mgr (serve mk (eval 'view/ed-view) (eval 'input/ed-update)))
@@ -3172,13 +3185,18 @@ presence, follow, and mirror. Prompts for your display name when none is set (se
 M-x share-session-stop ends it."
   (cond
     (get m :collab-serving) (message m "already sharing — M-x share-session-stop to end")
+    ;; an ATTACHED session already lives inside someone's share — serving from it
+    ;; would clobber the daemon's own session manager (one serve name per node)
+    (get m :collab-reg) (message m "already in a shared session")
     (nil? (get m :participant))
+    ;; a plain free-text prompt (the query-replace shape) — no candidate list to
+    ;; complete against, any typed name accepted on RET
     (assoc m :minibuffer
-      (ed-name-prompt "Your name: " '()
-        (fn (mm nm)
-          (if (= (trim nm) "")
-            (message mm "share-session needs a name")
-            (ed--share-session-start (collab/collab-set-name mm (trim nm)))))))
+      {:edit (ed-mb-edit "Your name: " "")
+       :on-complete (fn (mm nm)
+                      (if (= (trim nm) "")
+                        (message mm "share-session needs a name")
+                        (ed--share-session-start (collab/collab-set-name mm (trim nm)))))})
     :else (ed--share-session-start m)))
 
 (defcommand cmd-share-session-stop
