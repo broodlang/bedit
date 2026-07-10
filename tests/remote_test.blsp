@@ -1,0 +1,94 @@
+;; Slice 1 — myedit served as a daemon (the emacsclient / --daemon model, ADR-090).
+;; The daemon runs the REAL editor (ed-init model + ed-view + ed-update); a thin client
+;; paints pushed frames and ships back keys. Here the test process plays the client
+;; in-process (local pids send/receive exactly as a node link would — "the network is
+;; just a longer copy"), so the full serve → frame → key → frame path is exercised with
+;; the actual editor, no node and no window. Uses only the frontend-agnostic daemon seam
+;; (serve--manager + remote-display), so it runs on the installed nest; the GUI client
+;; (ed-attach / attach-display) is verified live — see docs/remote-multiplayer-plan.md.
+(defmodule remote-test
+  (:use model)
+  (:use view)
+  (:use input)
+  (:use remote)
+  (:use editor/serve)
+  (:use editor/buffer)
+  (:use test))
+
+;; The strings of a frame's [:text row col s …] ops — the editor renders many op kinds
+;; (rects, cursor, dividers); we only want the painted text to look for buffer content.
+(defn r-frame-strings (f)
+  (map (fn (op) (nth op 3 ""))
+    (filter (fn (op) (and (vector? op) (= (first op) :text))) f)))
+
+(defn r-frame-has? (f sub)
+  (> (count (filter (fn (s) (string-contains? s sub)) (r-frame-strings f))) 0))
+
+;; A make-model producing a fresh EMPTY editor buffer per session, so typed text is the
+;; only buffer content and easy to find in the rendered frame.
+(defn r-empty-model () (fn () (ed-init (make-buffer ""))))
+
+;; Drain every queued frame, returning the last (the one the final key produced).
+(defn r-drain-frames (acc)
+  (receive ([:frame f] (r-drain-frames f)) (after 300 acc)))
+
+(describe "remote — myedit served as a daemon (Slice 1)"
+  (test "ed-serve-model builds a fresh editor model on the served-welcome scratch buffer"
+    (let (m ((ed-serve-model nil)))
+      (is (map? m))
+      (is (string-contains? (buffer-text (ed-current-buf m)) "served over a Brood node link"))))
+
+  (test "ed-serve-model opens a given file into the session buffer"
+    (let (m ((ed-serve-model "src/remote.blsp")))
+      (is (string-contains? (buffer-text (ed-current-buf m)) "defmodule remote"))))
+
+  (test "a served session renders the real editor and folds shipped keys through ed-update"
+    (let (mgr (spawn (editor/serve/serve--manager (r-empty-model) ed-view ed-update)))
+      (send mgr [:attach (self) 80 24])
+      (let (session (receive ([:attached s] s) (after 2000 :no-attach)))
+        (is (not (= session :no-attach)))
+        ;; the fresh (empty) editor renders immediately — a non-empty render-op list
+        (let (f0 (receive ([:frame f] f) (after 2000 :none)))
+          (is (not (= f0 :none)))
+          (is (> (count f0) 0)))
+        ;; ship a distinctive string; the session folds each key via the real ed-update and
+        ;; re-renders via the real ed-view, so the final frame shows it in the buffer area
+        (doseq (k (string->list "Zq7"))
+          (send session [:key k]))
+        (let (last-frame (r-drain-frames :none))
+          (is (not (= last-frame :none)))
+          (is (r-frame-has? last-frame "Zq7"))))))
+
+  (test "CLI arg parsing: --serve / --attach detection and the token after a flag"
+    (is (remote-serve? ["bedit" "--name" "ed" "--serve"]))
+    (is (remote-attach? ["bedit" "--attach" "ed"]))
+    (is (not (remote-serve? ["bedit" "notes.txt"])))
+    (is (not (remote-attach? ["bedit" "--serve"])))
+    (assert= (remote/remote--arg-after ["bedit" "--attach" "ed"] "--attach") "ed")
+    (assert= (remote/remote--arg-after ["bedit" "--serve" "f.txt"] "--serve") "f.txt")
+    (is (nil? (remote/remote--arg-after ["bedit" "--serve"] "--serve")))   ; flag is last -> nil
+    (is (nil? (remote/remote--arg-after ["bedit" "x"] "--attach")))        ; flag absent -> nil
+    ;; --shared modifies --serve to a collaborative session
+    (is (remote-shared? ["bedit" "--name" "ed" "--serve" "--shared"]))
+    (is (not (remote-shared? ["bedit" "--serve"]))))
+
+  (test "remote--positional: the file arg, skipping flags AND flag-values (the --shared bug)"
+    ;; a bare --serve/--shared must NEVER be taken as a filename, and --name's value is skipped
+    (is (nil? (remote/remote--positional ["--name" "ed" "--serve" "--shared"])))
+    (is (nil? (remote/remote--positional ["--name" "ed" "--serve"])))
+    (assert= (remote/remote--positional ["--name" "ed" "--serve" "--shared" "notes.txt"]) "notes.txt")
+    (assert= (remote/remote--positional ["--name" "ed" "--serve" "notes.txt"]) "notes.txt")
+    (assert= (remote/remote--positional ["--serve" "a.txt"]) "a.txt")
+    (assert= (remote/remote--positional ["notes.txt"]) "notes.txt")   ; the normal `bedit notes.txt`
+    (is (nil? (remote/remote--positional []))))
+
+  (test "a served editor session quits cleanly on C-x C-c (the quit chord)"
+    (let (mgr (spawn (editor/serve/serve--manager (r-empty-model) ed-view ed-update)))
+      (send mgr [:attach (self) 80 24])
+      (let (session (receive ([:attached s] s) (after 2000 :no-attach)))
+        (monitor session)
+        (receive ([:frame _] nil) (after 2000 nil))  ; consume the initial frame
+        ;; C-x C-c is the editor's quit; ui-run then runs :leave -> [:bye] to the client
+        (send session [:key :ctrl-x])
+        (send session [:key (keyword "ctrl-c")])
+        (assert= (receive ([:bye] :bye) ([:down _ _ _] :bye) (after 2000 :no-quit)) :bye)))))

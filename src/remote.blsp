@@ -1,0 +1,148 @@
+(defmodule remote
+  "Native remote attach — the Emacs `--daemon` / `emacsclient` model for myedit (ADR-090;
+Slice 1 of `docs/remote-multiplayer-plan.md`). `ed-serve` runs the editor as a **headless
+daemon**: its model / `ed-view` / `ed-update` all live in the serving runtime, and each
+attaching frontend gets its own session (a fresh buffer). `ed-attach` opens a native window
+and attaches it to a daemon over a Brood node link — the *same* editor, driven from another
+terminal or machine. Both are thin wrappers over `std/editor/serve` (the frontend-agnostic
+`ui-run` serving seam) — there is no editor-specific wire protocol: the render frame is plain
+Brood data and the keys are the same values the local window delivers, so `ed-view`/`ed-update`
+run unchanged whether the frontend is local or across a link.
+
+The daemon's model is the pure `ed-init` model (no `gui-display`, no window id): the frame is
+rendered here and *painted on the client's* window, so a served session needs nothing GUI-local.
+It renders via `ed-view`'s frontend-agnostic path (`:gui` unset), which is correct on any client.
+
+Slice 1 gives each client an **independent** session (its own buffer) — the `serve` semantics.
+A *shared* model across clients (collaborative editing, live cursors) is Slice 2, which needs
+`std/buffer` markers + a participant model; see the plan doc."
+  (:use editor/ui)      ; gui-display — the native window a client attaches
+  (:use editor/serve)   ; serve / attach-display — the daemon + client seam (ADR-090)
+  (:use editor/buffer)  ; make-buffer / find-file-buffer
+  (:use model)          ; ed-init — the pure editor model
+  (:use view)           ; ed-view
+  (:use input)          ; ed-update
+  (:use system))        ; argv — the CLI dispatch reads it
+
+;; ---- CLI dispatch (bedit --name ed --serve  /  bedit --attach ed) -----------
+;; `main` scans `(argv)` for these flags and branches to the daemon / client instead of
+;; the normal local window. Kept as pure functions here so the arg parsing is unit-tested
+;; without launching anything (main is a GUI entry point, untestable headlessly).
+
+(defn remote--arg-after (args flag)
+  "The CLI token following `flag` in the string vector `args`, or nil when `flag` is
+absent or is the last token. Reads `--attach NAME` / `--serve [file]` (a tail-recursive
+pair scan — no dependence on `index-of` semantics for vectors)."
+  (cond
+    (< (count args) 2) nil
+    (= (first args) flag) (second args)
+    :else (remote--arg-after (rest args) flag)))
+
+(defn remote-serve? (args)
+  "Whether `args` (from `(argv)`) requests daemon mode (`--serve`)."
+  (member? "--serve" args))
+
+(defn remote-attach? (args)
+  "Whether `args` (from `(argv)`) requests client mode (`--attach`)."
+  (member? "--attach" args))
+
+(defn remote-shared? (args)
+  "Whether `args` modifies `--serve` to a SHARED (collaborative) session (`--shared`)."
+  (member? "--shared" args))
+
+(defn remote--positional (args)
+  "The first positional argument (a file path) in `args` — skipping flags (`--x`) AND the
+value token of a value-taking flag (`--name NAME` / `--attach NAME`). So `--serve --shared`
+and `--serve --shared notes.txt` both parse correctly: nil and \"notes.txt\" respectively
+(a bare `--serve` never swallows the following `--shared` as a filename). nil if none."
+  (cond
+    (empty? args) nil
+    (member? (first args) ["--name" "--attach"]) (remote--positional (rest (rest args)))
+    (starts-with? (first args) "--") (remote--positional (rest args))
+    :else (first args)))
+
+(defn remote--node-name (args)
+  "The daemon's node name from `--name NAME` in `args`, defaulting to \"myedit\"."
+  (or (remote--arg-after args "--name") "myedit"))
+
+(defn remote--ensure-node (name)
+  "Ensure this runtime is a Brood node called `name` so clients can attach to it. `nest run
+--name NAME` brings the node up for you, but the standalone `bedit` does not (it passes
+`--name` straight through as a program arg), so start the node here whenever we're not yet
+one. Idempotent — a no-op if `--name` already brought a node up."
+  (when (= (node-name) :nonode)
+    (node-start (keyword name))))
+
+(defn remote-main? (args)
+  "True when `args` (the CLI tokens `main` received) requested daemon (`--serve`) or client
+(`--attach`) mode — `main` hands off to `remote-main` instead of opening a local window."
+  (or (remote-serve? args) (remote-attach? args)))
+
+(defn remote-main (args)
+  "Run the CLI-requested remote mode from `args`: `--attach NAME` opens a window attached to
+daemon NAME; `--serve [file]` runs this runtime as a daemon (add `--shared` for one
+collaborative model shared by all clients, else a private buffer per client). The optional
+file is the positional arg (`remote--positional`), so `--serve --shared notes.txt` opens
+notes.txt — the `--shared` flag is never mistaken for the filename. Precondition:
+`remote-main?` is true."
+  (cond
+    (remote-attach? args) (ed-attach (remote--arg-after args "--attach"))
+    (remote-shared? args) (ed-serve-shared (remote--positional args))
+    :else (ed-serve (remote--positional args))))
+
+(def *served-welcome*
+  "myedit — served over a Brood node link (the emacsclient / --daemon model).\n\nThis session runs on the daemon; your window just paints its frames and ships keys.\nEach client gets its own buffer. C-x C-c / the window close button detaches.\n")
+
+(defn ed-serve-model (file)
+  "The `make-model` thunk for one served session: a fresh editor model, opening `file`
+(or a scratch buffer when nil). Deliberately the pure `ed-init` model — no `gui-display`,
+no `:window`, no `:gui` — because the frame is rendered on the daemon and painted on the
+*client's* window; a served session owns nothing GUI-local. Called once per attaching client
+(so sessions are independent — Slice 1)."
+  (fn () (ed-init (if (nil? file) (make-buffer *served-welcome*) (find-file-buffer file)))))
+
+(defn ed-serve--park ()
+  "Park the daemon process forever so the node stays up after `serve` returns (it is
+non-blocking). Any message re-parks; the process lives until the runtime is killed."
+  (receive (_ (ed-serve--park))))
+
+(defn ed-serve (&optional file)
+  "Run myedit as a daemon (ADR-090): register a session manager under the node's serve
+name, then park so the node stays alive. Each `ed-attach` (or `nest attach`) then gets its
+own editor session over the link. The runtime must already be a node — launch with
+`nest run --name NAME` (or `bedit --name NAME --serve [file]`). Blocks (parks) forever."
+  (let (name (remote--node-name (argv)))
+    (remote--ensure-node name)
+    (serve (ed-serve-model file) ed-view ed-update)
+    (println (str "myedit daemon '" name "' serving"
+               (if (nil? file) "" (str " " file)) " (private buffer per client)."))
+    (println (str "  attach from another terminal:  bedit --attach " name))
+    (ed-serve--park)))
+
+(defn ed-serve-shared (&optional file)
+  "Run myedit as a SHARED daemon: every attaching client edits ONE model and sees the
+others' edits live (collaborative), vs `ed-serve` (a private buffer per client). Builds a
+single editor model and serves it via `serve-shared`, then parks. Launch as
+`bedit --name ed --serve --shared [file]`; clients attach with `bedit --attach ed`. All
+clients share ONE cursor this slice — distinct per-participant cursors are deferred (they
+need `std/buffer` markers + point-off-buffer; see `docs/remote-multiplayer-plan.md`)."
+  (let (name (remote--node-name (argv)))
+    (remote--ensure-node name)
+    (if (bound? 'editor/serve/serve-shared)
+      (editor/serve/serve-shared ((ed-serve-model file)) ed-view ed-update)
+      (error "ed-serve-shared: this nest's std lacks serve-shared — rebuild Brood (cd ../brood && ./configure --with-gui && make install)"))
+    (println (str "myedit daemon '" name "' serving"
+               (if (nil? file) "" (str " " file)) " (SHARED — all clients edit one model)."))
+    (println (str "  attach from another terminal:  bedit --attach " name))
+    (ed-serve--park)))
+
+(defn ed-attach (spec)
+  "Open a native window and attach it to the myedit daemon named `spec` (\"name\" for a
+local daemon over the per-user Unix socket, or \"name@host:port\" over TCP) — the GUI
+`emacsclient`. The daemon runs the editor; this window paints the frames it pushes and ships
+back every keystroke, until the session ends (C-x C-c) or the link drops. Blocks until then.
+Needs a GUI-enabled `nest` whose `std` includes `attach-display` (rebuild `../brood` with
+`./configure --with-gui && make install`) — a clear error says so if it's missing."
+  (if (bound? 'editor/serve/attach-display)
+    (editor/serve/attach-display spec (gui-display))
+    (error "ed-attach: this nest's std lacks attach-display — rebuild Brood: (cd ../brood && ./configure --with-gui && make install)")))
