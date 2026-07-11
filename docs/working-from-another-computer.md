@@ -108,9 +108,8 @@ bedit --attach ed@HOST:7457 --as alice
 
 - A bare port binds `0.0.0.0` (every interface); give `HOST:PORT` to bind one.
 - The **cookie** (`~/.config/brood/cookie`) must match on both ends — that's the auth.
-- While listening on TCP the node does **not** also hold the Unix socket, so local
-  attaches on the host use the `@127.0.0.1:PORT` form too (kernel dual-listen is the
-  deferred refinement).
+- Dual-listen: the per-user Unix socket stays bound alongside TCP, so local attaches
+  keep the bare-NAME form while remote machines use `@HOST:PORT`.
 - Verified over a real TCP link (loopback: two runtimes, full presence + edit fan-out);
   cross-machine is the same code path — try it from the second machine.
 
@@ -125,9 +124,11 @@ bedit --attach ed@HOST:7457 --as alice
 | Echo suppression (own round-trip never flickers fast typing) | ✅ |
 | Cross-machine over TCP (`--listen`, cookie-authenticated) | ✅ (loopback-verified; try your second machine) |
 | Delta pushes (splices/marker moves on the wire — the document never ships) | ✅ |
+| Concurrent typing merges exactly (OT for disjoint edits; same-span resyncs) | ✅ |
 | Shared selections (everyone's region, tinted in their colour) | ✅ |
 | Modeline presence chip (`shared: alice, bob → alice`) | ✅ |
-| Kernel dual-listen (Unix socket *and* TCP at once) | ⬜ deferred |
+| Kernel dual-listen (Unix socket *and* TCP at once) | ✅ |
+| `share-session-stop` fully tears down (sessions, registry, buffer procs) | ✅ |
 
 The independent-cursor collab layer (a shared buffer process, positional-splice edits,
 per-pane cursors — `src/collab.blsp`) is live as `--serve --collab`: each attaching client

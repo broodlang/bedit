@@ -216,12 +216,24 @@ every-event path pays nothing."
           (let (bp (spawn-buffer (make-buffer text name path)))
             (send from [:reply r bp])
             (collab--registry-loop (assoc procs path bp))))))
+    ;; share-session-stop: end every buffer process this registry spawned, then this loop
+    ([:stop-all from r]
+      (do (doseq (kv (map-pairs procs)) (stop-buffer (second kv)))
+        (send from [:reply r (count procs)])))
     (_ (collab--registry-loop procs))))
 
 (defn collab-registry-start ()
   "Spawn the daemon's file → buffer-process registry; its pid rides every session
 model as `:collab-reg`."
   (spawn (collab--registry-loop {})))
+
+(defn collab-registry-stop (reg)
+  "End the registry AND every buffer process it spawned (the whole shared document
+set) — `share-session-stop`'s teardown. Synchronous; the count of processes stopped,
+or `:no-reply` when the registry is already gone."
+  (let (r (ref))
+    (send reg [:stop-all (self) r])
+    (receive ([:reply ~r n] n) (after 2000 :no-reply))))
 
 (defn collab-registry-share (reg path text name)
   "The ONE buffer process for `path` — spawned from `text`/`name` on the first ask;
@@ -299,7 +311,10 @@ window scrolls exactly as theirs does. Called from the `:buffer-updated` handler
 where the viewport height is known. A no-op when not following or their cursor is
 nowhere to be seen."
   (let (f (get m :follow))
-    (if (nil? f)
+    (if (or (nil? f)
+          ;; mid-minibuffer, stay put: yanking the buffer out from under an open
+          ;; prompt is disorienting — the jump resumes on the next push after it closes
+          (not (nil? (get m :minibuffer))))
       m
       (let (pid (get f :pid)
             j (collab--slot-of m pid))
@@ -398,12 +413,15 @@ content is never rebuilt from it: just the version bump + cursors. Without this,
 own round-trip briefly clobbers newer local keystrokes (a visible flicker) before the
 next push reconverges.
 
-**Deltas**: a splice view applies `replace-region` to the slot's buffer in place —
-O(change), the rope survives — but ONLY while we have no edit of our own in flight
-(`:pending` = splices sent, not yet echoed): a foreign splice racing our in-flight one
-was computed against text we've diverged from, so that rare collision resyncs from the
-process (`buffer-query`, the always-correct fallback). Cursor-only deltas touch no
-content at all.
+**Deltas + transforms**: a splice view applies `replace-region` to the slot's buffer
+in place — O(change), the rope survives. While our own edits are in flight
+(`:pending` — the splices sent, not yet echoed), a foreign splice is TRANSFORMED over
+them (`splice-transform`, the same function the process uses) before applying, and
+the pendings are remapped over it — so two people typing in DIFFERENT places inside
+one round-trip window merge exactly, no snap. Only a genuinely ambiguous collision
+(the foreign splice touches a span one of ours also touched) falls back to resyncing
+from the process — the always-correct authority. Cursor-only deltas touch no content
+at all.
 
 Every pane's window-local point is untouched — it lives on the pane, not the buffer —
 so cursors stay independent and simply clamp into the new text on render. Ignores a
@@ -434,7 +452,25 @@ stale/duplicate `version`; a no-op when no slot links to `proc`."
                              acc)))
                    {} (map-pairs raw))
             own? (and (not (nil? origin)) (= origin me))
-            pending (or (get sh :pending) 0)
+            pending (or (get sh :pending) ())
+            ;; a foreign splice can merge exactly iff it's strictly apart from every
+            ;; in-flight splice of ours; touching/overlapping is ambiguous → resync
+            mergeable? (and splice
+                         (or (empty? pending)
+                           (every? (fn (p) (splice-disjoint? splice p)) pending)))
+            npending (cond
+                       (and own? splice) (rest pending)   ; our echo — first in, first home
+                       (and splice mergeable? (not own?))
+                       ;; remap our in-flight splices over the foreign one, as the
+                       ;; process will when they arrive after it
+                       (map (fn (p)
+                              (let ([plo phi plen] p
+                                    [flo fhi frepl] splice
+                                    [nlo nhi _] (splice-transform [plo phi ""] [flo fhi (string-length frepl)]))
+                                [nlo nhi plen]))
+                         pending)
+                       (and splice (not own?)) ()          ; ambiguous → resync resets
+                       :else pending)
             others (if (nil? me) cursors (dissoc cursors me))
             seed? (= (or (get sh :version) -1) -1)
             old-cursors (or (get sh :cursors) {})
@@ -454,8 +490,7 @@ stale/duplicate `version`; a no-op when no slot links to `proc`."
                                               :tops tops
                                               :tag-ttl ttl
                                               :names names
-                                              ;; our own splice came home — one less in flight
-                                              :pending (if (and own? splice) (max 0 (dec pending)) pending)})))
+                                              :pending npending})))
             ;; the one we were following vanished from EVERY shared buffer → they're
             ;; gone (a buffer switch just moves their marker to another slot — kept)
             m2 (let (f (get m2 :follow))
@@ -467,15 +502,17 @@ stale/duplicate `version`; a no-op when no slot links to `proc`."
         (cond
           ;; our own edit coming back — the local model already applied it (echo suppression)
           own? m2
-          ;; a foreign DELTA, no divergence risk → apply the splice in place (O(change))
-          (and splice (= pending 0))
-          (let ([lo hi repl] splice)
+          ;; a foreign DELTA that merges: transform it over our in-flight splices (the
+          ;; process hasn't applied them yet, our local text has) and apply in place
+          (and splice mergeable?)
+          (let ([lo hi repl] (splice-transform-all splice
+                               (map (fn (p) (let ([plo phi plen] p) [plo phi plen])) pending)))
             (assoc m2 :buffers (assoc (get m2 :buffers) i (replace-region old lo hi repl))))
-          ;; a foreign delta while our own edit is in flight → we may have diverged; the
-          ;; rare collision resyncs the whole slot from the process (always correct)
+          ;; a genuinely ambiguous collision (same span touched on both sides inside one
+          ;; round-trip) → resync the whole slot from the process (always correct)
           splice
           (let (t (buffer-query proc buffer-text))
-            (assoc (assoc-in m2 [:shared i :pending] 0)
+            (assoc m2
               :buffers (assoc (get m2 :buffers) i
                          (ed-stamp (make-buffer t (buffer-name old) (buffer-file old))))))
           ;; a full-text view (closure edits / the seed): rebuild only on real change
@@ -502,9 +539,9 @@ the push then reconciles the content). When the buffer isn't shared, this is exa
             [lo hi repl] splice)
         (if (collab-splice-noop? splice)
           (ed-set-buf m nb)
-          (do (buffer-splice proc lo hi repl (get sh :me))
+          (do (buffer-splice proc lo hi repl (get sh :me) (get sh :version))
             (assoc-in (ed-set-buf m nb) [:shared i :pending]
-              (inc (or (get sh :pending) 0))))))
+              (concat (or (get sh :pending) ()) (list [lo hi (string-length repl)]))))))
       (ed-set-buf m nb))))
 
 (defn collab-propagate (before after)
@@ -531,8 +568,10 @@ edit, or the splice sends twice.)"
             (if (collab-splice-noop? splice)
               acc
               (let ([lo hi repl] splice)
-                (buffer-splice proc lo hi repl me)
-                (assoc-in acc [:shared i :pending] (inc (or (get-in acc [:shared i :pending]) 0)))))))))
+                (buffer-splice proc lo hi repl me (get-in acc [:shared i :version]))
+                (assoc-in acc [:shared i :pending]
+                  (concat (or (get-in acc [:shared i :pending]) ())
+                    (list [lo hi (string-length repl)])))))))))
     after
     (map-pairs (or (get after :shared) {}))))
 
