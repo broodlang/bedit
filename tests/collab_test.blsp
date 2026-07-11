@@ -72,8 +72,8 @@
                 mBf (ed-apply-buffer-update mB proc v view o))
             (assert= (ct-text mAf) "helloXYZ")
             (assert= (ct-text mBf) "helloXYZ")
-            ;; A's in-flight count drained by its own echo
-            (assert= (get-in mAf [:shared 0 :pending]) 0)
+            ;; A's in-flight splice drained by its own echo
+            (assert= (get-in mAf [:shared 0 :pending]) ())
             ;; cursors stayed independent: B's is still at 0, A moved with its own insert
             (assert= (ct-point mBf) 0)
             (is (> (ct-point mAf) 0)))))
@@ -121,7 +121,7 @@
       ;; a plain command edited the pooled buffer via ed-set-buf, unaware of sharing
       (let (after (ed-set-buf m (insert (end-of-buffer (ed-current-buf m)) "!")))
         (let (after2 (collab-propagate m after))
-          (assert= (get-in after2 [:shared 0 :pending]) 1))   ; one splice in flight
+          (assert= (count (get-in after2 [:shared 0 :pending])) 1))   ; one splice in flight
         (let ([_ view _] (ct-await* proc))
           (assert= (get view :splice) [5 5 "!"]))             ; the delta, not the doc
         (assert= (buffer-query proc buffer-text) "hello!"))
@@ -209,6 +209,38 @@
       (ct-drain-seed proc)
       (collab-edit (ct-at m0 2) (fn (b) (insert (goto-char b 2) "z")))
       (assert= (receive ([:buffer-updated ~proc _ _ o] o) (after 2000 :none)) me)
+      (stop-buffer proc)))
+
+  (test "concurrent typing in DIFFERENT places merges exactly — no resync, no snap"
+    (let (proc (spawn-buffer (make-buffer "hello" "ot.txt"))
+          mA (collab-share-slot (ed-init (make-buffer "hello" "ot.txt")) 0 proc)
+          me (get-in mA [:shared 0 :me])
+          mA0 (ed-apply-buffer-update mA proc 0 ["hello" {me 0} {me "guest"}]))
+      (ct-drain-seed proc)
+      ;; A types "X" at 0 — in flight (unacked); before its echo, B's "Y"@5 arrives
+      (let (mA1 (collab-edit mA0 (fn (b) (insert (goto-char b 0) "X")))
+            mA2 (ed-apply-buffer-update mA1 proc 5
+                  {:splice [5 5 "Y"] :markers {} :participants {}} :bob))
+        ;; B's splice transformed over our pending ([0 0 1] → +1) → applied at 6:
+        ;; both edits land exactly, mid-flight, with no full-text rebuild
+        (assert= (ct-text mA2) "XhelloY")
+        ;; and our in-flight record was remapped over B's splice (unchanged here — B is after)
+        (assert= (get-in mA2 [:shared 0 :pending]) (list [0 0 1])))
+      (stop-buffer proc)))
+
+  (test "an ambiguous same-span collision resyncs from the process (authority wins)"
+    (let (proc (spawn-buffer (make-buffer "hello" "amb.txt"))
+          mA (collab-share-slot (ed-init (make-buffer "hello" "amb.txt")) 0 proc)
+          me (get-in mA [:shared 0 :me])
+          mA0 (ed-apply-buffer-update mA proc 0 ["hello" {me 0} {me "guest"}]))
+      (ct-drain-seed proc)
+      ;; A's "X"@0 in flight; a foreign splice at the SAME spot arrives — ambiguous
+      (let (mA1 (collab-edit mA0 (fn (b) (insert (goto-char b 0) "X")))
+            mA2 (ed-apply-buffer-update mA1 proc 5
+                  {:splice [0 0 "Z"] :markers {} :participants {}} :bob))
+        ;; resynced to the process's truth (which HAS applied our X by now)
+        (assert= (ct-text mA2) "Xhello")
+        (assert= (get-in mA2 [:shared 0 :pending]) ()))
       (stop-buffer proc)))
 
   (test "follow: pushes move the follower's point; an own move or the leader leaving breaks it"
