@@ -2493,7 +2493,8 @@ killed; it re-arms on the next edit. Diagnostics, by contrast, recompute once ty
   (let (eval-p (get m :eval-proc)
         diag-p (get m :diag-proc)
         gd-p (get m :gitdiff-proc)
-        procs (remove nil? (list eval-p diag-p gd-p))
+        eldoc-p (get m :eldoc-proc)
+        procs (remove nil? (list eval-p diag-p gd-p eldoc-p))
         b (ed-current-buf m)
         ;; a cancelled diff-hl recompute: stamp :git-status-rope = the current rope so the
         ;; idle beat treats the gutter as current and won't relaunch the diff we just killed
@@ -2505,7 +2506,8 @@ killed; it re-arms on the next edit. Diagnostics, by contrast, recompute once ty
                :git-line-status (or (get b :git-line-status) {}))
              b)
         m1 (dissoc (ed-set-buf m (clear-mark b1))
-             :pending :prefix-arg :eval-proc :diag-proc :diag-checking :gitdiff-proc :gitdiff-checking)
+             :pending :prefix-arg :eval-proc :diag-proc :diag-checking :gitdiff-proc :gitdiff-checking
+             :eldoc-proc :eldoc-checking :lsp-pending)  ; in-flight LSP lookups: replies drop as stale
         _ (doseq (p procs) (cancel-task p)))
     (message m1 (if (empty? procs) "quit" "quit — interrupted background work"))))
 
@@ -2647,23 +2649,53 @@ accepting keeps it; cancelling restores the point and scroll the prompt opened f
   (m key)
   "Jump to a symbol in the current buffer, picked from the language server's
 `documentSymbol` list (M-g i). Starts the server on first use if one is configured for the
-file type; symbols are nested-name-qualified (Emacs-style `Class.method`)."
+file type; symbols are nested-name-qualified (Emacs-style `Class.method`). Async — the
+picker opens when the symbol list arrives."
   (let ([m2 ready?] (ed--lsp-ensure m))
     (if (not ready?)
       m2
       (let (buf (ed-current-buf m2)
             file (buffer-file buf)
-            syms (lsp/lsp-document-symbols-sync (get m2 :lsp) (lsp/lsp--path->uri file)
-                   (lsp/lsp--language-id file) (buffer-text buf)))
-        (if (empty? syms)
-          (message m2 "imenu: no symbols (is the server ready?)")
-          (ed--imenu-prompt m2 syms))))))
+            conn (get m2 :lsp))
+        (ed--lsp-ask m2 :imenu
+          (fn (corr) (lsp/lsp-document-symbols-async conn corr (self) (lsp/lsp--path->uri file)
+                       (lsp/lsp--language-id file) (buffer-text buf)))
+          nil "imenu: fetching symbols…")))))
 
 ;; ---- LSP navigation + edits: goto-def / back / references / hover / rename / format ----
-;; All ride the same request/response round-trip as completion + imenu. `ed--lsp-here`
-;; packages the current buffer's (conn, uri, lang, text, line, char) for a request at point;
+;; All ASYNC (§E.2 — services never block the loop): a command registers a pending lookup
+;; under a fresh corr (`ed--lsp-ask` → `:lsp-pending`) and fires the request; the conn's
+;; tagged reply lands on the loop as an event (`ed--ev-lsp-reply`, registered in input.blsp)
+;; and folds by corr — jump/show/apply happen when the answer ARRIVES, the echo says what's
+;; in flight meanwhile, and C-g clears the table (a late reply drops as stale). Mutating
+;; replies (format, rename) carry a rope guard: if the buffer changed while the server
+;; worked, the edits are dropped with a message instead of applied against the wrong text.
+;; `ed--lsp-here` packages the current buffer's (conn, uri, lang, text, line, char);
 ;; `ed--lsp-ensure` auto-starts the server on first use. Cross-file jumps open the target
 ;; with `ed-find-file` and push a marker (`:lsp-markers`) so M-, returns.
+
+(defn ed--lsp-ask (m kind fire &optional extra note)
+  "Register a pending LSP lookup of `kind` under a fresh corr and `fire` it (a
+`(corr) -> nil` sender — one of lsp's `-async` fns, with `(self)` as reply-to). `extra`
+merges context the fold will need (a rope guard, the rename's origin); `note` is the
+in-flight echo."
+  (let (corr (ref))
+    (fire corr)
+    (message (assoc m :lsp-pending
+               (assoc (get m :lsp-pending {}) corr (merge {:kind kind} (or extra {}))))
+      (or note "lsp: resolving…"))))
+
+(defn ed--ev-lsp-reply (m input textrows cols rows)
+  "An LSP reply landing on the loop (`[:lsp-definition corr locs]`, `[:lsp-hover corr
+s]`, …): fold its payload by corr against `:lsp-pending`; an unknown corr is a
+stale/cancelled lookup (C-g, or a completion's bounded wait that already timed out)
+and drops silently."
+  (let (corr (nth input 1)
+        pend (get-in m [:lsp-pending corr]))
+    (if (nil? pend)
+      m
+      (ed--lsp-fold (assoc m :lsp-pending (dissoc (get m :lsp-pending) corr))
+        pend (nth input 2)))))
 
 (defn ed--lsp-here (m)
   "The LSP request context for the current buffer at point:
@@ -2705,20 +2737,55 @@ references/definition picker."
           (let (hit (find (fn (p) (= (first p) t)) labeled))
             (if (nil? hit) (message mm "lsp: location gone") (ed--lsp-goto-loc mm (second hit)))))))))
 
+(defn ed--lsp-fold (m pend payload)
+  "Fold an arrived LSP reply's `payload` by the pending lookup's `:kind` — the action
+half of the commands below, unchanged from their synchronous days. Mutating kinds
+(format, rename) verify the buffer's rope still matches the one the request was
+computed against (`:rope` in `pend`) and drop the edits with a message otherwise."
+  (let (kind (get pend :kind))
+    (cond
+      (= kind :definition)
+      (cond
+        (empty? payload) (message m "no definition found")
+        (= (count payload) 1) (ed--lsp-goto-loc m (first payload))
+        :else (ed--lsp-locations-prompt m "Definition: " payload))
+      (= kind :references)
+      (if (empty? payload)
+        (message m "no references found")
+        (ed--lsp-locations-prompt m "References: " payload))
+      (= kind :hover)
+      (if (blank? payload) (message m "no hover info") (message m payload))
+      (= kind :imenu)
+      (if (empty? payload)
+        (message m "imenu: no symbols (is the server ready?)")
+        (ed--imenu-prompt m payload))
+      (= kind :format)
+      (cond
+        (empty? payload) (message m "lsp: no formatting changes")
+        (not (= (buffer-rope (ed-current-buf m)) (get pend :rope)))
+        (message m "lsp: buffer changed while formatting ran — dropped (re-run C-c C-f)")
+        :else (message (ed-apply m (fn (b) (ed--apply-text-edits b payload))) "formatted"))
+      (= kind :rename)
+      (cond
+        (empty? payload) (message m "lsp: rename produced no changes")
+        (not (= (buffer-rope (ed-current-buf m)) (get pend :rope)))
+        (message m "lsp: buffer changed while rename ran — dropped (re-run C-c C-r)")
+        :else (ed--lsp-apply-rename m pend payload))
+      :else m)))
+
 (defcommand cmd-goto-definition
   (m key)
   "Jump to the definition of the symbol at point (M-.); M-, returns. Picks among several
-definitions via a minibuffer. Auto-starts the server on first use."
+definitions via a minibuffer. Auto-starts the server on first use. Async — the jump
+happens when the location arrives."
   (let ([m2 ready?] (ed--lsp-ensure m))
     (if (not ready?)
       m2
-      (let (cx (ed--lsp-here m2)
-            locs (lsp/lsp-definition-sync (get cx :conn) (get cx :uri) (get cx :lang)
-                   (get cx :text) (get cx :line) (get cx :char)))
-        (cond
-          (empty? locs) (message m2 "no definition found")
-          (= (count locs) 1) (ed--lsp-goto-loc m2 (first locs))
-          :else (ed--lsp-locations-prompt m2 "Definition: " locs))))))
+      (let (cx (ed--lsp-here m2))
+        (ed--lsp-ask m2 :definition
+          (fn (corr) (lsp/lsp-definition-async (get cx :conn) corr (self) (get cx :uri)
+                       (get cx :lang) (get cx :text) (get cx :line) (get cx :char)))
+          nil "resolving definition…")))))
 
 (defcommand cmd-lsp-pop-marker
   (m key)
@@ -2736,27 +2803,29 @@ definitions via a minibuffer. Auto-starts the server on first use."
 
 (defcommand cmd-find-references
   (m key)
-  "List every reference to the symbol at point and jump to the chosen one (M-?)."
+  "List every reference to the symbol at point and jump to the chosen one (M-?).
+Async — the picker opens when the list arrives."
   (let ([m2 ready?] (ed--lsp-ensure m))
     (if (not ready?)
       m2
-      (let (cx (ed--lsp-here m2)
-            locs (lsp/lsp-references-sync (get cx :conn) (get cx :uri) (get cx :lang)
-                   (get cx :text) (get cx :line) (get cx :char)))
-        (if (empty? locs)
-          (message m2 "no references found")
-          (ed--lsp-locations-prompt m2 "References: " locs))))))
+      (let (cx (ed--lsp-here m2))
+        (ed--lsp-ask m2 :references
+          (fn (corr) (lsp/lsp-references-async (get cx :conn) corr (self) (get cx :uri)
+                       (get cx :lang) (get cx :text) (get cx :line) (get cx :char)))
+          nil "finding references…")))))
 
 (defcommand cmd-lsp-hover
   (m key)
-  "Show the type / signature / docs of the symbol at point in the echo area (C-c C-d)."
+  "Show the type / signature / docs of the symbol at point in the echo area (C-c C-d).
+Async — the docs show when they arrive."
   (let ([m2 ready?] (ed--lsp-ensure m))
     (if (not ready?)
       m2
-      (let (cx (ed--lsp-here m2)
-            text (lsp/lsp-hover-sync (get cx :conn) (get cx :uri) (get cx :lang)
-                   (get cx :text) (get cx :line) (get cx :char)))
-        (if (blank? text) (message m2 "no hover info") (message m2 text))))))
+      (let (cx (ed--lsp-here m2))
+        (ed--lsp-ask m2 :hover
+          (fn (corr) (lsp/lsp-hover-async (get cx :conn) corr (self) (get cx :uri)
+                       (get cx :lang) (get cx :text) (get cx :line) (get cx :char)))
+          nil "hover…")))))
 
 (defn ed--edit-offsets (b e)
   "The char-offset form `{:start :end :text}` of normalised LSP edit `e` in buffer `b`
@@ -2777,37 +2846,44 @@ applied last-position-first so each replace can't shift the offsets of edits sti
 
 (defcommand cmd-lsp-format-buffer
   (m key)
-  "Format the current buffer via the language server (C-c C-f)."
+  "Format the current buffer via the language server (C-c C-f). Async, rope-guarded:
+the edits apply when they arrive iff the buffer hasn't changed meanwhile."
   (let ([m2 ready?] (ed--lsp-ensure m))
     (if (not ready?)
       m2
-      (let (cx (ed--lsp-here m2)
-            edits (lsp/lsp-format-sync (get cx :conn) (get cx :uri) (get cx :lang) (get cx :text)))
-        (if (empty? edits)
-          (message m2 "lsp: no formatting changes")
-          (message (ed-apply m2 (fn (b) (ed--apply-text-edits b edits))) "formatted"))))))
+      (let (cx (ed--lsp-here m2))
+        (ed--lsp-ask m2 :format
+          (fn (corr) (lsp/lsp-format-async (get cx :conn) corr (self) (get cx :uri)
+                       (get cx :lang) (get cx :text)))
+          {:rope (buffer-rope (ed-current-buf m2))}
+          "formatting…")))))
 
 (defn ed--lsp-apply-file-edits (m path edits)
   "Open `path` and apply `edits` to its buffer (left modified for the user to save)."
   (ed-apply (ed-find-file m path) (fn (b) (ed--apply-text-edits b edits))))
 
+(defn ed--lsp-apply-rename (m pend wsedit)
+  "Apply an arrived rename's workspace edit across every affected file, returning to
+the buffer/point the rename started in (`:buffer`/`:point` captured in `pend`)."
+  (let (paths (keys wsedit)
+        m2 (fold (fn (mm path) (ed--lsp-apply-file-edits mm path (get wsedit path))) m paths)
+        idx (ed-buffer-index-by-name m2 (get pend :buffer))
+        m3 (if (nil? idx) m2
+             (ed-apply (ed-select m2 idx)
+               (fn (b) (goto-char b (min (get pend :point) (buffer-length b)))))))
+    (message m3 (str "renamed in " (count paths) " file(s)"))))
+
 (defn ed--lsp-do-rename (m new-name)
-  "Run the rename round-trip for the symbol at point → `new-name`, then apply the resulting
-workspace edit across every affected file, returning to the buffer the rename started in."
+  "Fire the rename request for the symbol at point → `new-name` (async); the workspace
+edit applies when it arrives (`ed--lsp-fold` `:rename`), rope-guarded against edits made
+while the server worked, returning to the origin buffer/point."
   (let (cx (ed--lsp-here m)
-        orig-name (buffer-name (ed-current-buf m))
-        orig-point (buffer-point (ed-current-buf m))
-        wsedit (lsp/lsp-rename-sync (get cx :conn) (get cx :uri) (get cx :lang)
-                 (get cx :text) (get cx :line) (get cx :char) new-name))
-    (if (empty? wsedit)
-      (message m "lsp: rename produced no changes")
-      (let (paths (keys wsedit)
-            m2 (fold (fn (mm path) (ed--lsp-apply-file-edits mm path (get wsedit path))) m paths)
-            idx (ed-buffer-index-by-name m2 orig-name)
-            m3 (if (nil? idx) m2
-                 (ed-apply (ed-select m2 idx)
-                   (fn (b) (goto-char b (min orig-point (buffer-length b)))))))
-        (message m3 (str "renamed in " (count paths) " file(s)"))))))
+        b (ed-current-buf m))
+    (ed--lsp-ask m :rename
+      (fn (corr) (lsp/lsp-rename-async (get cx :conn) corr (self) (get cx :uri)
+                   (get cx :lang) (get cx :text) (get cx :line) (get cx :char) new-name))
+      {:rope (buffer-rope b) :buffer (buffer-name b) :point (buffer-point b)}
+      "renaming…")))
 
 (defcommand cmd-lsp-rename
   (m key)

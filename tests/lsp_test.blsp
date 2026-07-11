@@ -165,3 +165,47 @@
           resp (lsp/lsp--frame (json-encode {:jsonrpc "2.0" :id 2 :result {:changes {"file:///a" [{:range {:start {:line 0 :character 0} :end {:line 0 :character 1}} :newText "N"}]}}}))
           [st2 replies] (lsp/lsp--ingest state resp))
       (assert= replies (list [:p [:lsp-workspace-edit :c {"/a" (list {:start-line 0 :start-char 0 :end-line 0 :end-char 1 :text "N"})}]])))))
+
+;; ---- the editor-side ASYNC fold (§E.2 — LSP lookups never block the loop) --------
+;; ed--lsp-ask registers a pending lookup under a fresh corr; the conn's tagged reply
+;; folds through ed--ev-lsp-reply by corr. Pure model-side: no conn process needed —
+;; the `fire` closure just hands the corr back for the test to reply with.
+(describe "lsp: async lookup fold (ed--lsp-ask / ed--ev-lsp-reply)"
+  (test "a hover reply folds when it arrives; a duplicate drops as stale"
+    (let (me (self)
+          m (model/ed-init (editor/buffer/make-buffer "x"))
+          m1 (commands/ed--lsp-ask m :hover (fn (corr) (send me [:corr corr])) nil "hover…")
+          corr (receive ([:corr c] c) (after 1000 :none)))
+      (assert= (get m1 :echo) "hover…")                     ; the in-flight echo
+      (let (m2 (commands/ed--ev-lsp-reply m1 [:lsp-hover corr "DOCS"] 24 80 24))
+        (assert= (get m2 :echo) "DOCS")
+        (is (empty? (get m2 :lsp-pending)))
+        ;; the same reply again (or after C-g cleared the table): stale → dropped
+        (assert= (get (commands/ed--ev-lsp-reply m2 [:lsp-hover corr "AGAIN"] 24 80 24) :echo)
+          "DOCS"))))
+  (test "a mutating reply is rope-guarded: format edits after a buffer change drop"
+    (let (me (self)
+          m (model/ed-init (editor/buffer/make-buffer "abc"))
+          m1 (commands/ed--lsp-ask m :format (fn (corr) (send me [:corr corr]))
+               {:rope (editor/buffer/buffer-rope (model/ed-current-buf m))} "formatting…")
+          corr (receive ([:corr c] c) (after 1000 :none))
+          ;; the user typed while the server worked
+          edited (model/ed-set-buf m1 (editor/buffer/insert (model/ed-current-buf m1) "X"))
+          m2 (commands/ed--ev-lsp-reply edited
+               [:lsp-text-edits corr
+                 (list {:start-line 0 :start-char 0 :end-line 0 :end-char 3 :text "zzz"})]
+               24 80 24))
+      (is (string-contains? (get m2 :echo) "dropped"))
+      (assert= (editor/buffer/buffer-text (model/ed-current-buf m2)) "Xabc")))
+  (test "an unchanged buffer's format edits apply on arrival"
+    (let (me (self)
+          m (model/ed-init (editor/buffer/make-buffer "abc"))
+          m1 (commands/ed--lsp-ask m :format (fn (corr) (send me [:corr corr]))
+               {:rope (editor/buffer/buffer-rope (model/ed-current-buf m))} "formatting…")
+          corr (receive ([:corr c] c) (after 1000 :none))
+          m2 (commands/ed--ev-lsp-reply m1
+               [:lsp-text-edits corr
+                 (list {:start-line 0 :start-char 0 :end-line 0 :end-char 3 :text "zzz"})]
+               24 80 24))
+      (assert= (editor/buffer/buffer-text (model/ed-current-buf m2)) "zzz")
+      (assert= (get m2 :echo) "formatted"))))
