@@ -164,18 +164,58 @@ every-event path pays nothing."
 ;; visits is collaborative — not just the file the daemon was launched on — which is
 ;; what lets `share-follow` track a participant across buffers.
 
+(defn collab--registry-entry-by-proc (procs pid)
+  "The `[path entry]` whose `:proc` is `pid`, or nil."
+  (find (fn (kv) (= (get (second kv) :proc) pid)) (map-pairs procs)))
+
+(defn collab--registry-spawn (procs path text name)
+  "Spawn (or respawn) `path`'s buffer process from `text`, monitored and mirrored:
+the registry subscribes itself (`buffer-text` projection) and keeps a per-path TEXT
+MIRROR folded from the pushes (`link-fold` + `text-apply-splice` — the same std
+client every other holder uses), so a died process can be respawned from current
+content, not the text it was first shared with. Returns the updated `procs`."
+  (let (bp (spawn-buffer (make-buffer text name path)))
+    (monitor bp)
+    (subscribe-buffer bp buffer-text)
+    (assoc procs path {:proc bp :name name :link (link-init bp (self)) :text text})))
+
 (defn collab--registry-loop (procs)
+  ;; procs: {path {:proc <pid> :name <str> :link <buffer-client link> :text <mirror>}}
   (receive
     ([:share path text name from r]
       (let (existing (get procs path))
         (if existing
-          (do (send from [:reply r existing]) (collab--registry-loop procs))
-          (let (bp (spawn-buffer (make-buffer text name path)))
-            (send from [:reply r bp])
-            (collab--registry-loop (assoc procs path bp))))))
+          (do (send from [:reply r (get existing :proc)]) (collab--registry-loop procs))
+          (let (np (collab--registry-spawn procs path text name))
+            (send from [:reply r (get-in np [path :proc])])
+            (collab--registry-loop np)))))
+    ;; a mirror push from one of our buffers: fold it into that path's text mirror
+    ([:buffer-updated bp v view o]
+      (let (hit (collab--registry-entry-by-proc procs bp))
+        (if (nil? hit)
+          (collab--registry-loop procs)
+          (let ([path e] hit
+                [link action] (link-fold (get e :link) v view o)
+                text (cond
+                       (and (vector? action) (= (first action) :splice))
+                       (text-apply-splice (get e :text) (second action))
+                       (and (vector? action) (= (first action) :text)) (second action)
+                       :else (get e :text)))
+            (collab--registry-loop
+              (assoc procs path (merge e {:link link :text text})))))))
+    ;; one of our buffer processes died: respawn it from the mirror. The shared
+    ;; document survives its process — subscribers notice their own [:down] and
+    ;; re-share, landing on the fresh pid (collab-reshare), seed-synced to the mirror.
+    ([:down _ pid _]
+      (let (hit (collab--registry-entry-by-proc procs pid))
+        (if (nil? hit)
+          (collab--registry-loop procs)
+          (let ([path e] hit)
+            (collab--registry-loop
+              (collab--registry-spawn (dissoc procs path) path (get e :text) (get e :name)))))))
     ;; share-session-stop: end every buffer process this registry spawned, then this loop
     ([:stop-all from r]
-      (do (doseq (kv (map-pairs procs)) (stop-buffer (second kv)))
+      (do (doseq (kv (map-pairs procs)) (stop-buffer (get (second kv) :proc)))
         (send from [:reply r (count procs)])))
     (_ (collab--registry-loop procs))))
 
@@ -220,6 +260,23 @@ collaborative; ordinary editors (no `:collab-reg`) never do anything here."
           (message (dissoc m :collab-reg)
             "shared-session registry unreachable — sharing disabled for this session")
           (collab-share-slot (ed-unhost-slot m i true) i bp))))))
+
+(defn collab-reshare (m i)
+  "A SHARED slot's buffer process died: ask the registry for the file's process
+again — the registry respawns a died buffer from its text mirror, so the fresh pid
+is already carrying the document; the seed push re-syncs our slot. Without a
+reachable registry (the host is gone) fall back to hosting LOCALLY from the pool
+cache, so editing never stops — the graceful end of a collab session."
+  (let (reg (get m :collab-reg)
+        buf (ed-buf-at m i)
+        m1 (assoc m :hosted (dissoc (get m :hosted) i))
+        bp (if (and reg (buffer-file buf))
+             (collab-registry-share reg (buffer-file buf) (buffer-text buf) (buffer-name buf))
+             nil))
+    (if (nil? bp)
+      (message (ed-host-slot m1 i)
+        (str "shared host for " (buffer-name buf) " lost — now editing locally"))
+      (message (collab-share-slot m1 i bp) (str "reshared " (buffer-name buf))))))
 
 ;; ---- follow: ride another participant's caret (the pairing mode) -------------
 ;; `collab-follow` pins your point (and view) to another participant's cursor: every
