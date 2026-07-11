@@ -71,21 +71,23 @@ slot isn't hosted."
         (when stop? (stop-buffer proc))
         (assoc m :hosted (dissoc (get m :hosted) i))))))
 
-(defn hosted-propagate (before after)
+(defn hosted-propagate (before after &optional skip-i)
   "Ship each event's text changes to their slots' processes: for every hosted slot
 whose text differs between `before` and `after`, `link-propagate` (std
 `editor/buffer-client`) sends the positional splice as a based structured
 `buffer-splice` (a DELTA on the wire) tagged with our id, counting it in the slot's
 `:pending` (in flight until its echo returns). Returns `after` with those counts.
 This is what lets every editing command stay `model -> model` with no knowledge of
-hosting — the loop calls this once per event (`hosted-step`).
+hosting — the loop calls this once per event (`hosted-step`). `skip-i` exempts one
+slot: the one a folded push just rewrote (that change IS the process's own truth).
 
 An unchanged slot costs one ROPE-HANDLE compare (an edit mints a fresh rope; movement
 keeps it), so a keystroke never materialises the text of the slots it didn't touch."
   (fold
     (fn (acc kv)
       (let (i (first kv))
-        (if (not (and (< i (count (get before :buffers))) (< i (count (get acc :buffers)))))
+        (if (or (= i skip-i)
+              (not (and (< i (count (get before :buffers))) (< i (count (get acc :buffers))))))
           acc
           (let (ob (ed-buf-at before i)
                 nb (ed-buf-at acc i))
@@ -103,8 +105,12 @@ on a model carrying `:host-buffers?` (the live window loop sets it; tests and
 headless models don't, staying pure), every buffer — files, `*Messages*`, dired,
 occur — is backed by its own process the moment it appears in the pool, with no
 call-site cooperation: buffer creation stays plain pool growth, and the loop tail
-reconciles. A model without the flag pays one map lookup."
-  (if (nil? (get m :host-buffers?))
+reconciles. A model without the flag pays one map lookup; a fully hosted one an
+O(1) count compare (hosted keys are exactly the pool indices — `hosted-drop-slot`
+keeps that true across kills), so the pool scan runs only on the event that
+actually grew the pool."
+  (if (or (nil? (get m :host-buffers?))
+        (= (count (or (get m :hosted) {})) (count (get m :buffers))))
     m
     (fold (fn (acc i) (if (get-in acc [:hosted i]) acc (ed-host-slot acc i)))
       m (range (count (get m :buffers))))))
@@ -114,9 +120,13 @@ reconciles. A model without the flag pays one map lookup."
 stop the process too when it is locally owned (not `:shared?` — a shared host
 outlives its subscribers), then shift the `:hosted` keys above `killed` down one,
 mirroring the pool shift, so every surviving link still points at its slot.
-Returns the model; safe on an unhosted slot (still remaps)."
+Also stamps `:pool-shifted` — pool indices no longer name the same documents
+across this event, so `hosted-step` must NOT diff before/after by index (it would
+ship splice(other-document → this-one) to every surviving process above the kill).
+Returns the model; safe on an unhosted slot (still remaps + stamps)."
   (let (sh (get-in m [:hosted killed])
         m1 (if (nil? sh) m (ed-unhost-slot m killed (not (get sh :shared?))))
+        m1 (assoc m1 :pool-shifted true)
         hosted (get m1 :hosted))
     (if (nil? hosted)
       m1
@@ -153,18 +163,55 @@ with it. Echoes the casualty by name."
     (message (ed-host-slot (assoc m :hosted (dissoc (get m :hosted) i)) i)
       (str "buffer process for " name " restarted"))))
 
+(defn hosted--propagate-shifted (before after)
+  "The pool-RESHAPE variant of `hosted-propagate`: pair each surviving hosted slot
+with its `before` document by NAME (`ed-buffer-index-by-name` — pool names are the
+standard identity), because the indices shifted and a positional diff would compare
+different documents. A slot with no same-named `before` buffer (freshly created
+this event) is skipped — its process seeds from current text."
+  (fold
+    (fn (acc kv)
+      (let (i (first kv)
+            nb (if (< i (count (get acc :buffers))) (ed-buf-at acc i) nil)
+            j (if (nil? nb) nil (ed-buffer-index-by-name before (buffer-name nb))))
+        (if (nil? j)
+          acc
+          (let (ob (ed-buf-at before j))
+            (if (= (buffer-rope ob) (buffer-rope nb))
+              acc
+              (assoc-in acc [:hosted i]
+                (link-propagate (get-in acc [:hosted i])
+                  (buffer-text ob) (buffer-text nb))))))))
+    after
+    (map-pairs (or (get after :hosted) {}))))
+
 (defn hosted-step (before after input)
   "The loop-tail content hook: host any new pool slot (`hosted-reconcile` — the
 every-buffer flip, on flagged models), then propagate this event's edits to every
-hosted slot's process — the propagate skipped when the event IS a `[:buffer-updated …]`
-push (that's the process's own truth arriving; echoing it back would apply it twice).
+hosted slot's process. Two exemptions keep the diff honest:
+
+- a `[:buffer-updated …]` event exempts ONLY the slot the push rewrote (re-sending
+  the process its own truth would apply it twice) — every OTHER slot still
+  propagates, because folding a push can edit other buffers too (a presence echo
+  appends to the hosted `*Messages*`, which must not silently diverge from its
+  process);
+- an event that RESHAPED the pool (`:pool-shifted`, stamped by `hosted-drop-slot`)
+  diffs each surviving slot against its `before` slot found BY NAME, not by index:
+  the indices shifted, so a positional diff would compare document i with document j
+  and ship a corrupting cross-document splice — while skipping outright would lose
+  same-event edits (the kill's own \"killed NAME\" echo appended to `*Messages*`).
+
 Costs a map lookup or two on a model with nothing hosted, so ordinary editing pays
 nothing."
   (let (m (hosted-reconcile after))
-    (if (or (nil? (get m :hosted))
-          (and (vector? input) (= (first input) :buffer-updated)))
-      m
-      (hosted-propagate before m))))
+    (cond
+      (nil? (get m :hosted)) m
+      (get m :pool-shifted) (hosted--propagate-shifted before (dissoc m :pool-shifted))
+      :else
+      (hosted-propagate before m
+        (if (and (vector? input) (= (first input) :buffer-updated))
+          (hosted-slot-for-proc m (nth input 1))
+          nil)))))
 
 (defn hosted-apply-content (m i version view origin)
   "Fold one push's CONTENT into hosted slot `i`: `link-fold` (std protocol client)
@@ -188,11 +235,20 @@ is untouched — it lives on the pane, not the buffer."
            (let ([lo hi repl] (second action))
              (assoc m1 :buffers (assoc (get m1 :buffers) i (replace-region old lo hi repl))))
            ;; a genuinely ambiguous collision (same span touched on both sides inside
-           ;; one round-trip) → resync the slot from the process (always correct)
+           ;; one round-trip) → resync the slot from the process (always correct).
+           ;; buffer-sync pairs text + version ATOMICALLY: edits applied between the
+           ;; ambiguous push and our snapshot are inside the returned text, and
+           ;; advancing the link to the snapshot version makes their queued pushes
+           ;; drop as stale instead of replaying onto the rebuilt copy (doubling).
            (= action :resync)
-           (let (t (buffer-query (get sh :proc) buffer-text))
-             (assoc m1 :buffers (assoc (get m1 :buffers) i
-                                  (ed-stamp (make-buffer t (buffer-name old) (buffer-file old))))))
+           (let (snap (buffer-sync (get sh :proc) buffer-text))
+             (if (= snap :no-reply)
+               m1   ; process died mid-resync — the [:down] rehost will recover
+               (let ([sv t] snap)
+                 (assoc m1
+                   :hosted (assoc (get m1 :hosted) i (assoc link :version sv))
+                   :buffers (assoc (get m1 :buffers) i
+                              (ed-stamp (make-buffer t (buffer-name old) (buffer-file old))))))))
            ;; [:text s] — a full-text view (closure edits / the seed): rebuild only
            ;; on real change (cheap no-op churn, and local undo state survives)
            (= (second action) (buffer-text old)) m1
