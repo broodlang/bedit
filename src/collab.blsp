@@ -30,46 +30,16 @@ Presence rides the same seam: cursor/selection/viewport markers keyed by the ses
 (cleaned up by the process when you die), a name registry, follow/mirror, and the
 per-daemon file registry that auto-shares every file anyone visits. Deferred to v2: a real
 sequence CRDT for offline/high-latency divergence (`docs/remote-multiplayer-plan.md`, Open)."
-  (:use editor/buffer)  ; spawn/subscribe/buffer-edit/replace-region/make-buffer/buffer-text …
-  (:use model))         ; ed-init / ed-current-buf / ed-set-buf / ed-buf-at / ed-stamp …
-
-;; ---- the single positional splice diff (candidate for std/string; see module doc) ----
-
-(defn collab--prefix-len (a b i)
-  "The length of the common prefix of strings `a` and `b`, scanning from index `i`."
-  (if (and (< i (string-length a)) (< i (string-length b))
-        (= (char-at a i) (char-at b i)))
-    (collab--prefix-len a b (inc i))
-    i))
-
-(defn collab--suffix-len (a b limit k)
-  "The length of the common suffix of `a` and `b`, capped at `limit` (so it never overlaps a
-prefix already counted). Scans inward from the end, `k` chars matched so far."
-  (if (and (< k limit)
-        (= (char-at a (- (string-length a) 1 k))
-          (char-at b (- (string-length b) 1 k))))
-    (collab--suffix-len a b limit (inc k))
-    k))
-
-(defn collab-splice (old new)
-  "The single positional splice `[lo hi repl]` that turns string `old` into `new`: replace
-`old[lo, hi)` with `repl`. `lo`/`hi` bound the minimal changed span (shared prefix + suffix
-trimmed off), so `(replace-region buf lo hi repl)` reproduces `new`. Equal strings give a
-no-op `[n n \"\"]`. This is the whole edit expressed positionally, so it lands correctly at the
-process no matter where other participants' points are."
-  (let (lo (collab--prefix-len old new 0)
-        maxsuf (min (- (string-length old) lo) (- (string-length new) lo))
-        suf (collab--suffix-len old new maxsuf 0)
-        hi (- (string-length old) suf))
-    [lo hi (substring new lo (- (string-length new) suf))]))
-
-(defn collab-splice-noop? (splice)
-  "True when `splice` (`[lo hi repl]`) changes nothing — an empty range and empty replacement.
-A pure-movement command (point moved, text unchanged) yields this, so no edit is sent."
-  (let ([lo hi repl] splice)
-    (and (= lo hi) (= repl ""))))
+  (:use editor/buffer)         ; spawn/subscribe/buffer-edit/replace-region/make-buffer …
+  (:use editor/buffer-client)  ; the protocol's client half: link-init/-propagate/-fold,
+                               ; text-splice, view-parts (ADR-134 — extracted from here)
+  (:use model))                ; ed-init / ed-current-buf / ed-set-buf / ed-buf-at / ed-stamp …
 
 ;; ---- the model <-> shared-process link --------------------------------------
+;; A slot's `:shared` record IS a buffer-client *link* (`{:proc :me :version :pending}`)
+;; plus the presence keys this module layers on (`:cursors :marks :tops :names :tag-ttl`,
+;; `:sent-*`): the content protocol — splice propagate, echo suppression, transform-fold,
+;; resync — is `std/editor/buffer-client`; everything presence is here.
 
 (defn collab-shared? (m &optional i)
   "Whether pool slot `i` (default the current buffer's) is backed by a shared buffer process."
@@ -91,20 +61,6 @@ A pure-movement command (point moved, text unchanged) yields this, so no edit is
 every participant's cursor marker (pid → offset), and the pid → name registry."
   [(buffer-text b) (buffer-markers b) (get b :participants {})])
 
-(defn collab--view-parts (view)
-  "Normalize a push `view` to `{:text :splice :cursors :names}`. Three wire shapes:
-the presence triple `[text markers names]` (closure edits and the seed), a DELTA map
-`{:splice [lo hi repl]? :markers … :participants …}` (structured `buffer-splice` /
-`buffer-marker-move` ops — O(change), the document never ships), or a bare text string
-(plain projections, tests)."
-  (cond
-    (map? view) {:text nil
-                 :splice (get view :splice)
-                 :cursors (or (get view :markers) {})
-                 :names (or (get view :participants) {})}
-    (vector? view) {:text (nth view 0) :splice nil :cursors (nth view 1) :names (nth view 2)}
-    :else {:text view :splice nil :cursors {} :names {}}))
-
 (defn collab-share-slot (m i proc)
   "Back pool slot `i` with buffer process `proc`: subscribe this model's process for
 presence pushes (`collab--proj`), announce ourselves — a cursor marker keyed by our pid
@@ -118,7 +74,7 @@ current text). Returns the model."
       (buffer-edit proc (fn (b) (assoc (buffer-marker-set b me 0)
                                   :participants (assoc (get b :participants {}) me name)))
         me)
-      (assoc-in m [:shared i] {:proc proc :version -1 :me me}))))
+      (assoc-in m [:shared i] (link-init proc me)))))
 
 (defn collab-set-name (m name)
   "Record this session's participant `name` (the attach identity — `bedit --attach ed
@@ -402,179 +358,138 @@ beyond that is vanishingly rare. Unchanged sets echo nothing."
     (if hit (first hit) nil)))
 
 (defn ed-apply-buffer-update (m proc version view &optional origin)
-  "Fold a `[:buffer-updated proc version view origin]` push into the model. `view` is
-the presence triple `[text cursors names]` (or a bare text string — see
-`collab--view-parts`): the slot's content is rebuilt from `text` when it actually
-changed (a cursor-only push touches no buffer — cheap, and local undo state survives),
-other participants' cursors/names land on the slot (`:cursors`, `:names` — own pid
-excluded), presence churn is echoed (`collab--presence-echo`, suppressed on the seed:
-finding people already here isn't news the same way), and the version advances.
-
-**Echo suppression**: a push whose `origin` is OUR OWN pid is our edit coming back —
-the local model already applied it (and may be ahead of it, mid-fast-typing), so the
-content is never rebuilt from it: just the version bump + cursors. Without this, your
-own round-trip briefly clobbers newer local keystrokes (a visible flicker) before the
-next push reconverges.
-
-**Deltas + transforms**: a splice view applies `replace-region` to the slot's buffer
-in place — O(change), the rope survives. While our own edits are in flight
-(`:pending` — the splices sent, not yet echoed), a foreign splice is TRANSFORMED over
-them (`splice-transform`, the same function the process uses) before applying, and
-the pendings are remapped over it — so two people typing in DIFFERENT places inside
-one round-trip window merge exactly, no snap. Only a genuinely ambiguous collision
-(the foreign splice touches a span one of ours also touched) falls back to resyncing
-from the process — the always-correct authority. Cursor-only deltas touch no content
-at all.
+  "Fold a `[:buffer-updated proc version view origin]` push into the model — the
+CONTENT decisions (stale drop, echo suppression, foreign-splice transform over our
+in-flight edits, ambiguous-collision resync, full-text rebuild) all made by the std
+protocol client (`editor/buffer-client` `link-fold` — the slot's `:shared` record IS
+its link), the returned action applied to the pool slot here, and the PRESENCE layer
+(this module's own) folded around it: other participants' cursors/marks/viewports
+land on the slot (own pid excluded), name tags re-arm on movement (`:tag-ttl`,
+decayed by `collab-decay-tags`), churn is echoed (`collab--presence-echo` — suppressed
+on the seed: finding people already here isn't news the same way), and a followed
+participant vanishing from every shared slot breaks the follow.
 
 Every pane's window-local point is untouched — it lives on the pane, not the buffer —
 so cursors stay independent and simply clamp into the new text on render. Ignores a
 stale/duplicate `version`; a no-op when no slot links to `proc`."
   (let (i (collab-slot-for-proc m proc))
-    (if (or (nil? i) (<= version (or (get-in m [:shared i :version]) -1)))
+    (if (nil? i)
       m
-      (let (vp (collab--view-parts view)
-            text (get vp :text)
-            splice (get vp :splice)
-            raw (get vp :cursors)
-            names (get vp :names)
-            sh (get-in m [:shared i])
-            me (get sh :me)
-            ;; plain pid keys are cursors; [pid :mark] anchors; [pid :top] viewport tops
-            cursors (fold (fn (acc kv) (if (vector? (first kv)) acc (assoc acc (first kv) (second kv))))
-                      {} (map-pairs raw))
-            marks (fold (fn (acc kv)
-                          (let (k (first kv))
-                            (if (and (vector? k) (= (nth k 1 nil) :mark) (not (= (first k) me)))
-                              (assoc acc (first k) (second kv))
-                              acc)))
-                    {} (map-pairs raw))
-            tops (fold (fn (acc kv)
-                         (let (k (first kv))
-                           (if (and (vector? k) (= (nth k 1 nil) :top) (not (= (first k) me)))
-                             (assoc acc (first k) (second kv))
-                             acc)))
-                   {} (map-pairs raw))
-            own? (and (not (nil? origin)) (= origin me))
-            pending (or (get sh :pending) ())
-            ;; a foreign splice can merge exactly iff it's strictly apart from every
-            ;; in-flight splice of ours; touching/overlapping is ambiguous → resync
-            mergeable? (and splice
-                         (or (empty? pending)
-                           (every? (fn (p) (splice-disjoint? splice p)) pending)))
-            npending (cond
-                       (and own? splice) (rest pending)   ; our echo — first in, first home
-                       (and splice mergeable? (not own?))
-                       ;; remap our in-flight splices over the foreign one, as the
-                       ;; process will when they arrive after it
-                       (map (fn (p)
-                              (let ([plo phi plen] p
-                                    [flo fhi frepl] splice
-                                    [nlo nhi _] (splice-transform [plo phi ""] [flo fhi (string-length frepl)]))
-                                [nlo nhi plen]))
-                         pending)
-                       (and splice (not own?)) ()          ; ambiguous → resync resets
-                       :else pending)
-            others (if (nil? me) cursors (dissoc cursors me))
-            seed? (= (or (get sh :version) -1) -1)
-            old-cursors (or (get sh :cursors) {})
-            ;; a caret that appeared or moved re-arms its owner's name tag for a few
-            ;; blink beats (`collab-decay-tags` ticks them down) — quiet presence
-            ttl (fold (fn (acc kv)
-                        (if (= (get old-cursors (first kv)) (second kv))
-                          acc
-                          (assoc acc (first kv) 6)))
-                  (or (get sh :tag-ttl) {}) (map-pairs others))
-            m1 (if seed? m (collab--presence-echo m old-cursors others
-                             (merge (or (get sh :names) {}) names)))
-            m2 (assoc m1 :shared (assoc (get m1 :shared) i
-                                   (merge sh {:version version
-                                              :cursors others
-                                              :marks marks
-                                              :tops tops
-                                              :tag-ttl ttl
-                                              :names names
-                                              :pending npending})))
-            ;; the one we were following vanished from EVERY shared buffer → they're
-            ;; gone (a buffer switch just moves their marker to another slot — kept)
-            m2 (let (f (get m2 :follow))
-                 (if (and f (contains? old-cursors (get f :pid))
-                       (nil? (collab--slot-of m2 (get f :pid))))
-                   (collab-unfollow m2 (str (get f :name) " left — stopped following"))
-                   m2))
-            old (ed-buf-at m2 i))
-        (cond
-          ;; our own edit coming back — the local model already applied it (echo suppression)
-          own? m2
-          ;; a foreign DELTA that merges: transform it over our in-flight splices (the
-          ;; process hasn't applied them yet, our local text has) and apply in place
-          (and splice mergeable?)
-          (let ([lo hi repl] (splice-transform-all splice
-                               (map (fn (p) (let ([plo phi plen] p) [plo phi plen])) pending)))
-            (assoc m2 :buffers (assoc (get m2 :buffers) i (replace-region old lo hi repl))))
-          ;; a genuinely ambiguous collision (same span touched on both sides inside one
-          ;; round-trip) → resync the whole slot from the process (always correct)
-          splice
-          (let (t (buffer-query proc buffer-text))
-            (assoc m2
-              :buffers (assoc (get m2 :buffers) i
-                         (ed-stamp (make-buffer t (buffer-name old) (buffer-file old))))))
-          ;; a full-text view (closure edits / the seed): rebuild only on real change
-          (or (nil? text) (= text (buffer-text old))) m2
-          :else
-          (assoc m2 :buffers (assoc (get m2 :buffers) i
-                               (ed-stamp (make-buffer text (buffer-name old) (buffer-file old))))))))))
+      (let (sh (get-in m [:shared i])
+            [link action] (link-fold sh version view origin))
+        (if (= action :stale)
+          m
+          (let (vp (view-parts view)
+                raw (get vp :cursors)
+                names (get vp :names)
+                me (get sh :me)
+                ;; plain pid keys are cursors; [pid :mark] anchors; [pid :top] viewport tops
+                cursors (fold (fn (acc kv) (if (vector? (first kv)) acc (assoc acc (first kv) (second kv))))
+                          {} (map-pairs raw))
+                marks (fold (fn (acc kv)
+                              (let (k (first kv))
+                                (if (and (vector? k) (= (nth k 1 nil) :mark) (not (= (first k) me)))
+                                  (assoc acc (first k) (second kv))
+                                  acc)))
+                        {} (map-pairs raw))
+                tops (fold (fn (acc kv)
+                             (let (k (first kv))
+                               (if (and (vector? k) (= (nth k 1 nil) :top) (not (= (first k) me)))
+                                 (assoc acc (first k) (second kv))
+                                 acc)))
+                       {} (map-pairs raw))
+                others (if (nil? me) cursors (dissoc cursors me))
+                seed? (= (or (get sh :version) -1) -1)
+                old-cursors (or (get sh :cursors) {})
+                ;; a caret that appeared or moved re-arms its owner's name tag for a few
+                ;; blink beats (`collab-decay-tags` ticks them down) — quiet presence
+                ttl (fold (fn (acc kv)
+                            (if (= (get old-cursors (first kv)) (second kv))
+                              acc
+                              (assoc acc (first kv) 6)))
+                      (or (get sh :tag-ttl) {}) (map-pairs others))
+                m1 (if seed? m (collab--presence-echo m old-cursors others
+                                 (merge (or (get sh :names) {}) names)))
+                m2 (assoc m1 :shared (assoc (get m1 :shared) i
+                                       (merge link {:cursors others
+                                                    :marks marks
+                                                    :tops tops
+                                                    :tag-ttl ttl
+                                                    :names names})))
+                ;; the one we were following vanished from EVERY shared buffer → they're
+                ;; gone (a buffer switch just moves their marker to another slot — kept)
+                m2 (let (f (get m2 :follow))
+                     (if (and f (contains? old-cursors (get f :pid))
+                           (nil? (collab--slot-of m2 (get f :pid))))
+                       (collab-unfollow m2 (str (get f :name) " left — stopped following"))
+                       m2))
+                old (ed-buf-at m2 i))
+            (cond
+              ;; our own echo / a cursor-only delta — content untouched
+              (= action :noop) m2
+              ;; a foreign DELTA that merges: already transformed over our in-flight
+              ;; splices by link-fold — apply in place (O(change), the rope survives)
+              (and (vector? action) (= (first action) :splice))
+              (let ([lo hi repl] (second action))
+                (assoc m2 :buffers (assoc (get m2 :buffers) i (replace-region old lo hi repl))))
+              ;; a genuinely ambiguous collision (same span touched on both sides inside
+              ;; one round-trip) → resync the slot from the process (always correct)
+              (= action :resync)
+              (let (t (buffer-query proc buffer-text))
+                (assoc m2
+                  :buffers (assoc (get m2 :buffers) i
+                             (ed-stamp (make-buffer t (buffer-name old) (buffer-file old))))))
+              ;; [:text s] — a full-text view (closure edits / the seed): rebuild only
+              ;; on real change (cheap no-op churn, and local undo state survives)
+              (= (second action) (buffer-text old)) m2
+              :else
+              (assoc m2 :buffers (assoc (get m2 :buffers) i
+                                   (ed-stamp (make-buffer (second action)
+                                               (buffer-name old) (buffer-file old))))))))))))
 
 (defn collab-edit (m op)
   "Apply edit `op` (a `buffer -> buffer` transform, as commands produce) to the current buffer.
-When the buffer is process-backed, express the change as a positional splice (`collab-splice`)
-and send it to the process (`buffer-edit` + `replace-region`); the process serializes it and
-pushes the result to every subscriber (including us), so all clients — each with their own
-cursor — converge. The local pane is updated at once (the caret responds without a round-trip;
-the push then reconciles the content). When the buffer isn't shared, this is exactly
-`ed-set-buf` with `op` applied — so a command may call `collab-edit` unconditionally."
+When the buffer is process-backed, express the change as a based positional splice and send it
+(`link-propagate` — the std protocol client); the process serializes it and pushes the result
+to every subscriber (including us), so all clients — each with their own cursor — converge.
+The local pane is updated at once (the caret responds without a round-trip; the push then
+reconciles the content). When the buffer isn't shared, this is exactly `ed-set-buf` with `op`
+applied — so a command may call `collab-edit` unconditionally."
   (let (buf (ed-current-buf m)
         nb (op buf))
     (if (collab-shared? m)
-      (let (i (ed-current-index m)
-            sh (get-in m [:shared i])
-            proc (get sh :proc)
-            splice (collab-splice (buffer-text buf) (buffer-text nb))
-            [lo hi repl] splice)
-        (if (collab-splice-noop? splice)
-          (ed-set-buf m nb)
-          (do (buffer-splice proc lo hi repl (get sh :me) (get sh :version))
-            (assoc-in (ed-set-buf m nb) [:shared i :pending]
-              (concat (or (get sh :pending) ()) (list [lo hi (string-length repl)]))))))
+      (let (i (ed-current-index m))
+        (assoc-in (ed-set-buf m nb) [:shared i]
+          (link-propagate (get-in m [:shared i]) (buffer-text buf) (buffer-text nb))))
       (ed-set-buf m nb))))
 
 (defn collab-propagate (before after)
   "The command-agnostic counterpart to `collab-edit`: after a command folds an event in, push
 each shared slot's text change to its process so other participants see it. For every
-process-backed slot whose text differs between `before` and `after`, send the positional splice
-(`collab-splice`) as a structured `buffer-splice` (a DELTA on the wire — the process pushes
-`[lo hi repl]`, not the document) tagged with our pid, and count it in the slot's `:pending`
-(in flight until its echo returns — the divergence guard `ed-apply-buffer-update` uses).
-Returns `after` with those counts. This lets the ordinary editing commands stay `model ->
-model` with no knowledge of sharing — the `ui-run` loop calls this once per event. (Use
-*either* this loop-level hook *or* explicit `collab-edit` call sites, not both on the same
-edit, or the splice sends twice.)"
+process-backed slot whose text differs between `before` and `after`, `link-propagate` (the std
+protocol client) sends the positional splice as a structured `buffer-splice` (a DELTA on the
+wire — the process pushes `[lo hi repl]`, not the document) tagged with our pid, and counts it
+in the slot's `:pending` (in flight until its echo returns — the divergence guard `link-fold`
+uses). Returns `after` with those counts. This lets the ordinary editing commands stay
+`model -> model` with no knowledge of sharing — the `ui-run` loop calls this once per event.
+(Use *either* this loop-level hook *or* explicit `collab-edit` call sites, not both on the
+same edit, or the splice sends twice.)
+
+An unchanged slot costs one ROPE-HANDLE compare (an edit mints a fresh rope; movement keeps
+it — the `ed-diag-stale?` trick), so a keystroke never materialises the text of the shared
+slots it didn't touch."
   (fold
     (fn (acc kv)
-      (let (i (first kv)
-            sh (second kv)
-            proc (get sh :proc)
-            me (get sh :me))
+      (let (i (first kv))
         (if (not (and (< i (count (get before :buffers))) (< i (count (get acc :buffers)))))
           acc
-          (let (splice (collab-splice (buffer-text (ed-buf-at before i))
-                         (buffer-text (ed-buf-at acc i))))
-            (if (collab-splice-noop? splice)
-              acc
-              (let ([lo hi repl] splice)
-                (buffer-splice proc lo hi repl me (get-in acc [:shared i :version]))
-                (assoc-in acc [:shared i :pending]
-                  (concat (or (get-in acc [:shared i :pending]) ())
-                    (list [lo hi (string-length repl)])))))))))
+          (let (ob (ed-buf-at before i)
+                nb (ed-buf-at acc i))
+            (if (= (buffer-rope ob) (buffer-rope nb))
+              acc  ; O(1): same rope handle — no edit here, don't even read the text
+              (assoc-in acc [:shared i]
+                (link-propagate (get-in acc [:shared i])
+                  (buffer-text ob) (buffer-text nb))))))))
     after
     (map-pairs (or (get after :shared) {}))))
 
