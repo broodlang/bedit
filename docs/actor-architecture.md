@@ -1,8 +1,14 @@
 # The actor-model editor (design note, deferred)
 
-**Status:** design-of-record for a direction we've decided on but are **not building
-yet**. Captured so the reasoning isn't lost. Nothing here is implemented; the editor
-today is the single-process `ui-run` loop described in `ROADMAP.md`.
+**Status:** design-of-record — and as of 2026-07-10/11 its first real slices are
+**built and shipped** by Track 1 (`remote-multiplayer-plan.md`): buffers as
+processes for SHARED buffers (`std/editor/buffer` `spawn-buffer` + subscriptions +
+versioned delta pushes), edit-surviving **markers** adjusted inside the process
+(presence cursors/selections/viewports ride them), and concurrent-splice
+transforms. The local single-window editor still runs the single-process pure
+`ui-run` loop; still open from this note: point-off-buffer for local panes,
+per-buffer supervision/fault isolation, services as processes, and the view as a
+pure aggregator of pushed projections.
 
 The question that started this: *why not have a process per buffer?* — and then, more
 pointedly, *what if we lean into message-passing instead of cataloguing what stops

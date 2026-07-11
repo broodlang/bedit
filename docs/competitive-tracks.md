@@ -2,8 +2,12 @@
 
 **Status:** strategy note. Where myedit stands against the big three, and the
 three tracks that would make someone *choose* it over them rather than settle for
-a smaller Emacs. The detailed, buildable plan for the flagship track lives in
-[`remote-multiplayer-plan.md`](remote-multiplayer-plan.md); this doc is the map.
+a smaller Emacs. **Track 1 (remote & multiplayer) is now largely BUILT** — daemon
+attach, one shared mode with per-participant carets/presence, follow/mirror,
+share-session from a live editor, delta+transform merges, TCP `--listen`; see the
+as-built ledger in [`remote-multiplayer-plan.md`](remote-multiplayer-plan.md) and
+the runbook in [`working-from-another-computer.md`](working-from-another-computer.md).
+Remaining on that track: the v2 CRDT and per-participant undo. This doc is the map.
 
 ## Where we actually stand
 

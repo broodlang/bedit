@@ -127,3 +127,37 @@ Language-level changes live in the Brood repo's `docs/devlog.md` + `docs/decisio
   XDG state dir for projects/recent/bookmarks/bshell-history.
 - **Files:** `src/bshell.blsp`, `src/projects.blsp`, `src/commands.blsp`, `src/modes.blsp`,
   and more. The project-files speedup is what motivated the `string-split` ADR-109 work.
+
+### Remote & multiplayer editing — Track 1 built end to end — `dff66ab`…`628c385`
+- **Why:** the flagship strategic track: one editor you attach to from anywhere, and
+  real multi-person editing with presence — the "ultimate pairing experience."
+- **What:** the daemon/emacsclient model (`--serve`/`--attach`, host window,
+  `--headless`); ONE shared mode (`--shared`, alias `--collab`) — shared content, a
+  caret per participant, every visited file auto-shared via a per-daemon registry;
+  presence (named coloured carets with fade-after-move tags, per-owner selection
+  tints, viewport markers, join/leave echoes, a modeline chip, `M-x collab-status`);
+  `share-follow` (C-x f) across buffers and `share-mirror` (leader's viewport);
+  `M-x share-session`/`-stop` (a live editor becomes a host; stop tears everything
+  down); names from `--as` → init `:share-name` → `$USER` → prompt; deltas + OT
+  (based splices, `splice-transform` at the process AND the client, origin-tagged
+  echo suppression — concurrent typing in different places merges exactly, undo
+  survives); `--listen` TCP beside the Unix socket (kernel dual-listen, ADR-074).
+- **Brood (prime directive), forced by this track:** serve identity opts +
+  event-bus pass-through in the daemon displays + `serve-stop`; buffer-process
+  subscriber lifecycle (monitor + pid-keyed marker cleanup), structured
+  `buffer-splice`/`buffer-marker-move` deltas, splice transforms; **pid equality/hash
+  across `node-start`** (captured pre-node pids silently stopped matching — the
+  "second attach sees nothing" bug); the **immortal-process bug** (exit signals never
+  reached a natively-nested receive; landed as ADR-132, independently from both
+  machines); `%isolate`'s reap no longer kills its own caller. Plus, found while
+  testing: `safe-restart`/`sexp--defun-start` had gone O(pos) interpreted (~3.3 s
+  eldoc stalls on 3K-line files) — now the native `scan-form-start` (ADR-093 family).
+- **Files:** `src/collab.blsp` (the whole presence/delta/follow layer),
+  `src/remote.blsp`, `src/commands.blsp` (share-session/-follow/-mirror/collab-status),
+  `src/input.blsp` (`collab-step` at `ed-update`'s tail; `:buffer-updated`/
+  `:client-opts` handlers), `src/view.blsp` (carets/tints/chip), `src/keymaps.blsp`,
+  `src/config.blsp` (`:share-name`). **Tests:** collab/remote suites (~40 new),
+  brood buffer/serve/exit-signal suites. **Docs:** `remote-multiplayer-plan.md`
+  (as-built ledger), `working-from-another-computer.md` (runbook),
+  `fuzz-diag-overrides-anomaly.md` (an open JIT compiled-vs-source lead found en
+  route). Open: v2 CRDT, per-participant undo, cross-machine verification.
