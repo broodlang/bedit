@@ -45,6 +45,33 @@ endgame (a staged sequence on top of Track 1's collab slices):
   death keeps the graceful "sharing disabled" path) and **session-local hosted
   teardown** on serve-session death (needs a last-subscriber-stops policy in std).
 
+**Review residue (2026-07-11 multi-angle review — accepted, not yet built).** The
+review's correctness findings were fixed the same day (see the two `fix(…): …review
+fixes…` commits + the brood repo's OT/`buffer-sync`/serve/require fixes); these
+efficiency/altitude items were judged real but deferrable:
+- **propagate cost**: the loop tail materialises the edited buffer's full text twice
+  per keystroke to recover a splice the edit primitive already knew (~1 ms/key at
+  100 KB, linear beyond). Deeper fix: stamp `:last-edit [lo hi repl]` on the buffer
+  value in std's editing ops (or a native rope-diff) and let propagate read it O(1).
+- **registry mirror is a string**: `text-apply-splice` rebuilds each shared document
+  O(doc) per keystroke server-side; a rope-backed mirror (`replace-region`, text
+  materialised only at respawn) is the drop-in fix. Extracting the whole mirror as a
+  std "holder" (ADR-134's shape) would also delete the registry's inline fold.
+- **presence ops ship the document**: announce/withdraw/mark-clear are closure edits
+  → full-projection pushes to every subscriber; the wire wants `:marker-delete` and
+  a participants-only delta op beside `:marker-set`, and the splice push could drop
+  its full marker map (clients can shift markers locally).
+- **eldoc ships the whole buffer** into its task per idle beat; a bounded window
+  around point suffices.
+- **wide-`receive` budget**: `buffer--serve` must stay ≤12 arms (brood KI-10 — the
+  13th arm cost +65% wall/+80% peak across the buffer suite until the two `[:edit]`
+  arms were merged). Bear it in mind before adding protocol ops; fix belongs in the
+  kernel's receive compiler.
+- smaller: LSP requests could carry protocol-level document versions instead of
+  per-command rope guards; `hosted--proj`'s presence-triple encoder belongs beside
+  its `view-parts` decoder in std; the `ht/ct-await-down` test helpers and the
+  `buffer--serve` splice-arm bodies each want one shared shape.
+
 The question that started this: *why not have a process per buffer?* — and then, more
 pointedly, *what if we lean into message-passing instead of cataloguing what stops
 us?* This note is the answer: how an actor-model editor would actually work in Brood,
