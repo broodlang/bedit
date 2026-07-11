@@ -134,7 +134,7 @@ The independent-cursor collab layer (a shared buffer process, positional-splice 
 per-pane cursors — `src/collab.blsp`) is live as `--serve --collab`: each attaching client
 gets its own session whose buffer is backed by the daemon's one buffer process, so edits
 serialize with no CRDT while every cursor stays independent (see
-`docs/remote-multiplayer-plan.md`, Slice 2 as-built, for the wiring and its tests).
+`docs/remote-multiplayer-plan.md` for the architecture).
 
 ## Verify a setup is good
 
