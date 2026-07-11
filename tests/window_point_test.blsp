@@ -1,6 +1,7 @@
 (defmodule main-test
   (:use model)
   (:use commands)
+  (:use hosted)
   (:use editor/buffer)
   (:use test))
 
@@ -10,6 +11,13 @@
 
 ;; The bug: point lived on the pooled buffer, so two views (panes) of the same buffer/file
 ;; shared one cursor. Fix = window-point: point/mark are per-pane; content stays shared.
+;;
+;; The INVARIANT (the actor architecture's point-off-buffer, docs/actor-architecture.md):
+;; while a pane shows a buffer, the pane's window-local point is authoritative; the pooled
+;; buffer's own :point is only the SAVED DEFAULT — consulted exactly when a pane's :point
+;; is nil (a fresh switch: ed-show-index clears it), maintained by ed-set-buf's copy-back.
+;; That is Emacs's own window-point/buffer-point split, and it must survive hosting: a
+;; process push folds content into the pool and never touches any pane's point.
 
 (describe "window-point — per-pane cursor over a shared buffer"
   (test "moving in one split pane leaves the other pane's cursor put"
@@ -38,3 +46,30 @@
   (test "a window-point left stale/past EOF by another view's edit is clamped, not a crash"
     (let (b (make-buffer "short"))
       (assert= (buffer-point (ed-with-window-point b 999 nil)) (buffer-length b)))))
+
+(describe "window-point — the saved-default invariant"
+  (test "switch-away then switch-back opens at the buffer's saved default point"
+    ;; ed-set-buf maintains the saved default (copy-back); ed-show-index clears the
+    ;; pane's window point, so the return consults the default — Emacs semantics.
+    (let (m0 (at (m-of "0123456789") 7)          ; buffer's saved default now 7
+          m1 (ed-show-index m0 1)                ; away (to *Messages*)…
+          m2 (ed-show-index m1 0))               ; …and back
+      (is (nil? (get (ed-current-pane m2) :point)))   ; fresh pane point — cleared
+      (assert= (buffer-point (cur m2)) 7)))           ; reads the saved default
+
+  (test "a hosted foreign splice moves neither pane's window point (two views, one process)"
+    (let (m0 (at (m-of "0123456789abcdef") 8)
+          m1 (cmd-split-pane-right m0 nil)       ; both panes on slot 0
+          m2 (at m1 2)                           ; selected pane at 2, other at 8
+          m3 (ed-host-slot m2 0)
+          proc (get-in m3 [:hosted 0 :proc]))
+      ;; drain the subscription seed, then a foreign edit lands
+      (receive ([:buffer-updated ~proc _ _ _] nil) (after 300 nil))
+      (buffer-splice proc 0 0 ">>" :someone-else)
+      (let ([v view o] (receive ([:buffer-updated ~proc v w o] [v w o]) (after 2000 :none))
+            [m4 st] (hosted-apply-content m3 0 v view o))
+        (assert= st :applied)
+        (assert= (buffer-text (cur m4)) ">>0123456789abcdef")
+        (assert= (buffer-point (cur m4)) 2)                       ; selected pane: untouched
+        (assert= (buffer-point (cur (cmd-other-pane m4 nil))) 8)) ; other pane: untouched
+      (stop-buffer proc))))
