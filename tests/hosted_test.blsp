@@ -1,0 +1,95 @@
+;; hosted — a pool buffer backed by a buffer PROCESS, without any collab/presence layer:
+;; the actor-architecture seam (docs/actor-architecture.md) every buffer will ride.
+;; The tests play the editor process themselves (the collab_test pattern): host a slot,
+;; drive real keys through ed-update (the loop-tail hosted-step propagates), receive the
+;; process's pushes and fold them back through ed-update — asserting convergence, echo
+;; suppression, untouched window-local points, and clean unhosting. No node, no window.
+(defmodule hosted-test
+  (:use hosted)
+  (:use model)
+  (:use input)
+  (:use editor/buffer)
+  (:use test))
+
+(defn ht-text (m) (buffer-text (ed-current-buf m)))
+(defn ht-press (m keys) (fold (fn (acc k) (ed-update acc k 80 24)) m keys))
+
+;; Wait for the next push from `proc` and return the raw [v view origin] (or :none).
+(defn ht-await (proc)
+  (receive ([:buffer-updated ~proc v view o] [v view o]) (after 2000 :none)))
+
+;; Drain until quiet (the seed push, marker announces, …).
+(defn ht-drain (proc)
+  (receive ([:buffer-updated ~proc _ _ _] (ht-drain proc)) (after 300 nil)))
+
+(describe "hosted — a pool buffer backed by a buffer process" :isolated
+
+  (test "ed-host-slot spawns from the slot's cache; the process holds the same text"
+    (let (m (ed-host-slot (ed-init (make-buffer "hello" "h.txt")) 0)
+          proc (get-in m [:hosted 0 :proc]))
+      (is (ed-hosted? m 0))
+      (assert= (buffer-query proc buffer-text) "hello")
+      (ht-drain proc)
+      (stop-buffer proc)))
+
+  (test "typing through ed-update converges the process (the loop-tail hosted-step)"
+    (let (m (ed-host-slot (ed-init (make-buffer "hello" "t.txt")) 0)
+          proc (get-in m [:hosted 0 :proc]))
+      (ht-drain proc)
+      (let (m2 (ht-press m ["!"]))
+        (assert= (ht-text m2) "!hello")                    ; local-apply-first (point 0)
+        (assert= (count (get-in m2 [:hosted 0 :pending])) 1)  ; splice in flight
+        (let ([v view o] (ht-await proc))
+          (assert= (get view :splice) [0 0 "!"])           ; the DELTA, not the document
+          (assert= (buffer-query proc buffer-text) "!hello")
+          ;; the echo folds back through ed-update as a version bump: pending drains,
+          ;; content untouched (never rebuilt from our own round-trip)
+          (let (m3 (ed-update m2 [:buffer-updated proc v view o] 80 24))
+            (assert= (ht-text m3) "!hello")
+            (assert= (get-in m3 [:hosted 0 :version]) v)
+            (assert= (get-in m3 [:hosted 0 :pending]) ()))))
+      (stop-buffer proc)))
+
+  (test "a foreign splice folds into the pool cache; the pane's window-local point stays"
+    (let (m0 (ed-host-slot (ed-init (make-buffer "hello" "f.txt")) 0)
+          proc (get-in m0 [:hosted 0 :proc])
+          ;; park the pane cursor at 5 (window-local)
+          m (ed-set-buf m0 (goto-char (ed-current-buf m0) 5)))
+      (ht-drain proc)
+      (buffer-splice proc 0 0 ">" :someone-else)
+      (let ([v view o] (ht-await proc)
+            m2 (ed-update m [:buffer-updated proc v view o] 80 24))
+        (assert= (ht-text m2) ">hello")
+        (assert= (get (ed-current-pane m2) :point) 5))     ; untouched by the push
+      (stop-buffer proc)))
+
+  (test "a push is not echoed back (hosted-step skips [:buffer-updated] inputs)"
+    (let (m (ed-host-slot (ed-init (make-buffer "hi" "e.txt")) 0)
+          proc (get-in m [:hosted 0 :proc]))
+      (ht-drain proc)
+      (buffer-splice proc 2 2 "!" :someone-else)
+      (let ([v view o] (ht-await proc)
+            m2 (ed-update m [:buffer-updated proc v view o] 80 24))
+        (assert= (ht-text m2) "hi!")
+        ;; folding the push changed the pool text, but hosted-step must NOT diff that
+        ;; change back out as a new splice — no further push arrives
+        (assert= (ht-await proc) :none))
+      (stop-buffer proc)))
+
+  (test "ed-unhost-slot with stop? reverts to a plain pool buffer and stops the process"
+    (let (m (ed-host-slot (ed-init (make-buffer "bye" "u.txt")) 0)
+          proc (get-in m [:hosted 0 :proc]))
+      (ht-drain proc)
+      (let (m2 (ed-unhost-slot m 0 true))
+        (is (not (ed-hosted? m2 0)))
+        (is (nil? (get-in m2 [:hosted 0])))
+        ;; the pool copy lives on as an ordinary buffer; edits stay local
+        (assert= (ht-text (ht-press m2 ["x"])) "xbye"))))
+
+  (test "hosted-slot-for-proc finds the slot; unrelated procs map to nil"
+    (let (m (ed-host-slot (ed-init (make-buffer "a" "s.txt")) 0)
+          proc (get-in m [:hosted 0 :proc]))
+      (ht-drain proc)
+      (assert= (hosted-slot-for-proc m proc) 0)
+      (is (nil? (hosted-slot-for-proc m :not-a-proc)))
+      (stop-buffer proc))))
