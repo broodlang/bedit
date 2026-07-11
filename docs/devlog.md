@@ -10,6 +10,47 @@ Language-level changes live in the Brood repo's `docs/devlog.md` + `docs/decisio
 
 ---
 
+## 2026-07-11 (later)
+
+### The actor-model endgame (§E.2) — every buffer a process — `b6937fa`…
+- **Why:** close `docs/actor-architecture.md` — the design-of-record since June. The
+  collab track had proven the seam on SHARED buffers; the endgame makes it the
+  editor's normal state: every buffer a fault-isolated, subscribable process, the
+  pure model kept as its projection cache.
+- **What (each slice its own commit, suite green throughout):**
+  - **E0 exoneration:** the June-16 "async replies don't land" revert was
+    misdiagnosed — the real bug was a stuck `:held-key` gating the idle beat
+    (`cac0ce3` had the truth); the task-reply contract is now test-pinned, so
+    services can trust the event bus.
+  - **hosted machinery** (`src/hosted.blsp`, model key `:shared` → `:hosted`):
+    `ed-host-slot`/`ed-unhost-slot`/`hosted-step` (loop-tail propagate with an O(1)
+    rope-handle guard)/`hosted-apply-content`; **the flip** — `:host-buffers?` on
+    the live window's model + `hosted-reconcile` hosts every slot as it appears;
+    kill-buffer stops local processes and remaps the index-keyed links (also fixing
+    the stale-index gap for shared slots).
+  - **fault isolation:** hosted processes monitored; `[:down]` → rehost from the
+    pool cache (local) or re-share onto the registry's respawn (shared); the
+    registry mirrors every document's text via the std client fold and respawns
+    died buffers from CURRENT content.
+  - **services:** eldoc joins diagnostics on the `std/task` idle pattern; every LSP
+    lookup async (corr-matched `:lsp-pending`, rope-guarded format/rename, stale
+    replies drop; completion keeps its bounded modal wait). kill-ring + persistent
+    fontify workers deferred with recorded triggers.
+  - **collab = hosted + people:** `collab-edit`→`hosted-edit`, propagate delegate
+    deleted, module doc rewritten — presence (markers, tags, follow, registry) is
+    all that remains there.
+- **Brood (prime directive), forced by this track:** **concurrent-safe `require`**
+  (defmodule's top-of-file `provide` let a racing require observe a half-loaded
+  module — surfaced as a 1-in-5 suite flake, fixed with `*features-loading*` +
+  waiter takeover); **`editor/buffer-client`** (ADR-134 — the protocol's client
+  half: `link-init/-propagate/-fold`, `text-splice`, `view-parts`,
+  `text-apply-splice`); `[:io-write]` as a ring-recorded splice delta;
+  `buffer-edit-reply`/`-value` (read-then-decide edits); native `%str-splice-diff`
+  (the per-keystroke diff: 40 ms → 0.4 ms on a 300-line hosted buffer).
+- **Tests:** `tests/hosted_test.blsp` (new — host/converge/echo/fault/flip/kill),
+  window_point invariants, registry-mirror respawn + reshare, async eldoc/LSP folds,
+  the std merge matrix + an 8-process require race upstream.
+
 ## 2026-07-10/11
 
 ### Remote & multiplayer editing — Track 1 built end to end — `dff66ab`…`628c385`
