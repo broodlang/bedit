@@ -1,13 +1,15 @@
 ;; collab — a pooled buffer backed by a shared buffer PROCESS (independent cursors, shared edits).
 ;; The content protocol (splice diff, echo suppression, transform-fold) is std
 ;; `editor/buffer-client` — its pure merge matrix is covered in the brood repo
-;; (tests/buffer_client_test.blsp); these tests cover the EDITOR layering: the round-trip
-;; tests play BOTH clients in one test process (local pids send/receive exactly as a node
-;; link would) — an edit through one client's `collab-edit` is serialized by the process and
-;; folded back into every client's model via `ed-apply-buffer-update`, each keeping its own
-;; pane cursor. No node, no window.
+;; (tests/buffer_client_test.blsp) — and the editor's content machinery is `hosted`
+;; (tests/hosted_test.blsp); these tests cover the COLLAB layering on top (sharing =
+;; hosting + presence): the round-trip tests play BOTH clients in one test process
+;; (local pids send/receive exactly as a node link would) — an edit through one client
+;; is serialized by the process and folded back into every client's model via
+;; `ed-apply-buffer-update`, each keeping its own pane cursor. No node, no window.
 (defmodule collab-test
   (:use collab)
+  (:use hosted)   ; hosted-edit / hosted-propagate — the content half the tests drive
   (:use model)
   (:use editor/buffer)
   (:use test))
@@ -43,7 +45,7 @@
 
 (describe "collab — shared buffer process, independent cursors" :isolated
 
-  (test "an edit through collab-edit is serialized by the process and folded into every client, each keeping its own point"
+  (test "an edit through hosted-edit is serialized by the process and folded into every client, each keeping its own point"
     (let (proc (spawn-buffer (make-buffer "hello" "shared.txt"))
           ;; client A subscribes (this test process) and sits at point 5; client B is another
           ;; view of the same slot at point 0 (link only — one subscription feeds both here).
@@ -51,12 +53,12 @@
           mB (ct-at (assoc-in (ed-init (make-buffer "hello" "shared.txt")) [:hosted 0] {:proc proc :version -1}) 0))
       (ct-drain-seed proc)
       ;; A appends "XYZ" at its point (5, end of "hello") — the wire carries the DELTA
-      (let (mA2 (collab-edit mA (fn (b) (insert (goto-char b 5) "XYZ"))))
+      (let (mA2 (hosted-edit mA (fn (b) (insert (goto-char b 5) "XYZ"))))
         (let ([v view o] (ct-await* proc))
           (assert= (get view :splice) [5 5 "XYZ"])   ; not the document
           (assert= (buffer-query proc buffer-text) "helloXYZ")
           ;; the push folds into BOTH clients' models — B applies the splice; A's own
-          ;; echo is suppressed (already applied locally by collab-edit)
+          ;; echo is suppressed (already applied locally by hosted-edit)
           (let (mAf (ed-apply-buffer-update mA2 proc v view o)
                 mBf (ed-apply-buffer-update mB proc v view o))
             (assert= (ct-text mAf) "helloXYZ")
@@ -72,7 +74,7 @@
     (let (proc (spawn-buffer (make-buffer "hello" "m.txt"))
           m (collab-share-slot (ed-init (make-buffer "hello" "m.txt")) 0 proc))
       (ct-drain-seed proc)
-      (collab-edit m (fn (b) (goto-char b 2)))   ; move only — no text change
+      (hosted-edit m (fn (b) (goto-char b 2)))   ; move only — no text change
       (assert= (ct-await proc) :none)            ; nothing pushed
       (stop-buffer proc)))
 
@@ -82,12 +84,12 @@
           mB (assoc-in (ed-init (make-buffer "hello" "rt.txt")) [:hosted 0] {:proc proc :version -1}))
       (ct-drain-seed proc)
       ;; A prepends "A" → "Ahello"; the delta push updates B's copy
-      (collab-edit mA (fn (b) (insert (goto-char b 0) "A")))
+      (hosted-edit mA (fn (b) (insert (goto-char b 0) "A")))
       (let ([v1 view1 o1] (ct-await* proc)
             mB1 (ed-apply-buffer-update mB proc v1 view1 o1))
         (assert= (ct-text mB1) "Ahello")
         ;; B, now on the updated text, appends "Z" → "AhelloZ"
-        (collab-edit mB1 (fn (b) (insert (end-of-buffer b) "Z")))
+        (hosted-edit mB1 (fn (b) (insert (end-of-buffer b) "Z")))
         (let ([_ view2 _] (ct-await* proc))
           (assert= (get view2 :splice) [6 6 "Z"])
           (assert= (buffer-query proc buffer-text) "AhelloZ")))
@@ -103,25 +105,25 @@
         (assert= (ct-text m3) "five"))
       (stop-buffer proc)))
 
-  (test "collab-propagate pushes an ordinary command's text change to the process (command-agnostic)"
+  (test "hosted-propagate pushes an ordinary command's text change to the process (command-agnostic)"
     (let (proc (spawn-buffer (make-buffer "hello" "p.txt"))
           m (collab-share-slot (ed-init (make-buffer "hello" "p.txt")) 0 proc))
       (ct-drain-seed proc)
       ;; a plain command edited the pooled buffer via ed-set-buf, unaware of sharing
       (let (after (ed-set-buf m (insert (end-of-buffer (ed-current-buf m)) "!")))
-        (let (after2 (collab-propagate m after))
+        (let (after2 (hosted-propagate m after))
           (assert= (count (get-in after2 [:hosted 0 :pending])) 1))   ; one splice in flight
         (let ([_ view _] (ct-await* proc))
           (assert= (get view :splice) [5 5 "!"]))             ; the delta, not the doc
         (assert= (buffer-query proc buffer-text) "hello!"))
       (stop-buffer proc)))
 
-  (test "collab-propagate sends nothing when no shared slot's text changed"
+  (test "hosted-propagate sends nothing when no hosted slot's text changed"
     (let (proc (spawn-buffer (make-buffer "hello" "p2.txt"))
           m (collab-share-slot (ed-init (make-buffer "hello" "p2.txt")) 0 proc))
       (ct-drain-seed proc)
       (let (after (ed-set-buf m (goto-char (ed-current-buf m) 2)))   ; move only
-        (collab-propagate m after)
+        (hosted-propagate m after)
         (assert= (ct-await proc) :none))
       (stop-buffer proc)))
 
@@ -194,9 +196,9 @@
       ;; a FOREIGN-origin push still rebuilds (reconvergence stays intact)
       (let (m3 (ed-apply-buffer-update m2 proc 2 ["abXY!" {me 0} {me "guest"}] :someone-else))
         (assert= (ct-text m3) "abXY!"))
-      ;; and the wire really carries our origin: a collab-edit's push is tagged with me
+      ;; and the wire really carries our origin: a hosted-edit's push is tagged with me
       (ct-drain-seed proc)
-      (collab-edit (ct-at m0 2) (fn (b) (insert (goto-char b 2) "z")))
+      (hosted-edit (ct-at m0 2) (fn (b) (insert (goto-char b 2) "z")))
       (assert= (receive ([:buffer-updated ~proc _ _ o] o) (after 2000 :none)) me)
       (stop-buffer proc)))
 
@@ -207,7 +209,7 @@
           mA0 (ed-apply-buffer-update mA proc 0 ["hello" {me 0} {me "guest"}]))
       (ct-drain-seed proc)
       ;; A types "X" at 0 — in flight (unacked); before its echo, B's "Y"@5 arrives
-      (let (mA1 (collab-edit mA0 (fn (b) (insert (goto-char b 0) "X")))
+      (let (mA1 (hosted-edit mA0 (fn (b) (insert (goto-char b 0) "X")))
             mA2 (ed-apply-buffer-update mA1 proc 5
                   {:splice [5 5 "Y"] :markers {} :participants {}} :bob))
         ;; B's splice transformed over our pending ([0 0 1] → +1) → applied at 6:
@@ -224,7 +226,7 @@
           mA0 (ed-apply-buffer-update mA proc 0 ["hello" {me 0} {me "guest"}]))
       (ct-drain-seed proc)
       ;; A's "X"@0 in flight; a foreign splice at the SAME spot arrives — ambiguous
-      (let (mA1 (collab-edit mA0 (fn (b) (insert (goto-char b 0) "X")))
+      (let (mA1 (hosted-edit mA0 (fn (b) (insert (goto-char b 0) "X")))
             mA2 (ed-apply-buffer-update mA1 proc 5
                   {:splice [0 0 "Z"] :markers {} :participants {}} :bob))
         ;; resynced to the process's truth (which HAS applied our X by now)

@@ -1,35 +1,23 @@
 (defmodule collab
-  "Back a POOL buffer with a shared buffer PROCESS — the seam that lets remote participants
-see each other's edits while each keeps their **own** cursor (the 'everyone their own caret'
-mode, vs `editor/serve/serve-shared`, which fans ONE model + ONE cursor to all clients).
+  "The PRESENCE layer over hosted buffers — collaboration is `hosted` plus people.
 
-The editor already gives two *local* panes on one pooled buffer this exact split: content
-lives on the pooled buffer value (`model/ed-set-buf` writes it back so every view sees the
-edit) while point/mark are per-pane (`model/ed-with-window-point`). This module lifts that one
-level — the pooled buffer's *content* is made authoritative in a **buffer process**
-(`std/editor/buffer` spawn/subscribe/push) — so panes in *different runtimes* (remote clients)
-share it too. Point stays per-pane, so cursors stay independent.
+Content is not this module's job any more: every process-backed pool slot — shared or
+purely local — rides the `hosted` machinery (`src/hosted.blsp` over std
+`editor/buffer-client`): based-splice propagation at the loop tail, echo suppression,
+exact concurrent merges, resync, crash rehosting. A SHARED buffer is simply a hosted
+slot whose process has remote subscribers — `collab-share-slot` = `ed-host-slot` + a
+presence announce + the slot's `:shared?` flag (`collab-shared?`), and
+`ed-apply-buffer-update` = `hosted-apply-content` + the presence fold.
 
-Per client model:
-
-  :hosted  {pool-index {:proc <pid> :version N}}   ; which pooled slots are process-backed
-
-Each client `subscribe-buffer`s the process; every edit anyone makes is serialized there and
-pushed back as a `[:buffer-updated proc version view origin]` DELTA (`{:splice … :markers …
-:participants …}` — the document never ships after the seed), folded via
-`ed-apply-buffer-update` into that slot's CONTENT — leaving every pane's window-local point
-alone (cursors stay independent). Outbound, edits travel as **based positional splices**
-(`buffer-splice` + the slot's version): the process transforms a stale-based splice over
-whatever landed since (std `splice-transform` — brood ADR ledger), and the client mirrors it
-against its in-flight `:pending` splices — so two people typing in DIFFERENT places inside one
-round-trip window merge exactly, with no CRDT, no resync, and local undo intact. Your own
-echo folds as a version bump (origin-tagged — no flicker); only a genuinely ambiguous
-same-span collision resyncs the slot from the process, the always-correct authority.
-
-Presence rides the same seam: cursor/selection/viewport markers keyed by the session pid
-(cleaned up by the process when you die), a name registry, follow/mirror, and the
-per-daemon file registry that auto-shares every file anyone visits. Deferred to v2: a real
-sequence CRDT for offline/high-latency divergence (`docs/remote-multiplayer-plan.md`, Open)."
+What lives here is everything about WHO: per-participant cursor/selection/viewport
+markers keyed by the session pid (edit-adjusted inside the buffer process; cleaned up
+by it when you die), the `:participants` name registry and its quiet tags
+(`:tag-ttl`), join/leave echoes, `share-follow`/`share-mirror`, presence migration on
+buffer switch (`collab-sync-point`), and the per-daemon FILE REGISTRY that auto-shares
+every file anyone visits (`collab-autoshare`) — respawning died buffer processes from
+its own text mirror (`collab--registry-loop`), with subscribers resharing onto the
+respawn (`collab-reshare`). Deferred to v2: a real sequence CRDT for
+offline/high-latency divergence (`docs/remote-multiplayer-plan.md`, Open)."
   (:use editor/buffer)         ; spawn/subscribe/buffer-edit/replace-region/make-buffer …
   (:use editor/buffer-client)  ; the protocol's client half: link-init/-propagate/-fold,
                                ; text-splice, view-parts (ADR-134 — extracted from here)
@@ -475,28 +463,6 @@ stale/duplicate `version`; a no-op when no slot links to `proc`."
               (collab-unfollow m2 (str (get f :name) " left — stopped following"))
               m2)))))))
 
-(defn collab-edit (m op)
-  "Apply edit `op` (a `buffer -> buffer` transform, as commands produce) to the current buffer.
-When the buffer is process-backed, express the change as a based positional splice and send it
-(`link-propagate` — the std protocol client); the process serializes it and pushes the result
-to every subscriber (including us), so all clients — each with their own cursor — converge.
-The local pane is updated at once (the caret responds without a round-trip; the push then
-reconciles the content). When the buffer isn't hosted at all, this is exactly `ed-set-buf`
-with `op` applied — so a command may call `collab-edit` unconditionally. (Content, not
-presence: any HOSTED slot propagates, shared or purely local.)"
-  (let (buf (ed-current-buf m)
-        nb (op buf))
-    (if (ed-hosted? m)
-      (let (i (ed-current-index m))
-        (assoc-in (ed-set-buf m nb) [:hosted i]
-          (link-propagate (get-in m [:hosted i]) (buffer-text buf) (buffer-text nb))))
-      (ed-set-buf m nb))))
-
-(defn collab-propagate (before after)
-  "The command-agnostic push of an event's edits to their processes — now the hosted
-machinery's `hosted-propagate` (sharing is hosting; the loop calls `hosted-step`
-directly, this name is kept for explicit call sites and the suite)."
-  (hosted-propagate before after))
 
 (defn collab-unshare (m i)
   "Drop the shared link on pool slot `i`: withdraw our presence (delete our cursor marker
