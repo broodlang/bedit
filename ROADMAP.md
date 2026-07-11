@@ -13,8 +13,9 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started
 **Strategic direction — competing with Neovim/Emacs/VSCode:** the honest standing
 vs the big three and the three tracks that would make someone *choose* myedit over
 them are in **`docs/competitive-tracks.md`**. The flagship (Track 1 — remote &
-multiplayer editing, the payoff of §E below) has its full two-part plan in
-**`docs/remote-multiplayer-plan.md`**.
+multiplayer editing) is now **largely built** — see §E below and the as-built ledger
+in **`docs/remote-multiplayer-plan.md`**; the user-facing runbook is
+**`docs/working-from-another-computer.md`**.
 
 ---
 
@@ -155,21 +156,55 @@ consume that shape. So the whole feature is one Rust builtin + Brood policy.
 - ⬜ Complements (not replaces) LSP: tree-sitter = fast local syntax/structure;
   `brood-lsp` & others = semantics.
 
-## E. The actor-model editor (deferred — design note)
+## E. Remote & multiplayer editing — Track 1 (largely BUILT, 2026-07-10/11)
 
-- ⬜ **Buffers (and services) as processes**, with **push-projection rendering** — the
-  loop becomes a view aggregator over buffer processes that publish versioned
-  viewport projections; point/scroll move to the pane, text+markers to the buffer
-  process; kill-ring / fontify / LSP become supervised services. Unlocks concurrency,
-  supervision/restart, and near-free collaboration (a buffer process on another node).
-  Decided direction, **not building yet** — the single-process pure model serves us
-  well today. Full reasoning, decomposition, hard-parts-and-answers, and a staged
-  (non-big-bang) path: **`docs/actor-architecture.md`**. Its collaboration payoff —
-  remote attach (the `emacsclient`/daemon model) and multiplayer presence — is
-  Track 1 of the strategic direction; the staged, buildable two-part plan (Slice 0:
-  read-write web mirror, no Brood change → Slice 1: native remote attach → Slice 2:
-  presence & multi-cursor → Slice 3: this actor endgame) is in
-  **`docs/remote-multiplayer-plan.md`**.
+The collaboration payoff of the actor direction shipped as a staged sequence
+(each slice a pushed, tested increment — the full as-built ledger with the Brood
+seams it forced is `docs/remote-multiplayer-plan.md`; usage is
+`docs/working-from-another-computer.md`):
+
+- ✅ **Daemon / emacsclient model** — `bedit --name ed --serve [file]`: sessions per
+  client over Brood node links (`std/editor/serve`, ADR-090), the host's own window
+  included (`--headless` to opt out), clean detach/teardown.
+- ✅ **ONE shared mode** — `--serve --shared` (alias `--collab`): one document,
+  everyone their **own** caret/panes/minibuffer. Content is authoritative in a
+  buffer process; every file anyone visits is auto-shared (a per-daemon registry).
+- ✅ **Presence** — named, coloured remote carets (quiet tags that fade after the
+  caret moves), selections tinted per owner, viewport markers, join/leave echoes,
+  a modeline chip, `M-x collab-status`. Markers are edit-adjusted **in** the buffer
+  process and cleaned up when a participant dies (never a ghost caret).
+- ✅ **`share-follow` (C-x f) / `share-mirror`** — ride a participant's caret across
+  buffers; mirror also adopts their viewport (the classic one-view pairing). Any
+  move of your own takes the wheel back; leaders leaving unfollow.
+- ✅ **`M-x share-session` / `share-session-stop`** — a live editor becomes a host
+  (no relaunch); stop ends every attached session, the registry, and every shared
+  buffer process. Names: `--as NAME` → init.blsp `:share-name` → `$USER` → prompt.
+- ✅ **Deltas + exact concurrent merges** — edits travel as based positional splices
+  (O(change), the document never ships after the seed); the buffer process and the
+  clients transform concurrent splices (std `splice-transform`), so typing in
+  different places inside one round-trip merges exactly — no CRDT, no flicker
+  (origin-tagged echo suppression), local undo intact. Ambiguous same-span
+  collisions resync from the process.
+- ✅ **Over the network** — `--listen [HOST:]PORT` adds a cookie-authenticated TCP
+  listener beside the always-bound Unix socket (kernel dual-listen, ADR-074);
+  `bedit --attach ed@HOST:PORT --as you`. Loopback-verified; cross-machine is the
+  same code path (verify from a real second machine — the one untested leg).
+- ⬜ **v2: CRDT** — offline / high-latency divergence (`std/text/replica`-shaped).
+- ⬜ **Per-participant undo** — "undo *my* edits" semantics once histories interleave.
+
+**Kernel bugs this track surfaced (all fixed upstream):** pid identity across
+`node-start` (equality/hash normalize the local stamp — a captured pre-node pid
+silently stopped matching); exit signals never reached a natively-nested `receive`
+(the immortal-process bug — ADR-132); `%isolate`'s reap could kill its own caller.
+
+### E.2 The actor-model endgame (still the design-of-record)
+
+- 🟡 **Buffers (and services) as processes** — the shared-buffer process, markers,
+  subscriptions, and delta pushes above ARE the first real slices of
+  `docs/actor-architecture.md` (its status header tracks what's built). Still open
+  from that note: point-off-buffer for local panes, supervised per-buffer fault
+  isolation, services (fontify/LSP/kill-ring) as processes, the view as a pure
+  aggregator of pushed projections.
 
 ## F. The customization surface (deferred — design note)
 
@@ -307,7 +342,9 @@ ranges and `layers` extras (§D).)
     Fixed in Brood (`crates/lisp/src/gui.rs` `translate_key`/`shift_char`, 2026-06-02),
     matching the crossterm frontend — no editor binding change. Still unverified: the
     capital-letter chords (`M-O` vs `M-o`) collapse to one keyword (both frontends
-    lower-case letters), so `M-O` open-line-above is M-x-only for now.
+    lower-case letters), so `M-O` open-line-above is M-x-only for now — and the same
+    caveat applies to **`C-x F` (share-mirror)**: if the capital never arrives it's
+    `M-x share-mirror` until verified/rebound on a live window.
 - Bindings live in `src/modes.blsp`; commands in `src/commands.blsp` (the
   `defcommand` macro + M-x registry in `src/interactive.blsp`); dispatch + minibuffer
   in `src/input.blsp`; model in `src/model.blsp`; pane geometry + mouse in
