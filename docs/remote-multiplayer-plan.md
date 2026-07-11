@@ -186,7 +186,26 @@ markers, rendered as owner-coloured tints) and the modeline presence chip. Also 
 en route: pid identity across `node-start` (brood kernel — equality/hash normalize the
 local-node stamp), without which a served daemon silently dropped every push.
 
-Still open: kernel dual-listen (Unix + TCP at once), CRDT (v2, unchanged).
+**As built (2026-07-11, the close-out).** Everything above the CRDT line is done:
+- **Exact concurrent merges (no CRDT):** based splices + operational transforms — the
+  process transforms a stale-based splice over its ring of since-applied splices
+  (std `splice-transform`, brood `0a9ccbe`), the client mirrors it against its
+  in-flight `:pending` records. Disjoint concurrent typing merges exactly; only a
+  same-span collision resyncs from the process. Undo survives in practice.
+- **`share-session` / `share-session-stop` (M-x):** a live editor becomes a host (the
+  collab chain runs at `ed-update`'s tail — `collab-step`, a no-op unless shared);
+  stop is a full teardown (`serve-stop` ends every session, the registry stops every
+  buffer process). Names: `--as` → init.blsp `:share-name` → $USER → a prompt.
+- **Dual-listen `--listen`:** the kernel's ADR-074 `node-also-listen`, finally wired —
+  Unix socket always, TCP added; local attaches stay bare-name.
+- **Found under this work, fixed in the kernel:** pid identity across `node-start`
+  (equality/hash normalize the local stamp — brood `7a42731`); exit signals reaching
+  natively-nested receives (the immortal-process bug — landed independently from both
+  machines, ADR-132 kept); `%isolate`'s reap no longer kills its own caller.
+
+Still open: CRDT (v2 — offline/high-latency divergence), per-participant undo
+semantics, and the JIT compiled-vs-source anomaly hunt
+(`docs/fuzz-diag-overrides-anomaly.md`).
 
 ### 1.3 A participant model — presence as plain data
 
