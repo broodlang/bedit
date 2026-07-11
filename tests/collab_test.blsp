@@ -35,6 +35,12 @@
 (defn ct-drain-seed (proc)
   (receive ([:buffer-updated ~proc _ _ _] (ct-drain-seed proc)) (after 300 nil)))
 
+;; THE [:down] for `pid` specifically — earlier tests' stopped-but-still-monitored
+;; procs can leave stale corpse messages queued; skip (consume) any that aren't ours.
+(defn ct-await-down (pid)
+  (receive ([:down r p rsn] (if (= p pid) [:down r p rsn] (ct-await-down pid)))
+    (after 2000 :none)))
+
 (describe "collab — shared buffer process, independent cursors" :isolated
 
   (test "an edit through collab-edit is serialized by the process and folded into every client, each keeping its own point"
@@ -303,6 +309,35 @@
                   [:hosted 0])))
       (ct-drain-seed (get-in m1 [:hosted 0 :proc]))
       (stop-buffer (get-in m1 [:hosted 0 :proc]))))
+
+  (test "the registry respawns a died buffer from its text MIRROR (post-seed edits kept)"
+    (let (reg (collab-registry-start)
+          p1 (collab-registry-share reg "/tmp/cl-rr.txt" "seed" "rr.txt"))
+      (buffer-splice p1 4 4 "+more" :someone)          ; a post-seed edit the mirror must track
+      (assert= (buffer-query p1 buffer-text) "seed+more")
+      (sleep 150)                                      ; let the mirror push fold at the registry
+      (exit p1 :kill)
+      (sleep 150)                                      ; let the registry's [:down] respawn land
+      (let (p2 (collab-registry-share reg "/tmp/cl-rr.txt" "stale-local" "rr.txt"))
+        (is (not (= p1 p2)))
+        (assert= (buffer-query p2 buffer-text) "seed+more"))  ; the MIRROR, not the re-asker's text
+      (collab-registry-stop reg)))
+
+  (test "a shared slot whose process died reshares onto the registry's respawn (ed--ev-down)"
+    (let (reg (collab-registry-start)
+          m0 (assoc (ed-init (make-buffer "doc" "rs.txt" "/tmp/cl-rs.txt")) :collab-reg reg)
+          m1 (collab-autoshare m0)
+          p1 (get-in m1 [:hosted 0 :proc]))
+      (ct-drain-seed p1)
+      (exit p1 :kill)
+      (sleep 150)                                      ; registry respawns from its mirror
+      (let (down (ct-await-down p1)
+            m2 (input/ed--ev-down m1 down 24 80 24)
+            p2 (get-in m2 [:hosted 0 :proc]))
+        (is (not (= p1 p2)))
+        (is (collab-shared? m2 0))                     ; re-linked as SHARED, not local
+        (assert= (buffer-query p2 buffer-text) "doc"))
+      (collab-registry-stop reg)))
 
   (test "presence migrates: switching buffers withdraws the markers from the buffer left"
     (let (procA (spawn-buffer (make-buffer "aaa" "a.txt"))
