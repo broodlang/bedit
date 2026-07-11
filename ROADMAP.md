@@ -197,14 +197,35 @@ seams it forced is `docs/remote-multiplayer-plan.md`; usage is
 silently stopped matching); exit signals never reached a natively-nested `receive`
 (the immortal-process bug — ADR-132); `%isolate`'s reap could kill its own caller.
 
-### E.2 The actor-model endgame (still the design-of-record)
+### E.2 The actor-model endgame (BUILT, 2026-07-11)
 
-- 🟡 **Buffers (and services) as processes** — the shared-buffer process, markers,
-  subscriptions, and delta pushes above ARE the first real slices of
-  `docs/actor-architecture.md` (its status header tracks what's built). Still open
-  from that note: point-off-buffer for local panes, supervised per-buffer fault
-  isolation, services (fontify/LSP/kill-ring) as processes, the view as a pure
-  aggregator of pushed projections.
+- ✅ **Every buffer hosted as a process** — the live window backs every pool slot
+  with a buffer process (`src/hosted.blsp` — `hosted-reconcile`/`hosted-step` at the
+  loop tail); the pool value is the local projection cache the pure view renders
+  unchanged, so commands stay `model -> model` and headless/test models stay pure.
+  The protocol's client half is **std `editor/buffer-client`** (ADR-134) with a
+  native `%str-splice-diff` (typing on a hosted 3000-line buffer: 0.94 ms/key).
+  A collab-shared buffer = a hosted slot with remote subscribers; `collab` shrank
+  to the presence layer.
+- ✅ **Point off the buffer** — invariant explicit + test-guarded (pane point
+  authoritative while displayed; the pooled `:point` only the Emacs saved default).
+- ✅ **Per-buffer fault isolation** — hosted processes are monitored; a died local
+  buffer rehosts from the pool cache, a shared one re-shares onto the registry's
+  respawn; the registry mirrors every shared document's text (the same std client
+  fold) and respawns died buffers from current content.
+- ✅ **Services off the loop** — eldoc joins diagnostics on the `std/task` idle
+  pattern; every LSP lookup is async (corr-matched, rope-guarded mutations);
+  eval/web/logger/bshell/compile were already processes. diff-hl stays sync by
+  decision (E0 exonerated the async reply path — the June-16 revert had
+  misdiagnosed a stuck `:held-key`). Deferred with recorded triggers: kill-ring
+  as a process, persistent fontify workers (see `docs/actor-architecture.md`).
+- ✅ **View as aggregator** — definitionally complete: the pool IS the
+  latest-projection cache, version-reconciled by `link-fold`.
+- **Upstream this track won:** concurrent-safe `require` (a top-of-file `provide`
+  let a racing require observe a half-loaded module — found by this track's suite
+  churn), `[:io-write]` as a ring-recorded splice delta, `buffer-edit-reply`
+  (read-then-decide edits), `std/editor/buffer-client` + `text-apply-splice`,
+  native `%str-splice-diff`.
 
 ## F. The customization surface (deferred — design note)
 

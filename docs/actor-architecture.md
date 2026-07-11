@@ -1,14 +1,49 @@
-# The actor-model editor (design note, deferred)
+# The actor-model editor (design note — BUILT)
 
-**Status:** design-of-record — and as of 2026-07-10/11 its first real slices are
-**built and shipped** by Track 1 (`remote-multiplayer-plan.md`): buffers as
-processes for SHARED buffers (`std/editor/buffer` `spawn-buffer` + subscriptions +
-versioned delta pushes), edit-surviving **markers** adjusted inside the process
-(presence cursors/selections/viewports ride them), and concurrent-splice
-transforms. The local single-window editor still runs the single-process pure
-`ui-run` loop; still open from this note: point-off-buffer for local panes,
-per-buffer supervision/fault isolation, services as processes, and the view as a
-pure aggregator of pushed projections.
+**Status: built, 2026-07-11.** Every open item from this note shipped as the §E.2
+endgame (a staged sequence on top of Track 1's collab slices):
+
+- **Every buffer hosted as a process** — the live window's model carries
+  `:host-buffers?`; `hosted/hosted-reconcile` at the loop tail backs every pool slot
+  (files, `*Messages*`, dired, occur) with a `std/editor/buffer` process, no
+  call-site cooperation. The pool value is the local **projection cache**: commands
+  stay pure `model -> model` (local-apply-first — the caret never waits), the loop
+  tail ships based splices (`hosted-step`), pushes fold back with echo suppression.
+  The content protocol's client half was extracted to **std `editor/buffer-client`**
+  (ADR-134: `link-init`/`link-propagate`/`link-fold`/`text-splice`, native
+  `%str-splice-diff`); a collab-SHARED buffer is now just a hosted slot whose
+  process has remote subscribers (`collab` = the presence layer, nothing more).
+- **Point off the buffer** — pane point/mark/scroll/zoom were already per-pane; the
+  invariant is now explicit and test-guarded (window_point_test): pane point is
+  authoritative while displayed, the pooled `:point` is only the Emacs-style saved
+  default (`ed-show-index` its one consumer). Kept deliberately — Emacs' own model.
+- **Per-buffer fault isolation** — every hosted process is monitored; `[:down]`
+  rehosts a local slot from the pool cache (`hosted-rehost` — the cache IS the
+  crash-recovery copy; at most in-flight splices lost) or re-shares a shared slot
+  onto the registry's respawn (`collab-reshare`); the registry keeps a per-path
+  text MIRROR (the same std client fold) and respawns died buffers from current
+  content. Supervision-by-monitor was chosen OVER an OTP supervisor for buffers:
+  restart must reseed from the newest cache, which lives with the model holder.
+- **Services as processes** — eval, web mirror, logger, bshell, compile were
+  already off-loop; diagnostics and now **eldoc** ride the `std/task` idle-beat
+  pattern; **every LSP lookup is async** (corr-matched `:lsp-pending` + event-bus
+  folds; mutating replies rope-guarded; completion keeps its bounded modal wait).
+  diff-hl stays synchronous BY DECISION — E0's investigation exonerated the async
+  reply path (the June-16 freeze was a stuck `:held-key` gating the idle beat) and
+  the sync-on-idle git diff stands on its own merits.
+- **View as aggregator** — definitionally complete: the pure `view` renders the
+  pool, and the pool IS the latest-projection cache of the authoritative buffer
+  processes, reconciled by version through `link-fold`.
+
+**Deferred, with triggers** (the honest residue):
+- **kill-ring as a process** — no present payoff (tiny single-writer model state);
+  trigger: a SHARED kill-ring across collab sessions / OS-clipboard bridging.
+- **fontify as a persistent per-buffer worker** — the lexer is stateless and the
+  lex is viewport-windowed (bounded per frame); trigger: incremental parse state
+  (tree-sitter incremental, ADR-103's deferral) worth keeping warm in a process.
+- **supervising the collab registry process itself** (its buffers self-heal; its
+  death keeps the graceful "sharing disabled" path) and **session-local hosted
+  teardown** on serve-session death (needs a last-subscriber-stops policy in std).
 
 The question that started this: *why not have a process per buffer?* — and then, more
 pointedly, *what if we lean into message-passing instead of cataloguing what stops
@@ -152,12 +187,12 @@ makes the system robust and distributable.
 
 **Part 2 — the editor.** The staged restructuring above.
 
-## When to actually do this
+## When to actually do this (historical)
 
-Not now. The single-process pure model is serving us well, and the actor rewrite
-dismantles it. Earn into it per-buffer when a buffer is genuinely heavy (huge files),
-externally backed (a `*shell*`/comint buffer that *owns* a subprocess — those should be
-buffer-processes, and the `[:io-write]` sink is built for it), or when we want true
-per-buffer fault isolation or collaboration. The conviction: the actor model is the
-right end-state for *this* editor — it's the one app Brood exists to make possible —
-and push-projection rendering removes the cost that would otherwise argue against it.
+This section originally said "not now — earn into it per-buffer." We earned into it:
+Track 1 proved the seam on shared buffers, and the §E.2 endgame (2026-07-11) flipped
+the pool. What made the flip cheap in the end was exactly what this note predicted —
+the pure model never went away: the pool value became the projection cache, commands
+stayed `(model, key) -> model`, and the ~800 pure tests run unchanged on unflagged
+(headless) models. The conviction held: the actor model is the right end-state for
+*this* editor, and push-projection rendering removed the cost that argued against it.

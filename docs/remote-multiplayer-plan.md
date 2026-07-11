@@ -58,5 +58,9 @@ buffer-process subscriber lifecycle + structured deltas + splice transforms.
 - **Per-participant undo** — "undo *my* edits" once histories interleave.
 - **Cross-machine verification** — `--listen` is loopback-verified; the same code
   path needs one real second-machine run.
-- Point-off-buffer for local panes, per-buffer supervision, services as
-  processes — the rest of `actor-architecture.md`.
+- ~~Point-off-buffer for local panes, per-buffer supervision, services as
+  processes~~ — **built 2026-07-11**: the §E.2 endgame flipped the pool (every
+  buffer hosted, fault-isolated, services async; `actor-architecture.md` is now
+  the as-built record). This ledger's shared-buffer machinery became the general
+  case: std `editor/buffer-client` (ADR-134) + `src/hosted.blsp`, with `collab`
+  reduced to the presence layer.
