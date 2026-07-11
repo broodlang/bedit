@@ -1,6 +1,6 @@
 (defmodule git
   "A git porcelain modelled on Magit: `C-x g` opens a read-only `*git-status*` buffer with
-Unstaged / Staged / Untracked / Unpushed / Unpulled sections. Single-key actions — s/u/k
+Unstaged / Staged / Untracked / Unpushed / Unpulled / Recent-commits sections. Single-key actions — s/u/k
 stage/unstage/discard the **file or hunk** under point, S stage-all, U unstage-all, c commit
 (a amend), b b checkout branch / b c create branch, n/p jump between actionable rows, TAB
 expand file hunks inline / collapse section, RET preview diff or show commit, d diff whole pane,
@@ -45,6 +45,23 @@ lines) so commands read the current row without re-parsing text. Git runs synchr
 (def git-face-unstaged  {:fg *yellow*})    ; the ~N unstaged-change count (modified, dirty)
 (def git-face-untracked {:fg *overlay0*})  ; the ?N untracked-file count (dim)
 
+;; the *git-status* header block: a local branch (the `Head:` line) reads blue, a remote /
+;; upstream branch (the `Merge:` line) green — Magit's magit-branch-local / -remote.
+(def git-face-branch-local  {:fg *blue*  :bold true})  ; the `Head:` line's branch
+(def git-face-branch-remote {:fg *green* :bold true})  ; the `Merge:` line's upstream
+
+;; the colour-coded file-status labels — a legend at a glance, reusing the diff-hl palette
+;; (modified yellow, added green, deleted red, rename/copy blue, untracked dim). Keyed by the
+;; human label `git--entry-label` emits, so the fontify colours just that word.
+(def git--label-faces
+  {"modified"  git-face-unstaged
+   "new file"  git-face-add
+   "deleted"   git-face-del
+   "renamed"   git-face-hunk
+   "copied"    git-face-hunk
+   "conflict"  git-face-del
+   "untracked" git-face-untracked})
+
 (defn git--diff-line-face (line)
   "The face for a unified-diff line (leading indent ignored), or nil for a context line."
   (let (t (triml line))
@@ -59,15 +76,67 @@ lines) so commands read the current row without re-parsing text. Git runs synchr
       (starts-with? t "-") git-face-del
       :else nil)))
 
-(defn git--status-line-face (line)
-  "The face for a *git-status* line: section headers stand out, inline diff lines use the
-diff colours, the clean-tree note is dim; file rows stay default."
+(defn git--hex? (s)
+  "True when `s` is a run of at least four lowercase-hex digits — i.e. a git short hash (so a
+commit row is told apart from a file row, whose label is a word)."
+  (and (>= (string-length s) 4)
+    (nil? (find (fn (i) (< (string-index-of "0123456789abcdef" (char-at s i)) 0))
+            (range (string-length s))))))
+
+(defn git--header-spans (line off)
+  "Spans for a `Head:`/`Merge:`/`Push:` header line: the `Label:` in the dim meta face, the
+branch/upstream name in a branch face (local blue on `Head:`, remote green otherwise), the
+trailing commit subject left in the default face."
+  (let (colon (string-index-of line ":")
+        rest  (if (< colon 0) "" (substring line (inc colon) (string-length line)))
+        after (triml rest)
+        lead  (- (string-length rest) (string-length after))
+        sp    (string-index-of after " ")
+        blen  (if (< sp 0) (string-length after) sp)
+        bstart (+ (inc colon) lead)
+        bface (if (starts-with? line "Head:") git-face-branch-local git-face-branch-remote))
+    (concat
+      (if (< colon 0) '() (list [off (+ off (inc colon)) git-face-meta]))
+      (if (= blen 0) '() (list [(+ off bstart) (+ off bstart blen) bface])))))
+
+(defn git--section-header-spans (line off)
+  "Spans for a section header (`Unstaged changes (2):`): the name in the section face, the
+`(N):` count in the dim meta face so the section name leads."
+  (let (i (string-index-of line " ("))
+    (if (< i 0)
+      (git--whole-line off line git-face-section)
+      (list [off (+ off i) git-face-section]
+            [(+ off i 1) (+ off (string-length line)) git-face-meta]))))
+
+(defn git--file-row-spans (line off)
+  "Spans for a file row (`\"  modified   path\"`): the status label in its state colour, the path
+left plain. A commit row (`\"  <hash>  subject\"`) instead gets its leading hash coloured; any
+other 2-space line is left uncoloured."
+  (let (end   (string-length line)
+        field (trim (substring line 2 (min end (+ 2 git--label-width))))
+        face  (get git--label-faces field))
+    (if face
+      (list [(+ off 2) (+ off 2 (string-length field)) face])
+      (let (body (substring line 2 end)
+            sp   (string-index-of body " ")
+            tok  (if (< sp 0) body (substring body 0 sp)))
+        (if (git--hex? tok)
+          (list [(+ off 2) (+ off 2 (string-length tok)) git-face-hash])
+          '())))))
+
+(defn git--status-line-spans (line off)
+  "The spans for one *git-status* line, dispatched on its shape: the header block, a section
+header (dim count), an inline diff line (4-space indent), a file or commit row (2-space
+indent), or the clean-tree note. `off` is the line's start offset in the buffer."
   (cond
-    (= line "") nil
-    (or (starts-with? line "Head:") (ends-with? line ":")) git-face-section
-    (starts-with? line "    ") (git--diff-line-face line)  ; indented inline diff
-    (starts-with? line "nothing to commit") git-face-note
-    :else nil))
+    (= line "") '()
+    (or (starts-with? line "Head:") (starts-with? line "Merge:") (starts-with? line "Push:"))
+    (git--header-spans line off)
+    (ends-with? line ":") (git--section-header-spans line off)
+    (starts-with? line "    ") (git--whole-line off line (git--diff-line-face line))
+    (starts-with? line "  ") (git--file-row-spans line off)
+    (starts-with? line "nothing to commit") (git--whole-line off line git-face-note)
+    :else '()))
 
 (defn git--whole-line (off line face)
   "A whole-line span `[off end face]`, or `()` when `face` is nil."
@@ -92,9 +161,9 @@ length + 1 (the stripped newline)."
     (fn (l off) (git--whole-line off l (git--diff-line-face l))) '()))
 
 (defn git-status-fontify (src)
-  "The *git-status* `:fontify` — section headers + inline diffs (`git--status-line-face`)."
-  (git--fontify-lines (string-split src "\n") 0
-    (fn (l off) (git--whole-line off l (git--status-line-face l))) '()))
+  "The *git-status* `:fontify` — the header block, section headers (dim counts), colour-coded
+file/commit rows, and inline diffs (`git--status-line-spans`)."
+  (git--fontify-lines (string-split src "\n") 0 git--status-line-spans '()))
 
 (defn git-log-fontify (src)
   "The *git-log* `:fontify` — the leading commit hash on each row."
@@ -385,22 +454,34 @@ lines are actionable; body lines are nil."
       (if (includes? collapsed section)
         '()
         (mapcat (fn (e) (git--file-pairs e section expanded diffs)) entries))
-      (list ["" nil]))))
+      (list ["" nil] ["" nil]))))  ; a blank rule between sections (Magit's breathing room)
+
+(defn git--parse-log-oneline (stdout)
+  "Parse `git log --oneline` output into `({:hash :subject} ...)` — the leading abbreviated
+hash (to the first space) and the rest as the subject. Blank output gives `()`."
+  (map (fn (line)
+         (let (i (string-index-of line " "))
+           {:hash (if (< i 1) line (substring line 0 i))
+            :subject (if (< i 1) "" (substring line (inc i) (string-length line)))}))
+    (remove empty? (string-split (trim (or stdout "")) "\n"))))
+
+(defn git--log-commits (root args)
+  "Run `git log --oneline` with the extra `args` and parse the result (`git--parse-log-oneline`),
+returning `()` when the command fails."
+  (let (r (git--git root (into ["log" "--oneline"] args)))
+    (if (= (get r :exit) 0) (git--parse-log-oneline (get r :stdout "")) '())))
+
+(def git--recent-count 10)  ; how many recent commits the status buffer lists (Magit's default)
+
+(defn git--recent-commits (root)
+  "The most recent commits on HEAD for the status buffer's `Recent commits` section."
+  (git--log-commits root [(str "-" git--recent-count)]))
 
 (defn git--upstream-commits (root direction)
   "Commits between HEAD and upstream in `direction` (`:unpushed` → commits ahead of upstream;
 `:unpulled` → commits upstream has that HEAD doesn't). Returns `({:hash :subject} ...)`,
 or `()` when there is no upstream or the command fails."
-  (let (range (if (= direction :unpushed) "@{u}..HEAD" "HEAD..@{u}")
-        r (git--git root ["log" range "--oneline"]))
-    (if (not (= (get r :exit) 0))
-      '()
-      (let (lines (remove empty? (string-split (trim (get r :stdout "")) "\n")))
-        (map (fn (line)
-               (let (i (string-index-of line " "))
-                 {:hash (if (< i 1) line (substring line 0 i))
-                  :subject (if (< i 1) "" (substring line (inc i) (string-length line)))}))
-          lines)))))
+  (git--log-commits root [(if (= direction :unpushed) "@{u}..HEAD" "HEAD..@{u}")]))
 
 (defn git--commit-pairs (title commits direction)
   "`[line row]` pairs for an upstream-commit section (Unpushed / Unpulled). The header gets a
@@ -414,22 +495,44 @@ or `()` when there is no upstream or the command fails."
              [(str "  " (get c :hash) "  " (get c :subject))
               {:hash (get c :hash) :subject (get c :subject) :commit-log? true}])
         commits)
+      (list ["" nil] ["" nil]))))
+
+(def git--head-label-width 8)  ; pads "Head:" / "Merge:" so the branch column aligns
+
+(defn git--head-line (label ref subject)
+  "One header line: a left-padded `label` (`Head:` / `Merge:`), the branch/upstream `ref`, then
+its commit `subject` (omitted when empty)."
+  (str (pad-right label git--head-label-width) ref (if (= subject "") "" (str "  " subject))))
+
+(defn git--head-pairs (branch head)
+  "The header block `[line row]` pairs: a `Head:` line (branch + latest commit subject) and,
+when `head` carries an `:upstream`, a `Merge:` line (upstream + its subject), then one blank.
+`head` is `{:subject :upstream :upstream-subject}` (all optional — an empty map just names the
+branch, as on a fresh repo)."
+  (let (upstream (get head :upstream))
+    (concat
+      (list [(git--head-line "Head:" branch (get head :subject "")) nil])
+      (if upstream
+        (list [(git--head-line "Merge:" upstream (get head :upstream-subject "")) nil])
+        '())
       (list ["" nil]))))
 
-(defn git--render (branch entries &optional (expanded '()) (diffs {}) (collapsed '()) (unpushed '()) (unpulled '()))
+(defn git--render (branch entries &optional (expanded '()) (diffs {}) (collapsed '()) (unpushed '()) (unpulled '()) (recent '()) (head {}))
   "`{:text :rows}` for the status buffer. `:rows` is a vector parallel to the buffer's lines —
 nil on a blank/body line; `{:section-header section}` on a section title line (TAB collapses);
 `{:path :staged? :untracked?}` for a file row; `{:path :section :hunk? true :hunk-patch ...}` for
-an inline hunk row; `{:hash :subject :commit-log? true}` for an unpushed/unpulled commit row.
-`diffs` is `path → {section → parsed}` from `git--expanded-diffs`."
+an inline hunk row; `{:hash :subject :commit-log? true}` for an unpushed/unpulled/recent commit row.
+`diffs` is `path → {section → parsed}` from `git--expanded-diffs`; `head` (see `git--head-pairs`)
+carries the branch/upstream commit subjects for the header block."
   (let (pairs (concat
-                (list [(str "Head: " branch) nil] ["" nil])
+                (git--head-pairs branch head)
                 (git--section-pairs "Untracked files" (filter git--untracked? entries) :untracked expanded diffs collapsed)
                 (git--section-pairs "Unstaged changes" (filter git--unstaged? entries) :unstaged expanded diffs collapsed)
                 (git--section-pairs "Staged changes" (filter git--staged? entries) :staged expanded diffs collapsed)
-                (if (empty? entries) (list ["nothing to commit, working tree clean" nil]) '())
+                (if (empty? entries) (list ["nothing to commit, working tree clean" nil] ["" nil]) '())
                 (git--commit-pairs "Unpushed to upstream" unpushed :unpushed)
-                (git--commit-pairs "Unpulled from upstream" unpulled :unpulled)))
+                (git--commit-pairs "Unpulled from upstream" unpulled :unpulled)
+                (git--commit-pairs "Recent commits" recent :recent)))
     {:text (join "\n" (map first pairs)) :rows (into [] (map second pairs))}))
 
 (defn git--row-section (row)
@@ -530,7 +633,14 @@ with many expanded files stays fast regardless of how many are off-screen."
         upstream (git--upstream root)
         unpushed (if upstream (git--upstream-commits root :unpushed) '())
         unpulled (if upstream (git--upstream-commits root :unpulled) '())
-        r (git--render (git--branch root) entries expanded diffs collapsed unpushed unpulled)
+        recent (git--recent-commits root)
+        head {:subject (if (empty? recent) "" (get (first recent) :subject ""))
+              :upstream upstream
+              :upstream-subject (if upstream
+                                  (let (cs (git--log-commits root ["-1" upstream]))
+                                    (if (empty? cs) "" (get (first cs) :subject "")))
+                                  "")}
+        r (git--render (git--branch root) entries expanded diffs collapsed unpushed unpulled recent head)
         rows (get r :rows)
         target (cond (fn? line) (line rows)
                      (nil? line) (git--first-row-line rows)
@@ -597,7 +707,8 @@ rows are all navigable; only nil rows are skipped."
 
 (defcommand cmd-git-status
   (m key)
-  "Open the git status buffer for the current project (C-x g)."
+  "Open the git status buffer for the current project (C-x g). Files start collapsed; TAB on a
+file expands its diff inline."
   (let (root (git--toplevel (commands/ed--default-dir m)))
     (if (nil? root) (message m "not in a git repository") (git--show-status m root))))
 
