@@ -2737,11 +2737,25 @@ references/definition picker."
           (let (hit (find (fn (p) (= (first p) t)) labeled))
             (if (nil? hit) (message mm "lsp: location gone") (ed--lsp-goto-loc mm (second hit)))))))))
 
+(defn ed--lsp-origin (m pend)
+  "The pool index of the buffer a mutating LSP request was made FROM (`:buffer` in
+`pend`), but only while its rope still matches the request-time `:rope` — nil when
+the buffer is gone or has changed (the edits were computed against text that no
+longer exists; applying them would land misaligned). The ORIGIN buffer, not the
+current one: the user may have switched buffers while the server worked."
+  (let (idx (ed-buffer-index-by-name m (get pend :buffer)))
+    (if (and idx (= (buffer-rope (ed-buf-at m idx)) (get pend :rope)))
+      idx
+      nil)))
+
 (defn ed--lsp-fold (m pend payload)
   "Fold an arrived LSP reply's `payload` by the pending lookup's `:kind` — the action
 half of the commands below, unchanged from their synchronous days. Mutating kinds
-(format, rename) verify the buffer's rope still matches the one the request was
-computed against (`:rope` in `pend`) and drop the edits with a message otherwise."
+(format, rename) verify the ORIGIN buffer (`ed--lsp-origin`) still holds the rope
+the request was computed against, and apply to THAT buffer — the user may be in
+another one by now. (Known limitation, as in most LSP clients: a rename's edits to
+OTHER open files are guarded only by the origin buffer; the LSP protocol's
+per-document versions would close that fully.)"
   (let (kind (get pend :kind))
     (cond
       (= kind :definition)
@@ -2760,15 +2774,20 @@ computed against (`:rope` in `pend`) and drop the edits with a message otherwise
         (message m "imenu: no symbols (is the server ready?)")
         (ed--imenu-prompt m payload))
       (= kind :format)
-      (cond
-        (empty? payload) (message m "lsp: no formatting changes")
-        (not (= (buffer-rope (ed-current-buf m)) (get pend :rope)))
-        (message m "lsp: buffer changed while formatting ran — dropped (re-run C-c C-f)")
-        :else (message (ed-apply m (fn (b) (ed--apply-text-edits b payload))) "formatted"))
+      (let (idx (ed--lsp-origin m pend))
+        (cond
+          (empty? payload) (message m "lsp: no formatting changes")
+          (nil? idx)
+          (message m "lsp: buffer changed while formatting ran — dropped (re-run C-c C-f)")
+          :else
+          (message (assoc m :buffers
+                     (assoc (get m :buffers) idx
+                       (ed--apply-text-edits (ed-buf-at m idx) payload)))
+            "formatted")))
       (= kind :rename)
       (cond
         (empty? payload) (message m "lsp: rename produced no changes")
-        (not (= (buffer-rope (ed-current-buf m)) (get pend :rope)))
+        (nil? (ed--lsp-origin m pend))
         (message m "lsp: buffer changed while rename ran — dropped (re-run C-c C-r)")
         :else (ed--lsp-apply-rename m pend payload))
       :else m)))
@@ -2851,11 +2870,12 @@ the edits apply when they arrive iff the buffer hasn't changed meanwhile."
   (let ([m2 ready?] (ed--lsp-ensure m))
     (if (not ready?)
       m2
-      (let (cx (ed--lsp-here m2))
+      (let (cx (ed--lsp-here m2)
+            b (ed-current-buf m2))
         (ed--lsp-ask m2 :format
           (fn (corr) (lsp/lsp-format-async (get cx :conn) corr (self) (get cx :uri)
                        (get cx :lang) (get cx :text)))
-          {:rope (buffer-rope (ed-current-buf m2))}
+          {:rope (buffer-rope b) :buffer (buffer-name b)}
           "formatting…")))))
 
 (defn ed--lsp-apply-file-edits (m path edits)
@@ -3290,8 +3310,14 @@ not just closed to newcomers. Your buffers keep their current content locally."
   (if (nil? (get m :collab-serving))
     (message m "not sharing — M-x share-session starts")
     (let (ended (serve-stop (get m :collab-serving))
-          ;; unshare our slots BEFORE stopping the processes (the withdraws still land)
-          m1 (fold (fn (acc kv) (collab/collab-unshare acc (first kv)))
+          ;; unshare the SHARED slots BEFORE stopping the processes (the withdraws
+          ;; still land). Only :shared? slots — under the flip every buffer is
+          ;; hosted, and unsharing a purely local one would orphan its process
+          ;; (unsubscribed but never stopped) and force a pointless respawn.
+          m1 (fold (fn (acc kv)
+                     (if (get (second kv) :shared?)
+                       (collab/collab-unshare acc (first kv))
+                       acc))
                m (map-pairs (or (get m :hosted) {})))
           _ (when (get m :collab-reg) (collab/collab-registry-stop (get m :collab-reg))))
       (message (dissoc (dissoc m1 :collab-reg) :collab-serving)
@@ -3304,7 +3330,7 @@ not just closed to newcomers. Your buffers keep their current content locally."
 who you're following (M-x collab-status; a quick sanity probe when testing sessions)."
   (let (i (ed-current-index m)
         sh (get-in m [:hosted i]))
-    (if (nil? sh)
+    (if (nil? (get sh :shared?))   ; hosted ≠ shared: every live buffer is hosted
       (message m "not a shared buffer")
       (let (who (map (fn (kv) (second kv)) (map-pairs (collab/collab-participants m)))
             f (get m :follow))
