@@ -10,9 +10,72 @@ Language-level changes live in the Brood repo's `docs/devlog.md` + `docs/decisio
 
 ---
 
+## 2026-07-10/11
+
+### Remote & multiplayer editing — Track 1 built end to end — `dff66ab`…`628c385`
+- **Why:** the flagship strategic track: one editor you attach to from anywhere, and
+  real multi-person editing with presence — the "ultimate pairing experience."
+- **What:** the daemon/emacsclient model (`--serve`/`--attach`, host window,
+  `--headless`); ONE shared mode (`--shared`, alias `--collab`) — shared content, a
+  caret per participant, every visited file auto-shared via a per-daemon registry;
+  presence (named coloured carets with fade-after-move tags, per-owner selection
+  tints, viewport markers, join/leave echoes, a modeline chip, `M-x collab-status`);
+  `share-follow` (C-x f) across buffers and `share-mirror` (leader's viewport);
+  `M-x share-session`/`-stop` (a live editor becomes a host; stop tears everything
+  down); names from `--as` → init `:share-name` → `$USER` → prompt; deltas + OT
+  (based splices, `splice-transform` at the process AND the client, origin-tagged
+  echo suppression — concurrent typing in different places merges exactly, undo
+  survives); `--listen` TCP beside the Unix socket (kernel dual-listen, ADR-074).
+- **Brood (prime directive), forced by this track:** serve identity opts +
+  event-bus pass-through in the daemon displays + `serve-stop`; buffer-process
+  subscriber lifecycle (monitor + pid-keyed marker cleanup), structured
+  `buffer-splice`/`buffer-marker-move` deltas, splice transforms; **pid equality/hash
+  across `node-start`** (captured pre-node pids silently stopped matching — the
+  "second attach sees nothing" bug); the **immortal-process bug** (exit signals never
+  reached a natively-nested receive; landed as ADR-132, independently from both
+  machines); `%isolate`'s reap no longer kills its own caller. Plus, found while
+  testing: `safe-restart`/`sexp--defun-start` had gone O(pos) interpreted (~3.3 s
+  eldoc stalls on 3K-line files) — now the native `scan-form-start` (ADR-093 family).
+- **Files:** `src/collab.blsp` (the whole presence/delta/follow layer),
+  `src/remote.blsp`, `src/commands.blsp` (share-session/-follow/-mirror/collab-status),
+  `src/input.blsp` (`collab-step` at `ed-update`'s tail; `:buffer-updated`/
+  `:client-opts` handlers), `src/view.blsp` (carets/tints/chip), `src/keymaps.blsp`,
+  `src/config.blsp` (`:share-name`). **Tests:** collab/remote suites (~40 new),
+  brood buffer/serve/exit-signal suites. **Docs:** `remote-multiplayer-plan.md`
+  (as-built ledger), `working-from-another-computer.md` (runbook),
+  `fuzz-diag-overrides-anomaly.md` (an open JIT compiled-vs-source lead found en
+  route). Open: v2 CRDT, per-participant undo, cross-machine verification.
+
+## 2026-06-16 → 2026-07-09 — catch-up (condensed)
+
+The devlog lapsed for three weeks. What shipped, newest first — one line each; the
+commits (`git log --since=2026-06-16 --until=2026-07-10`) have the detail:
+
+- **Buffer placement + CLI polish** — `ed-display-buffer` placement policy (git-log
+  pops a new pane) `daff168`; `bedit DIR` opens dired `9a4631b`; a Makefile install
+  target for the standalone `bedit` binary `7a9da03`.
+- **Git porcelain round 2** — Magit-style section nav, branch ops, unpushed/unpulled
+  sections, collapsing `b10a42e`; side-pane diff preview from status `5ad9c15`;
+  viewport-aware diff loading `e3c970c`; hunk-apply newline fix `0178763`.
+- **Startup** — async deferred loading, ~1.1 s → ~0.4 s perceived `a1647d8` (the
+  compiled-module-cache language gap remains — ROADMAP §H).
+- **Scrolling & chrome** — window title + smooth pixel scrolling (ADR-114) `a57c1da`;
+  macOS-style overlay scrollbar `f74fee6`/`6903958`; boundary-bounce and
+  cursor-vs-scroll-region fixes `63b572a`…`4607b6f`; themed padding, zero inset,
+  gutter margins.
+- **Compile mode & friends** — `M-x compile` + `C-x \`` next-error, auto-save,
+  `repeat`, M-x history, perf caches `0914ac0`.
+- **Status bar as segments** — clickable/hoverable segments + a git working-tree
+  indicator `882b2c4`; the design is `docs/ui-chrome.md`.
+- **diff-hl hardening** — synchronous recompute so the gutter follows edits,
+  blink-tick refresh, `C-g` cancels workers `b385e97`…`cac0ce3`.
+- **Meta** — LICENSE + CONTRIBUTING + the configurability/packages design notes
+  `645f9cd`; rename magit → git + idiomatic cleanup passes `823a2b5` `acde663`;
+  code-review fix batches `ad1b97b` `57067bc` `0ce6085` `84b92ef`.
+
 ## 2026-06-15
 
-### design notes: the customization surface + a package ecosystem — (uncommitted)
+### design notes: the customization surface + a package ecosystem — `645f9cd`
 - **Why:** the editor is internally layered and hot-swappable, but the user can
   configure almost none of it from `init.blsp`, and there's no way to load third-party
   extensions. Captured the design-of-record for both before building, so the reasoning
@@ -127,37 +190,3 @@ Language-level changes live in the Brood repo's `docs/devlog.md` + `docs/decisio
   XDG state dir for projects/recent/bookmarks/bshell-history.
 - **Files:** `src/bshell.blsp`, `src/projects.blsp`, `src/commands.blsp`, `src/modes.blsp`,
   and more. The project-files speedup is what motivated the `string-split` ADR-109 work.
-
-### Remote & multiplayer editing — Track 1 built end to end — `dff66ab`…`628c385`
-- **Why:** the flagship strategic track: one editor you attach to from anywhere, and
-  real multi-person editing with presence — the "ultimate pairing experience."
-- **What:** the daemon/emacsclient model (`--serve`/`--attach`, host window,
-  `--headless`); ONE shared mode (`--shared`, alias `--collab`) — shared content, a
-  caret per participant, every visited file auto-shared via a per-daemon registry;
-  presence (named coloured carets with fade-after-move tags, per-owner selection
-  tints, viewport markers, join/leave echoes, a modeline chip, `M-x collab-status`);
-  `share-follow` (C-x f) across buffers and `share-mirror` (leader's viewport);
-  `M-x share-session`/`-stop` (a live editor becomes a host; stop tears everything
-  down); names from `--as` → init `:share-name` → `$USER` → prompt; deltas + OT
-  (based splices, `splice-transform` at the process AND the client, origin-tagged
-  echo suppression — concurrent typing in different places merges exactly, undo
-  survives); `--listen` TCP beside the Unix socket (kernel dual-listen, ADR-074).
-- **Brood (prime directive), forced by this track:** serve identity opts +
-  event-bus pass-through in the daemon displays + `serve-stop`; buffer-process
-  subscriber lifecycle (monitor + pid-keyed marker cleanup), structured
-  `buffer-splice`/`buffer-marker-move` deltas, splice transforms; **pid equality/hash
-  across `node-start`** (captured pre-node pids silently stopped matching — the
-  "second attach sees nothing" bug); the **immortal-process bug** (exit signals never
-  reached a natively-nested receive; landed as ADR-132, independently from both
-  machines); `%isolate`'s reap no longer kills its own caller. Plus, found while
-  testing: `safe-restart`/`sexp--defun-start` had gone O(pos) interpreted (~3.3 s
-  eldoc stalls on 3K-line files) — now the native `scan-form-start` (ADR-093 family).
-- **Files:** `src/collab.blsp` (the whole presence/delta/follow layer),
-  `src/remote.blsp`, `src/commands.blsp` (share-session/-follow/-mirror/collab-status),
-  `src/input.blsp` (`collab-step` at `ed-update`'s tail; `:buffer-updated`/
-  `:client-opts` handlers), `src/view.blsp` (carets/tints/chip), `src/keymaps.blsp`,
-  `src/config.blsp` (`:share-name`). **Tests:** collab/remote suites (~40 new),
-  brood buffer/serve/exit-signal suites. **Docs:** `remote-multiplayer-plan.md`
-  (as-built ledger), `working-from-another-computer.md` (runbook),
-  `fuzz-diag-overrides-anomaly.md` (an open JIT compiled-vs-source lead found en
-  route). Open: v2 CRDT, per-participant undo, cross-machine verification.

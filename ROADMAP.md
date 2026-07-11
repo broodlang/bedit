@@ -312,7 +312,9 @@ not hacked in here. Recorded as suggestions; implement upstream.
     core). Lazy-loading them buys nothing — the cost is the mandatory core graph
     (model + commands + view + input + their `std` deps).
 
-  The fix is a **Brood loader feature**, in increasing payoff/effort:
+  An **editor-side mitigation shipped 2026-07-05** (`a1647d8`: async deferred loading —
+  ~1.1s → ~0.4s *perceived* startup), but the module-load cost itself is untouched; the
+  real fix is a **Brood loader feature**, in increasing payoff/effort:
   1. a **compiled-form cache** (`.pyc`/`.elc`-style): cache each module's macro-expanded /
      bytecode form keyed by source hash; skip parse+macroexpand when the source is unchanged
      (editor source rarely changes between launches → near-100% hit rate);

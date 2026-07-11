@@ -43,34 +43,58 @@ nest check               # advisory type/lint check
 ## What works today
 
 Emacs-style movement and editing, a kill ring, multiple buffers and a
-`*Messages*` echo area, a real minibuffer, completion-at-point, tiled window
-splits with mouse support, incremental search and query-replace, `M-x`,
-project-aware find-file, and `C-x C-e` eval-in-buffer (run off the loop so a
-looping form can't freeze the editor). brood-mode adds live syntax highlighting,
-bracket matching, eldoc, sexp-aware indentation and structural navigation, and
-advisory type-check diagnostics. See [`ROADMAP.md`](ROADMAP.md) for the full
-status and what's next.
+`*Messages*` echo area, a real minibuffer with Vertico-style completion,
+completion-at-point, tiled window splits with mouse support, incremental search
+and query-replace, `M-x`, registers, bookmarks, keyboard macros, occur, dired,
+project-aware find-file, a per-project shell, `M-x compile` with next-error,
+and `C-x C-e` eval-in-buffer (run off the loop so a looping form can't freeze
+the editor). brood-mode adds live syntax highlighting, bracket matching, eldoc,
+sexp-aware indentation, paredit-style structural editing, and advisory
+type-check diagnostics; ruby- and elixir-mode get fontification and structural
+motion via tree-sitter. An LSP client wires completion, goto-definition,
+references, hover, rename, and format into any server-backed buffer. Git is
+integrated as a diff-hl change gutter plus a Magit-style status / diff / log /
+commit porcelain (`C-x g`).
+
+The editor is also remotely hostable: `--serve` / `--attach` give the Emacs
+daemon/emacsclient model, and `--serve --shared` turns it into real multiplayer
+editing — one document, everyone their own caret, live named presence,
+follow/mirror — over a Unix socket or authenticated TCP (`--listen`). See
+[`docs/working-from-another-computer.md`](docs/working-from-another-computer.md)
+for the runbook, and [`ROADMAP.md`](ROADMAP.md) for the full status and what's
+next.
 
 ## Layout
 
 ```
-src/main.blsp               entry point — opens the window, runs the ui-run loop
+src/main.blsp               entry point — window / daemon startup (--serve/--attach), runs the ui-run loop
 src/model.blsp              the ui-run model: buffer pool, kill ring, minibuffer, *Messages*, scrolling
+src/config.blsp             ~/.config/brood-edit/init.blsp — the declarative user config (data, not eval'd)
+src/theme.blsp              every colour the editor paints (Catppuccin Mocha), referenced by role
 src/panes.blsp              pane-layout geometry + mouse-event folding (model -> model)
 src/view.blsp               pure view: model -> render frame (editor/display ops)
+src/statusbar.blsp          the mode line as extensible segments (render ops + click/hover zones)
 src/input.blsp              dispatch: fold a key/mouse/tick event into the next model
 src/commands.blsp           the editing commands, each a (model key) -> model
+src/keymaps.blsp            keybinding profiles (emacs / modal vim) as model-scope layers
 src/interactive.blsp        the `defcommand` macro + the M-x command registry
 src/modes.blsp              modes as layers: the keymaps (data) + brood-mode services
 src/complete.blsp           completion-at-point (the in-buffer Tab popup)
+src/lsp.blsp                LSP client — completion, goto-def/references, hover, rename, format, imenu
 src/mincomplete.blsp        minibuffer prompt completion (path / name)
 src/completion.blsp         shared fuzzy ranking + vertical-menu renderer (complete + minibuffer)
+src/plume.blsp              the minibuffer completion UI — list + marginalia (our Vertico/Marginalia)
 src/isearch.blsp            incremental search + query-replace (C-s/C-r/M-%) modal mini-loops
 src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
+src/compile.blsp            M-x compile: run a build in the project root, C-x ` next-error
 src/projects.blsp           project root + file walk (find-file-in-project)
+src/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e)
+src/git.blsp                git porcelain: C-x g status buffer, diff/log/commit, C-x v = vc-diff
+src/gitdiff.blsp            diff-hl change gutter: per-line added/modified/deleted vs HEAD
 src/web.blsp                live HTTP mirror of the selected buffer (C-x w)
-tests/main_test.blsp        pure update/view tests (no window needed)
-tests/eval_command_test.blsp  tests for the eval-command module
+src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclient model
+src/collab.blsp             shared-buffer collaboration: presence carets, delta merges, follow/mirror
+tests/*_test.blsp           pure model/view tests, one suite per area (no window needed)
 project.blsp                the nest manifest (:name "myedit")
 ```
 
