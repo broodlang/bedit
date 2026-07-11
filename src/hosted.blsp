@@ -1,0 +1,139 @@
+(defmodule hosted
+  "Back POOL buffers with buffer PROCESSES — the actor-architecture seam
+(`docs/actor-architecture.md`), generalized from the collab layer that proved it.
+
+A HOSTED slot is a pool buffer whose content is authoritative in a
+`std/editor/buffer` process; the pool value is the local **projection cache** — the
+pure view renders it unchanged, commands edit it unchanged (`model -> model`,
+local-apply-first: the caret never waits on a round-trip). The loop tail
+(`hosted-step`) diffs each event's change and ships it to the slot's process as a
+based positional splice; the process pushes `[:buffer-updated …]` deltas back, folded
+into the cache by `hosted-apply-content`. All of the protocol — splice diff, echo
+suppression, transform of foreign splices over in-flight ones, resync — is std
+`editor/buffer-client`; a slot's record under
+
+  :hosted  {pool-index <link + presence keys>}
+
+IS its link (`{:proc :me :version :pending}`). What hosting buys a LOCAL buffer:
+the process is subscribable (remote sessions, services, mirrors attach to it — a
+collab-shared buffer is just a hosted buffer whose process has remote subscribers),
+it is an `[:io-write]` log sink, and it is a fault boundary (a crashed buffer process
+is rehosted from the cache — the pool value doubles as the crash-recovery copy).
+
+Presence (cursors, name tags, follow) is the collab module's layer on top; this
+module is content only."
+  (:use editor/buffer)         ; spawn-buffer / subscribe / replace-region / ed-stamp deps
+  (:use editor/buffer-client)  ; link-init / link-propagate / link-fold / view-parts
+  (:use model))                ; ed-buf-at / ed-stamp
+
+(defn hosted--proj (b)
+  "The subscription projection: `[text markers participants]` — the document, every
+marker (pid → offset; presence cursors ride these), and the pid → name registry.
+Sent on the seed and on closure edits; structured ops push O(change) deltas instead."
+  [(buffer-text b) (buffer-markers b) (get b :participants {})])
+
+(defn ed-hosted? (m &optional i)
+  "Whether pool slot `i` (default the current buffer's) is backed by a buffer process."
+  (let (idx (or i (ed-current-index m)))
+    (not (nil? (get-in m [:hosted idx])))))
+
+(defn hosted-slot-for-proc (m proc)
+  "The pool index whose hosted link points at buffer process `proc`, or nil if none does."
+  (let (hit (find (fn (kv) (= (get (second kv) :proc) proc))
+              (map-pairs (or (get m :hosted) {}))))
+    (if hit (first hit) nil)))
+
+(defn ed-host-slot (m i &optional proc)
+  "Back pool slot `i` with a buffer process: the given `proc` (a shared / registry
+buffer that already exists), or one spawned from the slot's current cache when nil (a
+locally-hosted buffer — the common case). Subscribes this model's process for pushes
+(`hosted--proj`) and records the link at version -1, so the seed push always applies
+and syncs the slot to the process's current text. Returns the model."
+  (let (bp (or proc (spawn-buffer (ed-buf-at m i))))
+    (do (subscribe-buffer bp hosted--proj)
+      (assoc-in m [:hosted i] (link-init bp (self))))))
+
+(defn ed-unhost-slot (m i &optional stop?)
+  "Drop pool slot `i`'s hosted link: unsubscribe this model's process (the slot's
+content stops tracking; the local copy stays as an ordinary pool buffer), and with
+`stop?` also stop the buffer process — right for a locally-owned host (kill-buffer),
+wrong for a shared/registry process that outlives its subscribers. A no-op when the
+slot isn't hosted."
+  (let (proc (get-in m [:hosted i :proc]))
+    (if (nil? proc)
+      m
+      (do (unsubscribe-buffer proc)
+        (when stop? (stop-buffer proc))
+        (assoc m :hosted (dissoc (get m :hosted) i))))))
+
+(defn hosted-propagate (before after)
+  "Ship each event's text changes to their slots' processes: for every hosted slot
+whose text differs between `before` and `after`, `link-propagate` (std
+`editor/buffer-client`) sends the positional splice as a based structured
+`buffer-splice` (a DELTA on the wire) tagged with our id, counting it in the slot's
+`:pending` (in flight until its echo returns). Returns `after` with those counts.
+This is what lets every editing command stay `model -> model` with no knowledge of
+hosting — the loop calls this once per event (`hosted-step`).
+
+An unchanged slot costs one ROPE-HANDLE compare (an edit mints a fresh rope; movement
+keeps it), so a keystroke never materialises the text of the slots it didn't touch."
+  (fold
+    (fn (acc kv)
+      (let (i (first kv))
+        (if (not (and (< i (count (get before :buffers))) (< i (count (get acc :buffers)))))
+          acc
+          (let (ob (ed-buf-at before i)
+                nb (ed-buf-at acc i))
+            (if (= (buffer-rope ob) (buffer-rope nb))
+              acc  ; O(1): same rope handle — no edit here, don't even read the text
+              (assoc-in acc [:hosted i]
+                (link-propagate (get-in acc [:hosted i])
+                  (buffer-text ob) (buffer-text nb))))))))
+    after
+    (map-pairs (or (get after :hosted) {}))))
+
+(defn hosted-step (before after input)
+  "The loop-tail content hook: propagate this event's edits to every hosted slot's
+process — skipped when the event IS a `[:buffer-updated …]` push (that's the process's
+own truth arriving; echoing it back would apply it twice). A no-op costing one map
+lookup on a model with no hosted slots, so ordinary editing pays nothing."
+  (if (or (nil? (get after :hosted))
+        (and (vector? input) (= (first input) :buffer-updated)))
+    after
+    (hosted-propagate before after)))
+
+(defn hosted-apply-content (m i version view origin)
+  "Fold one push's CONTENT into hosted slot `i`: `link-fold` (std protocol client)
+decides — stale drop, own-echo version bump, foreign splice transformed over our
+in-flight edits, ambiguous resync, or full-text rebuild — and the action is applied
+to the pool cache here. Returns `[m' status]`, status `:stale` (push ignored — the
+caller should skip its own layers too) or `:applied`. Every pane's window-local point
+is untouched — it lives on the pane, not the buffer."
+  (let (sh (get-in m [:hosted i])
+        [link action] (link-fold sh version view origin))
+    (if (= action :stale)
+      [m :stale]
+      (let (m1 (assoc m :hosted (assoc (get m :hosted) i link))
+            old (ed-buf-at m1 i))
+        [(cond
+           ;; our own echo / a cursor-only delta — content untouched
+           (= action :noop) m1
+           ;; a foreign DELTA that merges: already transformed over our in-flight
+           ;; splices by link-fold — apply in place (O(change), the rope survives)
+           (and (vector? action) (= (first action) :splice))
+           (let ([lo hi repl] (second action))
+             (assoc m1 :buffers (assoc (get m1 :buffers) i (replace-region old lo hi repl))))
+           ;; a genuinely ambiguous collision (same span touched on both sides inside
+           ;; one round-trip) → resync the slot from the process (always correct)
+           (= action :resync)
+           (let (t (buffer-query (get sh :proc) buffer-text))
+             (assoc m1 :buffers (assoc (get m1 :buffers) i
+                                  (ed-stamp (make-buffer t (buffer-name old) (buffer-file old))))))
+           ;; [:text s] — a full-text view (closure edits / the seed): rebuild only
+           ;; on real change (cheap no-op churn, and local undo state survives)
+           (= (second action) (buffer-text old)) m1
+           :else
+           (assoc m1 :buffers (assoc (get m1 :buffers) i
+                                (ed-stamp (make-buffer (second action)
+                                            (buffer-name old) (buffer-file old))))))
+          :applied]))))

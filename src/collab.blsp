@@ -12,7 +12,7 @@ share it too. Point stays per-pane, so cursors stay independent.
 
 Per client model:
 
-  :shared  {pool-index {:proc <pid> :version N}}   ; which pooled slots are process-backed
+  :hosted  {pool-index {:proc <pid> :version N}}   ; which pooled slots are process-backed
 
 Each client `subscribe-buffer`s the process; every edit anyone makes is serialized there and
 pushed back as a `[:buffer-updated proc version view origin]` DELTA (`{:splice … :markers …
@@ -33,48 +33,46 @@ sequence CRDT for offline/high-latency divergence (`docs/remote-multiplayer-plan
   (:use editor/buffer)         ; spawn/subscribe/buffer-edit/replace-region/make-buffer …
   (:use editor/buffer-client)  ; the protocol's client half: link-init/-propagate/-fold,
                                ; text-splice, view-parts (ADR-134 — extracted from here)
+  (:use hosted)                ; ed-host-slot / ed-unhost-slot / hosted-apply-content —
+                               ; the content machinery (collab = its presence layer)
   (:use model))                ; ed-init / ed-current-buf / ed-set-buf / ed-buf-at / ed-stamp …
 
 ;; ---- the model <-> shared-process link --------------------------------------
-;; A slot's `:shared` record IS a buffer-client *link* (`{:proc :me :version :pending}`)
+;; A slot's `:hosted` record IS a buffer-client *link* (`{:proc :me :version :pending}`)
 ;; plus the presence keys this module layers on (`:cursors :marks :tops :names :tag-ttl`,
 ;; `:sent-*`): the content protocol — splice propagate, echo suppression, transform-fold,
 ;; resync — is `std/editor/buffer-client`; everything presence is here.
 
 (defn collab-shared? (m &optional i)
-  "Whether pool slot `i` (default the current buffer's) is backed by a shared buffer process."
+  "Whether pool slot `i` (default the current buffer's) is SHARED — hosted with the
+presence layer engaged (`collab-share-slot` sets the slot's `:shared?` flag). A merely
+hosted local buffer (`ed-host-slot`, no participants) is NOT shared: presence markers,
+name announces, and follow never touch it."
   (let (idx (or i (ed-current-index m)))
-    (not (nil? (get-in m [:shared idx])))))
+    (not (nil? (get-in m [:hosted idx :shared?])))))
 
 ;; ---- presence: who's on the buffer, and where --------------------------------
 ;; Each participant plants a MARKER keyed by its session pid in the shared buffer
 ;; process — markers are adjusted inside the process's edit primitives, so a cursor
 ;; stays on its logical spot while others type around it — and registers its display
 ;; name under `:participants` on the shared buffer value. The subscription projection
-;; (`collab--proj`) carries text + markers + names in every push, so every client
+;; (`hosted--proj`) carries text + markers + names in every push, so every client
 ;; always knows where everyone is; the buffer process deletes a dead subscriber's
 ;; pid-keyed marker (std/editor/buffer), so a crashed/detached participant's caret
 ;; vanishes instead of ghosting.
 
-(defn collab--proj (b)
-  "The presence subscription projection: `[text markers participants]` — the document,
-every participant's cursor marker (pid → offset), and the pid → name registry."
-  [(buffer-text b) (buffer-markers b) (get b :participants {})])
-
 (defn collab-share-slot (m i proc)
-  "Back pool slot `i` with buffer process `proc`: subscribe this model's process for
-presence pushes (`collab--proj`), announce ourselves — a cursor marker keyed by our pid
-(so the process cleans it up if we die) and our name (`:participant`, else \"guest\",
-upgraded later by `collab-set-name` when the attach identity arrives) — and record the
-link (version -1, so the seed push always applies and syncs the slot to the process's
-current text). Returns the model."
+  "Back pool slot `i` with buffer process `proc` (`ed-host-slot` — the hosted content
+machinery) and announce ourselves on it — a cursor marker keyed by our pid (so the
+process cleans it up if we die) and our name (`:participant`, else \"guest\", upgraded
+later by `collab-set-name` when the attach identity arrives). Sharing = hosting + a
+presence announce. Returns the model."
   (let (me (self)
         name (or (get m :participant) "guest"))
-    (do (subscribe-buffer proc collab--proj)
-      (buffer-edit proc (fn (b) (assoc (buffer-marker-set b me 0)
-                                  :participants (assoc (get b :participants {}) me name)))
-        me)
-      (assoc-in m [:shared i] (link-init proc me)))))
+    (do (buffer-edit proc (fn (b) (assoc (buffer-marker-set b me 0)
+                                    :participants (assoc (get b :participants {}) me name)))
+          me)
+      (assoc-in (ed-host-slot m i proc) [:hosted i :shared?] true))))
 
 (defn collab-set-name (m name)
   "Record this session's participant `name` (the attach identity — `bedit --attach ed
@@ -84,11 +82,11 @@ name instead of \"guest\". A no-op for a nil/empty name."
   (if (or (nil? name) (= name ""))
     m
     (do
-      (doseq (kv (map-pairs (or (get m :shared) {})))
+      (doseq (kv (map-pairs (or (get m :hosted) {})))
         (let (sh (second kv)
               proc (get sh :proc)
               me (get sh :me))
-          (when me
+          (when (and me (get sh :shared?))   ; announce on SHARED slots only
             (buffer-edit proc (fn (b) (assoc b :participants
                                         (assoc (get b :participants {}) me name)))
               me))))
@@ -100,7 +98,7 @@ name instead of \"guest\". A no-op for a nil/empty name."
 (that's also how `share-follow` finds you: your cursor marker exists in exactly one
 buffer). The subscription stays (content keeps tracking); the sent-* stamps reset so
 re-entering the buffer re-announces."
-  (let (sh (get-in m [:shared j])
+  (let (sh (get-in m [:hosted j])
         me (get sh :me))
     (if (or (nil? sh) (nil? me))
       m
@@ -109,7 +107,7 @@ re-entering the buffer re-announces."
                       (buffer-marker-delete (buffer-marker-delete b me) [me :mark])
                       [me :top]))
             me)
-        (assoc m :shared (assoc (get m :shared) j
+        (assoc m :hosted (assoc (get m :hosted) j
                            (merge sh {:sent-point nil :sent-mark nil :sent-top nil})))))))
 
 (defn collab-sync-point (m)
@@ -128,14 +126,14 @@ every-event path pays nothing."
         ;; its last shared spot — followers stay put instead of being dropped, and the
         ;; other side isn't spammed with left/joined echoes for every status peek.
         m0 (assoc (if (and prev (not (= prev i))
-                       (not (nil? (get-in m [:shared prev])))
-                       (not (nil? (get-in m [:shared i]))))
+                       (collab-shared? m prev)
+                       (collab-shared? m i))
                     (collab--withdraw-presence m prev)
                     m)
              :collab-active i)
-        sh (get-in m0 [:shared i]))
-    (if (nil? sh)
-      m0
+        sh (get-in m0 [:hosted i]))
+    (if (not (collab-shared? m0 i))   ; presence lives on SHARED slots only — a merely
+      m0                              ; hosted local buffer gets no cursor markers
       (let (me (get sh :me)
             buf (ed-current-buf m0)
             pt (buffer-point buf)
@@ -145,20 +143,20 @@ every-event path pays nothing."
             m1 (if (or (nil? me) (= pt (get sh :sent-point)))
                  m0
                  (do (buffer-marker-move (get sh :proc) me pt me)
-                   (assoc-in m0 [:shared i :sent-point] pt)))
+                   (assoc-in m0 [:hosted i :sent-point] pt)))
             m2 (cond
                  (nil? me) m1
-                 (= mk (get-in m1 [:shared i :sent-mark])) m1
+                 (= mk (get-in m1 [:hosted i :sent-mark])) m1
                  (nil? mk)
                  (do (buffer-edit (get sh :proc) (fn (b) (buffer-marker-delete b [me :mark])) me)
-                   (assoc-in m1 [:shared i :sent-mark] nil))
+                   (assoc-in m1 [:hosted i :sent-mark] nil))
                  :else
                  (do (buffer-marker-move (get sh :proc) [me :mark] mk me)
-                   (assoc-in m1 [:shared i :sent-mark] mk))))
-        (if (or (nil? me) (= top-off (get-in m2 [:shared i :sent-top])))
+                   (assoc-in m1 [:hosted i :sent-mark] mk))))
+        (if (or (nil? me) (= top-off (get-in m2 [:hosted i :sent-top])))
           m2
           (do (buffer-marker-move (get sh :proc) [me :top] top-off me)
-            (assoc-in m2 [:shared i :sent-top] top-off)))))))
+            (assoc-in m2 [:hosted i :sent-top] top-off)))))))
 
 ;; ---- the shared-buffer registry: every file, one process ---------------------
 ;; One registry process per collab daemon: the first session to open a file spawns
@@ -211,7 +209,7 @@ editors (no `:collab-reg`) never do anything here."
   (let (reg (get m :collab-reg)
         i (ed-current-index m)
         buf (ed-current-buf m))
-    (if (or (nil? reg) (not (nil? (get-in m [:shared i]))) (nil? (buffer-file buf)))
+    (if (or (nil? reg) (not (nil? (get-in m [:hosted i]))) (nil? (buffer-file buf)))
       m
       (let (bp (collab-registry-share reg (buffer-file buf) (buffer-text buf) (buffer-name buf)))
         (if (nil? bp)
@@ -237,13 +235,13 @@ everyone present anywhere). Named from the registries (\"guest\" when unnamed)."
             names (or (get sh :names) {}))
         (fold (fn (a kv) (assoc a (first kv) (get names (first kv) "guest")))
           acc (map-pairs (or (get sh :cursors) {})))))
-    {} (map-pairs (or (get m :shared) {}))))
+    {} (map-pairs (or (get m :hosted) {}))))
 
 (defn collab--slot-of (m pid)
   "The pool index of the slot whose `:cursors` contains `pid` — the buffer that
 participant is IN — or nil when they're nowhere (gone, or on an unshared buffer)."
   (let (hit (find (fn (kv) (contains? (or (get (second kv) :cursors) {}) pid))
-              (map-pairs (or (get m :shared) {}))))
+              (map-pairs (or (get m :hosted) {}))))
     (if hit (first hit) nil)))
 
 (defn collab-follow (m pid name &optional (mode :follow))
@@ -280,44 +278,44 @@ nowhere to be seen."
         (if (nil? j)
           m
           (let (m1 (if (= j (ed-current-index m)) m (ed-show-index m j))
-                pos (get-in m1 [:shared j :cursors pid])
+                pos (get-in m1 [:hosted j :cursors pid])
                 m2 (if (= pos (buffer-point (ed-current-buf m1)))
                      m1
                      (ed-scroll (ed-set-buf m1 (goto-char (ed-current-buf m1) pos)) textrows)))
             (if (not (= (get f :mode) :mirror))
               m2
-              (let (top-off (get-in m2 [:shared j :tops pid]))
+              (let (top-off (get-in m2 [:hosted j :tops pid]))
                 (if (nil? top-off)
                   m2
                   (ed-set-top m2 (rope-char->line (buffer-rope (ed-current-buf m2))
                                    (min top-off (buffer-length (ed-current-buf m2))))))))))))))
 
 (defn collab-step (before after input)
-  "The whole per-event collab chain, in order: auto-share a newly visited file
-(`collab-autoshare`), propagate this event's text change to the shared processes
-(`collab-propagate` — skipped when the event IS a `[:buffer-updated …]` push: that's
-the process's own truth arriving, and echoing it back would apply it twice), break a
-follow the user steered out of (`collab-follow-step`), and sync our presence markers
-(`collab-sync-point`). Runs at the tail of EVERY `ed-update` — a no-op costing two map
-lookups on a model with neither a registry nor shared slots, so ordinary editing pays
-nothing; this is what lets a live editor start sharing mid-session (`share-session`)
-without swapping its update function."
-  (if (and (nil? (get after :collab-reg)) (nil? (get after :shared)))
+  "The per-event PRESENCE chain: auto-share a newly visited file (`collab-autoshare` —
+a registry daemon's clients see every file anyone opens), break a follow the user
+steered out of (`collab-follow-step`), and sync our presence markers
+(`collab-sync-point`). Content propagation is NOT here any more — `hosted-step` (the
+hosted machinery) runs it for every process-backed slot, shared or purely local; the
+loop tail chains the two. Runs at the tail of EVERY `ed-update` — a no-op costing two
+map lookups on a model with neither a registry nor hosted slots, so ordinary editing
+pays nothing; this is what lets a live editor start sharing mid-session
+(`share-session`) without swapping its update function."
+  (if (and (nil? (get after :collab-reg)) (nil? (get after :hosted)))
     after
     (collab-sync-point
       (collab-follow-step before
         (if (and (vector? input) (= (first input) :buffer-updated))
           after
-          (collab-propagate before (collab-autoshare after)))
+          (collab-autoshare after))
         input))))
 
 (defn collab-decay-tags (m)
   "Tick every participant name-tag's time-to-live down one (the `:cursor-blink` beat
 calls this): a tag shows for a few beats after that caret MOVED, then fades to just
 the coloured bar — presence without shouting. Cheap when nothing is shared."
-  (if (nil? (get m :shared))
+  (if (nil? (get m :hosted))
     m
-    (assoc m :shared
+    (assoc m :hosted
       (fold (fn (acc kv)
               (let (sh (second kv)
                     ttl (or (get sh :tag-ttl) {}))
@@ -327,7 +325,7 @@ the coloured bar — presence without shouting. Cheap when nothing is shared."
                     (assoc sh :tag-ttl
                       (fold (fn (a t) (if (> (second t) 1) (assoc a (first t) (dec (second t))) a))
                         {} (map-pairs ttl)))))))
-        {} (map-pairs (get m :shared))))))
+        {} (map-pairs (get m :hosted))))))
 
 (defn collab-follow-step (before after input)
   "Break the follow when the USER moved point — a real key/mouse (`ed-real-input?`)
@@ -351,33 +349,26 @@ beyond that is vanishingly rare. Unchanged sets echo nothing."
       (not (empty? left)) (message m (str (get names (first left) "guest") " left"))
       :else m)))
 
-(defn collab-slot-for-proc (m proc)
-  "The pool index whose shared link points at buffer process `proc`, or nil if none does."
-  (let (hit (find (fn (kv) (= (get (second kv) :proc) proc))
-              (map-pairs (or (get m :shared) {}))))
-    (if hit (first hit) nil)))
-
 (defn ed-apply-buffer-update (m proc version view &optional origin)
-  "Fold a `[:buffer-updated proc version view origin]` push into the model — the
-CONTENT decisions (stale drop, echo suppression, foreign-splice transform over our
-in-flight edits, ambiguous-collision resync, full-text rebuild) all made by the std
-protocol client (`editor/buffer-client` `link-fold` — the slot's `:shared` record IS
-its link), the returned action applied to the pool slot here, and the PRESENCE layer
-(this module's own) folded around it: other participants' cursors/marks/viewports
-land on the slot (own pid excluded), name tags re-arm on movement (`:tag-ttl`,
-decayed by `collab-decay-tags`), churn is echoed (`collab--presence-echo` — suppressed
-on the seed: finding people already here isn't news the same way), and a followed
+  "Fold a `[:buffer-updated proc version view origin]` push into the model: the
+CONTENT (stale drop, echo suppression, foreign-splice transform over our in-flight
+edits, ambiguous-collision resync, full-text rebuild) is `hosted-apply-content` — the
+hosted machinery every process-backed buffer shares — and the PRESENCE layer (this
+module's own) folds around it: other participants' cursors/marks/viewports land on
+the slot (own pid excluded), name tags re-arm on movement (`:tag-ttl`, decayed by
+`collab-decay-tags`), churn is echoed (`collab--presence-echo` — suppressed on the
+seed: finding people already here isn't news the same way), and a followed
 participant vanishing from every shared slot breaks the follow.
 
 Every pane's window-local point is untouched — it lives on the pane, not the buffer —
 so cursors stay independent and simply clamp into the new text on render. Ignores a
 stale/duplicate `version`; a no-op when no slot links to `proc`."
-  (let (i (collab-slot-for-proc m proc))
+  (let (i (hosted-slot-for-proc m proc))
     (if (nil? i)
       m
-      (let (sh (get-in m [:shared i])
-            [link action] (link-fold sh version view origin))
-        (if (= action :stale)
+      (let (sh (get-in m [:hosted i])   ; the PRE-fold slot: old cursors/names/seed?
+            [mc status] (hosted-apply-content m i version view origin))
+        (if (= status :stale)
           m
           (let (vp (view-parts view)
                 raw (get vp :cursors)
@@ -408,44 +399,22 @@ stale/duplicate `version`; a no-op when no slot links to `proc`."
                               acc
                               (assoc acc (first kv) 6)))
                       (or (get sh :tag-ttl) {}) (map-pairs others))
-                m1 (if seed? m (collab--presence-echo m old-cursors others
-                                 (merge (or (get sh :names) {}) names)))
-                m2 (assoc m1 :shared (assoc (get m1 :shared) i
-                                       (merge link {:cursors others
-                                                    :marks marks
-                                                    :tops tops
-                                                    :tag-ttl ttl
-                                                    :names names})))
+                m1 (if seed? mc (collab--presence-echo mc old-cursors others
+                                  (merge (or (get sh :names) {}) names)))
+                m2 (assoc m1 :hosted (assoc (get m1 :hosted) i
+                                       (merge (get-in m1 [:hosted i])
+                                         {:cursors others
+                                          :marks marks
+                                          :tops tops
+                                          :tag-ttl ttl
+                                          :names names})))
                 ;; the one we were following vanished from EVERY shared buffer → they're
                 ;; gone (a buffer switch just moves their marker to another slot — kept)
-                m2 (let (f (get m2 :follow))
-                     (if (and f (contains? old-cursors (get f :pid))
-                           (nil? (collab--slot-of m2 (get f :pid))))
-                       (collab-unfollow m2 (str (get f :name) " left — stopped following"))
-                       m2))
-                old (ed-buf-at m2 i))
-            (cond
-              ;; our own echo / a cursor-only delta — content untouched
-              (= action :noop) m2
-              ;; a foreign DELTA that merges: already transformed over our in-flight
-              ;; splices by link-fold — apply in place (O(change), the rope survives)
-              (and (vector? action) (= (first action) :splice))
-              (let ([lo hi repl] (second action))
-                (assoc m2 :buffers (assoc (get m2 :buffers) i (replace-region old lo hi repl))))
-              ;; a genuinely ambiguous collision (same span touched on both sides inside
-              ;; one round-trip) → resync the slot from the process (always correct)
-              (= action :resync)
-              (let (t (buffer-query proc buffer-text))
-                (assoc m2
-                  :buffers (assoc (get m2 :buffers) i
-                             (ed-stamp (make-buffer t (buffer-name old) (buffer-file old))))))
-              ;; [:text s] — a full-text view (closure edits / the seed): rebuild only
-              ;; on real change (cheap no-op churn, and local undo state survives)
-              (= (second action) (buffer-text old)) m2
-              :else
-              (assoc m2 :buffers (assoc (get m2 :buffers) i
-                                   (ed-stamp (make-buffer (second action)
-                                               (buffer-name old) (buffer-file old))))))))))))
+                f (get m2 :follow))
+            (if (and f (contains? old-cursors (get f :pid))
+                  (nil? (collab--slot-of m2 (get f :pid))))
+              (collab-unfollow m2 (str (get f :name) " left — stopped following"))
+              m2)))))))
 
 (defn collab-edit (m op)
   "Apply edit `op` (a `buffer -> buffer` transform, as commands produce) to the current buffer.
@@ -453,52 +422,30 @@ When the buffer is process-backed, express the change as a based positional spli
 (`link-propagate` — the std protocol client); the process serializes it and pushes the result
 to every subscriber (including us), so all clients — each with their own cursor — converge.
 The local pane is updated at once (the caret responds without a round-trip; the push then
-reconciles the content). When the buffer isn't shared, this is exactly `ed-set-buf` with `op`
-applied — so a command may call `collab-edit` unconditionally."
+reconciles the content). When the buffer isn't hosted at all, this is exactly `ed-set-buf`
+with `op` applied — so a command may call `collab-edit` unconditionally. (Content, not
+presence: any HOSTED slot propagates, shared or purely local.)"
   (let (buf (ed-current-buf m)
         nb (op buf))
-    (if (collab-shared? m)
+    (if (ed-hosted? m)
       (let (i (ed-current-index m))
-        (assoc-in (ed-set-buf m nb) [:shared i]
-          (link-propagate (get-in m [:shared i]) (buffer-text buf) (buffer-text nb))))
+        (assoc-in (ed-set-buf m nb) [:hosted i]
+          (link-propagate (get-in m [:hosted i]) (buffer-text buf) (buffer-text nb))))
       (ed-set-buf m nb))))
 
 (defn collab-propagate (before after)
-  "The command-agnostic counterpart to `collab-edit`: after a command folds an event in, push
-each shared slot's text change to its process so other participants see it. For every
-process-backed slot whose text differs between `before` and `after`, `link-propagate` (the std
-protocol client) sends the positional splice as a structured `buffer-splice` (a DELTA on the
-wire — the process pushes `[lo hi repl]`, not the document) tagged with our pid, and counts it
-in the slot's `:pending` (in flight until its echo returns — the divergence guard `link-fold`
-uses). Returns `after` with those counts. This lets the ordinary editing commands stay
-`model -> model` with no knowledge of sharing — the `ui-run` loop calls this once per event.
-(Use *either* this loop-level hook *or* explicit `collab-edit` call sites, not both on the
-same edit, or the splice sends twice.)
-
-An unchanged slot costs one ROPE-HANDLE compare (an edit mints a fresh rope; movement keeps
-it — the `ed-diag-stale?` trick), so a keystroke never materialises the text of the shared
-slots it didn't touch."
-  (fold
-    (fn (acc kv)
-      (let (i (first kv))
-        (if (not (and (< i (count (get before :buffers))) (< i (count (get acc :buffers)))))
-          acc
-          (let (ob (ed-buf-at before i)
-                nb (ed-buf-at acc i))
-            (if (= (buffer-rope ob) (buffer-rope nb))
-              acc  ; O(1): same rope handle — no edit here, don't even read the text
-              (assoc-in acc [:shared i]
-                (link-propagate (get-in acc [:shared i])
-                  (buffer-text ob) (buffer-text nb))))))))
-    after
-    (map-pairs (or (get after :shared) {}))))
+  "The command-agnostic push of an event's edits to their processes — now the hosted
+machinery's `hosted-propagate` (sharing is hosting; the loop calls `hosted-step`
+directly, this name is kept for explicit call sites and the suite)."
+  (hosted-propagate before after))
 
 (defn collab-unshare (m i)
   "Drop the shared link on pool slot `i`: withdraw our presence (delete our cursor marker
 and name — the graceful counterpart of the buffer process's dead-subscriber cleanup) and
-unsubscribe this model's process (its content stops tracking; the local copy is kept as
-an ordinary buffer). A no-op when the slot isn't shared."
-  (let (sh (get-in m [:shared i])
+unhost the slot (`ed-unhost-slot` — its content stops tracking; the local copy is kept as
+an ordinary buffer; the process is NOT stopped — a shared host outlives its subscribers).
+A no-op when the slot isn't shared."
+  (let (sh (get-in m [:hosted i])
         proc (get sh :proc)
         me (get sh :me))
     (if (nil? proc)
@@ -507,5 +454,4 @@ an ordinary buffer). A no-op when the slot isn't shared."
             (buffer-edit proc (fn (b) (assoc (buffer-marker-delete b me)
                                         :participants (dissoc (get b :participants {}) me)))
               me))
-        (unsubscribe-buffer proc)
-        (assoc m :shared (dissoc (get m :shared) i))))))
+        (ed-unhost-slot m i)))))
