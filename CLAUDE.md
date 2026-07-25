@@ -85,7 +85,8 @@ src/commands.blsp           the editing commands, each a (model key) -> model
 src/keymaps.blsp            keybinding profiles (emacs / modal vim) as model-scope layers
 src/interactive.blsp        the `defcommand` macro + the M-x command registry
 src/modes.blsp              modes as layers: the keymaps (data) + brood-mode services
-src/complete.blsp           completion-at-point (the in-buffer Tab popup) — multi-source merge
+src/complete-at-point.blsp  completion-at-point (the in-buffer Tab popup) — multi-source merge
+                            (named to dodge std's `tool/complete`, which shadows a bare `complete`)
 src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, goto-def/references, hover, rename, format, imenu
 src/mincomplete.blsp        minibuffer prompt completion (path / name)
 src/completion.blsp         shared fuzzy ranking + vertical-menu card + ls -l perms (complete + plume + dired)
@@ -116,7 +117,11 @@ be built with the GUI backend. Building it lives in the Brood repo:
 # here:
 nest run                 # open the editor on a scratch buffer (native window)
 nest run -- notes.txt    # open (Ctrl-S saves) that file
-nest test                # run the test suite
+nest test                # run the test suite (~5s, 829 tests)
+nest test tests/git_test.blsp:42     # one file, or the one test at that line
+nest test --failed       # just what failed last run — the edit/rerun loop
+nest test --cover        # function-level coverage: what the suite never calls
+nest test --repeat-until-failure 5 --seed 0   # shake out a flaky/order-dependent test
 nest check               # advisory type/lint check
 ```
 
@@ -124,6 +129,21 @@ nest check               # advisory type/lint check
 brood/gui` in ../brood). A plain `cargo run -p nest -- test` rebuilds
 `target/debug/nest` *without* the GUI feature and clobbers the installed binary's
 counterpart — it won't reflect the windowed build.
+
+**Don't run `nest format` here.** It reformats all ~55 files and hoists every
+trailing `; comment` onto its own line above the form — this codebase documents
+`(:use …)` clauses and assertions with trailing comments deliberately, so the
+formatter's output is a large, lossy diff. Reformatting is a decision to take
+explicitly, not a side effect of a change.
+
+**Process tests use barriers, not sleeps.** `buffer-query` (and any other
+synchronous call) is a FIFO round-trip: when it returns, every message the test
+sent that process has been handled and every push it triggered is already queued.
+`ct-settle`/`ht-settle` in `tests/collab_test.blsp` / `tests/hosted_test.blsp` are
+that barrier — drain with `(after 0 …)` behind one, and assert "nothing was
+pushed" *strictly* instead of racing a timeout. Only an event routed through a
+third process (the collab registry learning of a `[:down]`) needs waiting, and
+that polls (`ct-await-respawn`) rather than guessing a delay.
 
 ## Conventions
 
