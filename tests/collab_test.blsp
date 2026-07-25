@@ -33,10 +33,47 @@
 (defn ct-await* (proc)
   (receive ([:buffer-updated ~proc v view o] [v view o]) (after 2000 :none)))
 
+;; ---- barriers, not delays ---------------------------------------------------
+;; `buffer-query` is a synchronous round-trip through the process's mailbox, and a
+;; mailbox is FIFO per sender: when the reply lands, every message WE sent `proc`
+;; before it has been handled, and every push it made in response is already queued
+;; on us. So a round-trip is a barrier — the deterministic replacement for "sleep a
+;; bit and hope". It orders our own traffic only; a push routed through a third
+;; process (the registry) still needs a real await.
+(defn ct-settle (proc) (buffer-query proc buffer-text) nil)
+
+;; Consume the pushes already queued from `proc`; never waits (barrier first).
+(defn ct-drain-now (proc)
+  (receive ([:buffer-updated ~proc _ _ _] (ct-drain-now proc)) (after 0 nil)))
+
 ;; Drain until quiet: the seed push AND the join announce (`collab-share-slot` plants a
 ;; cursor marker + name right after subscribing), so a test sees only its own edits after.
 (defn ct-drain-seed (proc)
-  (receive ([:buffer-updated ~proc _ _ _] (ct-drain-seed proc)) (after 300 nil)))
+  (ct-settle proc)
+  (ct-drain-now proc))
+
+;; `:none` iff `proc` pushed us nothing. Barrier first, so a push that simply hasn't
+;; arrived yet FAILS the assertion instead of passing it by outrunning a timeout —
+;; and the negative case costs nothing rather than the full `ct-await` wait.
+(defn ct-none (proc)
+  (ct-settle proc)
+  (receive ([:buffer-updated ~proc v view _] [v (ct-view-text view)]) (after 0 :none)))
+
+;; The registry's own barrier: `collab-registry-share` is a synchronous call, so its
+;; reply proves the registry has drained everything already in its mailbox — including
+;; a mirror push a buffer process sent before we asked.
+(defn ct-registry-settle (reg path text name) (collab-registry-share reg path text name))
+
+;; The one event no round-trip of ours can order: the runtime's `[:down]` reaches the
+;; registry independently, so the respawn may not have happened yet. Poll for it (bounded)
+;; instead of sleeping a guess — this returns the instant the registry has respawned, and
+;; still yields the dead pid if it never does, so the caller's assertion fails honestly.
+(defn ct-await-respawn (reg path text name dead n)
+  (let (p (collab-registry-share reg path text name))
+    (cond
+      (not (= p dead)) p
+      (<= n 0) p
+      :else (do (sleep 2) (ct-await-respawn reg path text name dead (dec n))))))
 
 ;; THE [:down] for `pid` specifically — earlier tests' stopped-but-still-monitored
 ;; procs can leave stale corpse messages queued; skip (consume) any that aren't ours.
@@ -76,7 +113,7 @@
           m (collab-share-slot (ed-init (make-buffer "hello" "m.txt")) 0 proc))
       (ct-drain-seed proc)
       (hosted-edit m (fn (b) (goto-char b 2)))   ; move only — no text change
-      (assert= (ct-await proc) :none)            ; nothing pushed
+      (assert= (ct-none proc) :none)            ; nothing pushed
       (stop-buffer proc)))
 
   (test "two participants' edits both survive when each round-trips before the next (v1 serialized)"
@@ -125,7 +162,7 @@
       (ct-drain-seed proc)
       (let (after (ed-set-buf m (goto-char (ed-current-buf m) 2)))   ; move only
         (hosted-propagate m after)
-        (assert= (ct-await proc) :none))
+        (assert= (ct-none proc) :none))
       (stop-buffer proc)))
 
   (test "collab-unshare stops the slot tracking further edits"
@@ -136,7 +173,7 @@
         (is (not (collab-shared? m2)))
         (ct-drain-seed proc)                     ; the presence-withdraw push + settle
         (buffer-edit proc (fn (b) (insert (end-of-buffer b) "!")))
-        (assert= (ct-await proc) :none))         ; no more pushes to us
+        (assert= (ct-none proc) :none))         ; no more pushes to us
       (stop-buffer proc)))
 
   (test "presence: joining announces a pid-keyed cursor marker and the participant name"
@@ -157,12 +194,11 @@
       (ct-drain-seed proc)
       (let (m2 (collab-sync-point m)
             me (get-in m2 [:hosted 0 :me]))
-        (receive (after 200 nil))                ; let the marker edit land
         (assert= (buffer-query proc (fn (b) (buffer-marker b me))) 3)
         (ct-drain-seed proc)                     ; consume the marker push
         ;; unmoved point → no further edit, nothing pushed
         (collab-sync-point m2)
-        (assert= (ct-await proc) :none))
+        (assert= (ct-none proc) :none))
       (stop-buffer proc)))
 
   (test "presence: a push's cursors/names land on the slot, own pid excluded; churn echoes"
@@ -269,13 +305,11 @@
       ;; region 2..6 active locally (mark 2, point 6) → the sync ships cursor AND anchor
       (let (m1 (ed-set-buf m (assoc (goto-char (ed-current-buf m) 6) :mark 2))
             m2 (collab-sync-point m1))
-        (receive (after 200 nil))
         (assert= (buffer-query proc (fn (b) (buffer-marker b [me :mark]))) 2)
         (assert= (buffer-query proc (fn (b) (buffer-marker b me))) 6)
         ;; dropping the region deletes the anchor (cursor marker stays)
         (let (m3 (ed-set-buf m2 (assoc (ed-current-buf m2) :mark nil))
               _ (collab-sync-point m3))
-          (receive (after 200 nil))
           (is (nil? (buffer-query proc (fn (b) (buffer-marker b [me :mark])))))))
       (stop-buffer proc)))
 
@@ -318,10 +352,11 @@
           p1 (collab-registry-share reg "/tmp/cl-rr.txt" "seed" "rr.txt"))
       (buffer-splice p1 4 4 "+more" :someone)          ; a post-seed edit the mirror must track
       (assert= (buffer-query p1 buffer-text) "seed+more")
-      (sleep 150)                                      ; let the mirror push fold at the registry
+      ;; the query above proves p1 SENT its mirror push; this call proves the registry
+      ;; folded it — two barriers, no guessed delay
+      (ct-registry-settle reg "/tmp/cl-rr.txt" "seed" "rr.txt")
       (exit p1 :kill)
-      (sleep 150)                                      ; let the registry's [:down] respawn land
-      (let (p2 (collab-registry-share reg "/tmp/cl-rr.txt" "stale-local" "rr.txt"))
+      (let (p2 (ct-await-respawn reg "/tmp/cl-rr.txt" "stale-local" "rr.txt" p1 100))
         (is (not (= p1 p2)))
         (assert= (buffer-query p2 buffer-text) "seed+more"))  ; the MIRROR, not the re-asker's text
       (collab-registry-stop reg)))
@@ -333,7 +368,9 @@
           p1 (get-in m1 [:hosted 0 :proc]))
       (ct-drain-seed p1)
       (exit p1 :kill)
-      (sleep 150)                                      ; registry respawns from its mirror
+      ;; wait for the registry to have respawned (it learns from its own [:down], which
+      ;; nothing we send can be ordered against) — then the fold below re-links onto it
+      (ct-await-respawn reg "/tmp/cl-rs.txt" "doc" "rs.txt" p1 100)
       (let (down (ct-await-down p1)
             m2 (input/ed--ev-down m1 down 24 80 24)
             p2 (get-in m2 [:hosted 0 :proc]))
@@ -350,11 +387,9 @@
           ;; a second pool buffer, shared with B, then sync while A is current
           m1 (collab-share-slot (ed-append-named m0 "b.txt" "bbb") 1 procB)
           m2 (collab-sync-point m1))
-      (receive (after 250 nil))
       (is (not (nil? (buffer-query procA (fn (b) (buffer-marker b me))))))
       ;; switch to buffer 1 and sync → presence leaves A, lands on B
       (let (_ (collab-sync-point (ed-show-index m2 1)))
-        (receive (after 250 nil))
         (is (nil? (buffer-query procA (fn (b) (buffer-marker b me)))))
         (is (not (nil? (buffer-query procB (fn (b) (buffer-marker b me)))))))
       (stop-buffer procA)

@@ -20,9 +20,26 @@
 (defn ht-await (proc)
   (receive ([:buffer-updated ~proc v view o] [v view o]) (after 2000 :none)))
 
+;; A BARRIER, not a delay: `buffer-query` is a synchronous round-trip, and a mailbox is
+;; FIFO per sender — when the reply lands, every message we sent `proc` before it has been
+;; handled and every push it made in response is already queued on us. So the drain below
+;; never has to wait, and an "expect nothing" assertion after it is strict rather than a
+;; race with a timeout.
+(defn ht-settle (proc) (buffer-query proc buffer-text) nil)
+
 ;; Drain until quiet (the seed push, marker announces, …).
 (defn ht-drain (proc)
-  (receive ([:buffer-updated ~proc _ _ _] (ht-drain proc)) (after 300 nil)))
+  (ht-settle proc)
+  (ht-drain-now proc))
+
+(defn ht-drain-now (proc)
+  (receive ([:buffer-updated ~proc _ _ _] (ht-drain-now proc)) (after 0 nil)))
+
+;; `:none` iff `proc` pushed us nothing — barrier first, so a push that merely hasn't
+;; arrived yet fails the assertion instead of outrunning a timeout.
+(defn ht-none (proc)
+  (ht-settle proc)
+  (receive ([:buffer-updated ~proc v view o] [v view o]) (after 0 :none)))
 
 ;; THE [:down] for `pid` specifically — earlier tests' stopped-but-still-monitored
 ;; procs can leave stale corpse messages queued; skip (consume) any that aren't ours.
@@ -81,7 +98,7 @@
         (assert= (ht-text m2) "hi!")
         ;; folding the push changed the pool text, but hosted-step must NOT diff that
         ;; change back out as a new splice — no further push arrives
-        (assert= (ht-await proc) :none))
+        (assert= (ht-none proc) :none))
       (stop-buffer proc)))
 
   (test "ed-unhost-slot with stop? reverts to a plain pool buffer and stops the process"
@@ -146,14 +163,12 @@
           pm (get-in m2 [:hosted 1 :proc])
           ;; kill a.txt (slot 0) THROUGH ed-update — the loop tail runs after it
           m3 (ht-press (ed-select m2 0) [:ctrl-x "k"]))
-      (sleep 100)                                         ; let any (wrong) splice land
       (assert= (buffer-query pb buffer-text) "bbbbbbbb")  ; b.txt's process untouched
       (assert= (buffer-query pm buffer-text)
         (buffer-text (ed-buf-at m3 0)))                   ; *Messages* still converged
       ;; …and the survivors still track edits (links point at the right processes):
       ;; the invariant is CONVERGENCE — the process holds exactly the pool's text
       (let (m4 (ht-press (ed-select m3 1) ["Z"])) ; type into b.txt (now slot 1)
-        (sleep 100)
         (assert= (buffer-query pb buffer-text) (buffer-text (ed-buf-at m4 1)))
         (is (string-contains? (buffer-query pb buffer-text) "Z"))
         (ed-unhost-slot (ed-unhost-slot m4 0 true) 1 true))))
@@ -171,7 +186,6 @@
       ;; *Messages* in the same event
       (let (m2 (ed-append-named m1 "*Messages*" "bob joined\n")
             m3 (hosted-step m1 m2 [:buffer-updated p0 99 {:splice [0 0 "!"]} nil]))
-        (sleep 100)
         ;; slot 0 was exempt (nothing sent for it: its rope didn't change here anyway),
         ;; but *Messages*' append reached its process
         (assert= (buffer-query pm buffer-text)
