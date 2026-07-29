@@ -29,6 +29,7 @@ suite's own output is visible rather than lost."
 
 (require 'path)  ; path/basename — run labels (bare require: path's `join` must not shadow prelude's)
 (require 'debugger)  ; debugger-spy-tap-form — the shared spy tap the script splices in
+(require 'procstream)  ; the shared streaming-subprocess worker (:testrun rides it)
 
 (def *tests-buffer* "*Tests*")
 
@@ -139,55 +140,25 @@ line can arrive with a `F..`-style prefix — salvage by re-parsing from the fir
       :output (send (testrun--editor) (test-output-event (second kv)))
       nil)))
 
-(defn testrun--feed (buf data)
-  "Fold a stdout chunk into the line buffer: dispatch every complete line, return
-the trailing partial."
-  (let (parts (string-split (str buf data) "\n")
-        complete (take (dec (count parts)) parts))
-    (doseq (line complete) (testrun--dispatch-line line))
-    (last parts)))
-
-(defn testrun--recv (proc buf)
-  "Stream the runner's stdout until it exits. A fresh `[:run …]` mid-flight kills the
-current run and starts over (re-running tests never queues); stderr lines forward as
-plain output."
-  (receive
-    ([:proc p data]
-      (testrun--recv proc (if (= p proc) (testrun--feed buf data) buf)))
-    ([:proc-err p data]
-      (do (when (= p proc) (doseq (line (string-split data "\n"))
-                             (when (not= (trim line) "") (send (testrun--editor) (test-output-event line)))))
-        (testrun--recv proc buf)))
-    ([:proc-closed p code]
-      (if (= p proc)
-        (do (when (not= (trim buf) "") (testrun--dispatch-line buf))
-          (send (testrun--editor) (test-done-event code))
-          (testrun--loop))
-        (testrun--recv proc buf)))
-    ([:run argv root]
-      (do (try (proc-close proc) (catch e nil))
-        (testrun--recv (proc-spawn "nest" argv {:cwd root}) "")))
-    ([:shutdown]
-      (do (try (proc-close proc) (catch e nil)) :testrun-stopped))))
-
-(defn testrun--loop ()
-  "Idle between runs — runs are human-paced, so hibernate while waiting."
-  (hibernate)
-  (receive
-    ([:run argv root] (testrun--recv (proc-spawn "nest" argv {:cwd root}) ""))
-    ([:shutdown] :testrun-stopped)))
+(defn testrun--handlers ()
+  "The `procstream` handlers: stdout decodes into event records, stderr forwards as
+plain output, the exit becomes the done event."
+  {:on-line testrun--dispatch-line
+   :on-err-line (fn (line) (send (testrun--editor) (test-output-event line)))
+   :on-done (fn (code) (send (testrun--editor) (test-done-event code)))})
 
 (defn testrun--clear-marks (m)
   "Drop every buffer's `:test-marks` — a fresh run's verdicts replace the last run's."
   (assoc m :buffers
-    (into [] (map (fn (b) (dissoc b :test-marks :test-marks-count)) (:buffers m)))))
+    (into [] (map (fn (b) (dissoc b :test-marks :test-marks-count :test-marks-rope))
+               (:buffers m)))))
 
 (defn testrun-start (m specs root label)
   "Write the runner script for `specs`, (re)start the `:testrun` worker, reset the
 *Tests* buffer (and every buffer's old verdict marks), and remember the invocation
 for `g`/rerun."
   (spit *testrun-script-path* (testrun--script-source specs))
-  (let (proc (spawn :testrun (testrun--loop))
+  (let (proc (spawn :testrun (procstream/procstream-loop (testrun--handlers)))
         argv ["run" *testrun-script-path*]
         ;; the runner reads FILES — a spec'd buffer with unsaved edits tests the
         ;; saved content, and the echo should say so rather than let it surprise
@@ -195,7 +166,7 @@ for `g`/rerun."
                          (let (i (testrun--buffer-for m (get spec :file)))
                            (and i (:modified (ed-buf-at m i)))))
                    specs))
-    (send proc [:run argv root])
+    (send proc [:run "nest" argv root])
     (ed-show-named-aside
       (message (assoc (testrun--clear-marks m)
                  :testrun {:specs specs :root root :label label
@@ -260,11 +231,13 @@ marks nothing."
             idx (when (int? line) (testrun--buffer-for m relpath)))
         (if (nil? idx)
           m
-          (let (b (ed-buf-at m idx))
+          (let (b (ed-buf-at m idx)
+                verdict (cond (get r :skipped) :skipped (get r :passed) true else false))
             (update m :buffers assoc idx
               (assoc b
-                :test-marks (assoc (or (:test-marks b) {}) (dec line) (get r :passed))
-                :test-marks-count (buffer-line-count b)))))))))
+                :test-marks (assoc (or (:test-marks b) {}) (dec line) verdict)
+                :test-marks-count (buffer-line-count b)
+                :test-marks-rope (buffer-rope b)))))))))
 
 (impl UiEvent test-result-event
   ;; A finished test streams into *Tests* AND stamps its ✓/✗ into the test file's

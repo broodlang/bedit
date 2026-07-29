@@ -21,6 +21,7 @@ and forwards `UiEvent` records the loop folds."
   (:use json))  ; json-parse — decode the taps' event lines
 
 (require 'debugger)  ; debugger-spy-tap-form — the shared spy tap the script splices in
+(require 'procstream)  ; the shared streaming-subprocess worker (:apprun rides it)
 
 (def *run-buffer* "*Run*")
 (def *apprun-script-path* "/tmp/myedit-apprun.blsp")
@@ -87,41 +88,12 @@ testrun--decode-line shape; the shared decoder is a fold-up candidate)."
       :output (send (apprun--editor) (apprun-output-event (second kv)))
       nil)))
 
-(defn apprun--feed (buf data)
-  (let (parts (string-split (str buf data) "\n")
-        complete (take (dec (count parts)) parts))
-    (doseq (line complete) (apprun--dispatch-line line))
-    (last parts)))
-
-(defn apprun--recv (proc buf)
-  "Stream the app until it exits; `[:run …]` mid-flight restarts it, `[:shutdown]`
-kills it (the stop command)."
-  (receive
-    ([:proc p data]
-      (apprun--recv proc (if (= p proc) (apprun--feed buf data) buf)))
-    ([:proc-err p data]
-      (do (when (= p proc)
-            (doseq (line (string-split data "\n"))
-              (when (not= (trim line) "") (send (apprun--editor) (apprun-output-event line)))))
-        (apprun--recv proc buf)))
-    ([:proc-closed p code]
-      (if (= p proc)
-        (do (when (not= (trim buf) "") (apprun--dispatch-line buf))
-          (send (apprun--editor) (apprun-done-event code))
-          (apprun--loop))
-        (apprun--recv proc buf)))
-    ([:run argv root]
-      (do (try (proc-close proc) (catch e nil))
-        (apprun--recv (proc-spawn "nest" argv {:cwd root}) "")))
-    ([:shutdown]
-      (do (try (proc-close proc) (catch e nil)) :apprun-stopped))))
-
-(defn apprun--loop ()
-  "Idle between runs — hibernate while waiting."
-  (hibernate)
-  (receive
-    ([:run argv root] (apprun--recv (proc-spawn "nest" argv {:cwd root}) ""))
-    ([:shutdown] :apprun-stopped)))
+(defn apprun--handlers ()
+  "The `procstream` handlers: stdout decodes into spy/stats/output events, stderr
+forwards as plain output, the exit becomes the done event."
+  {:on-line apprun--dispatch-line
+   :on-err-line (fn (line) (send (apprun--editor) (apprun-output-event line)))
+   :on-done (fn (code) (send (apprun--editor) (apprun-done-event code)))})
 
 ;; ---- rendering + folds -------------------------------------------------------------
 
@@ -132,16 +104,10 @@ kills it (the stop command)."
     else (str n " B")))
 
 (defn apprun-spy-line (e)
-  "One *Run* line for a decoded spy entry (pr-str'd fields from the tap)."
-  (case (get e :kind)
-    "enter" (str "spy " (get e :form))
-    "node" (str "  " (get e :form) " => " (get e :value))
-    "exit" (str "=> " (get e :value))
-    "call" (str "call (" (get e :fn) " " (or (get e :args) "") ")")
-    "return" (str "  " (get e :fn) " => " (get e :value))
-    "span-enter" (str "span " (get e :form))
-    "span-exit" (str "span => " (get e :value))
-    (pr-str e)))
+  "One *Run* line for a decoded spy entry — the tap pr-str'd the fields, so this is
+the shared renderer verbatim (`debugger-spy-body`)."
+  (debugger/debugger-spy-body (get e :kind) (get e :form) (get e :value)
+    (get e :fn) (get e :args)))
 
 (defn apprun-stats-line (s)
   "The one-line stats rendering (the chip tooltip's first line)."
@@ -187,8 +153,8 @@ the debug taps installed — app output, coloured spy/trace traffic and a stats
 heartbeat stream into *Run*."
   (spit *apprun-script-path* (apprun--script-source))
   (let (root (or (:project-root m) (cwd))
-        proc (spawn :apprun (apprun--loop)))
-    (send proc [:run ["run" *apprun-script-path*] root])
+        proc (spawn :apprun (procstream/procstream-loop (apprun--handlers))))
+    (send proc [:run "nest" ["run" *apprun-script-path*] root])
     (ed-show-named-aside
       (message (assoc m :apprun {:root root}) (str "running project in " root "…"))
       *run-buffer*
