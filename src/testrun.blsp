@@ -172,16 +172,23 @@ plain output."
     ([:run argv root] (testrun--recv (proc-spawn "nest" argv {:cwd root}) ""))
     ([:shutdown] :testrun-stopped)))
 
+(defn testrun--clear-marks (m)
+  "Drop every buffer's `:test-marks` — a fresh run's verdicts replace the last run's."
+  (assoc m :buffers
+    (into [] (map (fn (b) (dissoc b :test-marks :test-marks-count)) (:buffers m)))))
+
 (defn testrun-start (m specs root label)
   "Write the runner script for `specs`, (re)start the `:testrun` worker, reset the
-*Tests* buffer, and remember the invocation for `g`/rerun."
+*Tests* buffer (and every buffer's old verdict marks), and remember the invocation
+for `g`/rerun."
   (spit *testrun-script-path* (testrun--script-source specs))
   (let (proc (spawn :testrun (testrun--loop))
         argv ["run" *testrun-script-path*])
     (send proc [:run argv root])
     (ed-show-named-aside
-      (message (assoc m :testrun {:specs specs :root root :label label
-                                  :passed 0 :failed 0})
+      (message (assoc (testrun--clear-marks m)
+                 :testrun {:specs specs :root root :label label
+                           :passed 0 :failed 0})
         (str "testing " label "…"))
       *tests-buffer*
       (str "-*- tests: " label " -*-\n\n")
@@ -214,14 +221,46 @@ failing one)."
       row
       (join "\n" (cons row (map testrun--loc-line (get r :failures)))))))
 
+(defn testrun--buffer-for (m relpath)
+  "The pool index of the open buffer backing `relpath` (a run-root-relative test
+file), or nil — matched by path suffix."
+  (first (keep (fn (i)
+                 (let (f (buffer-file (ed-buf-at m i)))
+                   (when (and f (ends-with? f relpath)) i)))
+           (range (count (:buffers m))))))
+
+(defn testrun--annotate (m r)
+  "Stamp a finished test's verdict into its buffer's margin (`:test-marks
+{0-based-line passed?}`, drawn by `modes/gutter-mark-for`): ✓/✗ on the test's
+declaration line, dimmed by the gutter once the buffer is edited. The `:where`
+carries `relpath:line`; a test with no recorded position, or whose file isn't open,
+marks nothing."
+  (let (where (or (get r :where) ""))
+    (if (= where "")
+      m
+      (let (parts (string-split where ":")
+            line (string->number (last parts))
+            relpath (join ":" (take (dec (count parts)) parts))
+            idx (when (int? line) (testrun--buffer-for m relpath)))
+        (if (nil? idx)
+          m
+          (let (b (ed-buf-at m idx))
+            (update m :buffers assoc idx
+              (assoc b
+                :test-marks (assoc (or (:test-marks b) {}) (dec line) (get r :passed))
+                :test-marks-count (buffer-line-count b)))))))))
+
 (impl UiEvent test-result-event
-  ;; A finished test streams into *Tests*; failures also bump the model's count so
-  ;; the summary echo can say "3 failed" before the summary line lands.
+  ;; A finished test streams into *Tests* AND stamps its ✓/✗ into the test file's
+  ;; margin; failures also bump the model's count so the summary echo can say
+  ;; "3 failed" before the summary line lands.
   (ui-event-fold [e m textrows cols rows]
     (let (r (test-result-event-result e)
           key (if (get r :passed) :passed :failed)
           m1 (update-in m [:testrun key] (fn (n) (inc (or n 0)))))
-      (ed-append-named m1 *tests-buffer* (str (testrun-result-lines r) "\n")))))
+      (testrun--annotate
+        (ed-append-named m1 *tests-buffer* (str (testrun-result-lines r) "\n"))
+        r))))
 
 (impl UiEvent test-summary-event
   (ui-event-fold [e m textrows cols rows]
