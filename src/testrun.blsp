@@ -28,6 +28,7 @@ suite's own output is visible rather than lost."
   (:use json))  ; json-parse — decode the runner's event lines
 
 (require 'path)  ; path/basename — run labels (bare require: path's `join` must not shadow prelude's)
+(require 'debugger)  ; debugger-spy-tap-form — the shared spy tap the script splices in
 
 (def *tests-buffer* "*Tests*")
 
@@ -58,17 +59,8 @@ suite's own output is visible rather than lost."
     ;; a modest parallel batch: the editor may live in a small container, and
     ;; `nest run` sets no test memory ceiling (that's `nest test`'s ADR-043 default)
     '(def *parallel-batch* 2)
-    ;; spy in test code streams out too (the apprun tap): one JSON line per entry
-    '(def *spy-sink*
-       (fn (e)
-         (println (json/json-encode
-                    {:event "spy"
-                     :kind (name (get e :spy))
-                     :form (when (get e :form) (pr-str (get e :form)))
-                     :value (when (contains? e :value) (pr-str (get e :value)))
-                     :fn (when (get e :fn) (str (get e :fn)))
-                     :args (when (get e :args) (pr-str (get e :args)))
-                     :depth (get e :depth)}))))
+    ;; spy in test code streams out too — the shared debugger tap
+    debugger/debugger-spy-tap-form
     ;; the streaming seam: `*test-report-sink*` (a defdyn, so a root-rebinding `def`
     ;; installs it image-wide — `trace-result` itself is a reserved name, ADR-166)
     ;; is handed each finished result in the worker — emit one JSON line per test
@@ -125,12 +117,8 @@ a terminal run, noise in *Tests*."
 The driver's progress dots print WITHOUT a newline from another process, so a JSON
 line can arrive with a `F..`-style prefix — salvage by re-parsing from the first
 `{` when the line plainly carries an event object."
-  (let (parse (fn (s) (try (json-parse s) (catch e nil)))
-        parsed (or (parse line)
-                 (let (i (index-of line "{"))
-                   (when (and (includes? line "\"event\":") (>= i 0))
-                     (parse (substring line i (string-length line))))))
-        event (when (map? parsed) (get parsed :event)))
+  (let (parsed (ed-json-event-line line)
+        event (when parsed (get parsed :event)))
     (cond
       (= event "test") [:test parsed]
       (= event "summary") [:summary parsed]
@@ -200,13 +188,20 @@ plain output."
 for `g`/rerun."
   (spit *testrun-script-path* (testrun--script-source specs))
   (let (proc (spawn :testrun (testrun--loop))
-        argv ["run" *testrun-script-path*])
+        argv ["run" *testrun-script-path*]
+        ;; the runner reads FILES — a spec'd buffer with unsaved edits tests the
+        ;; saved content, and the echo should say so rather than let it surprise
+        unsaved? (any? (fn (spec)
+                         (let (i (testrun--buffer-for m (get spec :file)))
+                           (and i (:modified (ed-buf-at m i)))))
+                   specs))
     (send proc [:run argv root])
     (ed-show-named-aside
       (message (assoc (testrun--clear-marks m)
                  :testrun {:specs specs :root root :label label
                            :passed 0 :failed 0})
-        (str "testing " label "…"))
+        (str "testing " label "…"
+          (if unsaved? "  (unsaved changes — testing the file as saved)" "")))
       *tests-buffer*
       (str "-*- tests: " label " -*-\n\n")
       :test-menu)))
@@ -366,17 +361,6 @@ the parallel batch.)"
 (def test-face-spy {:fg *teal*})  ; spy traffic from inside a test
 (def test-face-header {:fg *subtext* :bold true})
 
-(defn testrun--fontify-lines (lines off line-face acc)
-  ;; the whole-line span accumulator every report fontifier hand-rolls (git, bshell,
-  ;; here) — the shared shape worth pulling into std/editor/highlight one day
-  (if (empty? lines)
-    acc
-    (let (line (first lines)
-          face (line-face line)
-          spans (if (nil? face) '() (list [off (+ off (string-length line)) face])))
-      (testrun--fontify-lines (rest lines) (+ off (string-length line) 1) line-face
-        (append acc spans)))))
-
 (defn testrun--line-face (line)
   (let (t (triml line))
     (cond
@@ -391,7 +375,7 @@ the parallel batch.)"
 (defn testrun-fontify (src)
   "The *Tests* `:fontify`: green ✓ rows, red ✗ rows, blue jumpable locations, dim
 suite output."
-  (testrun--fontify-lines (string-split src "\n") 0 testrun--line-face '()))
+  (modes/fontify-line-faces src testrun--line-face))
 
 (def test-menu-mode-layer
   {:name 'test-menu
