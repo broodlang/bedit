@@ -29,10 +29,10 @@ and forwards `UiEvent` records the loop folds."
 
 ;; ---- the async events (UiEvent records — see model.blsp) --------------------
 
-(defrecord apprun-output-event (text))  ; one line of the app's own stdout/stderr
-(defrecord apprun-spy-event (entry))  ; a spy/trace-fn entry: {:kind :form :value :fn :args :depth}
-(defrecord apprun-stats-event (stats))  ; the heartbeat: {:procs :memory :uptime-ms}
-(defrecord apprun-done-event (code))  ; the app exited
+(defrecord apprun-output-event (text gen))  ; one line of the app's own stdout/stderr
+(defrecord apprun-spy-event (entry gen))  ; a spy/trace-fn entry: {:kind :form :value :fn :args :depth}
+(defrecord apprun-stats-event (stats gen))  ; the heartbeat: {:procs :memory :uptime-ms}
+(defrecord apprun-done-event (code gen))  ; the app exited
 
 ;; ---- the generated wrapper script ----------------------------------------------
 ;; Quoted forms, pr-str'd (the testrun pattern). The taps go in BEFORE run-project
@@ -80,54 +80,61 @@ testrun--decode-line shape; the shared decoder is a fold-up candidate)."
       (= (trim line) "") [:drop]
       else [:output line])))
 
-(defn apprun--dispatch-line (line)
+(defn apprun--dispatch-line (line gen)
   (let (kv (apprun--decode-line line))
     (case (first kv)
-      :spy (send (apprun--editor) (apprun-spy-event (second kv)))
-      :stats (send (apprun--editor) (apprun-stats-event (second kv)))
-      :output (send (apprun--editor) (apprun-output-event (second kv)))
+      :spy (send (apprun--editor) (apprun-spy-event (second kv) gen))
+      :stats (send (apprun--editor) (apprun-stats-event (second kv) gen))
+      :output (send (apprun--editor) (apprun-output-event (second kv) gen))
       nil)))
 
 (defn apprun--handlers ()
-  "The `procstream` handlers: stdout decodes into spy/stats/output events, stderr
-forwards as plain output, the exit becomes the done event."
+  "The `procstream` handlers (each takes the run token): stdout decodes into
+spy/stats/output events, stderr forwards as plain output, the exit becomes done."
   {:on-line apprun--dispatch-line
-   :on-err-line (fn (line) (send (apprun--editor) (apprun-output-event line)))
-   :on-done (fn (code) (send (apprun--editor) (apprun-done-event code)))})
+   :on-err-line (fn (line gen) (send (apprun--editor) (apprun-output-event line gen)))
+   :on-done (fn (code gen) (send (apprun--editor) (apprun-done-event code gen)))})
 
 ;; ---- rendering + folds -------------------------------------------------------------
 
 (defn apprun-bytes-human (n)
   (cond
-    (>= n 1048576) (str (quot n 1048576) "." (quot (rem (quot n 1024) 1024) 105) " MB")
+    (>= n 1048576) (str (quot n 1048576) "." (quot (rem (quot n 1024) 1024) 102) " MB")
     (>= n 1024) (str (quot n 1024) " KB")
     else (str n " B")))
-
-(defn apprun-spy-line (e)
-  "One *Run* line for a decoded spy entry — the tap pr-str'd the fields, so this is
-the shared renderer verbatim (`debugger-spy-body`)."
-  (debugger/debugger-spy-body (get e :kind) (get e :form) (get e :value)
-    (get e :fn) (get e :args)))
 
 (defn apprun-stats-line (s)
   "The one-line stats rendering (the chip tooltip's first line)."
   (str (get s :procs) " procs · " (apprun-bytes-human (or (get s :memory) 0))
     " · up " (quot (or (get s :uptime-ms) 0) 1000) "s"))
 
+(defn apprun--current? (m gen)
+  "Whether `gen` is the running app's generation — a superseded run's straggler is
+dropped."
+  (= gen (get-in m [:apprun :gen])))
+
 (impl UiEvent apprun-output-event
   (ui-event-fold [e m textrows cols rows]
-    (ed-append-named m *run-buffer* (str (apprun-output-event-text e) "\n"))))
+    (if (apprun--current? m (apprun-output-event-gen e))
+      (ed-append-named m *run-buffer* (str (apprun-output-event-text e) "\n"))
+      m)))
 
 (impl UiEvent apprun-spy-event
   (ui-event-fold [e m textrows cols rows]
-    (ed-append-named m *run-buffer* (str "~ " (apprun-spy-line (apprun-spy-event-entry e)) "\n"))))
+    (if (apprun--current? m (apprun-spy-event-gen e))
+      (ed-append-named m *run-buffer*
+        (str "~ " (let (sp (apprun-spy-event-entry e))
+                    (debugger/debugger-spy-body (get sp :kind) (get sp :form) (get sp :value)
+                      (get sp :fn) (get sp :args)))
+          "\n"))
+      m)))
 
 (impl UiEvent apprun-stats-event
   ;; model-only: the statusbar chip renders the stats live and its hover carries the
   ;; detail (current + peak) — *Run* stays the app's OWN output, never the taps'.
   ;; Peaks make a leak/spawn-storm visible even if you look after it settled.
   (ui-event-fold [e m textrows cols rows]
-    (if (nil? (:apprun m))
+    (if (not (apprun--current? m (apprun-stats-event-gen e)))
       m
       (let (s (apprun-stats-event-stats e)
             peak (get-in m [:apprun :peak] {}))
@@ -137,12 +144,15 @@ the shared renderer verbatim (`debugger-spy-body`)."
                  :memory (max (or (get s :memory) 0) (or (get peak :memory) 0))})))))
 
 (impl UiEvent apprun-done-event
-  ;; drop :apprun so the statusbar chip disappears with the app
+  ;; drop :apprun so the statusbar chip disappears with the app. A stale-gen done
+  ;; (an old run exiting just as a new one starts) must NOT clear the new run's chip.
   (ui-event-fold [e m textrows cols rows]
-    (let (code (apprun-done-event-code e))
-      (message (ed-append-named (dissoc m :apprun) *run-buffer*
-                 (str "\n[app exited " (if (nil? code) "killed" code) "]\n"))
-        (str "app exited " (if (nil? code) "(killed)" code))))))
+    (if (not (apprun--current? m (apprun-done-event-gen e)))
+      m
+      (let (code (apprun-done-event-code e))
+        (message (ed-append-named (dissoc m :apprun) *run-buffer*
+                   (str "\n[app exited " (if (nil? code) "killed" code) "]\n"))
+          (str "app exited " (if (nil? code) "(killed)" code)))))))
 
 ;; ---- the commands -------------------------------------------------------------------
 
@@ -153,10 +163,11 @@ the debug taps installed — app output, coloured spy/trace traffic and a stats
 heartbeat stream into *Run*."
   (spit *apprun-script-path* (apprun--script-source))
   (let (root (or (:project-root m) (cwd))
-        proc (spawn :apprun (procstream/procstream-loop (apprun--handlers))))
-    (send proc [:run "nest" ["run" *apprun-script-path*] root])
+        proc (spawn :apprun (procstream/procstream-loop (apprun--handlers)))
+        gen (inc (or (get-in m [:apprun :gen]) 0)))
+    (send proc [:run "nest" ["run" *apprun-script-path*] root gen])
     (ed-show-named-aside
-      (message (assoc m :apprun {:root root}) (str "running project in " root "…"))
+      (message (assoc m :apprun {:root root :gen gen}) (str "running project in " root "…"))
       *run-buffer*
       (str "-*- run: " root " -*-\n\n")
       :run-log)))
@@ -168,12 +179,13 @@ heartbeat stream into *Run*."
 
 (defcommand cmd-run-stop
   (m key)
-  "Stop the running app (C-c r k)."
-  (let (proc (whereis :apprun))
-    (if (nil? proc)
-      (message m "nothing is running")
-      (do (send proc [:shutdown])
-        (message m "app stopped")))))
+  "Stop the running app (C-c r k). Keys off the model's `:apprun` (a live run), not
+the worker's mere existence — the worker idles alive between runs. `[:shutdown]`
+fires the done event, so the chip clears and *Run* gets its footer."
+  (if (nil? (:apprun m))
+    (message m "nothing is running")
+    (do (send (whereis :apprun) [:shutdown])
+      m)))
 
 ;; ---- the :run-log buffer type ---------------------------------------------------
 
@@ -195,7 +207,7 @@ heartbeat stream into *Run*."
     else nil))
 
 (defn run-log-fontify (src)
-  "The *Run* `:fontify`: teal spy traffic, dim heartbeats, red error locations."
+  "The *Run* `:fontify`: teal spy traffic, red error locations."
   (modes/fontify-line-faces src apprun--line-face))
 
 (def run-log-mode-layer

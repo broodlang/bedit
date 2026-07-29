@@ -73,30 +73,39 @@ keys snapshots by pid and the *Debug* rows carry stable indices per render."
   (when (not (empty? pending))
     (send editor (debug-trace-event (reverse pending)))))
 
-(defn debugger--gather (editor pending)
-  (receive
-    ([:trace entry from] (debugger--gather editor (cons (debugger--entry from entry) pending)))
-    ([:span-enter span parent pid label]
-      (debugger--gather editor (cons (debugger--entry pid {:spy :span-enter :label label}) pending)))
-    ([:span-exit span pid value]
-      (debugger--gather editor (cons (debugger--entry pid {:spy :span-exit :value value}) pending)))
-    ([:break pid snap]
-      (do (debugger--flush editor pending)
-        (send editor (debug-break-event pid snap))
-        (debugger--loop editor)))
-    ([:stop] (do (debugger--flush editor pending) :debugger-stopped))
-    (after *spy-flush-ms*
-      (do (debugger--flush editor pending)
-        (debugger--loop editor)))))
+(defn debugger--gather (editor pending deadline)
+  ;; `deadline` is ABSOLUTE: `(after …)` restarts per receive, so a steady trace
+  ;; flood would otherwise reset the timer forever and flush nothing.
+  (let (remaining (- deadline (now)))
+    (if (<= remaining 0)
+      (do (debugger--flush editor pending) (debugger--loop editor))
+      (receive
+        ([:trace entry from]
+          (debugger--gather editor (cons (debugger--entry from entry) pending) deadline))
+        ([:span-enter span parent pid label]
+          (debugger--gather editor (cons (debugger--entry pid {:spy :span-enter :label label}) pending) deadline))
+        ([:span-exit span pid value]
+          (debugger--gather editor (cons (debugger--entry pid {:spy :span-exit :value value}) pending) deadline))
+        ([:break pid snap]
+          (do (debugger--flush editor pending)
+            (send editor (debug-break-event pid snap))
+            (debugger--loop editor)))
+        ([:stop] (do (debugger--flush editor pending) :debugger-stopped))
+        (after remaining
+          (do (debugger--flush editor pending)
+            (debugger--loop editor)))))))
 
 (defn debugger--loop (editor)
   "The quiet state: park (cheaply, forever) until debug traffic arrives."
   (receive
-    ([:trace entry from] (debugger--gather editor (list (debugger--entry from entry))))
+    ([:trace entry from]
+      (debugger--gather editor (list (debugger--entry from entry)) (+ (now) *spy-flush-ms*)))
     ([:span-enter span parent pid label]
-      (debugger--gather editor (list (debugger--entry pid {:spy :span-enter :label label}))))
+      (debugger--gather editor (list (debugger--entry pid {:spy :span-enter :label label}))
+        (+ (now) *spy-flush-ms*)))
     ([:span-exit span pid value]
-      (debugger--gather editor (list (debugger--entry pid {:spy :span-exit :value value}))))
+      (debugger--gather editor (list (debugger--entry pid {:spy :span-exit :value value}))
+        (+ (now) *spy-flush-ms*)))
     ([:break pid snap]
       (do (send editor (debug-break-event pid snap))
         (debugger--loop editor)))
@@ -141,14 +150,17 @@ pre-rendered its fields)."
     (str "[" (debugger--pid-label (:pid traced)) "] " body)))
 
 (defn debugger--vals-preview (vals)
-  "The captured-locals cell of a *Debug* row (`{:name value …}`, `break`'s map)."
-  (let (s (pr-str vals))
+  "The captured-locals cell of a *Debug* row (`{:name value …}`, `break`'s map) —
+one line always: an embedded newline would split the row and desync the N column
+the row commands parse."
+  (let (s (replace (pr-str vals) "\n" "␤"))
     (if (> (string-length s) 48) (str (substring s 0 47) "…") s)))
 
-(defn debugger-buffer-text (paused order traced)
+(defn debugger-buffer-text (paused order breakpoints traced)
   "The *Debug* buffer text: one row per parked process (stable indices from `order`,
-the pid list of this render), then the instrumented fns. `r` resume · `R` resume all
-· `e` eval in the row's captured scope · `g` refresh."
+the pid list of this render), then the breakpoints (ours) and traces (std's),
+separately — they are different registries with different lifecycles. `r` resume ·
+`R` resume all · `e` eval in the row's captured scope · `g` refresh."
   (let (rows (map (fn (i)
                     (let (pid (nth order i)
                           snap (get paused pid))
@@ -159,7 +171,9 @@ the pid list of this render), then the instrumented fns. `r` resume · `R` resum
                (range (count order))))
     (str (pad-right "N" 4) (pad-right "PID" 6) (pad-right "LABEL" 24) "VALS\n"
       (if (empty? rows) "(no parked processes)" (join "\n" rows))
-      "\n\ntraced fns: "
+      "\n\nbreakpoints: "
+      (if (empty? breakpoints) "(none)" (join " " (map str breakpoints)))
+      "\ntraced fns: "
       (if (empty? traced) "(none)" (join " " (map str traced)))
       "\n\nr resume · R resume all · e eval in scope · g refresh\n")))
 
@@ -181,10 +195,16 @@ screen must not go stale); record this render's row order for the row commands."
         idx (ed-buffer-index-by-name m1 *debug-buffer*))
     (if (nil? idx)
       m1
-      (update m1 :buffers assoc idx
-        (ed-stamp (assoc (make-buffer (debugger-buffer-text paused order (debug/traced-fns))
-                           *debug-buffer* nil)
-                    :type :debug-menu))))))
+      (let (old (ed-buf-at m1 idx)
+            fresh (ed-stamp (assoc (make-buffer
+                                     (debugger-buffer-text paused order
+                                       (debugger-breakpoints) (debug/traced-fns))
+                                     *debug-buffer* nil)
+                              :type :debug-menu)))
+        ;; keep point where the user parked it — a break arriving mid-inspection
+        ;; must not drop the cursor back onto the header
+        (update m1 :buffers assoc idx
+          (goto-char fresh (min (buffer-point old) (buffer-length fresh))))))))
 
 (defn debugger--ensure-spy-type (m)
   "Stamp a freshly-created *Spy* as `:spy-log` (colours + special-mode) — the log
@@ -207,16 +227,35 @@ sink is created lazily by the first append, untyped."
 
 (impl UiEvent debug-break-event
   ;; A parked process → record its snapshot (pid-keyed), tell the user, and refresh
-  ;; a visible *Debug* so the queue on screen is never stale.
+  ;; a visible *Debug* so the queue on screen is never stale. With NO live session
+  ;; (stopped, or a stale context in a child spawned during an old one) recording
+  ;; would strand the pid — release it immediately instead.
   (ui-event-fold [e m textrows cols rows]
     (let (pid (debug-break-event-pid e)
-          snap (debug-break-event-snapshot e)
-          m1 (assoc-in m [:debug :paused pid] snap))
-      (message (debugger--rerender m1)
-        (str "process " (debugger--pid-label pid) " paused at " (:label snap)
-          " — C-c d d to inspect")))))
+          snap (debug-break-event-snapshot e))
+      (if (debug-session-active? m)
+        (message (debugger--rerender (assoc-in m [:debug :paused pid] snap))
+          (str "process " (debugger--pid-label pid) " paused at " (:label snap)
+            " — C-c d d to inspect"))
+        (do (debugger--resume pid)
+          (message m (str "process " (debugger--pid-label pid) " hit a stale breakpoint at "
+                       (:label snap) " — resumed (no debug session)")))))))
 
 ;; ---- the session ----------------------------------------------------------------
+
+(def *debugger-collector* nil)
+;; the ONE collector pid — it survives a session stop deliberately: children spawned
+;; during an old session keep the copied trace context (the kernel copies it at
+;; spawn), and their late `break` must reach a LIVE endpoint so the break fold can
+;; auto-resume them instead of leaving them parked at a dead pid's void.
+
+(defn debugger--collector ()
+  "The live collector, spawned on first use and reused across sessions."
+  (if (and (not (nil? *debugger-collector*)) (process-info *debugger-collector*))
+    *debugger-collector*
+    (let (c (debugger-collector-start (whereis :editor)))
+      (def *debugger-collector* c)
+      c)))
 
 (defn debug-session-active? (m) (not (nil? (get-in m [:debug :collector]))))
 
@@ -232,18 +271,28 @@ it) and route the image-wide `*spy-sink*` to the debugger sink. Stop: restore bo
 resume anything still parked, drop the state (the *Spy*/*Debug* buffers stay for
 reading). A `spy`/`break` in code spawned before the session start is unaffected."
   (if (debug-session-active? m)
-    (let (paused (get-in m [:debug :paused] {}))
+    (let (paused (get-in m [:debug :paused] {})
+          prior (get-in m [:debug :prior-sink]))
       (doseq (pid (keys paused)) (debugger--resume pid))
-      (send (get-in m [:debug :collector]) [:stop])
+      ;; the collector stays alive (see *debugger-collector*) — only the wiring goes
       (%set-trace-context nil)
-      (def *spy-sink* nil)
-      (debug/untrace-all)  ; stopping the session restores every instrumented fn
+      (def *spy-sink* prior)  ; RESTORE, not nil — a pre-session sink survives us
+      (debug/untrace-all)
+      (debugger-clear-all-breakpoints)
       (message (debugger--remark (debugger--rerender (dissoc m :debug)))
         "debug session stopped — instrumentation removed"))
-    (let (collector (debugger-collector-start (self)))
+    (let (collector (debugger--collector)
+          prior *spy-sink*
+          editor-pid (self))
       (%set-trace-context {:debugger collector :span nil})
-      (def *spy-sink* (debug/debugger-sink))
-      (message (assoc m :debug {:collector collector :paused {} :order '()})
+      ;; the editor process's own emissions are DROPPED at the sink: a traced fn on
+      ;; the append path would otherwise feed back (*Spy* append -> trace -> append…)
+      ;; and flood; spawned processes (evals, tasks, shells) flow through untouched
+      (def *spy-sink*
+        (let (inner (debug/debugger-sink))
+          (fn (entry) (when (not= (self) editor-pid) (inner entry)))))
+      (message (assoc m :debug {:collector collector :paused {} :order '()
+                                :prior-sink prior})
         "debug session started — spy/break/trace-fn now land in *Spy* / *Debug*"))))
 
 (defn debugger--ensure-session (m)
@@ -276,32 +325,32 @@ value to *Spy* (`trace-fn`, ADR-184 — no source edit; `C-c d u` untraces)."
   "Set a function-boundary breakpoint (C-c d b): every caller parks on entry with its
 args captured for eval-in-scope (`break-fn`, ADR-184). `C-c d u` removes it."
   (debugger--fn-prompt (debugger--ensure-session m) "Break on function: "
-    (fn (mm sym) (debugger--set-breakpoint mm sym))))
+    (fn (mm sym) (debugger--set-breakpoint mm sym nil))))
 
 (defcommand cmd-debug-untrace-fn
   (m key)
-  "Remove one function's trace/breakpoint (C-c d u) — restores the original definition."
-  (let (traced (debug/traced-fns))
-    (if (empty? traced)
-      (message m "nothing is traced")
+  "Remove one trace or breakpoint (C-c d u) — restores the original definition.
+Completes over BOTH registries (std's traces + our breakpoints)."
+  (let (names (append (map str (debug/traced-fns)) (map str (debugger-breakpoints))))
+    (if (empty? names)
+      (message m "nothing is instrumented")
       (assoc m :minibuffer
-        (ed-name-prompt "Untrace function: " (sort (map str traced))
+        (ed-name-prompt "Remove instrumentation: " (sort names)
           (fn (mm nm)
             (let (sym (read-string nm))
-              (debug/untrace-fn sym)
-              (message
-                (debugger--remark
-                  (debugger--rerender
-                    (update-in mm [:debug :break-syms]
-                      (fn (syms) (remove (fn (s) (= s sym)) (or syms '()))))))
-                (str "untraced " nm)))))))))
+              (if (member? sym (debugger-breakpoints))
+                (debugger--clear-breakpoint (debugger--rerender mm) sym)
+                (do (debug/untrace-fn sym)
+                  (message (debugger--remark (debugger--rerender mm))
+                    (str "untraced " nm)))))))))))
 
 (defcommand cmd-debug-untrace-all
   (m key)
-  "Remove every trace/breakpoint (M-x debug-untrace-all)."
-  (let (n (debug/untrace-all)
-        m1 (if (:debug m) (assoc-in m [:debug :break-syms] '()) m))
-    (message (debugger--remark (debugger--rerender m1)) (str "untraced " n " function(s)"))))
+  "Remove every trace AND breakpoint (M-x debug-untrace-all)."
+  (let (traces (debug/untrace-all)
+        breaks (debugger-clear-all-breakpoints))
+    (message (debugger--remark (debugger--rerender m))
+      (str "removed " traces " trace(s) + " breaks " breakpoint(s)"))))
 
 ;; ---- the *Debug* buffer (the paused queue) ---------------------------------------
 
@@ -314,7 +363,7 @@ plus the instrumented fns. `r`/`R` resume, `e` evals in a row's captured scope."
         order (debugger--order paused))
     (ed-show-named (assoc-in m1 [:debug :order] order)
       *debug-buffer*
-      (debugger-buffer-text paused order (debug/traced-fns))
+      (debugger-buffer-text paused order (debugger-breakpoints) (debug/traced-fns))
       :debug-menu)))
 
 (defn debugger--leading-int (line)
@@ -405,34 +454,81 @@ or nil for any other line."
                (string-split text "\n")))
     (when (not (empty? hits)) (trimr (first (string-split (first hits) ")"))))))
 
-(defn debugger-defn-line-at (buf line)
-  "The nearest top-level definition head AT or ABOVE `line` — a margin click works
-from anywhere inside a definition's body, not just its head line (the IDE
-convention). Test scaffolding (`describe`/`test` blocks) is skipped over: the margin
-is the DEBUGGER's margin, and only a function can carry a boundary breakpoint. nil
-when `line` sits above the first definition."
+(defn debugger--head-at (buf line)
+  "The nearest TOP-LEVEL `(def…)` head at or above `line`: `[:fn N]` for a
+defn/defcommand (breakpointable), `[:other N head-word]` for any other definition
+form (defmacro/defrecord/defability/… — no fn boundary to break on; walking PAST it
+would silently retarget the previous defn), nil above everything. Test scaffolding
+(describe/test) is body content and is skipped."
   (cond
     (< line 0) nil
-    (not (nil? (debugger-defn-name (buffer-line-at buf line)))) line
-    else (debugger-defn-line-at buf (dec line))))
+    else (let (raw (buffer-line-at buf line))
+           (cond
+             (not (nil? (debugger-defn-name raw))) [:fn line]
+             (starts-with? raw "(def")
+             [:other line (first (string-split (triml (substring raw 1 (string-length raw))) " "))]
+             else (debugger--head-at buf (dec line))))))
+
+(defn debugger-defn-line-at (buf line)
+  "The enclosing defn/defcommand head line for a margin click at `line` (the IDE
+convention: any body line works), or nil — including when the enclosing form is a
+non-function definition (`debugger--head-at`'s `:other`)."
+  (let (head (debugger--head-at buf line))
+    (when (= (first head) :fn) (second head))))
 
 (defn debugger--qualified-at (buf line)
-  "The fully-qualified symbol of the definition enclosing `line`, or nil."
+  "The fully-qualified `module/name` symbol of the definition enclosing `line`, or
+nil — requiring a `(defmodule …)` header. A bare name from a headerless buffer would
+qualify to root and could shadow-instrument a prelude/root binding of the same name
+(a different function than the one clicked), so we refuse it rather than guess."
   (let (head (debugger-defn-line-at buf line))
     (when head
       (let (nm (debugger-defn-name (buffer-line-at buf head))
             module (debugger-buffer-module (buffer-text buf)))
-        (read-string (if module (str module "/" nm) nm))))))
+        (when module (read-string (str module "/" nm)))))))
 
-(defn debugger--break-syms (m)
-  "The breakpointed symbols (set via the margin / C-c d b) — kept on the model,
-distinct from std's one `traced-fns` registry, so a margin toggle never silently
-removes a TRACE (C-c d t) and the ● marks only genuine breakpoints."
-  (or (get-in m [:debug :break-syms]) '()))
+(def *breakpoint-originals* {})
+;; sym -> the original fn value. The editor's OWN breakpoint registry (std's
+;; break-fn would park whatever process calls the function — including the ui-run
+;; loop itself, the only sender of [:resume]: an unrecoverable freeze). Our wrapper
+;; parks every caller EXCEPT the editor process.
+
+(defn debugger-breakpoints ()
+  "The symbols currently carrying a margin/C-c d b breakpoint."
+  (keys *breakpoint-originals*))
+
+(defn debugger--install-breakpoint (sym)
+  "Rebind `sym` to a parking wrapper. The editor's loop process runs the original
+untouched — it must never park (nothing else can resume it); every other caller
+(an eval task, a shell, app code) parks with its args captured for eval-in-scope."
+  (let (orig (or (get *breakpoint-originals* sym) (eval sym))
+        editor-pid (whereis :editor))
+    (when (not (fn? orig)) (error "breakpoint: not a function: " sym))
+    (def *breakpoint-originals* (assoc *breakpoint-originals* sym orig))
+    (eval (list 'def sym
+            (fn (& args)
+              (if (= (self) editor-pid)
+                (apply orig args)
+                (do (apply debug/break (str sym) (list :args args))
+                  (apply orig args))))))
+    sym))
+
+(defn debugger--uninstall-breakpoint (sym)
+  (let (orig (get *breakpoint-originals* sym))
+    (when orig
+      (eval (list 'def sym orig))
+      (def *breakpoint-originals* (dissoc *breakpoint-originals* sym))
+      sym)))
+
+(defn debugger-clear-all-breakpoints ()
+  "Restore every breakpointed fn; returns how many."
+  (let (syms (keys *breakpoint-originals*))
+    (doseq (sym syms) (debugger--uninstall-breakpoint sym))
+    (count syms)))
 
 (defn debugger-break-lines (buf break-syms)
   "Every 0-based line in `buf` whose definition carries a breakpoint — the
-`:debug-break-lines` annotation, recomputed after each toggle."
+`:debug-break-lines` annotation, recomputed by `debugger--remark` after each toggle."
   (let (module (debugger-buffer-module (buffer-text buf))
         lines (string-split (buffer-text buf) "\n"))
     (fold (fn (acc i)
@@ -447,7 +543,7 @@ removes a TRACE (C-c d t) and the ● marks only genuine breakpoints."
   "Refresh EVERY open .blsp buffer's breakpoint marks — a breakpoint set from the
 prompt (C-c d b) or an untrace-all must not leave stale ●s in buffers other than
 the clicked one."
-  (let (break-syms (debugger--break-syms m))
+  (let (break-syms (debugger-breakpoints))
     (assoc m :buffers
       (into []
         (map (fn (b)
@@ -459,51 +555,59 @@ the clicked one."
                    b)))
           (:buffers m))))))
 
-(defn debugger--ensure-loaded (m sym)
-  "Make `sym`'s definition live in the image, loading the buffer's FILE on the spot
-when it isn't — a margin click must just work, no manual eval first (the file's
-top-level forms run: the self-hosting deal). nil on success, else the problem as a
-message string."
+(defn debugger--ensure-loaded (sym file)
+  "Make `sym`'s definition live in the image, loading `file` on the spot when it
+isn't — a MARGIN click must just work, no manual eval first (the file's top-level
+forms run: the self-hosting deal; a file with a blocking top-level form will block).
+`file` nil (the C-c d b prompt has no file to blame) refuses instead of loading
+something unrelated. nil on success, else the problem as a message string."
   (if (bound? sym)
     nil
-    (let (file (buffer-file (ed-current-buf m)))
-      (cond
-        (nil? file) (str sym " isn't loaded and the buffer has no file to load")
-        else (try
-               (do (load file)
-                 (if (bound? sym) nil (str sym " is still unbound after loading " (path/basename file))))
-               (catch e (str "loading " (path/basename file) " failed: " (error-message e))))))))
+    (cond
+      (nil? file) (str sym " isn't loaded — eval its module first (C-x C-e / eval-buffer)")
+      else (try
+             (do (load file)
+               (if (bound? sym) nil (str sym " is still unbound after loading " (path/basename file))))
+             (catch e (str "loading " (path/basename file) " failed: " (error-message e)))))))
 
-(defn debugger--set-breakpoint (m sym)
-  (let (problem (debugger--ensure-loaded m sym))
+(defn debugger--set-breakpoint (m sym file)
+  "Auto-load (`file` non-nil), start the session if needed, install the wrapper."
+  (let (problem (debugger--ensure-loaded sym file))
     (if problem
       (message m problem)
-      (let (m1 (update-in (debugger--ensure-session m) [:debug :break-syms]
-                 (fn (syms) (cons sym (or syms '())))))
-        (debug/break-fn sym)
-        (message (debugger--remark m1)
-          (str "breakpoint on " sym " — callers park in *Debug* (C-c d d)"))))))
+      (let (m1 (debugger--ensure-session m))
+        (try
+          (do (debugger--install-breakpoint sym)
+            (message (debugger--remark m1)
+              (str "breakpoint on " sym " — callers park in *Debug* (C-c d d)")))
+          (catch e (message m1 (str "breakpoint: " (error-message e)))))))))
 
 (defn debugger--clear-breakpoint (m sym)
-  (debug/untrace-fn sym)
-  (message
-    (debugger--remark
-      (update-in m [:debug :break-syms] (fn (syms) (remove (fn (s) (= s sym)) (or syms '())))))
-    (str "breakpoint removed: " sym)))
+  (debugger--uninstall-breakpoint sym)
+  (message (debugger--remark m) (str "breakpoint removed: " sym)))
 
 (defn brood-gutter-click (m line)
   "brood-mode's `:gutter-click`: toggle a function-boundary breakpoint on the
-definition enclosing the clicked line (nearest defn/defcommand head at-or-above —
-test scaffolding is skipped). An unloaded definition is LOADED automatically
-(`debugger--ensure-loaded`); a traced-not-breakpointed fn is left alone with a
-pointer at C-c d u. Above any definition the click says so."
-  (let (sym (debugger--qualified-at (ed-current-buf m) line))
+definition ENCLOSING the clicked line. An unloaded definition's file is loaded
+automatically; a non-function definition form (defmacro/defrecord/…) refuses
+rather than silently retargeting the defn above it; a traced fn is left alone
+with a pointer at C-c d u. The editor's own loop process never parks on these
+(the wrapper runs the original there), so a breakpoint on an editor-internal fn
+fires only for spawned callers — evals, tasks, shells, app code."
+  (let (buf (ed-current-buf m)
+        head (debugger--head-at buf line))
     (cond
-      (nil? sym) (message m "no definition at or above this line")
-      (member? sym (debugger--break-syms m)) (debugger--clear-breakpoint m sym)
-      (member? sym (debug/traced-fns))
-      (message m (str sym " is traced (C-c d t) — C-c d u removes the trace"))
-      else (debugger--set-breakpoint m sym))))
+      (nil? head) (message m "no definition at or above this line")
+      (= (first head) :other)
+      (message m (str "(" (nth head 2) " …) has no function boundary to break on — click inside a defn"))
+      else
+      (let (sym (debugger--qualified-at buf line))
+        (cond
+          (nil? sym) (message m "buffer has no (defmodule …) — can't name the function to break")
+          (member? sym (debugger-breakpoints)) (debugger--clear-breakpoint m sym)
+          (member? sym (debug/traced-fns))
+          (message m (str sym " is traced (C-c d t) — C-c d u removes the trace"))
+          else (debugger--set-breakpoint m sym (buffer-file buf)))))))
 
 ;; ---- the :debug-menu / :spy-log buffer types -----------------------------------
 

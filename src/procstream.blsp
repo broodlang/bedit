@@ -3,55 +3,79 @@
 apprun's `:apprun`): one long-lived NAMED process that owns a `proc-spawn` handle
 and line-buffers its stdout. Drive it with messages:
 
-  [:run cmd argv root]   spawn (or replace — re-running never queues) the child
-  [:shutdown]            kill the child and stop the worker
+  [:run cmd argv root token]   spawn (or replace — re-running never queues) the
+                               child; `token` (any value) tags every event of this
+                               run so the editor can discard a previous run's
+                               in-flight events (see below)
+  [:shutdown]                  kill the child, fire `:on-done` with `nil`, and stop
 
-`handlers` is a map of plain fns (closures cross `spawn`):
+`handlers` is a map of plain fns (closures cross `spawn`); each takes the run token
+as its LAST argument, so a stale run's events are distinguishable from the fresh
+run's on the editor side:
 
-  :on-line      (line) — each complete stdout line (the trailing partial flushes
-                on exit); the consumer decodes/classifies (JSON events, raw output)
-  :on-err-line  (line) — each non-blank stderr line
-  :on-done      (code) — the child exited (nil = killed)
+  :on-line      (line token)  — each complete stdout line (the trailing partial
+                flushes on exit); the consumer decodes/classifies
+  :on-err-line  (line token)  — each non-blank stderr line
+  :on-done      (code token)  — the child exited (nil = killed, incl. via [:shutdown])
 
-The handlers are captured at the worker's FIRST spawn (a named spawn is idempotent),
-so redefining a consumer's dispatch fn live reaches the worker only after it is shut
-down and respawned — the one late-binding exception in the runner stack, traded for
-one worker implementation instead of three.")
+A handler that throws is caught and reported through `:on-err-line` rather than
+killing the worker (which would orphan the OS child, unread). The handlers are
+captured at the worker's FIRST spawn (a named spawn is idempotent), so redefining a
+consumer's dispatch fn live reaches the worker only after a shutdown+respawn — the
+one late-binding exception in the runner stack, traded for one worker implementation
+instead of three."
+  )  ; no imports — hibernate / proc-spawn / string ops are all prelude
 
-(defn procstream--feed (buf data on-line)
+(defn procstream--safe (f a token on-err)
+  "Call `(f a token)`, routing a throw to `on-err` so a handler bug can't kill the
+worker and orphan the child."
+  (try (f a token)
+    (catch e (on-err (str "procstream handler error: " (error-message e)) token))))
+
+(defn procstream--feed (buf data on-line on-err token)
   "Fold a stdout chunk into the line buffer: hand each complete line to `on-line`,
 return the trailing partial."
   (let (parts (string-split (str buf data) "\n")
         complete (take (dec (count parts)) parts))
-    (doseq (line complete) (on-line line))
+    (doseq (line complete) (procstream--safe on-line line token on-err))
     (last parts)))
 
-(defn procstream--recv (proc buf handlers)
+(defn procstream--recv (proc buf handlers token errbuf)
+  ;; `errbuf` carries the stderr partial so a backtrace split across read chunks is
+  ;; line-assembled like stdout (the contract promises whole lines).
   (receive
     ([:proc p data]
       (procstream--recv proc
-        (if (= p proc) (procstream--feed buf data (:on-line handlers)) buf)
-        handlers))
+        (if (= p proc)
+          (procstream--feed buf data (:on-line handlers) (:on-err-line handlers) token)
+          buf)
+        handlers token errbuf))
     ([:proc-err p data]
-      (do (when (= p proc)
-            (doseq (line (string-split data "\n"))
-              (when (not= (trim line) "") ((:on-err-line handlers) line))))
-        (procstream--recv proc buf handlers)))
+      (if (= p proc)
+        (let (parts (string-split (str errbuf data) "\n")
+              complete (take (dec (count parts)) parts))
+          (doseq (line complete)
+            (when (not= (trim line) "") (procstream--safe (:on-err-line handlers) line token (:on-err-line handlers))))
+          (procstream--recv proc buf handlers token (last parts)))
+        (procstream--recv proc buf handlers token errbuf)))
     ([:proc-closed p code]
       (if (= p proc)
-        (do (when (not= (trim buf) "") ((:on-line handlers) buf))
-          ((:on-done handlers) code)
+        (do (when (not= (trim buf) "") (procstream--safe (:on-line handlers) buf token (:on-err-line handlers)))
+          (when (not= (trim errbuf) "") (procstream--safe (:on-err-line handlers) errbuf token (:on-err-line handlers)))
+          ((:on-done handlers) code token)
           (procstream-loop handlers))
-        (procstream--recv proc buf handlers)))
-    ([:run cmd argv root]
+        (procstream--recv proc buf handlers token errbuf)))
+    ([:run cmd argv root new-token]
       (do (try (proc-close proc) (catch e nil))
-        (procstream--recv (proc-spawn cmd argv {:cwd root}) "" handlers)))
+        (procstream--recv (proc-spawn cmd argv {:cwd root}) "" handlers new-token "")))
     ([:shutdown]
-      (do (try (proc-close proc) (catch e nil)) :procstream-stopped))))
+      (do (try (proc-close proc) (catch e nil))
+        ((:on-done handlers) nil token)  ; a stop is an exit — the consumer clears its UI
+        :procstream-stopped))))
 
 (defn procstream-loop (handlers)
   "The idle state between runs — runs are human-paced, so hibernate while waiting."
   (hibernate)
   (receive
-    ([:run cmd argv root] (procstream--recv (proc-spawn cmd argv {:cwd root}) "" handlers))
+    ([:run cmd argv root token] (procstream--recv (proc-spawn cmd argv {:cwd root}) "" handlers token ""))
     ([:shutdown] :procstream-stopped)))
