@@ -1,0 +1,120 @@
+;; Tests for src/testrun.blsp — native test runs in a dedicated nest subprocess.
+;; Pure folds + line parsing, plus one end-to-end run of the GENERATED script against
+;; a throwaway fixture project — that pins the advised std seam (trace-result and the
+;; r-* accessors) against upstream drift, which a pure test can't.
+(defmodule testrun-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use-internals testrun))
+
+(defn trt-model () (ed-init (make-buffer "x")))
+
+(describe "testrun — rendering (pure)"
+  (test "a passing result renders one ✓ row"
+    (let (lines (testrun-result-lines {:group "math" :name "adds" :passed true :ms 3}))
+      (is (includes? lines "✓ math › adds"))
+      (is (includes? lines "(3 ms)"))))
+  (test "a failing result renders its ✗ row plus file:line:col failure lines"
+    (let (lines (testrun-result-lines
+                  {:group "math" :name "adds" :passed false :ms 1
+                   :failures [{:loc ["tests/math_test.blsp" 2 25]
+                               :details ["assert: (assert= (+ 1 1) 3)" "actual: 2" "expect: 3"]}]}))
+      (is (includes? lines "✗ math › adds"))
+      (is (includes? lines "tests/math_test.blsp:2:25: assert:"))
+      (is (includes? lines "actual: 2"))))
+  (test "an ungrouped test renders without the › separator"
+    (is (includes? (testrun-result-lines {:group "" :name "solo" :passed true :ms 0}) "✓ solo"))))
+
+(describe "testrun — stdout line decoding (pure)"
+  (test "JSON events classify; dot-noise drops; prints pass through"
+    (assert= :test (first (testrun/testrun--decode-line "{\"event\":\"test\",\"name\":\"n\"}")))
+    (assert= :summary (first (testrun/testrun--decode-line "{\"event\":\"summary\",\"total\":1}")))
+    (assert= [:drop] (testrun/testrun--decode-line "F.○."))
+    (assert= [:drop] (testrun/testrun--decode-line "   "))
+    (assert= [:output "hello from a test"] (testrun/testrun--decode-line "hello from a test")))
+  (test "a dots-prefixed JSON line is salvaged from the first brace"
+    (let ([kind value] (testrun/testrun--decode-line "F.{\"event\":\"summary\",\"total\":2}"))
+      (assert= :summary kind)
+      (assert= 2 (get value :total)))))
+
+(describe "testrun — failure-line location parse (RET jump)"
+  (test "file:line:col: parses; plain rows do not"
+    (assert= {:file "tests/x_test.blsp" :line 42 :col 3}
+      (testrun/testrun--line-loc "    tests/x_test.blsp:42:3: assert: boom"))
+    (assert= {:file "src/a.blsp" :line 7 :col 1}
+      (testrun/testrun--line-loc "src/a.blsp:7: whatever"))
+    (is (nil? (testrun/testrun--line-loc "✓ math › adds  (3 ms)")))
+    (is (nil? (testrun/testrun--line-loc "")))))
+
+(describe "testrun — model folds"
+  (test "a test-result-event appends its row to *Tests* and counts it"
+    (let (m (assoc (trt-model) :testrun {:passed 0 :failed 0})
+          e (test-result-event {:group "g" :name "n" :passed true :ms 2})
+          m2 (ui-event-fold e m 24 80 24)
+          i (ed-buffer-index-by-name m2 "*Tests*"))
+      (is (not (nil? i)))
+      (is (includes? (buffer-text (ed-buf-at m2 i)) "✓ g › n"))
+      (assert= 1 (get-in m2 [:testrun :passed]))))
+  (test "a test-summary-event appends the tally and echoes it"
+    (let (m2 (ui-event-fold (test-summary-event {:total 3 :passed 2 :failed 1 :ms 40})
+               (trt-model) 24 80 24))
+      (is (includes? (:echo m2) "2/3 passed"))
+      (is (includes? (:echo m2) "1 FAILED"))))
+  (test "a non-zero exit without a summary reports the runner death"
+    (let (m2 (ui-event-fold (test-done-event 2) (trt-model) 24 80 24))
+      (is (includes? (:echo m2) "exited 2")))))
+
+;; ---- end to end: the generated script against a fixture project ------------------
+;; Slow-ish (a nest subprocess boots an image), so one test covers the whole path:
+;; script generation -> nest run -> JSON events -> parseability. Uses the runner's
+;; own dispatch indirectly by parsing the raw stdout the way testrun--feed does.
+
+(defn trt-write-fixture (dir)
+  (make-dir dir)
+  (make-dir (str dir "/src"))
+  (make-dir (str dir "/tests"))
+  (spit (str dir "/project.blsp") "(project :name \"trt-fixture\" :version \"0.0.1\")")
+  (spit (str dir "/src/core.blsp") "(defmodule core \"d\")\n(defn core-add (a b) (+ a b))")
+  (spit (str dir "/tests/core_test.blsp")
+    (str "(defmodule core-test (:use test) (:use core))\n"
+      "(describe \"core\"\n"
+      "  (test \"adds\" (assert= 5 (core-add 2 3)))\n"
+      "  (test \"fails\" (assert= 9 (core-add 2 3))))\n")))
+
+(describe "testrun — end to end (fixture project, real subprocess)"
+  :isolated
+  (test "the generated runner streams one JSON event per test plus a summary"
+    (let (dir (str "/tmp/myedit-trt-fixture-" (self-id))
+          script (str dir "/runner.blsp"))
+      (trt-write-fixture dir)
+      (spit script (testrun/testrun--script-source
+                     (list {:file (str dir "/tests/core_test.blsp") :line nil})))
+      (let (runner-proc (proc-spawn "nest" ["run" script] {:cwd dir})
+            out (letrec (drain (fn (acc)
+                                 (receive
+                                   ([:proc pp data] (drain (str acc data)))
+                                   ([:proc-err pp data] (drain acc))
+                                   ([:proc-closed pp code] (do (try (proc-close runner-proc) (catch e nil)) acc))
+                                   (after 30000 acc))))
+                  (drain ""))
+            events (keep (fn (line)
+                           (let (kv (testrun/testrun--decode-line line))
+                             (when (or (= (first kv) :test) (= (first kv) :summary)) kv)))
+                     (string-split out "\n"))
+            tests (keep (fn (kv) (when (= (first kv) :test) (second kv))) events)
+            summary (first (keep (fn (kv) (when (= (first kv) :summary) (second kv))) events)))
+        (assert= 2 (count tests))
+        (let (adds (find (fn (e) (= (get e :name) "adds")) tests)
+              fails (find (fn (e) (= (get e :name) "fails")) tests))
+          (assert= true (get adds :passed))
+          (assert= false (get fails :passed))
+          ;; the test row carries its declaration site (per-assertion :loc is nil
+          ;; here — same as real `nest test` on this shape — so RET falls back to it)
+          (is (includes? (get fails :where) "core_test.blsp:4")))
+        (is (not (nil? summary)))
+        (assert= 2 (get summary :total))
+        (assert= 1 (get summary :failed))))))
+
+;; self-id: a per-run unique suffix so parallel/repeat runs never share the fixture dir
+(defn self-id () (:id (process-info (self))))
