@@ -114,21 +114,31 @@ the value to put in the trace context's `:debugger` slot."
   (let (info (process-info pid))
     (if info (str (:id info)) "?")))
 
+(defn debugger-spy-body (kind form value fnname args)
+  "One rendered spy-entry body from STRING fields — the shared renderer behind
+*Spy* (record entries, pr-str'd by the caller) and *Run*/*Tests* (the JSON tap
+pre-rendered its fields)."
+  (case kind
+    "enter" (str "spy " form)
+    "node" (str "  " form " => " value)
+    "exit" (str "=> " value)
+    "call" (str "call (" fnname (if args (str " " args) "") ")")
+    "return" (str "  " fnname " => " value)
+    "span-enter" (str "span " form)
+    "span-exit" (str "span => " value)
+    (str kind " " form " " value)))
+
 (defn debugger-trace-line (traced)
   "One *Spy* line for a `{:pid :entry}` trace item — the entry kinds `spy` (ADR-173),
 `trace-fn` (ADR-184) and `span` emit, prefixed with the emitting process's id."
   (let (e (:entry traced)
-        pid-label (debugger--pid-label (:pid traced))
-        body (case (:spy e)
-               :enter (str "spy " (pr-str (:form e)))
-               :node (str "  " (pr-str (:form e)) " => " (pr-str (:value e)))
-               :exit (str "=> " (pr-str (:value e)))
-               :call (str "call " (pr-str (cons (:fn e) (:args e))))
-               :return (str "  " (pr-str (:fn e)) " => " (pr-str (:value e)))
-               :span-enter (str "span " (pr-str (:label e)))
-               :span-exit (str "span => " (pr-str (:value e)))
-               (pr-str e)))
-    (str "[" pid-label "] " body)))
+        kind (name (or (:spy e) :unknown))
+        body (debugger-spy-body kind
+               (pr-str (or (:form e) (:label e)))
+               (pr-str (:value e))
+               (str (:fn e))
+               (when (:args e) (pr-str (:args e)))))
+    (str "[" (debugger--pid-label (:pid traced)) "] " body)))
 
 (defn debugger--vals-preview (vals)
   "The captured-locals cell of a *Debug* row (`{:name value …}`, `break`'s map)."
@@ -165,7 +175,9 @@ own order reshuffles as keys come and go — never index by it)."
 screen must not go stale); record this render's row order for the row commands."
   (let (paused (get-in m [:debug :paused] {})
         order (debugger--order paused)
-        m1 (assoc-in m [:debug :order] order)
+        ;; only record :order into a LIVE session — a rerender after stop must not
+        ;; resurrect the :debug key
+        m1 (if (:debug m) (assoc-in m [:debug :order] order) m)
         idx (ed-buffer-index-by-name m1 *debug-buffer*))
     (if (nil? idx)
       m1
@@ -225,7 +237,9 @@ reading). A `spy`/`break` in code spawned before the session start is unaffected
       (send (get-in m [:debug :collector]) [:stop])
       (%set-trace-context nil)
       (def *spy-sink* nil)
-      (message (dissoc m :debug) "debug session stopped"))
+      (debug/untrace-all)  ; stopping the session restores every instrumented fn
+      (message (debugger--remark (debugger--rerender (dissoc m :debug)))
+        "debug session stopped — instrumentation removed"))
     (let (collector (debugger-collector-start (self)))
       (%set-trace-context {:debugger collector :span nil})
       (def *spy-sink* (debug/debugger-sink))
@@ -262,9 +276,7 @@ value to *Spy* (`trace-fn`, ADR-184 — no source edit; `C-c d u` untraces)."
   "Set a function-boundary breakpoint (C-c d b): every caller parks on entry with its
 args captured for eval-in-scope (`break-fn`, ADR-184). `C-c d u` removes it."
   (debugger--fn-prompt (debugger--ensure-session m) "Break on function: "
-    (fn (mm sym)
-      (debug/break-fn sym)
-      (message (debugger--rerender mm) (str "break on " sym " — callers will park in *Debug*")))))
+    (fn (mm sym) (debugger--set-breakpoint mm sym))))
 
 (defcommand cmd-debug-untrace-fn
   (m key)
@@ -275,13 +287,21 @@ args captured for eval-in-scope (`break-fn`, ADR-184). `C-c d u` removes it."
       (assoc m :minibuffer
         (ed-name-prompt "Untrace function: " (sort (map str traced))
           (fn (mm nm)
-            (debug/untrace-fn (read-string nm))
-            (message (debugger--rerender mm) (str "untraced " nm))))))))
+            (let (sym (read-string nm))
+              (debug/untrace-fn sym)
+              (message
+                (debugger--remark
+                  (debugger--rerender
+                    (update-in mm [:debug :break-syms]
+                      (fn (syms) (remove (fn (s) (= s sym)) (or syms '()))))))
+                (str "untraced " nm)))))))))
 
 (defcommand cmd-debug-untrace-all
   (m key)
   "Remove every trace/breakpoint (M-x debug-untrace-all)."
-  (message (debugger--rerender m) (str "untraced " (debug/untrace-all) " function(s)")))
+  (let (n (debug/untrace-all)
+        m1 (if (:debug m) (assoc-in m [:debug :break-syms] '()) m))
+    (message (debugger--remark (debugger--rerender m1)) (str "untraced " n " function(s)"))))
 
 ;; ---- the *Debug* buffer (the paused queue) ---------------------------------------
 
@@ -385,27 +405,16 @@ or nil for any other line."
                (string-split text "\n")))
     (when (not (empty? hits)) (trimr (first (string-split (first hits) ")"))))))
 
-(defn debugger-margin-action (buf line)
-  "What a margin click at `line` means — the nearest head AT or ABOVE it decides:
-`[:test N]` (a `(test …)` head, 0-based — run that test), `[:describe]` (a
-`(describe …)` head — run the file), `[:defn N]` (a top-level defn/defcommand head —
-toggle its breakpoint), or nil above everything."
-  (if (< line 0)
-    nil
-    (let (raw (buffer-line-at buf line)
-          t (triml raw))
-      (cond
-        (starts-with? t "(test ") [:test line]
-        (starts-with? raw "(describe") [:describe]
-        (not (nil? (debugger-defn-name raw))) [:defn line]
-        else (debugger-margin-action buf (dec line))))))
-
 (defn debugger-defn-line-at (buf line)
   "The nearest top-level definition head AT or ABOVE `line` — a margin click works
 from anywhere inside a definition's body, not just its head line (the IDE
-convention). nil when `line` sits above the first definition."
-  (let (action (debugger-margin-action buf line))
-    (when (= (first action) :defn) (second action))))
+convention). Test scaffolding (`describe`/`test` blocks) is skipped over: the margin
+is the DEBUGGER's margin, and only a function can carry a boundary breakpoint. nil
+when `line` sits above the first definition."
+  (cond
+    (< line 0) nil
+    (not (nil? (debugger-defn-name (buffer-line-at buf line)))) line
+    else (debugger-defn-line-at buf (dec line))))
 
 (defn debugger--qualified-at (buf line)
   "The fully-qualified symbol of the definition enclosing `line`, or nil."
@@ -415,15 +424,20 @@ convention). nil when `line` sits above the first definition."
             module (debugger-buffer-module (buffer-text buf)))
         (read-string (if module (str module "/" nm) nm))))))
 
-(defn debugger-break-lines (buf)
-  "Every 0-based line in `buf` whose definition is currently instrumented
-(`traced-fns`) — the `:debug-break-lines` annotation, recomputed after each toggle."
+(defn debugger--break-syms (m)
+  "The breakpointed symbols (set via the margin / C-c d b) — kept on the model,
+distinct from std's one `traced-fns` registry, so a margin toggle never silently
+removes a TRACE (C-c d t) and the ● marks only genuine breakpoints."
+  (or (get-in m [:debug :break-syms]) '()))
+
+(defn debugger-break-lines (buf break-syms)
+  "Every 0-based line in `buf` whose definition carries a breakpoint — the
+`:debug-break-lines` annotation, recomputed after each toggle."
   (let (module (debugger-buffer-module (buffer-text buf))
-        traced (debug/traced-fns)
         lines (string-split (buffer-text buf) "\n"))
     (fold (fn (acc i)
             (let (nm (debugger-defn-name (nth lines i)))
-              (if (and nm (member? (read-string (if module (str module "/" nm) nm)) traced))
+              (if (and nm (member? (read-string (if module (str module "/" nm) nm)) break-syms))
                 (assoc acc i true)
                 acc)))
       {}
@@ -433,57 +447,63 @@ convention). nil when `line` sits above the first definition."
   "Refresh EVERY open .blsp buffer's breakpoint marks — a breakpoint set from the
 prompt (C-c d b) or an untrace-all must not leave stale ●s in buffers other than
 the clicked one."
-  (assoc m :buffers
-    (into []
-      (map (fn (b)
-             (let (f (buffer-file b))
-               (if (and f (ends-with? f ".blsp"))
-                 (assoc b
-                   :debug-break-lines (debugger-break-lines b)
-                   :debug-break-lines-count (buffer-line-count b))
-                 b)))
-        (:buffers m)))))
+  (let (break-syms (debugger--break-syms m))
+    (assoc m :buffers
+      (into []
+        (map (fn (b)
+               (let (f (buffer-file b))
+                 (if (and f (ends-with? f ".blsp"))
+                   (assoc b
+                     :debug-break-lines (debugger-break-lines b break-syms)
+                     :debug-break-lines-count (buffer-line-count b))
+                   b)))
+          (:buffers m))))))
 
-(defn debugger--toggle-breakpoint (m line)
-  (let (sym (debugger--qualified-at (ed-current-buf m) line))
-    (cond
-      (member? sym (debug/traced-fns))
-      (do (debug/untrace-fn sym)
-        (message (debugger--remark m) (str "breakpoint removed: " sym)))
-      (not (bound? sym))
-      (message m (str sym " isn't loaded — eval the buffer first, then click"))
-      else
-      (let (m1 (debugger--ensure-session m))
+(defn debugger--ensure-loaded (m sym)
+  "Make `sym`'s definition live in the image, loading the buffer's FILE on the spot
+when it isn't — a margin click must just work, no manual eval first (the file's
+top-level forms run: the self-hosting deal). nil on success, else the problem as a
+message string."
+  (if (bound? sym)
+    nil
+    (let (file (buffer-file (ed-current-buf m)))
+      (cond
+        (nil? file) (str sym " isn't loaded and the buffer has no file to load")
+        else (try
+               (do (load file)
+                 (if (bound? sym) nil (str sym " is still unbound after loading " (path/basename file))))
+               (catch e (str "loading " (path/basename file) " failed: " (error-message e))))))))
+
+(defn debugger--set-breakpoint (m sym)
+  (let (problem (debugger--ensure-loaded m sym))
+    (if problem
+      (message m problem)
+      (let (m1 (update-in (debugger--ensure-session m) [:debug :break-syms]
+                 (fn (syms) (cons sym (or syms '())))))
         (debug/break-fn sym)
         (message (debugger--remark m1)
           (str "breakpoint on " sym " — callers park in *Debug* (C-c d d)"))))))
 
+(defn debugger--clear-breakpoint (m sym)
+  (debug/untrace-fn sym)
+  (message
+    (debugger--remark
+      (update-in m [:debug :break-syms] (fn (syms) (remove (fn (s) (= s sym)) (or syms '())))))
+    (str "breakpoint removed: " sym)))
+
 (defn brood-gutter-click (m line)
-  "brood-mode's `:gutter-click` — the margin does the right thing for what encloses
-the clicked line (`debugger-margin-action`, nearest head at-or-above):
-
-  - a `(test …)` body → run THAT test (the C-c t t path, streamed into *Tests*)
-  - a `(describe …)` head → run the whole file
-  - a defn/defcommand body → toggle a function-boundary breakpoint (●)
-
-Above everything the click says so; a breakpointed definition must be loaded in the
-image (eval first — self-hosted debugging)."
-  (let (buf (ed-current-buf m)
-        file (buffer-file buf)
-        action (debugger-margin-action buf line)
-        root (or (:project-root m) (cwd)))
-    (case (first action)
-      :defn (debugger--toggle-breakpoint m line)
-      :test (if (nil? file)
-              (message m "buffer has no file to test")
-              (let (head-line (inc (second action)))
-                (testrun/testrun-start m (list {:file file :line head-line}) root
-                  (str (path/basename file) ":" head-line))))
-      :describe (if (nil? file)
-                  (message m "buffer has no file to test")
-                  (testrun/testrun-start m (list {:file file :line nil}) root
-                    (path/basename file)))
-      (message m "nothing to run or break at or above this line"))))
+  "brood-mode's `:gutter-click`: toggle a function-boundary breakpoint on the
+definition enclosing the clicked line (nearest defn/defcommand head at-or-above —
+test scaffolding is skipped). An unloaded definition is LOADED automatically
+(`debugger--ensure-loaded`); a traced-not-breakpointed fn is left alone with a
+pointer at C-c d u. Above any definition the click says so."
+  (let (sym (debugger--qualified-at (ed-current-buf m) line))
+    (cond
+      (nil? sym) (message m "no definition at or above this line")
+      (member? sym (debugger--break-syms m)) (debugger--clear-breakpoint m sym)
+      (member? sym (debug/traced-fns))
+      (message m (str sym " is traced (C-c d t) — C-c d u removes the trace"))
+      else (debugger--set-breakpoint m sym))))
 
 ;; ---- the :debug-menu / :spy-log buffer types -----------------------------------
 
