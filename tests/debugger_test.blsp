@@ -1,0 +1,110 @@
+;; Tests for src/debugger.blsp — the editor as the debugger endpoint.
+;; Pure model folds + the collector's wire-protocol translation; no window needed.
+;; The collector is spawned with THIS test process as the "editor", so forwarded
+;; UiEvent records land in our own mailbox — the same push path the loop gets.
+(defmodule debugger-test
+  (:use test)
+  (:use model)  ; ed-init / message / ed-buf-at / ui-event-fold (UiEvent)
+  (:use editor/buffer)
+  (:use debugger)
+  (:use debug))  ; start/step the std side where a real park is wanted
+
+(defn dbt-model () (ed-init (make-buffer "x")))
+
+;; A tiny wait: receive one UiEvent record (they're maps, so a catch-all pattern
+;; with a guard keeps the filterable clauses unharmed elsewhere).
+(defn dbt-next-event (ms)
+  (receive (e :when (record? e) e) (after ms :timeout)))
+
+(describe "debugger collector — wire protocol -> UiEvent records"
+  (test "a [:break pid snap] forwards immediately as a debug-break-event"
+    (let (c (debugger-collector-start (self)))
+      (send c [:break (self) {:label "bp" :vals {:n 6} :span nil}])
+      (let (e (dbt-next-event 1000))
+        (is (record? e))
+        (assert= (self) (debug-break-event-pid e))
+        (assert= "bp" (:label (debug-break-event-snapshot e))))
+      (send c [:stop])))
+  (test "trace entries batch into ONE debug-trace-event, oldest first"
+    (let (c (debugger-collector-start (self)))
+      (send c [:trace {:spy :call :fn 'f :args (list 1)} (self)])
+      (send c [:trace {:spy :return :fn 'f :value 2} (self)])
+      (let (e (dbt-next-event 1000))
+        (is (record? e))
+        (let (batch (debug-trace-event-batch e))
+          (assert= 2 (count batch))
+          (assert= :call (:spy (:entry (first batch))))
+          (assert= :return (:spy (:entry (second batch))))))
+      ;; one flush, not one event per entry
+      (assert= :timeout (dbt-next-event 100))
+      (send c [:stop])))
+  (test "a break flushes pending traces first — *Spy* order is preserved"
+    (let (c (debugger-collector-start (self)))
+      (send c [:trace {:spy :node :form '(+ 1 2) :value 3 :depth 0} (self)])
+      (send c [:break (self) {:label "bp" :vals {} :span nil}])
+      (let (first-event (dbt-next-event 1000)
+            second-event (dbt-next-event 1000))
+        (is (not (nil? (debug-trace-event-batch first-event))))   ; the trace batch…
+        (is (not (nil? (debug-break-event-snapshot second-event)))))  ; …then the break
+      (send c [:stop]))))
+
+(describe "debugger — model folds"
+  (test "a debug-break-event records the snapshot pid-keyed and echoes"
+    (let (m (assoc (dbt-model) :debug {:collector :fake :paused {} :order '()})
+          e (debug-break-event (self) {:label "square" :vals {:args (list 6)} :span nil})
+          m2 (ui-event-fold e m 24 80 24))
+      (assert= {:label "square" :vals {:args (list 6)} :span nil}
+        (get-in m2 [:debug :paused (self)]))
+      (is (includes? (:echo m2) "paused at square"))))
+  (test "a debug-trace-event appends rendered lines to *Spy* with no echo"
+    (let (m (dbt-model)
+          e (debug-trace-event
+              (list {:pid (self) :entry {:spy :call :fn 'f :args (list 1 2)}}
+                {:pid (self) :entry {:spy :return :fn 'f :value 3}}))
+          m2 (ui-event-fold e m 24 80 24)
+          i (ed-buffer-index-by-name m2 "*Spy*"))
+      (is (not (nil? i)))
+      (let (text (buffer-text (ed-buf-at m2 i)))
+        (is (includes? text "call (f 1 2)"))
+        (is (includes? text "f => 3")))
+      (assert= "" (:echo m2)))))
+
+(describe "debugger — rendering (pure)"
+  (test "trace lines render each entry kind"
+    (assert= true (includes? (debugger-trace-line {:pid (self) :entry {:spy :enter :form '(+ 1 2)}}) "spy (+ 1 2)"))
+    (assert= true (includes? (debugger-trace-line {:pid (self) :entry {:spy :span-enter :label "req"}}) "span \"req\"")))
+  (test "the *Debug* text lists rows with stable indices and the traced fns"
+    (let (text (debugger-buffer-text {} '() (list 'my/fn)))
+      (is (includes? text "(no parked processes)"))
+      (is (includes? text "my/fn"))))
+  (test "eval-in-scope resolves the captured names (pid-keyed eval-at)"
+    (assert= 36 (debugger-eval-in "(* n n)" {:n 6}))
+    (assert= (list 6) (debugger-eval-in "args" {:args (list 6)}))))
+
+(describe "debugger — end to end: break-fn parks a worker into the editor's queue"
+  :isolated
+  (test "a break-fn'd function parks its caller; resume releases it"
+    (let (me (self)
+          c (debugger-collector-start me))
+      ;; a session, hand-wired to the collector (what cmd-debug-session does)
+      (%set-trace-context {:debugger c :span nil})
+      (def *spy-sink* (debug/debugger-sink))
+      (eval '(defn dbt-target (n) (* n n)))
+      (debug/break-fn 'dbt-target)
+      ;; the worker inherits the context (own) across spawn and parks at the call
+      (spawn (send me [:result (dbt-target 7)]))
+      (let (e (dbt-next-event 2000))
+        (is (record? e))
+        (let (pid (debug-break-event-pid e)
+              snap (debug-break-event-snapshot e))
+          (assert= "dbt-target" (:label snap))
+          (assert= (list 7) (:args (:vals snap)))
+          ;; eval in its captured scope, then release it
+          (assert= (list 7) (debugger-eval-in "args" (:vals snap)))
+          (send pid [:resume])))
+      (assert= 49 (receive ([:result r] r) (after 2000 :timeout)))
+      ;; unwind: restore the image-wide seams for the rest of the suite
+      (debug/untrace-fn 'dbt-target)
+      (%set-trace-context nil)
+      (def *spy-sink* nil)
+      (send c [:stop]))))

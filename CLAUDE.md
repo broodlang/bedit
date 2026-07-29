@@ -94,6 +94,10 @@ src/lsp-requests.blsp       the LSP request-kind records + `LspRequest` ability 
 src/mincomplete.blsp        minibuffer prompt completion (path / name)
 src/completion.blsp         shared fuzzy ranking + vertical-menu card + ls -l perms (complete + plume + dired)
 src/plume.blsp              the minibuffer completion UI — vertical list + marginalia + N/M counter (our Vertico/Marginalia)
+src/debugger.blsp           the editor as the debugger (ADR-174/184): C-c d session, *Spy* trace
+                            stream, *Debug* paused-process queue with resume/eval-in-scope,
+                            trace-fn/break-fn by name — the collector process speaks std/debug's
+                            wire protocol and forwards UiEvent records to the loop
 src/isearch.blsp            incremental search + query-replace (C-s/C-r/M-%) modal mini-loops
 src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
 src/compile.blsp            M-x compile: run a build in the project root, C-x ` next-error
