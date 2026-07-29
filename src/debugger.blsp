@@ -1,0 +1,350 @@
+(defmodule debugger
+  "The editor as the debugger — std/tool/debug's endpoint is just a pid speaking a
+message protocol (`[:break pid snap]`, `[:trace entry from]`, spans — ADR-174), so
+the editor supplies its OWN endpoint instead of driving the terminal renderers:
+
+  - a **collector** process receives the wire protocol, batches trace traffic (a
+    `spy`/`trace-fn` flood must not render per entry), and forwards it to the
+    editor loop as `UiEvent` records — a break arriving IS a mailbox message the
+    loop already folds, so there is no polling anywhere;
+  - `*Spy*` streams the trace entries (spy nodes, `trace-fn` call/returns, spans);
+  - `*Debug*` lists the parked processes (label + captured vals) with resume /
+    eval-in-scope keys — `:debug-menu`, a `special-mode` listing like the process
+    list;
+  - `trace-fn`/`break-fn` (ADR-184) give function-boundary instrumentation from
+    M-x / C-c d with no source edit — the registry lives in std (`traced-fns`).
+
+Starting a session (C-c d s) wires the EDITOR process's trace context to the
+collector (`%set-trace-context` — an `own` context, so every process the editor
+spawns afterwards inherits it: C-x C-e evals, tasks, shells) and points the
+image-wide `*spy-sink*` at the debugger sink. A process spawned BEFORE the session
+has no context — its `spy` output falls back to stderr; its `break` stays a no-op.
+Stopping restores both and resumes anything still parked.
+
+`eval-at` is reimplemented pid-keyed (`debugger-eval-in`): the std one indexes
+`(vec paused)` whose CHAMP order reshuffles as processes park/resume — the model
+keys snapshots by pid and the *Debug* rows carry stable indices per render."
+  (:use editor/buffer)  ; buffer-line-at / buffer-current-line — the *Debug* row under point
+  (:use model)  ; UiEvent + message / ed-append-named / ed-buf-at / ed-mb-edit
+  (:use interactive)  ; defcommand — the M-x registry
+  (:use commands)  ; ed-show-named (report buffers) + ed-name-prompt (fn-name prompts)
+  (:use editor/keymap)  ; keymap-bind — the :debug-menu keys
+  (:use editor/layers))  ; register-type-layers — the :debug-menu buffer type
+
+(require 'debug)  ; std/tool/debug — break/trace wire shapes, trace-fn/break-fn, debugger-sink
+
+(def *spy-buffer* "*Spy*")
+(def *debug-buffer* "*Debug*")
+(def *spy-flush-ms* 30)  ; trace batching: collect quietly this long, then one UiEvent
+
+;; ---- the async events (UiEvent records — see model.blsp) --------------------
+
+(defrecord debug-trace-event (batch))  ; a flushed batch: ({:pid p :entry spy-entry} …), oldest first
+(defrecord debug-break-event (pid snapshot))  ; one parked process: {:label :vals :span}
+
+;; ---- the collector process ---------------------------------------------------
+;; Speaks the ADR-174 wire protocol as the `:debugger` pid. Two receive states so
+;; the idle collector blocks without a timer: quiet (block until traffic) and
+;; gathering (an `(after *spy-flush-ms*)` flush while trace entries stream in).
+;; A break flushes pending traces first so the *Spy* stream stays ordered, then
+;; forwards immediately — a park should surface at once, not on the next flush.
+
+(defn debugger--entry (pid entry)
+  {:pid pid :entry entry})
+
+(defn debugger--flush (editor pending)
+  "Send the gathered trace batch (stored newest-first) to the editor, oldest first."
+  (when (not (empty? pending))
+    (send editor (debug-trace-event (reverse pending)))))
+
+(defn debugger--gather (editor pending)
+  (receive
+    ([:trace entry from] (debugger--gather editor (cons (debugger--entry from entry) pending)))
+    ([:span-enter span parent pid label]
+      (debugger--gather editor (cons (debugger--entry pid {:spy :span-enter :label label}) pending)))
+    ([:span-exit span pid value]
+      (debugger--gather editor (cons (debugger--entry pid {:spy :span-exit :value value}) pending)))
+    ([:break pid snap]
+      (do (debugger--flush editor pending)
+        (send editor (debug-break-event pid snap))
+        (debugger--loop editor)))
+    ([:stop] (do (debugger--flush editor pending) :debugger-stopped))
+    (after *spy-flush-ms*
+      (do (debugger--flush editor pending)
+        (debugger--loop editor)))))
+
+(defn debugger--loop (editor)
+  "The quiet state: park (cheaply, forever) until debug traffic arrives."
+  (receive
+    ([:trace entry from] (debugger--gather editor (list (debugger--entry from entry))))
+    ([:span-enter span parent pid label]
+      (debugger--gather editor (list (debugger--entry pid {:spy :span-enter :label label}))))
+    ([:span-exit span pid value]
+      (debugger--gather editor (list (debugger--entry pid {:spy :span-exit :value value}))))
+    ([:break pid snap]
+      (do (send editor (debug-break-event pid snap))
+        (debugger--loop editor)))
+    ([:stop] :debugger-stopped)))
+
+(defn debugger-collector-start (editor)
+  "Spawn the collector forwarding to `editor` (the ui-run loop's pid). Returns its pid —
+the value to put in the trace context's `:debugger` slot."
+  (spawn (debugger--loop editor)))
+
+;; ---- rendering (pure) ---------------------------------------------------------
+
+(defn debugger--pid-label (pid)
+  "A short display id for `pid` — its process id when alive, else `?`."
+  (let (info (process-info pid))
+    (if info (str (:id info)) "?")))
+
+(defn debugger-trace-line (traced)
+  "One *Spy* line for a `{:pid :entry}` trace item — the entry kinds `spy` (ADR-173),
+`trace-fn` (ADR-184) and `span` emit, prefixed with the emitting process's id."
+  (let (e (:entry traced)
+        pid-label (debugger--pid-label (:pid traced))
+        body (case (:spy e)
+               :enter (str "spy " (pr-str (:form e)))
+               :node (str "  " (pr-str (:form e)) " => " (pr-str (:value e)))
+               :exit (str "=> " (pr-str (:value e)))
+               :call (str "call " (pr-str (cons (:fn e) (:args e))))
+               :return (str "  " (pr-str (:fn e)) " => " (pr-str (:value e)))
+               :span-enter (str "span " (pr-str (:label e)))
+               :span-exit (str "span => " (pr-str (:value e)))
+               (pr-str e)))
+    (str "[" pid-label "] " body)))
+
+(defn debugger--vals-preview (vals)
+  "The captured-locals cell of a *Debug* row (`{:name value …}`, `break`'s map)."
+  (let (s (pr-str vals))
+    (if (> (string-length s) 48) (str (substring s 0 47) "…") s)))
+
+(defn debugger-buffer-text (paused order traced)
+  "The *Debug* buffer text: one row per parked process (stable indices from `order`,
+the pid list of this render), then the instrumented fns. `r` resume · `R` resume all
+· `e` eval in the row's captured scope · `g` refresh."
+  (let (rows (map (fn (i)
+                    (let (pid (nth order i)
+                          snap (get paused pid))
+                      (str (pad-right (str (inc i)) 4)
+                        (pad-right (debugger--pid-label pid) 6)
+                        (pad-right (or (:label snap) "?") 24)
+                        (debugger--vals-preview (:vals snap)))))
+               (range (count order))))
+    (str (pad-right "N" 4) (pad-right "PID" 6) (pad-right "LABEL" 24) "VALS\n"
+      (if (empty? rows) "(no parked processes)" (join "\n" rows))
+      "\n\ntraced fns: "
+      (if (empty? traced) "(none)" (join " " (map str traced)))
+      "\n\nr resume · R resume all · e eval in scope · g refresh\n")))
+
+;; ---- model folds ---------------------------------------------------------------
+
+(defn debugger--order (paused)
+  "A stable row order for the paused map: pids sorted by process id (a CHAMP map's
+own order reshuffles as keys come and go — never index by it)."
+  (sort-by (fn (pid) (or (:id (process-info pid)) 0)) (keys paused)))
+
+(defn debugger--rerender (m)
+  "Refresh *Debug* in place when it exists (a break arriving while the list is on
+screen must not go stale); record this render's row order for the row commands."
+  (let (paused (get-in m [:debug :paused] {})
+        order (debugger--order paused)
+        m1 (assoc-in m [:debug :order] order)
+        idx (ed-buffer-index-by-name m1 *debug-buffer*))
+    (if (nil? idx)
+      m1
+      (update m1 :buffers assoc idx
+        (ed-stamp (assoc (make-buffer (debugger-buffer-text paused order (debug/traced-fns))
+                           *debug-buffer* nil)
+                    :type :debug-menu))))))
+
+(impl UiEvent debug-trace-event
+  ;; A flushed trace batch → append to *Spy* (created on first traffic), no echo —
+  ;; a spy stream must never flood the echo area (same policy as buffer-log-event).
+  (ui-event-fold [e m textrows cols rows]
+    (let (lines (map debugger-trace-line (debug-trace-event-batch e)))
+      (ed-append-named m *spy-buffer* (str (join "\n" lines) "\n")))))
+
+(impl UiEvent debug-break-event
+  ;; A parked process → record its snapshot (pid-keyed), tell the user, and refresh
+  ;; a visible *Debug* so the queue on screen is never stale.
+  (ui-event-fold [e m textrows cols rows]
+    (let (pid (debug-break-event-pid e)
+          snap (debug-break-event-snapshot e)
+          m1 (assoc-in m [:debug :paused pid] snap))
+      (message (debugger--rerender m1)
+        (str "process " (debugger--pid-label pid) " paused at " (:label snap)
+          " — C-c d d to inspect")))))
+
+;; ---- the session ----------------------------------------------------------------
+
+(defn debug-session-active? (m) (not (nil? (get-in m [:debug :collector]))))
+
+(defn debugger--resume (pid)
+  "Release one parked process (the wire is ours: `break` blocks on `[:resume]`)."
+  (send pid [:resume]))
+
+(defcommand cmd-debug-session
+  (m key)
+  "Toggle the debug session (C-c d s). Start: spawn the collector, point THIS process's
+trace context at it (`own`, so every later spawn — evals, tasks, shells — inherits
+it) and route the image-wide `*spy-sink*` to the debugger sink. Stop: restore both,
+resume anything still parked, drop the state (the *Spy*/*Debug* buffers stay for
+reading). A `spy`/`break` in code spawned before the session start is unaffected."
+  (if (debug-session-active? m)
+    (let (paused (get-in m [:debug :paused] {}))
+      (doseq (pid (keys paused)) (debugger--resume pid))
+      (send (get-in m [:debug :collector]) [:stop])
+      (%set-trace-context nil)
+      (def *spy-sink* nil)
+      (message (dissoc m :debug) "debug session stopped"))
+    (let (collector (debugger-collector-start (self)))
+      (%set-trace-context {:debugger collector :span nil})
+      (def *spy-sink* (debug/debugger-sink))
+      (message (assoc m :debug {:collector collector :paused {} :order '()})
+        "debug session started — spy/break/trace-fn now land in *Spy* / *Debug*"))))
+
+(defn debugger--ensure-session (m)
+  "The session, started if it wasn't (the trace/break commands imply one)."
+  (if (debug-session-active? m) m (cmd-debug-session m nil)))
+
+;; ---- instrument a function by name (trace-fn / break-fn, ADR-184) ---------------
+
+(defn debugger--fn-prompt (m prompt apply-fn)
+  "Prompt (with completion over the live global names) for a function and hand the
+symbol to `apply-fn (m sym) -> m`. Instrumentation is by NAME in the live image —
+reserved std/prelude names are refused by ADR-166 and reported in the echo area."
+  (assoc m :minibuffer
+    (ed-name-prompt prompt (sort (map str (global-names)))
+      (fn (mm nm)
+        (try (apply-fn mm (read-string nm))
+          (catch e (message mm (str "debug: " (error-message e)))))))))
+
+(defcommand cmd-debug-trace-fn
+  (m key)
+  "Trace a function at its boundary (C-c d t): every call logs its args and return
+value to *Spy* (`trace-fn`, ADR-184 — no source edit; `C-c d u` untraces)."
+  (debugger--fn-prompt (debugger--ensure-session m) "Trace function: "
+    (fn (mm sym)
+      (debug/trace-fn sym)
+      (message (debugger--rerender mm) (str "tracing " sym " — calls land in *Spy*")))))
+
+(defcommand cmd-debug-break-fn
+  (m key)
+  "Set a function-boundary breakpoint (C-c d b): every caller parks on entry with its
+args captured for eval-in-scope (`break-fn`, ADR-184). `C-c d u` removes it."
+  (debugger--fn-prompt (debugger--ensure-session m) "Break on function: "
+    (fn (mm sym)
+      (debug/break-fn sym)
+      (message (debugger--rerender mm) (str "break on " sym " — callers will park in *Debug*")))))
+
+(defcommand cmd-debug-untrace-fn
+  (m key)
+  "Remove one function's trace/breakpoint (C-c d u) — restores the original definition."
+  (let (traced (debug/traced-fns))
+    (if (empty? traced)
+      (message m "nothing is traced")
+      (assoc m :minibuffer
+        (ed-name-prompt "Untrace function: " (sort (map str traced))
+          (fn (mm nm)
+            (debug/untrace-fn (read-string nm))
+            (message (debugger--rerender mm) (str "untraced " nm))))))))
+
+(defcommand cmd-debug-untrace-all
+  (m key)
+  "Remove every trace/breakpoint (M-x debug-untrace-all)."
+  (message (debugger--rerender m) (str "untraced " (debug/untrace-all) " function(s)")))
+
+;; ---- the *Debug* buffer (the paused queue) ---------------------------------------
+
+(defcommand cmd-debug-buffer
+  (m key)
+  "Show the *Debug* buffer (C-c d d): the parked processes with their captured vals,
+plus the instrumented fns. `r`/`R` resume, `e` evals in a row's captured scope."
+  (let (m1 (debugger--ensure-session m)
+        paused (get-in m1 [:debug :paused] {})
+        order (debugger--order paused))
+    (ed-show-named (assoc-in m1 [:debug :order] order)
+      *debug-buffer*
+      (debugger-buffer-text paused order (debug/traced-fns))
+      :debug-menu)))
+
+(defn debugger--leading-int (line)
+  "The leading integer of a *Debug* row (its N column), or nil off the rows."
+  (let (t (triml line)
+        n (string-span t 0 "0123456789"))
+    (if (= n 0) nil (string->number (substring t 0 n)))))
+
+(defn debugger--row-pid (m)
+  "The parked pid of the *Debug* row under point, or nil (uses this render's `:order`,
+so a reshuffling paused map can't misdirect a resume)."
+  (let (buf (ed-current-buf m)
+        n (debugger--leading-int (buffer-line-at buf (buffer-current-line buf)))
+        order (get-in m [:debug :order] '()))
+    (when (and n (>= n 1) (<= n (count order)))
+      (nth order (dec n)))))
+
+(defcommand cmd-debug-resume
+  (m key)
+  "Resume the parked process on the current *Debug* row (`r`)."
+  (let (pid (debugger--row-pid m))
+    (if (nil? pid)
+      (message m "not on a parked-process row")
+      (do (debugger--resume pid)
+        (message (debugger--rerender (update-in m [:debug :paused] dissoc pid))
+          (str "resumed " (debugger--pid-label pid)))))))
+
+(defcommand cmd-debug-resume-all
+  (m key)
+  "Resume every parked process (`R` in *Debug*, C-c d r anywhere)."
+  (let (paused (get-in m [:debug :paused] {}))
+    (doseq (pid (keys paused)) (debugger--resume pid))
+    (message (debugger--rerender (assoc-in m [:debug :paused] {}))
+      (str "resumed " (count paused) " process(es)"))))
+
+(defcommand cmd-debug-refresh
+  (m key)
+  "Re-render *Debug* (`g`)."
+  (cmd-debug-buffer m key))
+
+(defn debugger-eval-in (src vals)
+  "Evaluate `src` against a break's captured `vals` map — pid-keyed `eval-at`
+(ADR-174 §5 path A): only the values named at the `break` are in scope, and the
+eval runs HERE (the editor process), not in the parked one."
+  (%eval-in src vals))
+
+(defcommand cmd-debug-eval
+  (m key)
+  "Evaluate an expression in the captured scope of the *Debug* row under point (`e`):
+the values named at its `break` (`break-fn` captures `args`) are in scope. Echoes
+the result; errors echo instead of throwing."
+  (let (pid (debugger--row-pid m))
+    (if (nil? pid)
+      (message m "not on a parked-process row")
+      (let (snap (get-in m [:debug :paused pid]))
+        (assoc m :minibuffer
+          {:edit (ed-mb-edit (str "Eval in " (:label snap) ": ") "")
+           :on-complete
+           (fn (m2 src)
+             (message m2
+               (try (pr-str (debugger-eval-in src (or (:vals snap) {})))
+                 (catch e (str "debug eval: " (error-message e))))))})))))
+
+;; ---- the :debug-menu buffer type ---------------------------------------------
+
+(def debug-menu-keymap
+  (-> {}
+    (keymap-bind ["r"] 'debugger/cmd-debug-resume)
+    (keymap-bind ["R"] 'debugger/cmd-debug-resume-all)
+    (keymap-bind ["e"] 'debugger/cmd-debug-eval)
+    (keymap-bind ["g"] 'debugger/cmd-debug-refresh)))
+
+(def debug-menu-mode-layer
+  {:name 'debug-menu
+   :keymap debugger/debug-menu-keymap
+   :commands '("debug-resume" "debug-resume-all" "debug-eval" "debug-refresh")})
+
+;; :debug-menu stacks the resume/eval keys over special-mode (read-only, no gutter)
+;; over text-mode — exactly the process list's shape.
+(register-type-layers :debug-menu
+  (list 'debugger/debug-menu-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
