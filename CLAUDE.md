@@ -101,6 +101,8 @@ src/debugger.blsp           the editor as the debugger (ADR-174/184): C-c d sess
 src/testrun.blsp            native test runs (C-c t): a dedicated nest subprocess streams per-test
                             JSON (std's *test-report-sink*) into the *Tests* buffer — never
                             in-image (%isolate would revert the editor's globals + kill its pids)
+src/apprun.blsp             run the project (C-c r): nest run in a subprocess with debug taps —
+                            app output + spy/trace traffic + a stats heartbeat stream into *Run*
 src/isearch.blsp            incremental search + query-replace (C-s/C-r/M-%) modal mini-loops
 src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
 src/compile.blsp            M-x compile: run a build in the project root, C-x ` next-error

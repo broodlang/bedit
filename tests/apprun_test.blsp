@@ -1,0 +1,69 @@
+;; Tests for src/apprun.blsp — run the project with debug taps.
+(defmodule apprun-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use-internals apprun))
+
+(defn art-model () (ed-init (make-buffer "x")))
+
+(describe "apprun — stdout line decoding (pure)"
+  (test "spy and stats events classify; app output passes through"
+    (assert= :spy (first (apprun/apprun--decode-line "{\"event\":\"spy\",\"kind\":\"call\"}")))
+    (assert= :stats (first (apprun/apprun--decode-line "{\"event\":\"stats\",\"procs\":3}")))
+    (assert= [:output "hello app"] (apprun/apprun--decode-line "hello app"))
+    (assert= [:drop] (apprun/apprun--decode-line "  "))))
+
+(describe "apprun — rendering (pure)"
+  (test "spy entries render by kind"
+    (assert= "call (my/fn (1 2))" (apprun-spy-line {:kind "call" :fn "my/fn" :args "(1 2)"}))
+    (assert= "  (+ 1 2) => 3" (apprun-spy-line {:kind "node" :form "(+ 1 2)" :value "3"})))
+  (test "the heartbeat renders procs, memory, uptime"
+    (let (line (apprun-stats-line {:procs 12 :memory 2048 :uptime-ms 65000}))
+      (is (includes? line "12 procs"))
+      (is (includes? line "2 KB"))
+      (is (includes? line "65s")))))
+
+(describe "apprun — model folds"
+  (test "app output, spy traffic and heartbeats append to *Run*; exit echoes"
+    (let (m1 (ui-event-fold (apprun-output-event "booting") (art-model) 24 80 24)
+          m2 (ui-event-fold (apprun-spy-event {:kind "call" :fn "f" :args "(1)"}) m1 24 80 24)
+          m3 (ui-event-fold (apprun-stats-event {:procs 3 :memory 1024 :uptime-ms 5000}) m2 24 80 24)
+          m4 (ui-event-fold (apprun-done-event 0) m3 24 80 24)
+          text (buffer-text (ed-buf-at m4 (ed-buffer-index-by-name m4 "*Run*"))))
+      (is (includes? text "booting"))
+      (is (includes? text "~ call (f (1))"))
+      (is (includes? text "· 3 procs"))
+      (is (includes? text "[app exited 0]"))
+      (is (includes? (:echo m4) "app exited 0"))
+      (assert= {:procs 3 :memory 1024 :uptime-ms 5000} (get-in m4 [:apprun :stats])))))
+
+;; ---- end to end: the wrapper script boots a fixture app's entry point ------------
+
+(describe "apprun — end to end (fixture project, real subprocess)"
+  :isolated
+  (test "the wrapper streams app output AND its spy traffic as events"
+    (let (dir (str "/tmp/myedit-art-fixture-" (:id (process-info (self)))))
+      (make-dir dir)
+      (make-dir (str dir "/src"))
+      (spit (str dir "/project.blsp") "(project :name \"art-fixture\" :version \"0.0.1\")")
+      (spit (str dir "/src/main.blsp")
+        (str "(defmodule main \"d\")\n"
+          "(defn main (& args)\n"
+          "  (do (println \"app says hi\")\n"
+          "    (spy (+ 20 22))))\n"))
+      (spit (str dir "/runner.blsp") (apprun/apprun--script-source))
+      (let (p (proc-spawn "nest" ["run" (str dir "/runner.blsp")] {:cwd dir})
+            out (letrec (drain (fn (acc)
+                                 (receive
+                                   ([:proc pp data] (drain (str acc data)))
+                                   ([:proc-err pp data] (drain acc))
+                                   ([:proc-closed pp code] (do (try (proc-close p) (catch e nil)) acc))
+                                   (after 30000 acc))))
+                  (drain ""))
+            decoded (map apprun/apprun--decode-line (string-split out "\n"))
+            outputs (keep (fn (kv) (when (= (first kv) :output) (second kv))) decoded)
+            spies (keep (fn (kv) (when (= (first kv) :spy) (second kv))) decoded))
+        (is (any? (fn (line) (includes? line "app says hi")) outputs))
+        ;; the spy tap streamed the app's (spy (+ 20 22)) — its exit carries 42
+        (is (any? (fn (e) (and (= (get e :kind) "exit") (= (get e :value) "42"))) spies))))))
