@@ -11,15 +11,16 @@ The subprocess runs a generated Brood script (`testrun--script-source`, written 
 in the worker as it finishes — that prints one JSON object per line, then the
 `run-tests-structured` summary map. (A defdyn seam, added for exactly this: the
 runner fns ship in the binary, so ADR-166 reserves their names against advice.)
-The editor side is compile.blsp's proven shape: a `:testrun`
-process owns the proc handle, line-buffers stdout, JSON-decodes each line, and
-forwards `UiEvent` records the loop folds into the `*Tests*` buffer — pass/fail rows
-stream in live, failures carry `file:line:col` and RET jumps to them.
+The editor side is compile.blsp's proven shape: the shared
+`procstream` worker owns the proc handle and line-buffers stdout; testrun supplies
+the handlers that JSON-decode each line and forward `UiEvent` records the loop folds
+into `*Tests*` — pass/fail rows stream in live, failures carry `file:line:col`, and
+RET/click jumps to them (the shared location-jump layer).
 
 Test prints from the suite itself interleave with the JSON on stdout; anything that
 doesn't parse as a tagged object is forwarded verbatim (`test-output-event`), so a
 suite's own output is visible rather than lost."
-  (:use editor/buffer)  ; buffer-file / buffer-current-line / buffer-line-at
+  (:use editor/buffer)  ; buffer-file / buffer-rope / buffer-line-count — the marks + jump
   (:use model)  ; UiEvent + message / ed-append-named / ed-buf-at
   (:use interactive)  ; defcommand
   (:use commands)  ; ed-show-named / ed-find-file / ed-apply / ed-goto-line
@@ -28,17 +29,17 @@ suite's own output is visible rather than lost."
   (:use json))  ; json-parse — decode the runner's event lines
 
 (require 'path)  ; path/basename — run labels (bare require: path's `join` must not shadow prelude's)
-(require 'debugger)  ; debugger-spy-tap-form — the shared spy tap the script splices in
+(require 'debugger)  ; debugger-spy-tap-form (script) + debugger-spy-body (render)
 (require 'procstream)  ; the shared streaming-subprocess worker (:testrun rides it)
 
 (def *tests-buffer* "*Tests*")
 
 ;; ---- the async events (UiEvent records — see model.blsp) --------------------
 
-(defrecord test-result-event (result))  ; one finished test: {:group :name :passed :ms :where :failures}
-(defrecord test-summary-event (summary))  ; the run's structured summary map
-(defrecord test-output-event (text))  ; a non-JSON stdout line (the suite's own prints)
-(defrecord test-done-event (code))  ; the runner subprocess exited
+(defrecord test-result-event (result gen))  ; one finished test; `gen` = the run it belongs to
+(defrecord test-summary-event (summary gen))  ; the run's structured summary map
+(defrecord test-output-event (text gen))  ; a non-JSON stdout line (the suite's own prints)
+(defrecord test-done-event (code gen))  ; the runner subprocess exited
 
 ;; ---- the generated runner script ---------------------------------------------
 ;; Built as quoted FORMS and pr-str'd — no string escaping, and the per-run spec
@@ -128,24 +129,28 @@ line can arrive with a `F..`-style prefix — salvage by re-parsing from the fir
       (testrun--progress-noise? line) [:drop]
       else [:output line])))
 
-(defn testrun--dispatch-line (line)
-  "Decode one stdout line (`testrun--decode-line`) and forward its event record."
+(defn testrun--dispatch-line (line gen)
+  "Decode one stdout line (`testrun--decode-line`) and forward its event record,
+stamped with the run `gen` so a previous run's straggler is discarded."
   (let (kv (testrun--decode-line line))
     (case (first kv)
-      :test (send (testrun--editor) (test-result-event (second kv)))
-      :summary (send (testrun--editor) (test-summary-event (second kv)))
-      ;; a spy entry from test code: rendered like *Run*'s (apprun owns the renderer)
+      :test (send (testrun--editor) (test-result-event (second kv) gen))
+      :summary (send (testrun--editor) (test-summary-event (second kv) gen))
+      ;; a spy entry from test code: rendered like *Run*'s (the shared renderer)
       :spy (send (testrun--editor)
-             (test-output-event (str "~ " (apprun/apprun-spy-line (second kv)))))
-      :output (send (testrun--editor) (test-output-event (second kv)))
+             (test-output-event (str "~ " (debugger/debugger-spy-body
+                                            (get (second kv) :kind) (get (second kv) :form)
+                                            (get (second kv) :value) (get (second kv) :fn)
+                                            (get (second kv) :args))) gen))
+      :output (send (testrun--editor) (test-output-event (second kv) gen))
       nil)))
 
 (defn testrun--handlers ()
-  "The `procstream` handlers: stdout decodes into event records, stderr forwards as
-plain output, the exit becomes the done event."
+  "The `procstream` handlers (each takes the run token): stdout decodes into event
+records, stderr forwards as plain output, the exit becomes the done event."
   {:on-line testrun--dispatch-line
-   :on-err-line (fn (line) (send (testrun--editor) (test-output-event line)))
-   :on-done (fn (code) (send (testrun--editor) (test-done-event code)))})
+   :on-err-line (fn (line gen) (send (testrun--editor) (test-output-event line gen)))
+   :on-done (fn (code gen) (send (testrun--editor) (test-done-event code gen)))})
 
 (defn testrun--clear-marks (m)
   "Drop every buffer's `:test-marks` — a fresh run's verdicts replace the last run's."
@@ -160,17 +165,20 @@ for `g`/rerun."
   (spit *testrun-script-path* (testrun--script-source specs))
   (let (proc (spawn :testrun (procstream/procstream-loop (testrun--handlers)))
         argv ["run" *testrun-script-path*]
+        ;; a fresh run generation — events tagged with an older gen (a superseded
+        ;; run's in-flight stragglers) are dropped by the folds
+        gen (inc (or (get-in m [:testrun :gen]) 0))
         ;; the runner reads FILES — a spec'd buffer with unsaved edits tests the
         ;; saved content, and the echo should say so rather than let it surprise
         unsaved? (any? (fn (spec)
                          (let (i (testrun--buffer-for m (get spec :file)))
                            (and i (:modified (ed-buf-at m i)))))
                    specs))
-    (send proc [:run "nest" argv root])
+    (send proc [:run "nest" argv root gen])
     (ed-show-named-aside
       (message (assoc (testrun--clear-marks m)
                  :testrun {:specs specs :root root :label label
-                           :passed 0 :failed 0})
+                           :gen gen :passed 0 :failed 0})
         (str "testing " label "…"
           (if unsaved? "  (unsaved changes — testing the file as saved)" "")))
       *tests-buffer*
@@ -208,12 +216,19 @@ any row to visit its test."
       row
       (join "\n" (cons row (map testrun--loc-line (get r :failures)))))))
 
+(defn testrun--path-suffix? (path relpath)
+  "Whether `relpath` matches `path` at a component boundary (so `foo_test.blsp`
+matches `a/foo_test.blsp` but not `xfoo_test.blsp`) — the std `test--path-suffix?`
+discipline, avoiding a wrong-buffer mark on a coincidental suffix."
+  (or (= path relpath)
+    (ends-with? path (str "/" relpath))))
+
 (defn testrun--buffer-for (m relpath)
   "The pool index of the open buffer backing `relpath` (a run-root-relative test
-file), or nil — matched by path suffix."
+file), or nil — matched at a path-component boundary."
   (first (keep (fn (i)
                  (let (f (buffer-file (ed-buf-at m i)))
-                   (when (and f (ends-with? f relpath)) i)))
+                   (when (and f (testrun--path-suffix? f relpath)) i)))
            (range (count (:buffers m))))))
 
 (defn testrun--annotate (m r)
@@ -239,37 +254,48 @@ marks nothing."
                 :test-marks-count (buffer-line-count b)
                 :test-marks-rope (buffer-rope b)))))))))
 
+(defn testrun--current? (m gen)
+  "Whether `gen` is the run the model is currently showing — a straggler from a
+superseded run (rapid re-runs) is dropped so it can't corrupt the fresh report."
+  (= gen (get-in m [:testrun :gen])))
+
 (impl UiEvent test-result-event
   ;; A finished test streams into *Tests* AND stamps its ✓/✗ into the test file's
   ;; margin; failures also bump the model's count so the summary echo can say
-  ;; "3 failed" before the summary line lands.
+  ;; "3 failed" before the summary line lands. Stale-run events are ignored.
   (ui-event-fold [e m textrows cols rows]
-    (let (r (test-result-event-result e)
-          key (if (get r :passed) :passed :failed)
-          m1 (update-in m [:testrun key] (fn (n) (inc (or n 0)))))
-      (testrun--annotate
-        (ed-append-named m1 *tests-buffer* (str (testrun-result-lines r) "\n"))
-        r))))
+    (if (not (testrun--current? m (test-result-event-gen e)))
+      m
+      (let (r (test-result-event-result e)
+            key (if (get r :passed) :passed :failed)
+            m1 (update-in m [:testrun key] (fn (n) (inc (or n 0)))))
+        (testrun--annotate
+          (ed-append-named m1 *tests-buffer* (str (testrun-result-lines r) "\n"))
+          r)))))
 
 (impl UiEvent test-summary-event
   (ui-event-fold [e m textrows cols rows]
-    (let (s (test-summary-event-summary e)
-          line (str "\n" (get s :total) " tests, " (get s :passed) " passed, "
-                 (get s :failed) " failed (" (get s :ms) " ms)\n"))
-      (message (ed-append-named m *tests-buffer* line)
-        (str "tests: " (get s :passed) "/" (get s :total) " passed"
-          (if (> (get s :failed) 0) (str ", " (get s :failed) " FAILED") ""))))))
+    (if (not (testrun--current? m (test-summary-event-gen e)))
+      m
+      (let (s (test-summary-event-summary e)
+            line (str "\n" (get s :total) " tests, " (get s :passed) " passed, "
+                   (get s :failed) " failed (" (get s :ms) " ms)\n"))
+        (message (ed-append-named m *tests-buffer* line)
+          (str "tests: " (get s :passed) "/" (get s :total) " passed"
+            (if (> (get s :failed) 0) (str ", " (get s :failed) " FAILED") "")))))))
 
 (impl UiEvent test-output-event
   (ui-event-fold [e m textrows cols rows]
-    (ed-append-named m *tests-buffer* (str "  | " (test-output-event-text e) "\n"))))
+    (if (not (testrun--current? m (test-output-event-gen e)))
+      m
+      (ed-append-named m *tests-buffer* (str "  | " (test-output-event-text e) "\n")))))
 
 (impl UiEvent test-done-event
   ;; Non-zero exit with no summary = the run itself broke (a load error, a crash) —
   ;; say so; a clean exit already reported via the summary.
   (ui-event-fold [e m textrows cols rows]
     (let (code (test-done-event-code e))
-      (if (and code (not= code 0))
+      (if (and (testrun--current? m (test-done-event-gen e)) code (not= code 0))
         (message (ed-append-named m *tests-buffer* (str "\n[runner exited " code "]\n"))
           (str "test runner exited " code " — see " *tests-buffer*))
         m))))
@@ -316,7 +342,15 @@ the parallel batch.)"
       (message m "no test run to repeat")
       (testrun-start m (:specs last-run) (:root last-run) (:label last-run)))))
 
-;; ---- RET on a failure: jump to file:line:col --------------------------------------
+(defcommand cmd-test-stop
+  (m key)
+  "Stop a running test suite (C-c t k) — kills the runner subprocess (an infinite
+loop in a test, a slow suite). A no-op when nothing is running."
+  (let (proc (whereis :testrun))
+    (if (nil? proc)
+      (message m "no test run in progress")
+      (do (send proc [:shutdown])
+        (message m "test run stopped")))))
 
 ;; ---- the :test-menu buffer type ----------------------------------------------
 

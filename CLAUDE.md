@@ -102,7 +102,10 @@ src/testrun.blsp            native test runs (C-c t): a dedicated nest subproces
                             JSON (std's *test-report-sink*) into the *Tests* buffer — never
                             in-image (%isolate would revert the editor's globals + kill its pids)
 src/apprun.blsp             run the project (C-c r): nest run in a subprocess with debug taps —
-                            app output + spy/trace traffic + a stats heartbeat stream into *Run*
+                            app output + spy/trace traffic into *Run*; live stats on a statusbar chip
+src/hosted.blsp             THE FLIP: every pool buffer backed by its own process (hosted-reconcile)
+src/procstream.blsp         the shared streaming-subprocess worker (testrun's :testrun and
+                            apprun's :apprun ride it): line-buffered stdout -> handler fns
 src/isearch.blsp            incremental search + query-replace (C-s/C-r/M-%) modal mini-loops
 src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
 src/compile.blsp            M-x compile: run a build in the project root, C-x ` next-error
@@ -129,7 +132,7 @@ be built with the GUI backend. Building it lives in the Brood repo:
 # here:
 nest run                 # open the editor on a scratch buffer (native window)
 nest run -- notes.txt    # open (Ctrl-S saves) that file
-nest test                # run the test suite (~5s, 829 tests)
+nest test                # run the test suite (~3s, 900+ tests)
 nest test tests/git_test.blsp:42     # one file, or the one test at that line
 nest test --failed       # just what failed last run — the edit/rerun loop
 nest test --cover        # function-level coverage: what the suite never calls
