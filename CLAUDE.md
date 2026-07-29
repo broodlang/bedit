@@ -88,6 +88,9 @@ src/modes.blsp              modes as layers: the keymaps (data) + brood-mode ser
 src/complete-at-point.blsp  completion-at-point (the in-buffer Tab popup) — multi-source merge
                             (named to dodge std's `tool/complete`, which shadows a bare `complete`)
 src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, goto-def/references, hover, rename, format, imenu
+src/lsp-requests.blsp       the LSP request-kind records + `LspRequest` ability — the shape/fold vocabulary
+                            shared by lsp (connection side) and commands (model side); eager-loaded so
+                            commands can register fold impls while lsp stays deferred
 src/mincomplete.blsp        minibuffer prompt completion (path / name)
 src/completion.blsp         shared fuzzy ranking + vertical-menu card + ls -l perms (complete + plume + dired)
 src/plume.blsp              the minibuffer completion UI — vertical list + marginalia + N/M counter (our Vertico/Marginalia)
