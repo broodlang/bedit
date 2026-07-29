@@ -1,0 +1,275 @@
+(defmodule apprun
+  "Run the project from the editor (C-c r) — `nest run` in a dedicated subprocess,
+with debug taps wrapped around it. A generated script boots the app exactly as
+`nest run` does (`project/run-project`), after installing two image-wide taps:
+
+  - `*spy-sink*` — every `(spy …)` / `trace-fn` entry anywhere in the app (any
+    process: the root `def` is ambient) streams out as a JSON line;
+  - a stats heartbeat — process count + total memory, every few seconds, so a leak
+    or a spawn storm is visible as a trend while the app runs.
+
+The `*Run*` buffer shows the app's own stdout/stderr as-is, spy traffic coloured
+like `*Spy*`, dim `·` heartbeat lines, and an exit footer; error locations
+(`file:line[:col]:`) are jumpable with RET. The editor side is the same shape as
+testrun/compile: a `:apprun` process owns the proc handle, line-buffers stdout,
+and forwards `UiEvent` records the loop folds."
+  (:use editor/buffer)  ; buffer-line-at / buffer-current-line — the RET jump
+  (:use model)  ; UiEvent + message / ed-append-named / ed-buf-at
+  (:use interactive)  ; defcommand
+  (:use commands)  ; ed-show-named-aside / ed-find-file / ed-apply / ed-goto-line
+  (:use editor/keymap)  ; keymap-bind — the *Run* keys
+  (:use editor/layers)  ; register-type-layers — the :run-log buffer type
+  (:use json))  ; json-parse — decode the taps' event lines
+
+(def *run-buffer* "*Run*")
+(def *apprun-script-path* "/tmp/myedit-apprun.blsp")
+(def *apprun-stats-ms* 5000)  ; the heartbeat period
+
+;; ---- the async events (UiEvent records — see model.blsp) --------------------
+
+(defrecord apprun-output-event (text))  ; one line of the app's own stdout/stderr
+(defrecord apprun-spy-event (entry))  ; a spy/trace-fn entry: {:kind :form :value :fn :args :depth}
+(defrecord apprun-stats-event (stats))  ; the heartbeat: {:procs :memory :uptime-ms}
+(defrecord apprun-done-event (code))  ; the app exited
+
+;; ---- the generated wrapper script ----------------------------------------------
+;; Quoted forms, pr-str'd (the testrun pattern). The taps go in BEFORE run-project
+;; boots the app, as root `def`s — ambient, so every process the app spawns streams
+;; through them.
+
+(def apprun--script-forms
+  (list
+    '(require 'project)
+    '(require 'json)
+    ;; every spy/trace-fn entry, anywhere in the app -> one JSON line (forms and
+    ;; values pr-str'd — arbitrary app data doesn't JSON-encode, strings do)
+    '(def *spy-sink*
+       (fn (e)
+         (println (json/json-encode
+                    {:event "spy"
+                     :kind (name (get e :spy))
+                     :form (when (get e :form) (pr-str (get e :form)))
+                     :value (when (contains? e :value) (pr-str (get e :value)))
+                     :fn (when (get e :fn) (str (get e :fn)))
+                     :args (when (get e :args) (pr-str (get e :args)))
+                     :depth (get e :depth)}))))
+    ;; the stats heartbeat: a tiny sibling process, hibernating between beats
+    (list 'def 'apprun--stats-ms *apprun-stats-ms*)
+    '(defn apprun--beat (started)
+       (do
+         (receive (after apprun--stats-ms nil))
+         (let (infos (keep process-info (list-processes)))
+           (println (json/json-encode
+                      {:event "stats"
+                       :procs (count infos)
+                       :memory (fold (fn (acc p) (+ acc (or (get p :memory) 0))) 0 infos)
+                       :uptime-ms (- (now) started)})))
+         (apprun--beat started)))
+    '(spawn (apprun--beat (now)))
+    '(project/run-project '())))
+
+(defn apprun--script-source ()
+  (join "\n" (map pr-str apprun--script-forms)))
+
+;; ---- the runner process ----------------------------------------------------------
+
+(defn apprun--editor () (whereis :editor))
+
+(defn apprun--decode-line (line)
+  "Classify one stdout line — `[:spy m]` / `[:stats m]` / `[:output s]` / `[:drop]` —
+salvaging a JSON line another process's unflushed `print` may have prefixed (the
+testrun--decode-line shape; the shared decoder is a fold-up candidate)."
+  (let (parse (fn (s) (try (json-parse s) (catch e nil)))
+        parsed (or (parse line)
+                 (let (i (index-of line "{"))
+                   (when (and (includes? line "\"event\":") (>= i 0))
+                     (parse (substring line i (string-length line))))))
+        event (when (map? parsed) (get parsed :event)))
+    (cond
+      (= event "spy") [:spy parsed]
+      (= event "stats") [:stats parsed]
+      (= (trim line) "") [:drop]
+      else [:output line])))
+
+(defn apprun--dispatch-line (line)
+  (let (kv (apprun--decode-line line))
+    (case (first kv)
+      :spy (send (apprun--editor) (apprun-spy-event (second kv)))
+      :stats (send (apprun--editor) (apprun-stats-event (second kv)))
+      :output (send (apprun--editor) (apprun-output-event (second kv)))
+      nil)))
+
+(defn apprun--feed (buf data)
+  (let (parts (string-split (str buf data) "\n")
+        complete (take (dec (count parts)) parts))
+    (doseq (line complete) (apprun--dispatch-line line))
+    (last parts)))
+
+(defn apprun--recv (proc buf)
+  "Stream the app until it exits; `[:run …]` mid-flight restarts it, `[:shutdown]`
+kills it (the stop command)."
+  (receive
+    ([:proc p data]
+      (apprun--recv proc (if (= p proc) (apprun--feed buf data) buf)))
+    ([:proc-err p data]
+      (do (when (= p proc)
+            (doseq (line (string-split data "\n"))
+              (when (not= (trim line) "") (send (apprun--editor) (apprun-output-event line)))))
+        (apprun--recv proc buf)))
+    ([:proc-closed p code]
+      (if (= p proc)
+        (do (when (not= (trim buf) "") (apprun--dispatch-line buf))
+          (send (apprun--editor) (apprun-done-event code))
+          (apprun--loop))
+        (apprun--recv proc buf)))
+    ([:run argv root]
+      (do (try (proc-close proc) (catch e nil))
+        (apprun--recv (proc-spawn "nest" argv {:cwd root}) "")))
+    ([:shutdown]
+      (do (try (proc-close proc) (catch e nil)) :apprun-stopped))))
+
+(defn apprun--loop ()
+  "Idle between runs — hibernate while waiting."
+  (hibernate)
+  (receive
+    ([:run argv root] (apprun--recv (proc-spawn "nest" argv {:cwd root}) ""))
+    ([:shutdown] :apprun-stopped)))
+
+;; ---- rendering + folds -------------------------------------------------------------
+
+(defn apprun--bytes->human (n)
+  (cond
+    (>= n 1048576) (str (quot n 1048576) "." (quot (rem (quot n 1024) 1024) 105) " MB")
+    (>= n 1024) (str (quot n 1024) " KB")
+    else (str n " B")))
+
+(defn apprun-spy-line (e)
+  "One *Run* line for a decoded spy entry (pr-str'd fields from the tap)."
+  (case (get e :kind)
+    "enter" (str "spy " (get e :form))
+    "node" (str "  " (get e :form) " => " (get e :value))
+    "exit" (str "=> " (get e :value))
+    "call" (str "call (" (get e :fn) " " (or (get e :args) "") ")")
+    "return" (str "  " (get e :fn) " => " (get e :value))
+    "span-enter" (str "span " (get e :form))
+    "span-exit" (str "span => " (get e :value))
+    (pr-str e)))
+
+(defn apprun-stats-line (s)
+  (str "· " (get s :procs) " procs · " (apprun--bytes->human (or (get s :memory) 0))
+    " · up " (quot (or (get s :uptime-ms) 0) 1000) "s"))
+
+(impl UiEvent apprun-output-event
+  (ui-event-fold [e m textrows cols rows]
+    (ed-append-named m *run-buffer* (str (apprun-output-event-text e) "\n"))))
+
+(impl UiEvent apprun-spy-event
+  (ui-event-fold [e m textrows cols rows]
+    (ed-append-named m *run-buffer* (str "~ " (apprun-spy-line (apprun-spy-event-entry e)) "\n"))))
+
+(impl UiEvent apprun-stats-event
+  ;; append the dim heartbeat line AND keep the latest on the model (a leak shows
+  ;; as a memory trend down the buffer)
+  (ui-event-fold [e m textrows cols rows]
+    (let (s (apprun-stats-event-stats e))
+      (ed-append-named (assoc-in m [:apprun :stats] s)
+        *run-buffer* (str (apprun-stats-line s) "\n")))))
+
+(impl UiEvent apprun-done-event
+  (ui-event-fold [e m textrows cols rows]
+    (let (code (apprun-done-event-code e))
+      (message (ed-append-named m *run-buffer*
+                 (str "\n[app exited " (if (nil? code) "killed" code) "]\n"))
+        (str "app exited " (if (nil? code) "(killed)" code))))))
+
+;; ---- the commands -------------------------------------------------------------------
+
+(defcommand cmd-run-project
+  (m key)
+  "Run the project's entry point (C-c r r): `nest run` in a dedicated subprocess with
+the debug taps installed — app output, coloured spy/trace traffic and a stats
+heartbeat stream into *Run*."
+  (spit *apprun-script-path* (apprun--script-source))
+  (let (root (or (:project-root m) (cwd))
+        proc (spawn :apprun (apprun--loop)))
+    (send proc [:run ["run" *apprun-script-path*] root])
+    (ed-show-named-aside
+      (message (assoc m :apprun {:root root}) (str "running project in " root "…"))
+      *run-buffer*
+      (str "-*- run: " root " -*-\n\n")
+      :run-log)))
+
+(defcommand cmd-run-stop
+  (m key)
+  "Stop the running app (C-c r k)."
+  (let (proc (whereis :apprun))
+    (if (nil? proc)
+      (message m "nothing is running")
+      (do (send proc [:shutdown])
+        (message m "app stopped")))))
+
+(defn apprun--line-loc (line)
+  "Parse a `file:line[:col]:` prefix — the testrun--line-loc shape (fold-up candidate)."
+  (let (t (triml line)
+        token (first (string-split t " "))
+        parts (string-split (or token "") ":")
+        n (count parts))
+    (when (>= n 2)
+      (let (nums (filter int? (map string->number (rest parts)))
+            file (first parts))
+        (when (and (> (string-length file) 0) (not (empty? nums)))
+          {:file file :line (first nums) :col (or (second nums) 1)})))))
+
+(defcommand cmd-run-jump
+  (m key)
+  "Visit the error location on the current *Run* line (RET)."
+  (let (buf (ed-current-buf m)
+        loc (apprun--line-loc (buffer-line-at buf (buffer-current-line buf))))
+    (if (nil? loc)
+      (message m "not on a location line")
+      (let (m1 (ed-find-file m (:file loc)))
+        (ed-apply m1 (fn (b) (ed-goto-line b (:line loc))))))))
+
+;; ---- the :run-log buffer type ---------------------------------------------------
+
+(def run-log-keymap
+  (-> {}
+    (keymap-bind [:enter] 'apprun/cmd-run-jump)
+    (keymap-bind ["k"] 'apprun/cmd-run-stop)))
+
+(def run-face-spy {:fg *teal*})
+(def run-face-stats {:fg *subtext* :italic true})
+(def run-face-error {:fg *red* :bold true})
+(def run-face-header {:fg *subtext* :bold true})
+
+(defn apprun--fontify-lines (lines off line-face acc)
+  ;; the whole-line accumulator again (git/bshell/testrun/debugger) — fold-up candidate
+  (if (empty? lines)
+    acc
+    (let (line (first lines)
+          face (line-face line)
+          spans (if (nil? face) '() (list [off (+ off (string-length line)) face])))
+      (apprun--fontify-lines (rest lines) (+ off (string-length line) 1) line-face
+        (append acc spans)))))
+
+(defn apprun--line-face (line)
+  (cond
+    (starts-with? line "~ ") run-face-spy
+    (starts-with? line "· ") run-face-stats
+    (starts-with? line "-*-") run-face-header
+    (starts-with? line "[app exited") run-face-header
+    (or (includes? line "error") (not (nil? (apprun--line-loc line)))) run-face-error
+    else nil))
+
+(defn run-log-fontify (src)
+  "The *Run* `:fontify`: teal spy traffic, dim heartbeats, red error locations."
+  (apprun--fontify-lines (string-split src "\n") 0 apprun--line-face '()))
+
+(def run-log-mode-layer
+  {:name 'run-log
+   :keymap apprun/run-log-keymap
+   :fontify 'apprun/run-log-fontify
+   :commands '("run-jump" "run-stop")})
+
+(register-type-layers :run-log
+  (list 'apprun/run-log-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
