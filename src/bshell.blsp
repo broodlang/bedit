@@ -17,8 +17,8 @@ input form. The `proc` mechanism is pipe-based (no PTY) — no raw mode; ANSI es
 
 Structure mirrors `lsp.blsp`: a dedicated **shell process** (`bshell--loop`, per buffer)
 owns the child `proc` (and runs Brood eval in its own image, off the editor loop). It
-receives `[:bshell-run line]`, runs it, and forwards each chunk as `[:bshell-output buf
-text]` / the exit as `[:bshell-done buf code]` (keyed by buffer name; `input` folds these)."
+receives `[:bshell-run line]`, runs it, and forwards each chunk as a `bshell-output-event`
+/ the exit as a `bshell-done-event` (keyed by buffer name; each folds itself in — `UiEvent`)."
   (:use model)  ; ed-buffer-index-by-name / ed-scroll / ed-stamp / ed-log-buffer / ed-set-buf
   (:use commands)  ; ed-open-buffer / ed-select / ed-project-root + the editing commands wrapped
   (:use projects)  ; editor-state-dir + the shared persist-read / persist-write! layer
@@ -131,14 +131,14 @@ a REPL — and off the editor loop), then push the formatted result + a success 
   (let (buf (:buffer state)
         out (eval-source line))  ; never throws: captured output then `=> value`, or `error: …`
     (do
-      (send (whereis :editor) [:bshell-output buf (str out "\n")])
-      (send (whereis :editor) [:bshell-done buf 0])
+      (send (whereis :editor) (bshell-output-event buf (str out "\n")))
+      (send (whereis :editor) (bshell-done-event buf 0))
       (bshell--loop state))))
 
 (defn bshell--loop (state)
   "The shell process's receive loop: `[:bshell-run line]` evaluates `line` as Brood when it
 starts with `(`, else spawns `sh -c line` in `:root`; the child's stdout/stderr forward to
-the editor as `[:bshell-output …]`; its exit as `[:bshell-done …]`; `:shutdown` kills any
+the editor as a `bshell-output-event`; its exit as a `bshell-done-event`; `:shutdown` kills any
 live child and stops."
   (receive
     ([:bshell-run line]
@@ -147,13 +147,13 @@ live child and stops."
         (let (p (proc-spawn "sh" ["-c" line] {:cwd (:root state)}))
           (bshell--loop (assoc state :proc p)))))
     ([:proc p data]
-      (do (send (whereis :editor) [:bshell-output (:buffer state) (ansi/strip-ansi data)])
+      (do (send (whereis :editor) (bshell-output-event (:buffer state) (ansi/strip-ansi data)))
         (bshell--loop state)))
     ([:proc-err p data]
-      (do (send (whereis :editor) [:bshell-output (:buffer state) (ansi/strip-ansi data)])
+      (do (send (whereis :editor) (bshell-output-event (:buffer state) (ansi/strip-ansi data)))
         (bshell--loop state)))
     ([:proc-closed p code]
-      (do (send (whereis :editor) [:bshell-done (:buffer state) code])
+      (do (send (whereis :editor) (bshell-done-event (:buffer state) code))
         (bshell--loop (assoc state :proc nil))))
     ([:shutdown]
       (do (when (:proc state) (proc-close (:proc state))) :bshell-stopped))))
@@ -203,19 +203,29 @@ starting at the new end (`:bshell-input-start`, on the buffer)."
   "The prompt string for the shell buffer `nm` (from its `:dir` — its project root)."
   (bshell--prompt (or (bshell--bufget m nm :dir) ".")))
 
-;; ---- the inbound async events (registered in input/ed--event-handlers) ------
+;; ---- the inbound async events (UiEvent records — see model.blsp) ------------
+;; The impls delegate to the named `ed-ev-*` fns so redefining one hot-swaps the
+;; live editor (the impl body's global call resolves late, like a keymap binding).
 
-(defn ed-ev-bshell-output (m input textrows cols rows)
-  "`[:bshell-output buffer text]` from the shell process → append the (ANSI-stripped)
+(defrecord bshell-output-event (buffer text))  ; a chunk of shell/eval output
+(defrecord bshell-done-event (buffer code))  ; the command's exit (nil = killed)
+
+(impl UiEvent bshell-output-event
+  (ui-event-fold [e m textrows cols rows] (ed-ev-bshell-output m e textrows cols rows)))
+(impl UiEvent bshell-done-event
+  (ui-event-fold [e m textrows cols rows] (ed-ev-bshell-done m e textrows cols rows)))
+
+(defn ed-ev-bshell-output (m event textrows cols rows)
+  "A `bshell-output-event` from the shell process → append the (ANSI-stripped)
 chunk to that buffer and keep the viewport following the output."
-  (ed-scroll (bshell--append m (nth input 1) (nth input 2)) textrows))
+  (ed-scroll (bshell--append m (bshell-output-event-buffer event) (bshell-output-event-text event)) textrows))
 
-(defn ed-ev-bshell-done (m input textrows cols rows)
-  "`[:bshell-done buffer code]` → on a line of its own, a non-zero `[exit N]` (a clean exit
+(defn ed-ev-bshell-done (m event textrows cols rows)
+  "A `bshell-done-event` → on a line of its own, a non-zero `[exit N]` (a clean exit
 0 is silent; a signal is `[exit killed]`), then a fresh prompt for that buffer; mark *that*
 shell idle and reset *its* input region to the new end (all per-buffer)."
-  (let (nm (nth input 1)
-        code (nth input 2)
+  (let (nm (bshell-done-event-buffer event)
+        code (bshell-done-event-code event)
         m0 (bshell--ensure-bol m nm)  ; the prompt starts at column 0, no blank line
         m1 (cond
              (= code 0) m0

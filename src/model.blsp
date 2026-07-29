@@ -33,7 +33,7 @@ pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
   (:use editor/pane)  ; the pane-tree layout: pane-single / selected payload / update / map
   (:use completion)  ; completion-rank-incremental — the minibuffer's narrowable fuzzy rank
   (:use log)  ; backend — the log-routing backends (one filtered backend per buffer)
-  (:use io)  ; fn-port — the editor-targeting log sink ([:buffer-log name line])
+  (:use io)  ; fn-port — the editor-targeting log sink (buffer-log-event)
   (:use keymaps)  ; profile-layers — seed the model-scope keybinding profile (emacs default)
   (:use task))  ; task — run the advisory diagnostics check off the loop (async recheck)
 
@@ -827,8 +827,40 @@ the echo area. Never disturbs the current buffer's point. The editor's primary o
 ;; destination buffer, each a `:filter` on the record's `:meta :category`, so a
 ;; component's logs land in its own buffer: uncategorised → *Messages* (the default),
 ;; `{:category :lsp}` → *LSP*, etc. A backend's sink is a `process-port`-style `io`
-;; port that sends `[:buffer-log <name> <line>]` to the editor, which `input` folds
-;; into that buffer (`ed-append-named`) — the same share-nothing path `print` uses.
+;; port that sends a `buffer-log-event` to the editor, which folds it into that
+;; buffer (`ed-append-named`) — the same share-nothing path `print` uses.
+
+;; ---- the async event contract (UiEvent) --------------------------------------
+;; Besides keys, the ui-run loop's mailbox receives async events from the editor's
+;; own producers (the compile worker, the project shell, the web mirror, the log
+;; backends below). Each is a RECORD implementing `UiEvent`: the producer module
+;; defines the record + impl and just sends it — no central handler table to edit
+;; (`ed-update` folds any `UiEvent` record via `ui-event-fold`). Declared here
+;; because every producer already `:use`s the model. Events whose producer we don't
+;; own — the GUI frontend's `[:resize]`/`[:mouse]`/`[:key-up]`, the runtime's
+;; `[:down]`, std's `[:buffer-updated]`/`[:io-write]`/`[:task-*]`/`[:client-opts]`,
+;; and the lsp replies interlocked with completion's bounded wait — stay tagged
+;; vectors in input's residual registry.
+
+(defability UiEvent
+  "An app-produced async event on the ui-run mailbox: `ui-event-fold` folds it into
+the model (the async analogue of a command's `model -> model`). Each impl does its
+own scroll-clamp, and delegates to a NAMED handler fn so redefining that global
+hot-swaps the live editor (the impl body's call is resolved late, like a keymap
+binding)."
+  (ui-event-fold [self m textrows cols rows] :-> any))
+
+(defn ui-event? (input)
+  "Whether `input` is an async event record (implements `UiEvent`)."
+  (and (record? input) (satisfies? 'UiEvent input)))
+
+(defrecord buffer-log-event (buffer line))  ; a routed log line -> append to that buffer
+
+(impl UiEvent buffer-log-event
+  ;; Unlike `[:io-write]` it sets *no* echo, so a category's stream (e.g. *LSP*)
+  ;; never floods the echo area.
+  (ui-event-fold [e m textrows cols rows]
+    (ed-append-named m (buffer-log-event-buffer e) (buffer-log-event-line e))))
 
 ;; Registered category→buffer log routes — a list of `{:category :buffer}`. A `def`
 ;; registry (rebound by `register-log-route`, like `layers/*type-layers*`), so it's
@@ -848,11 +880,11 @@ declares its destination by calling this (its `:log-category` / `:log-buffer`)."
   (get-in rec [:meta :category]))
 
 (defn ed-buffer-backend (nm &optional (opts {}))
-  "A std/log backend whose sink sends each formatted line to the editor as
-`[:buffer-log nm line]` (the editor appends it to buffer `nm`). `opts` is the usual
+  "A std/log backend whose sink sends each formatted line to the editor as a
+`buffer-log-event` (the editor appends it to buffer `nm`). `opts` is the usual
 `backend` map (`:filter` / `:min-level` / `:format`). The log-side counterpart of
 `message`: a component points its logger here to stream into its own buffer."
-  (log/backend (io/fn-port (fn (s) (send (whereis :editor) [:buffer-log nm s]) nil)) opts))
+  (log/backend (io/fn-port (fn (s) (send (whereis :editor) (buffer-log-event nm s)) nil)) opts))
 
 (defn ed-log-backends ()
   "The logger's full backend list, built from `*log-routes*`: one filtered backend

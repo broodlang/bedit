@@ -25,7 +25,8 @@ self-editing editor)."
   (:use editor/keymap)  ; keymap-step — the std chord dispatcher
   (:use editor/ui)  ; overlay-route — the shared modal-overlay dispatch fallthrough
   (:use bshell)  ; the project shell (C-x p e): bshell-enforce-boundary on every key + event handlers
-  (:use compile)  ; M-x compile + C-x ` next-error: its event handlers
+  ; compile is loaded below with a bare `require`: its defcommands + UiEvent impls
+  ; register at load, but nothing here refers to its names anymore
   (:use hosted)  ; hosted-step — the loop-tail content propagate for process-backed slots
   (:use collab)  ; shared-buffer-process pushes: the [:buffer-updated …] event handler
   ; web / git are deferred — guarded at their call sites with (bound? ...)
@@ -35,6 +36,7 @@ self-editing editor)."
 ;; Loading `modes` defines the layers and registers the default (text-mode); the
 ;; bindings live there, as data, not here.
 (require 'modes)
+(require 'compile)  ; M-x compile + C-x ` next-error — loads its defcommands + UiEvent impls
 (require 'editor/lineedit)  ; the minibuffer drives lineedit's pure one-line editor core
 
 ;; ---- the active keymap comes from the buffer's layers -----------------------
@@ -614,27 +616,23 @@ group); `:cursor-blink` toggles the caret. An unknown name is a no-op."
     else m))
 
 ;; ---- inbound system / async events (the loop's event bus) -------------------
-;; Besides keys, the ui-run loop receives async `[:tag …]` messages on its mailbox:
-;; redirected output (`:io-write` — std/io / std/log), a spawned eval's reply
-;; (`:task-done` / `:task-error` / `:task-timeout`), and the frontend's `:resize` /
-;; `:mouse`. Each is a handler `(fn (m input textrows cols rows) -> m)` in a registry
-;; keyed by tag; `ed-update` looks the tag up instead of a chain of `(vector? input)`
-;; arms — so a new async producer (an LSP client, a file-watcher, a buffer-process
-;; stream) registers a handler rather than editing the loop. Each handler does its own
-;; scroll-clamp (output/eval don't move point; resize/mouse do). (This "fold tagged
-;; mailbox messages into update" is a candidate std/ui capability — kept here for now.)
+;; Besides keys, the ui-run loop receives async messages on its mailbox. An event the
+;; editor PRODUCES ITSELF is a record implementing model's `UiEvent` ability — the
+;; producer module defines the record + impl and just sends it; `ed-update` folds any
+;; such record via `ui-event-fold`, so a new async producer (an LSP client, a
+;; file-watcher, a buffer-process stream) registers an impl rather than editing the
+;; loop or this file. What remains BELOW is the residual `[:tag …]` vector registry,
+;; for events whose producer we don't own: redirected output (`:io-write` — std/io /
+;; std/log), a spawned eval's reply (`:task-done` / `:task-error` / `:task-timeout`,
+;; std/task), the frontend's `:resize` / `:mouse` / `:key-up`, the runtime's `:down`,
+;; std's `:buffer-updated` / `:client-opts`, and the lsp reply tags (vectors because
+;; completion's bounded wait selectively receives `[:lsp-completion ^corr …]`). Each
+;; handler does its own scroll-clamp (output/eval don't move point; resize/mouse do).
 
 (defn ed--ev-io-write (m input textrows cols rows)
   "Redirected output (`[:io-write s]`) → *Messages* + the echo area (the default
 output sink: eval stdout, the uncategorised logger backend)."
   (message m (trimr (nth input 1))))
-
-(defn ed--ev-buffer-log (m input textrows cols rows)
-  "A routed log line (`[:buffer-log <name> <s>]`, from a category log backend — see
-`model/ed-buffer-backend`) → append to that buffer (`ed-append-named`, created if
-absent). Unlike `:io-write` it sets *no* echo, so a category's stream (e.g. *LSP*)
-never floods the echo area."
-  (ed-append-named m (nth input 1) (nth input 2)))
 
 (defn ed--ev-task-reply (m input textrows cols rows)
   "A spawned task's reply (`:task-done` / `:task-error` / `:task-timeout`): route by which
@@ -656,15 +654,6 @@ none is a stale/cancelled reply and is dropped, so it can't clobber a newer one.
 (defn ed--ev-resize (m input textrows cols rows)
   "A `[:resize cols rows]`: re-clamp the scroll (vertical + horizontal) to the new viewport."
   (ed-scroll-horizontal (ed-scroll m textrows) (ed-selected-text-cols m cols rows)))
-
-(defn ed--ev-web-port (m input textrows cols rows)
-  "The buffer web server's bound port (`[:web-port n]`, sent once it has listened —
-see `web/web-serve-proc`): record it on `:server` and echo the URL. Guarded against
-a stop that raced ahead of the bind."
-  (if (:server m)
-    (message (update m :server assoc :port (nth input 1))
-      (str "serving selected buffer on http://localhost:" (nth input 1)))
-    m))
 
 (defn ed--mouse-on-click (m)
   "After a left-click moved point, run the current buffer mode's `:on-click` command (a
@@ -764,14 +753,12 @@ the repeat. Other releases just keep the flag set."
   ;; (and would hide every handler from `nest test --cover`, whose instrumentation
   ;; rebinds the global that a captured value has already bypassed).
   {:io-write 'input/ed--ev-io-write
-   :buffer-log 'input/ed--ev-buffer-log
    :key-up 'input/ed--ev-key-up
    :task-done 'input/ed--ev-task-reply
    :task-error 'input/ed--ev-task-reply
    :task-timeout 'input/ed--ev-task-reply
    :resize 'input/ed--ev-resize
    :mouse 'input/ed--ev-mouse
-   :web-port 'input/ed--ev-web-port
    :buffer-updated 'input/ed--ev-buffer-updated
    :down 'input/ed--ev-down
    :client-opts 'input/ed--ev-client-opts
@@ -783,11 +770,7 @@ the repeat. Other releases just keep the flag set."
    :lsp-symbols 'commands/ed-ev-lsp-reply
    :lsp-text-edits 'commands/ed-ev-lsp-reply
    :lsp-workspace-edit 'commands/ed-ev-lsp-reply
-   :lsp-completion 'commands/ed-ev-lsp-reply  ; only ever stale here (completion's bounded wait consumes live ones)
-   :bshell-output 'bshell/ed-ev-bshell-output
-   :bshell-done 'bshell/ed-ev-bshell-done
-   :compile-output 'compile/ed-ev-compile-output
-   :compile-done 'compile/ed-ev-compile-done})
+   :lsp-completion 'commands/ed-ev-lsp-reply})  ; only ever stale here (completion's bounded wait consumes live ones)
 
 (defn ed-system-event? (input)
   "Whether `input` is an inbound `[:tag …]` event with a registered handler."
@@ -870,6 +853,9 @@ owns it, else through the keymap (`ed-dispatch`)."
                            ;; release lands in another window), so stop any repeat now — the safety net
                            ;; for a missed key-up.
                            (= input :blur) (ed--repeat-clear m0)
+                           ;; an app-produced async event record → it folds itself in
+                           ;; (`UiEvent`, see model.blsp — no handler table to consult).
+                           (ui-event? input) (ui-event-fold input m0 textrows cols rows)
                            ;; an inbound async/system event (`[:tag …]`) → its registered handler.
                            (ed-system-event? input) ((eval (get ed--event-handlers (first input))) m0
                                                       input
