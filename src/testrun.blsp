@@ -31,6 +31,7 @@ suite's own output is visible rather than lost."
 (require 'path)  ; path/basename — run labels (bare require: path's `join` must not shadow prelude's)
 (require 'debugger)  ; debugger-spy-tap-form (script) + debugger-spy-body (render)
 (require 'procstream)  ; the shared streaming-subprocess worker (:testrun rides it)
+(require 'modes)  ; fontify-line-faces + the gutter mark faces
 
 (def *tests-buffer* "*Tests*")
 
@@ -156,7 +157,7 @@ records, stderr forwards as plain output, the exit becomes the done event."
   "Drop every buffer's test verdict marks (per-test + describe rollup) — a fresh
 run's verdicts replace the last run's."
   (assoc m :buffers
-    (into [] (map (fn (b) (dissoc b :test-marks :test-marks-count :test-marks-rope :describe-marks))
+    (into [] (map (fn (b) (dissoc b :test-marks :test-marks-count :test-marks-rope :describe-marks :line-links))
                (:buffers m)))))
 
 (defn testrun-start (m specs root label)
@@ -200,28 +201,47 @@ parses), then the remaining details indented."
     (join "\n" (cons (str head " " first-detail)
                  (map (fn (d) (str "        " d)) (rest details))))))
 
-(defn testrun--describe-loc (m r)
-  "`relpath:line` for `r`'s describe head — resolved to the `(describe …)` line via
-the open source buffer when possible, else the test's own `:where` (still lands
-inside the describe). Makes the header a jump target."
-  (let (where (or (get r :where) ""))
-    (if (= where "")
-      nil
-      (let (parts (string-split where ":")
-            wl (string->number (last parts))
-            relpath (join ":" (take (dec (count parts)) parts))
-            idx (when (int? wl) (testrun--buffer-for m relpath)))
-        (if (nil? idx)
-          where
-          (let (dh (testrun--describe-head-line (ed-buf-at m idx) (dec wl)))
-            (if (nil? dh) where (str relpath ":" (inc dh)))))))))
+(defn testrun--where->loc (where)
+  "Parse a `relpath:line` `:where` into a `{:file :line :col}` loc, or nil."
+  (when (and where (not= where ""))
+    (let (parts (string-split where ":")
+          ln (string->number (last parts)))
+      (when (int? ln)
+        {:file (join ":" (take (dec (count parts)) parts)) :line ln :col 1}))))
 
-(defn testrun-group-header (group loc)
-  "The *Tests* header line for a describe `group` — the group name, bold and
-un-indented (its tests indent under it), followed by its `loc` as a link (so a click
-on the header visits the describe in source)."
-  (str (if (= group "") "(top level)" group)
-    (if (nil? loc) "" (str "  " loc))))
+(defn testrun--describe-loc (m r)
+  "The `{:file :line}` loc of `r`'s describe head — the `(describe …)` line resolved
+via the open source buffer when possible, else the test's own `:where` (still inside
+the describe). Makes the header a jump target (off-text)."
+  (let (base (testrun--where->loc (get r :where)))
+    (if (nil? base)
+      nil
+      (let (idx (testrun--buffer-for m (:file base)))
+        (if (nil? idx)
+          base
+          (let (dh (testrun--describe-head-line (ed-buf-at m idx) (dec (:line base))))
+            (if (nil? dh) base (assoc base :line (inc dh)))))))))
+
+(defn testrun-group-header (group)
+  "The *Tests* header line for a describe `group` — just the group name, bold and
+un-indented; its tests indent under it. Clickable via the off-text `:line-links`
+store (a describe header links to its source), not visible link text."
+  (if (= group "") "(top level)" group))
+
+(defn testrun--append-link (m text loc)
+  "Append `text` (one logical line, +failure lines) to *Tests* and, when `loc` is
+non-nil, record the LINE the text lands on in the buffer's `:line-links` map — the
+off-text jump target the pointer/hover and click read (`:line-loc`), so the visible
+row stays clean (no file path)."
+  (let (idx0 (ed-buffer-index-by-name m *tests-buffer*)
+        landed (if (nil? idx0) 0 (dec (buffer-line-count (ed-buf-at m idx0))))
+        m1 (ed-append-named m *tests-buffer* (str text "\n")))
+    (if (nil? loc)
+      m1
+      (let (idx (ed-buffer-index-by-name m1 *tests-buffer*)
+            b (ed-buf-at m1 idx))
+        (update m1 :buffers assoc idx
+          (assoc b :line-links (assoc (or (:line-links b) {}) (max 0 landed) loc)))))))
 
 (defn testrun-result-lines (r)
   "The *Tests* lines for one finished test: an indented ✓/✗ row under its describe
@@ -229,10 +249,7 @@ header (+ failure locations under a failing one). The row carries its declaratio
 site (`:where`) at the end, so the rows themselves are jump targets through the
 shared location parser — RET or click any row to visit its test."
   (let (mark (cond (get r :skipped) "·" (get r :passed) "✓" else "✗")
-        where (or (get r :where) "")
-        row (str "  " mark " " (get r :name)
-              "  (" (get r :ms) " ms)"
-              (if (= where "") "" (str "  " where))))
+        row (str "  " mark " " (get r :name) "  (" (get r :ms) " ms)"))
     (if (get r :passed)
       row
       (join "\n" (cons row (map testrun--loc-line (get r :failures)))))))
@@ -346,10 +363,10 @@ superseded run (rapid re-runs) is dropped so it can't corrupt the fresh report."
             ;; interleaved parallel groups is informative, not wrong)
             m2 (if (= group (get-in m1 [:testrun :last-group]))
                  m1
-                 (ed-append-named (assoc-in m1 [:testrun :last-group] group)
-                   *tests-buffer* (str (testrun-group-header group (testrun--describe-loc m1 r)) "\n"))))
+                 (testrun--append-link (assoc-in m1 [:testrun :last-group] group)
+                   (testrun-group-header group) (testrun--describe-loc m1 r))))
         (testrun--annotate
-          (ed-append-named m2 *tests-buffer* (str (testrun-result-lines r) "\n"))
+          (testrun--append-link m2 (testrun-result-lines r) (testrun--where->loc (get r :where)))
           r)))))
 
 (impl UiEvent test-summary-event
@@ -463,15 +480,24 @@ loop in a test, a slow suite). A no-op when nothing is running."
       else nil)))
 
 (defn testrun-fontify (src)
-  "The *Tests* `:fontify`: role colour per line (`testrun--line-face`) with every
-`file:line` rendered as an underlined link — the shared results styling
-(`modes/fontify-results`), so *Tests* looks and clicks like *Run* / *compilation*."
-  (modes/fontify-results src testrun--line-face))
+  "The *Tests* `:fontify`: role colour per line (green ✓, red ✗, mauve group
+headers, dim output). Clickability is the pointer cursor + hover highlight the view
+draws from `:line-loc`, not visible link text."
+  (modes/fontify-line-faces src testrun--line-face))
+
+(defn testrun-line-loc (buf line0)
+  "*Tests* `:line-loc`: the off-text `:line-links` location for a clean row/header,
+else the text parse (a failure detail line shows its real `file:line:col`) — so
+every result line is a clickable link (pointer + hover) to its source, with no
+visible link text on the clean rows."
+  (or (get (:line-links buf) line0)
+    (commands/default-line-loc buf line0)))
 
 (def test-menu-mode-layer
   {:name 'test-menu
    :keymap testrun/test-menu-keymap
    :fontify 'testrun/testrun-fontify
+   :line-loc 'testrun/testrun-line-loc
    :commands '("test-rerun")})
 
 ;; :test-menu stacks the jump/rerun keys over special-mode (read-only, no gutter)
