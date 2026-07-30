@@ -452,8 +452,19 @@ dispatched normally (Emacs' dismiss-and-process)."
 ;; there the terminal's own key repeat still applies, and we never engage (and so
 ;; never run away with no release to stop us).
 
-(defdyn *repeat-delay-ms* 300)  ; initial pause before a held key starts repeating (typematic)
-(defdyn *repeat-rate-ms* 35)  ; interval between repeats once it has started
+(defdyn *repeat-delay-ms* 220)  ; initial pause before a held key starts repeating (typematic)
+(defdyn *repeat-rate-ms* 30)  ; interval between repeats once it has started
+
+(defn ed-repeat-delay (m)
+  "The hold-before-repeat delay for this model: the init file's `:repeat-delay` when
+set (`config/apply-to-model` seeds it), else `*repeat-delay-ms*`. The 'initial motion'
+feel of holding a key is exactly this number."
+  (or (:repeat-delay m) *repeat-delay-ms*))
+
+(defn ed-repeat-rate (m)
+  "The interval between repeats once a held key is repeating: the init file's
+`:repeat-rate` when set, else `*repeat-rate-ms*`."
+  (or (:repeat-rate m) *repeat-rate-ms*))
 
 (def *view-resume-keys*
   ;; Plain cursor-movement keys that should resume from the VISIBLE area after you've
@@ -585,7 +596,7 @@ group); `:cursor-blink` toggles the caret. An unknown name is a no-op."
                                                  (:held-key m)
                                                  textrows
                                                  textcols
-                                                 {:every *repeat-rate-ms*})
+                                                 {:every (ed-repeat-rate m)})
                            else (ed--repeat-clear m))
     ;; the idle debounce: eldoc + diagnostics + a large completion source's candidate re-rank,
     ;; plus the off-the-loop diff-hl launch and the debounced web-mirror push — all the work
@@ -643,12 +654,13 @@ output sink: eval stdout, the uncategorised logger backend)."
   "A spawned task's reply (`:task-done` / `:task-error` / `:task-timeout`): route by which
 in-flight handle it matches. The async diagnostics check (`:diag-proc`) folds its result
 into the `:diagnostics` cache; the async eldoc compute (`:eldoc-proc`) caches its hint;
-the C-x C-e eval (`:eval-proc`) shows its message in the echo area. A handle matching
-none is a stale/cancelled reply and is dropped, so it can't clobber a newer one.
-(diff-hl is computed synchronously on the idle beat — no async reply.)"
+the C-x C-e eval (`:eval-proc`) shows its message in the echo area; the async diff-hl gutter
+(`:gitdiff-proc`) folds its `{line -> status}` map onto the buffer it diffed. A handle matching
+none is a stale/cancelled reply and is dropped, so it can't clobber a newer one."
   (let (h (nth input 1))
     (cond
       (= (:diag-proc m) h) (ed-apply-diag m (if (= (first input) :task-done) (nth input 2) '()))
+      (= (:gitdiff-proc m) h) (ed-apply-gitdiff m (if (= (first input) :task-done) (nth input 2) '()))
       (= (:eldoc-proc m) h) (ed-apply-eldoc m (if (= (first input) :task-done) (nth input 2) nil))
       (= (:eval-proc m) h) (message (dissoc m :eval-proc)
                                  (if (= (first input) :task-timeout)
@@ -666,6 +678,27 @@ command symbol, resolved late like a keymap binding) — e.g. *git-status* visit
 under the click. A no-op when the buffer's mode defines no `:on-click`."
   (let (svc (ed-mode-service (ed-current-buf m) :on-click))
     (if (nil? svc) m (svc m :mouse))))
+
+(defn ed--drag-release (m input textrows cols rows row col)
+  "End a left press over the text: a real drag-selection copies its region to the kill
+ring + OS clipboard (Emacs `mouse-drag-copy-region`, in ANY buffer, keeping the region
+highlighted); a plain CLICK (no region) runs the buffer mode's `:on-click` — so a
+results-buffer row (`*Tests*` / `*git-status*` / `*Occur*` / `*compile*`) navigates to
+its source ON CLICK, while a press-and-drag in the SAME buffer selects text instead.
+That click-vs-drag split is what makes a results buffer's output highlightable/copyable
+rather than every press being swallowed as a link jump.
+
+A navigate then re-clamps the (now-selected) SOURCE pane so the visited line is actually
+brought on screen — `ed-pop-to-file` only moves point and relies on this clamp, and unlike
+the key path (RET) a mouse release returns straight out of here, so without it a click set
+point but never scrolled the target into view. The copy path scrolls nothing (the region
+stays put)."
+  (let (folded (ed-mouse m input cols rows))  ; ends the drag; the region (mark↔point) survives
+    (if (nil? (buffer-region (ed-current-buf folded)))
+      (let (navigated (ed--mouse-on-click folded))  ; a plain click — navigate via :on-click (if any)
+        (ed-scroll-horizontal (ed-scroll navigated textrows)
+          (ed-selected-text-cols navigated cols rows)))
+      (ed-drag-copy folded))))     ; a real region — copy it, leaving it selected
 
 (defn ed--menu-mouse-press (m cols rows row col)
   "A press while the context menu is open: hit-test via the view's widget zones
@@ -707,26 +740,13 @@ over the view widget's zones)."
                   else m)
       (= action :move) (ed-link-hover (ed-modeline-hover m cols rows col row) cols rows col row)
       (and (= action :press) (= button :right)) (ed-open-menu m row col)
-      ;; A left-press inside a RESULTS buffer is link-only: a link line navigates
-      ;; (open the source in another pane — the results stay), a non-link line does
-      ;; NOTHING (no point move, no pane select). `ed-results-link-at` is nil for an
-      ;; ordinary buffer, so normal clicks are untouched.
-      (and (= action :press) (= button :left)
-        (let (r (ed-results-link-at m cols rows row col)) (and r (= (first r) :link))))
-      (let (loc (second (ed-results-link-at m cols rows row col))
-            path (:file loc)
-            resolved (if (starts-with? path "/") path (str (or (:project-root m) (cwd)) "/" path)))
-        ;; select the clicked pane first, so `ed-pop-to-file` opens the source in a
-        ;; pane OTHER than the results one (and the results buffer stays visible)
-        (ed-pop-to-file (ed-select-pane-at m cols rows row col) resolved (:line loc)))
-      (and (= action :press) (= button :left)
-        (let (r (ed-results-link-at m cols rows row col)) (and r (= (first r) :inert))))
-      m  ; a results buffer, non-link line → the click is inert
-      ;; Releasing a text drag-select copies the highlighted region to the kill
-      ;; ring + OS clipboard (Emacs mouse-drag-copy-region) — in ANY buffer — then
-      ;; ends the drag. A plain click (no region) is a silent no-op.
+      ;; Releasing a left press: a real drag-selection copies its region; a plain click
+      ;; runs the row's `:on-click` (a results buffer navigates to its source ON CLICK).
+      ;; Navigation is here on RELEASE, not on press, so a press begins a drag-select
+      ;; instead of being swallowed as a link jump — that's what lets you highlight and
+      ;; copy text in *Tests* / *git-status* / *Occur* / *compile*.
       (and (= action :release) (:text-drag m))
-      (ed-drag-copy (ed-mouse m input cols rows))
+      (ed--drag-release m input textrows cols rows row col)
       ;; A left-press on a clickable status-bar segment (the branch / git indicator) runs its
       ;; command instead of the normal press handling — so it opens *git-status*, not moves
       ;; point. `ed-modeline-click` is nil unless a segment with an `:on-click` is under it.
@@ -734,17 +754,16 @@ over the view widget's zones)."
                            (ed-modeline-click m cols rows col row) nil))
               (if mclick
                 mclick
-                (let (folded (ed-mouse m input cols rows)
-                      ;; a completed left-click runs the buffer mode's :on-click command (if any),
-                      ;; after the press has moved point to the clicked line — e.g. *git-status*
-                      ;; visits the file under the click. Generic; ordinary buffers define none.
-                      mm (if (and (= action :press) (= button :left)) (ed--mouse-on-click folded) folded))
+                (let (folded (ed-mouse m input cols rows))
+                  ;; NB: a results row's `:on-click` navigation fires on the click's RELEASE
+                  ;; (ed--drag-release), NOT here on press — so the press can begin a
+                  ;; drag-select rather than steal it as a link click.
                   (if (or (= action :scroll-up)
                         (= action :scroll-down)
                         (:sb-drag m)
-                        (:sb-drag mm))
-                    mm
-                    (ed-scroll-horizontal (ed-scroll mm textrows) (ed-selected-text-cols mm cols rows)))))))))
+                        (:sb-drag folded))
+                    folded
+                    (ed-scroll-horizontal (ed-scroll folded textrows) (ed-selected-text-cols folded cols rows)))))))))
 
 (defn ed--ev-buffer-updated (m input textrows cols rows)
   "A shared buffer process's push (`[:buffer-updated proc version text]`, from
@@ -929,7 +948,7 @@ owns it, else through the keymap (`ed-dispatch`)."
                                     input
                                     textrows
                                     textcols
-                                    {:after *repeat-delay-ms*})))
+                                    {:after (ed-repeat-delay m0)})))
                          input)
                        cols
                        rows))

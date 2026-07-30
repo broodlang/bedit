@@ -126,6 +126,12 @@ minibuffer/prefix."
    :edit-state nil
    :status (str "editing " (buffer-name buf))
    :done false
+   ;; ui-run coalesces a queued input burst into ONE render (std/editor/ui.blsp): the
+   ;; editor streams async events into its own mailbox — a test/run feed, collab deltas,
+   ;; an LSP/debugger push — so without this a 900-test run would cost ~900 full frames
+   ;; and dribble in over seconds after the run finished. Inert in pure `ed-update` tests
+   ;; (it only affects the live loop).
+   :coalesce-input? true
    :blink-on? true
    :timers {:cursor-blink {:every *blink-ms* :idle? true}}})
 
@@ -308,35 +314,63 @@ re-fires iff the buffer moved on while the check ran, so the next idle tick rela
 
 (defn ed-gitdiff-stale? (m)
   "True when the current buffer wants a diff-hl recompute: diff-hl is on (`:diff-hl?`,
-default true), it's a file buffer, and its **rope differs from the one the cached gutter
-was computed for** (`:git-status-rope`) — its first view (no cache), or any edit since.
-An O(1) rope-handle compare (like `ed-diag-stale?`), so plain motion costs nothing but a
-text change re-arms the diff, so the change bars follow edits instead of freezing at their
-old lines until a save (the 'bars drift the further down you scroll' symptom)."
+default true), it's a file buffer, and its **rope differs from the one the cached gutter was
+computed for** (`:git-status-rope`) — its first view (no cache), or any edit since. An O(1)
+rope-handle compare (like `ed-diag-stale?`), so plain motion costs nothing but a text change
+re-arms the diff, so the change bars follow edits instead of freezing at their old lines until
+a save (the 'bars drift the further down you scroll' symptom). No size cap — the recompute
+runs OFF the loop (`ed-launch-gitdiff`), so a large file no longer blocks it."
   (and (:diff-hl? m true)
     (let (b (ed-current-buf m))
       (and (buffer-file b)
         (not (= (buffer-rope b) (:git-status-rope b)))))))
 
 (defn ed-launch-gitdiff (m)
-  "Recompute the current buffer's diff-hl gutter when it's stale (its rope differs from the
-one the cached gutter was computed for). Runs `git diff` **synchronously** here, stamping the
-result + the rope + the line count on the buffer. It's safe to run inline because (a) git's C
-diff is fast (~tens of ms even on a large file) and (b) this fires only on the **idle beat**
-(`input/ed--timer-fire :idle-recompute`), debounced off the per-key path — so it never blocks
-typing yet updates reliably on every settled edit.
+  "Recompute the current buffer's diff-hl gutter when stale, OFF THE LOOP — mirroring
+`ed-launch-diag`. `git show HEAD:file` + `git diff` is tens of ms on a normal file but scales
+with the file size (~45ms on an 848KB / 12k-line doc, seconds on a huge one) — too much for the
+per-event loop, which once wedged the whole editor on a large file — so it runs in a spawned
+task (std/task): record the task handle on `:gitdiff-proc` and the rope it is diffing on
+`:gitdiff-checking`, so a stale reply can't clobber a newer cache. Fires on the idle beat, gated
+on an in-flight check. Headless (no `:editor`) → synchronous fallback.
 
-(It replaced a spawned-task version blamed at the time for a frozen gutter — but the async
-reply path was later exonerated: the real bug was the idle beat suppressed by a stuck
-`:held-key` (cac0ce3), so the recompute never *fired*, sync or async. The task-reply
-contract is pinned by tests/gitdiff_async_test.blsp's last describe. Synchronous stays
-because it's the simpler design at this cost profile, not because async is unreliable.)"
-  (if (or (not (ed-gitdiff-stale? m)) (not (bound? 'gitdiff/gitdiff-annotate)))
-    m
-    (let (b (ed-current-buf m))
-      (ed-set-buf m (assoc (gitdiff/gitdiff-annotate b)
-                      :git-status-rope (buffer-rope b)
-                      :git-status-lines (buffer-line-count b))))))
+(An earlier async version was blamed for a frozen gutter but later exonerated — the real bug
+was the idle beat suppressed by a stuck `:held-key`, cac0ce3; the task-reply contract is pinned
+by tests/gitdiff_async_test.blsp's last describe. Async is restored here because sync scales
+with file size and blocks the loop — the very failure the user hit on a 12k-line file.)"
+  (cond
+    (not (ed-gitdiff-stale? m)) m
+    (:gitdiff-proc m) m
+    (not (bound? 'gitdiff/gitdiff-status)) m
+    (nil? (whereis :editor))
+      (let (b (ed-current-buf m))
+        (ed-set-buf m (assoc (gitdiff/gitdiff-annotate b)
+                        :git-status-rope (buffer-rope b)
+                        :git-status-lines (buffer-line-count b))))
+    :else
+      (let (b (ed-current-buf m)
+            path (buffer-file b)
+            text (buffer-text b)
+            job (task (fn () (gitdiff/gitdiff-status path text))))
+        (assoc m :gitdiff-proc job :gitdiff-checking (buffer-rope b)))))
+
+(defn ed-apply-gitdiff (m result)
+  "Fold a finished diff-hl compute's `result` (the `{0-based-line -> status}` map; nil/() on
+error/timeout) into the buffer it was diffed for — located by the rope it carried
+(`:gitdiff-checking`), so a buffer switch mid-flight still stamps the RIGHT buffer — with the
+rope + line count, and clear the in-flight handle. A buffer edited since the launch has no
+matching rope, so its stale result is dropped and `ed-gitdiff-stale?` re-fires next idle tick.
+Mirrors `ed-apply-diag`."
+  (let (rope (:gitdiff-checking m)
+        m1 (dissoc m :gitdiff-proc :gitdiff-checking)
+        idx (index-where (fn (b) (= (buffer-rope b) rope)) (:buffers m1)))
+    (if (< idx 0)
+      m1
+      (update m1 :buffers assoc idx
+        (assoc (nth (:buffers m1) idx)
+          :git-line-status (or result {})
+          :git-status-rope rope
+          :git-status-lines (buffer-line-count (nth (:buffers m1) idx)))))))
 
 
 (defn ed-layer-modeline-segments (m buf)

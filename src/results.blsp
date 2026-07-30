@@ -1,0 +1,152 @@
+(defmodule results
+  "**The results-buffer abstraction** — the one shared foundation behind every read-only
+report buffer whose rows name a source location: `*Tests*`, `*Run*`, `*compilation*`,
+`*Occur*`, `*git-status*`. Three concerns, all app-agnostic (no command, no pane/pool
+navigation — that stays in the editor's command layer, which *consumes* this):
+
+  1. **Location vocabulary** — parse a `file:line[:col]` out of a report row (`loc-at-line`)
+     and resolve the location a row links to, walking up to the nearest one above for a
+     row that names none (`line-link-loc`). A mode with OFF-text locations (a test runner
+     storing them by line) overrides the `:line-loc` service; the default reads the text.
+     This one predicate drives the jump, the pointer cursor, and the hover underline alike.
+
+  2. **The layer** — `location-jump-layer`: stack it on any results buffer and every
+     location row becomes navigable (RET / click → `commands/cmd-visit-location`, resolved
+     late by symbol so this module needn't depend on the command layer). Read-only + the
+     `:line-loc` contract is all a consumer needs; an unusual row shape just overrides
+     `:line-loc`.
+
+  3. **Streaming** — `ed-append-follow`: append a line to a report buffer and follow the
+     tail in any pane already at the bottom (Emacs `compilation-scroll-output`), never
+     yanking a pane the reader scrolled up. The shared append behind live `*Tests*`/`*Run*`.
+
+Consumers (`testrun`/`apprun`/`compile`/`modes`' occur+git) stack the layer, override
+`:line-loc` if needed, and stream through `ed-append-follow`. The navigation *command*
+(`cmd-visit-location` → `ed-pop-to-file`, pane/pool-coupled) lives in `commands` and uses
+this layer's vocabulary — the app-specific half, kept out of the abstraction."
+  (:use model)  ; ed-mode-service / ed-append-named / ed-buf-at / ed-buffer-index-by-name
+  (:use editor/buffer)  ; buffer-line-at / buffer-line-count — read a row's text / length
+  (:use editor/keymap)  ; keymap-bind — the RET binding on the jump keymap
+  (:use panes)  ; ed-body-layout / ed-pane-vrows / ed-pane-top — find + measure the panes
+  (:use editor/pane))  ; pane-update-path — scroll the pane that follows the tail
+
+;; ---- location vocabulary: parse a row → a source location -------------------
+
+(defn loc--file-token? (file)
+  "Whether `file` looks like a source path rather than a host / clock field. A path
+separator is decisive; a dot counts only when the part after the LAST dot is a
+non-empty, non-numeric extension (`foo.blsp` yes; `0.0.0.0`, `127.0.0.1` no — an
+all-numeric tail is an IP octet, not an extension). Guards against `12:34:56`
+timestamps and `host:port` being read as `file:line` (a red log line + a jump to a
+bogus `<root>/12` on click)."
+  (and (> (string-length file) 0)
+    (or (includes? file "/")
+      (let (i (last-index-of file "."))
+        (and (>= i 0)
+          (let (ext (substring file (inc i) (string-length file)))
+            (and (> (string-length ext) 0)
+              (nil? (string->number ext)))))))))
+
+(defn loc--parse-token (token)
+  (let (parts (string-split (or token "") ":")
+        n (count parts))
+    (when (>= n 2)
+      (let (nums (filter int? (map string->number (rest parts)))
+            file (first parts))
+        (when (and (loc--file-token? file) (not (empty? nums)))
+          {:file file :line (first nums) :col (or (second nums) 1)})))))
+
+(defn loc-at-line (line)
+  "Parse a `file:line[:col]` location from a report row — the leading token (an
+indented failure line) or the trailing one (a labelled ✓/✗ row that carries its
+declaration site at the end). nil when the row names none."
+  ;; `trim`, not `triml`: `buffer-line-at` keeps the trailing newline, which would
+  ;; otherwise stick to a TRAILING location token (`12\n`) and fail to parse — the
+  ;; reason a ✓/✗ row (its `file:line` at the end) wouldn't jump.
+  (let (tokens (filter (fn (t) (not= t "")) (string-split (trim line) " ")))
+    (when (not (empty? tokens))
+      (or (loc--parse-token (first tokens))
+        (loc--parse-token (last tokens))))))
+
+(defn default-line-loc (buf line0)
+  "The default `:line-loc` service — parse `file:line[:col]` from the line's TEXT
+(`loc-at-line`). A mode with off-text locations (a test runner storing them by line)
+provides its own `:line-loc (buf line0) -> loc`."
+  (loc-at-line (buffer-line-at buf line0)))
+
+(defn line-loc-service (buf)
+  "The buffer's `:line-loc` service (`(buf line0) -> {:file :line :col}|nil`), or the
+default text parser. THE seam a results mode implements to become link-navigable."
+  (or (ed-mode-service buf :line-loc) default-line-loc))
+
+(defn line-links-loc (buf line0)
+  "A `:line-loc` for a results buffer that stores its row→location map OFF-text in `:line-links`
+(0-based line → `{:file :line :col}`) — the ONE mechanism `*Tests*` and `*git-status*` share:
+the visible row stays clean (no file path in the text) while the click / hover / RET resolve
+through the map, falling back to the text parser (`default-line-loc`) for a row not in it. A mode
+becomes link-navigable by (1) stashing `:line-links` on its buffer and (2) setting
+`:line-loc 'results/line-links-loc`."
+  (or (get (:line-links buf) line0)
+    (default-line-loc buf line0)))
+
+(defn line-link-loc (buf line0)
+  "The source location line `line0` links to, or — when it names none — the nearest
+one on a line ABOVE it (bounded 40): so a test's indented output/detail lines link
+to the test row above them. Drives BOTH the jump and the hover/cursor affordance."
+  (let (svc (line-loc-service buf))
+    (letrec (go (fn (i limit)
+                  (cond
+                    (or (< i 0) (<= limit 0)) nil
+                    else (let (loc (svc buf i))
+                           (if (nil? loc) (go (dec i) (dec limit)) loc)))))
+      (go line0 40))))
+
+;; ---- the layer: read-only + navigable location rows -------------------------
+;; Any report buffer whose rows name source locations stacks this: RET and a mouse click
+;; both visit the row's location (`commands/cmd-visit-location`, resolved late by symbol),
+;; parsed by the mode's `:line-loc` service or the standard `file:line[:col]:` shape, and
+;; every clickable line gets a pointer cursor + a subtle hover highlight (the view reads
+;; `:line-loc`). A mode with off-text locations overrides `:line-loc`; everyone else needs
+;; nothing but to stack the layer.
+
+(def location-jump-keymap
+  (-> {}
+    (keymap-bind [:enter] 'commands/cmd-visit-location)))
+
+(def location-jump-layer
+  {:name 'location-jump
+   :keymap location-jump-keymap
+   :on-click 'commands/cmd-visit-location
+   :line-loc 'results/default-line-loc
+   :commands '("visit-location")})
+
+;; ---- streaming: append + follow the tail ------------------------------------
+
+(defn ed--follow-tail (m idx old-lines cols rows)
+  "Scroll every pane showing pool buffer `idx` that was at the BOTTOM before an append
+(its line count then = `old-lines`, and its viewport reached that last line) down to the
+new last line — so streamed output stays in view (Emacs `compilation-scroll-output`)
+without yanking a pane the user has scrolled UP to read. No-op unless `:scroll-output`."
+  (if (not (:scroll-output m))
+    m
+    (let (buf (ed-buf-at m idx)
+          new-lines (buffer-line-count buf))
+      (fold (fn (mm pane)
+              (let (vrows (ed-pane-vrows pane))
+                (if (and (= (get-in pane [:payload :buffer]) idx)
+                      (>= (+ (ed-pane-top pane buf) vrows) old-lines))  ; was showing the old last line
+                  (assoc mm :layout
+                    (pane-update-path (:layout mm) (:path pane)
+                      (fn (w) (assoc w :top (max 0 (- new-lines vrows))))))
+                  mm)))
+        m (:panes (ed-body-layout m cols rows))))))
+
+(defn ed-append-follow (m nm s cols rows)
+  "Append `s` to buffer `nm` (`ed-append-named`) then follow the tail in any pane already
+at its bottom (`ed--follow-tail`) — the streaming-output append shared by *Tests* / *Run*.
+Falls back to a plain append when no pane shows the buffer."
+  (let (idx0 (ed-buffer-index-by-name m nm)
+        old-lines (if (nil? idx0) 0 (buffer-line-count (ed-buf-at m idx0)))
+        m1 (ed-append-named m nm s)
+        idx (ed-buffer-index-by-name m1 nm))
+    (if (nil? idx) m1 (ed--follow-tail m1 idx old-lines cols rows))))

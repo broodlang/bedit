@@ -510,29 +510,46 @@ pass through unchanged."
 ;; number and the text (not a heavy dark band). The gutter cell already reserves that space.
 (def *gutter-edit-margin* 1)
 
-(defn ed--gutter-line-ops (row bx result)
-  "Render ops for one gutter cell `result`: its `[text face]` chunks (normalised via
-`model/gutter-cell-chunks`, which accepts a single pair or a list) laid left-to-right from
-column `bx` — so a gutter can carry a coloured change bar *and* the dim line number in one cell
-(diff-hl). The web mirror renders the same chunks through the same decoder (`web--gutter-html`)."
+(def ed--gutter-bar-width 0.28)  ; the change-bar's width in cells (a thin diff-hl rule)
+
+(defn ed--gutter-line-ops (row bx result gui?)
+  "Render ops for one gutter cell `result`: its chunks (normalised via
+`model/gutter-cell-chunks`) laid left-to-right from column `bx` — so a gutter can carry a
+change bar *and* the dim line number in one cell (diff-hl). A `[:bar colour]` chunk is a git
+change bar: in the GUI a thin **full-cell-height** `frect` (a CONTINUOUS solid rule — a
+half-block glyph leaves a gap at the 1.4 line-height, reading as a dashed TUI bar), in the
+terminal the `▌` half-block. Other chunks are `[text face]`. The web mirror decodes the same
+chunks (`web--gutter-html`)."
   (reverse
     (second
       (fold (fn (st chunk)
               (let (col (first st) ops (second st) [t f] chunk)
-                [(+ col (string-length t)) (cons (text row col t f) ops)]))
+                (if (= t :bar)
+                  [(+ col 1)
+                   (cons (if gui?
+                           (frect (+ col 0.0) (+ row 0.0) ed--gutter-bar-width 1.0 {:bg f})
+                           (text row col "▌" {:fg f}))
+                     ops)]
+                  [(+ col (string-length t)) (cons (text row col t f) ops)])))
         [bx '()] (gutter-cell-chunks result)))))
 
-(defn ed-gutter-ops (buf top vh bx by gw)
-  "Gutter cells for the up-to-`vh` visible lines from `top`, via the buffer mode's
-`:gutter-cell` service (`[text face]`, or a list of such chunks, per 0-based line), placed at
-column `bx` (rows from `by`, width `gw`). `()` when `gw` is 0 or the mode offers no gutter."
-  (let (cell (ed-mode-service buf :gutter-cell))
-    (if (or (<= gw 0) (nil? cell))
-      '()
-      (let (last-line (min (dec (buffer-line-count buf)) (dec (+ top vh))))
-        (fold (fn (acc line)
-                (append acc (ed--gutter-line-ops (+ by (- line top)) bx (cell buf line gw))))
-          '() (range top (inc last-line)))))))
+(defn ed-gutter-ops (cells bx by gui?)
+  "Render ops for prebuilt gutter `cells` (one `[text face]` / `[:bar colour]` chunk list
+per visible line, from `panes/ed-pane-gutter-cells` — cached across frames, since typing
+never changes them), placed at column `bx`, rows from `by`. `gui?` picks the change bar's
+rendering (frect vs `▌`). `()` when `cells` is nil (gutter hidden / no service)."
+  (if (nil? cells)
+    '()
+    ;; cons each line's ops + reverse once, NOT `append acc` (which recopies the
+    ;; accumulator every visible line — O(rows²) per frame in the gutter).
+    (reverse
+      (first
+        (fold (fn (acc cell)
+                (let ([ops row] acc)
+                  [(fold (fn (a op) (cons op a))
+                     ops (ed--gutter-line-ops row bx cell gui?))
+                   (inc row)]))
+          ['() by] cells)))))
 
 ;; ---- per-pane scrollbar (rightmost column) ----------------------------------
 
@@ -569,18 +586,19 @@ predicate (`panes/ed-scrollbar-hit?`)."
         [(frect x (+ sy thumb-y) *scrollbar-width* thumb-h
            ed-face-scrollbar-thumb opacity (/ *scrollbar-width* 2))]))))
 
-(defn ed--pane-body-ops (buf top text-h x y w gw s hl-ranges spans overrides hscroll)
-  "The pane's body ops — its optional gutter plus visible buffer lines. At scale 1 the
-body renders straight into the rect (`[x y]`, width `w` less gutter and scrollbar). At
-scale `s>1` it renders into a virtual `vw×vh` area at the origin, then every op is scaled
-`s`× and re-anchored to `[x y]`, so the gutter magnifies in lock-step with the text."
+(defn ed--pane-body-ops (buf cells top text-h x y w gw s hl-ranges spans overrides hscroll gui?)
+  "The pane's body ops — its optional gutter (`cells`, prebuilt/cached chunk lists) plus
+visible buffer lines. At scale 1 the body renders straight into the rect (`[x y]`, width
+`w` less gutter and scrollbar). At scale `s>1` it renders into a virtual `vw×vh` area at
+the origin, then every op is scaled `s`× and re-anchored to `[x y]`, so the gutter
+magnifies in lock-step with the text."
   (if (= s 1)
-    (append (ed-gutter-ops buf top text-h x y gw)
+    (append (ed-gutter-ops cells x y gui?)
       (ed-visible-lines buf top text-h (+ x gw) y (max 1 (- w gw 1))
         hl-ranges spans overrides hscroll))
     (let (vh (max 1 (quot text-h s))
           vw (max 1 (quot (dec w) s))
-          body (append (ed-gutter-ops buf top vh 0 0 gw)
+          body (append (ed-gutter-ops cells 0 0 gui?)
                  (ed-visible-lines buf top vh gw 0 (max 1 (- vw gw))
                    hl-ranges spans overrides hscroll)))
       (map (fn (op) (ed--scale-op op x y s)) body))))
@@ -700,7 +718,11 @@ the ops are emitted flat (no region wrapper) for test-compatibility and zero ove
                        ;; highlight goes UNDER the text (like the hl-line band); the
                        ;; pointer-cursor zones draw nothing, so their order is free
                        (ed--pane-link-ops m pane buf top text-h x y w gw s)
-                       (ed--pane-body-ops buf top render-h x y w gw s hl-ranges spans overrides hscroll)
+                       (ed--pane-body-ops buf
+                         ;; cached across frames — typing never changes the gutter
+                         (ed-pane-gutter-cells m pane buf top
+                           (if (= s 1) render-h (max 1 (quot render-h s))) gw)
+                         top render-h x y w gw s hl-ranges spans overrides hscroll (:gui m))
                        ;; other participants' carets + name tags (collab presence) — drawn
                        ;; over the text, under our own cursor
                        (ed--remote-cursor-ops m pane buf top x y w gw text-h s hscroll)
@@ -879,11 +901,17 @@ plain prompt (find-file) keeps the inline ` {a b c}` here."
                     (if sel? "" (ed-mb-candidates mb)))))
         cols))))
 
+(def ed-plume-style
+  ;; the minibuffer list rows: painted by role (ui-ctx palette), a rounded selection pill
+  ;; (GUI) / bar (terminal) inset in the row — the same ui-list widget as the popup + menu.
+  {:fg :on-surface :bg :surface :radius *completion-card-radius*})
+
 (defn ed-mb-candidates-ops (m cols rows)
   "Plume's vertical candidate list for a minibuffer with `:accept-selection`: the fuzzy
-candidates drawn in the rows just above the prompt, the `:sel` row highlighted, each row
-carrying its category's marginalia (`plume-annotation`) when the prompt declares one. `[]`
-for no minibuffer, a plain prompt, or no candidates."
+candidates drawn in the rows just above the prompt as a windowed `ui-list` (src/ui-kit.blsp)
+INSET by `*plume-inset*`, the `:sel` row a rounded selection pill, each row carrying its
+category's marginalia (`plume-annotation`) in the widget's right-aligned `:key` slot when
+the prompt declares one. `[]` for no minibuffer, a plain prompt, or no candidates."
   (let (mb (:minibuffer m))
     (if (or (nil? mb) (not (:accept-selection mb)))
       []
@@ -901,12 +929,26 @@ for no minibuffer, a plain prompt, or no candidates."
                 values (take vis (drop wstart cands))
                 window (map labelf values)
                 ;; Plume marginalia: a per-category annotation for each visible candidate
-                ;; value; all-empty (aw 0) when the prompt's category has no annotator.
+                ;; value; nil (no :key) when the prompt's category has no annotator.
                 annots (map (fn (v) (or (plume-annotation mb v) "")) values)
                 aw (plume-annot-width annots)
-                ;; the list fills the bottom `vis` rows, full width, just below the prompt
-                row0 (- rows vis))
-            (plume-menu-ops window annots wstart sel row0 cols aw)))))))
+                inset *plume-inset*
+                inner-w (max 1 (- cols (* 2 inset)))
+                ;; the label fits before the right-aligned marginalia (1 lead + 1 gap + aw)
+                lab-w (max 1 (- inner-w 2 (if (= aw 0) 0 (inc aw))))
+                ;; pad each annotation to the column width so the widget's right-aligned
+                ;; :key slot puts EVERY row's marginalia at the same left column (perms /
+                ;; size / mtime line up) — right-aligning by raw length would ragged them.
+                rowvals (map (fn (i)
+                               (let (an (nth annots i))
+                                 {:label (plume-clip (nth window i) lab-w)
+                                  :key (if (= an "") nil (pad-right an aw)) :enabled true}))
+                          (range (count window)))
+                ;; the list fills the bottom `vis` rows, inset, just below the prompt
+                row0 (- rows vis)
+                widget (ui-list {:items rowvals :selected sel :base wstart
+                                 :row (fn (it i sel?) it) :tag :plume-pick :style ed-plume-style}))
+            (:ops (widget [inset row0 inner-w vis] (ui-ctx (:gui m))))))))))
 
 ;; `ed-selected-pane` lives in `panes` (this module `(:use panes)`).
 
@@ -937,24 +979,11 @@ width of the current line from char column `hscroll` to point (0 when point is l
         p (buffer-point buf))
     (if (>= from p) 0 (display-width (rope-slice rope from p)))))
 
-;; ---- the right-click context menu (Copy / Cut / Paste) ----------------------
-;; Rendered through the shared `completion-menu-ops` (the same bordered box as the
-;; autocomplete popup and the minibuffer list), so it reads as a floating menu rather
-;; than reverse-video text and looks identical to the rest. Reads only labels off the
-;; model (`:menu`), so the view stays independent of the command layer that builds it.
-
 ;; ---- the right-click context menu, as a ui-kit widget -----------------------
-;; The menu is now ONE `ui-list` inside a `ui-panel` (src/ui-kit.blsp). The widget emits
-;; its paint AND its click zones in one pass, so the view renders `:ops` and the click
-;; hit-test (input/ed--menu-mouse-*) reads `:zones` from the SAME widget — no parallel
-;; geometry to drift. Styling is by role (`ui-ctx` supplies the theme palette).
-
-(defn ui-ctx (m)
-  "The ui-kit render context: the GUI flag + the editor's semantic role palette
-(theme.blsp), so the theme-agnostic kit paints in our colours."
-  {:gui? (:gui m)
-   :theme {:surface *surface0* :on-surface *text* :muted *subtext*
-           :selection *blue* :on-selection *base* :border *surface1*}})
+;; The menu is ONE `ui-list` inside a `ui-panel` (src/ui-kit.blsp). The widget emits its
+;; paint AND its click zones in one pass, so the view renders `:ops` and the click hit-test
+;; (input/ed--menu-mouse-*) reads `:zones` from the SAME widget — no parallel geometry to
+;; drift. Styling is by role (`ui-ctx`, in theme.blsp, supplies the palette).
 
 (defn ed--menu-rowfn (it i sel?)
   "A menu item → a `ui-list` row: label + shortcut key + enabled + the divider-above flag."
@@ -975,7 +1004,7 @@ keeps the menu open). `{:ops [] :zones [] :area nil}` when no menu is open."
       (let (items (:items menu)
             meas (ui-list-measure items ed--menu-rowfn (:sel menu))
             area (ui-clamp [(:col menu) (:row menu) (+ (:w meas) 2) (:h meas)] cols rows)
-            ctx (ui-ctx m)
+            ctx (ui-ctx (:gui m))
             res (ui-panel area ctx ed-menu-style
                   (ui-list {:items items :selected (:sel menu) :row ed--menu-rowfn
                             :tag :menu-run :style ed-menu-style})))
@@ -1045,9 +1074,12 @@ cell's left edge — display.blsp; Vim insert always bar, normal/visual always b
           (ed--cursor-style m))))))
 
 (defn ed--which-key-rows (km)
-  "Sorted `\"<key>   <command>\"` rows for the entries of pending sub-keymap `km`."
-  (sort (map (fn (p) (str (ed-key-label (first p)) "   " (ed-cmd-label (second p))))
-          (map-pairs km))))
+  "Sorted `\"<key>   <command>\"` rows for the entries of pending sub-keymap `km`, the key
+column padded to a common width so the command column lines up across rows."
+  (let (pairs (map-pairs km)
+        kw (fold (fn (w p) (max w (string-length (ed-key-label (first p))))) 0 pairs))
+    (sort (map (fn (p) (str (pad-right (ed-key-label (first p)) kw) "   " (ed-cmd-label (second p))))
+            pairs))))
 
 (defn ed-which-key-ops (m cols rows)
   "When a prefix chord has been pending past the which-key delay (`:which-key` set by
@@ -1063,8 +1095,12 @@ list. `[]` otherwise, so a fast chord (C-x C-f) completes before the panel ever 
             row0 (- rows vis))               ; fills the bottom rows, below the echo row
         (if (empty? window)
           []
-          ;; no selection (selected = -1 → no highlight band); no marginalia column (aw 0)
-          (plume-menu-ops window (map (fn (_) "") window) 0 -1 row0 cols 0))))))  ; selected = -1 → no highlight
+          ;; the same `ui-list` widget as Plume, full-width with NO selection (`:selected nil`
+          ;; ⇒ no pill) — each row is a whole `"<key>   <command>"` label, no marginalia.
+          (let (widget (ui-list {:items window :selected nil
+                                 :row (fn (s i sel?) {:label s :enabled true})
+                                 :tag :which-key :style ed-plume-style}))
+            (:ops (widget [0 row0 cols vis] (ui-ctx (:gui m))))))))))
 
 (defn ed-view (m cols rows)
   "ui-run view (pure): lay the pane tree into the body (everything above the echo
