@@ -5,14 +5,18 @@ with debug taps wrapped around it. A generated script boots the app exactly as
 
   - `*spy-sink*` — every `(spy …)` / `trace-fn` entry anywhere in the app (any
     process: the root `def` is ambient) streams out as a JSON line;
-  - a stats heartbeat — process count + total memory, every few seconds, so a leak
-    or a spawn storm is visible as a trend while the app runs.
+  - a stats heartbeat — process count · reductions · uptime, on the statusbar chip
+    (not the buffer); a leak/spawn-storm shows as a trend (current + peak on hover).
 
-The `*Run*` buffer shows the app's own stdout/stderr as-is, spy traffic coloured
-like `*Spy*`, dim `·` heartbeat lines, and an exit footer; error locations
-(`file:line[:col]:`) are jumpable with RET. The editor side is the same shape as
-testrun/compile: a `:apprun` process owns the proc handle, line-buffers stdout,
-and forwards `UiEvent` records the loop folds."
+A margin breakpoint on the edited project's code (which lives in THIS run's image,
+not the editor's) is applied here: the run's `:run-breaks` are `trace-fn`'d after
+the project loads, so each breakpointed call streams into *Run* like a spy entry.
+
+The `*Run*` buffer shows the app's own stdout/stderr as-is, spy/trace traffic
+coloured like `*Spy*`, and an exit footer; error locations are jumpable with RET.
+The editor side is testrun/compile's shape: a `:apprun` process (via `procstream`)
+owns the proc handle, line-buffers stdout, and forwards `UiEvent` records the loop
+folds; the statusbar chip shows live telemetry."
   (:use model)  ; UiEvent + message / ed-append-named / ed-buf-at
   (:use interactive)  ; defcommand
   (:use commands)  ; ed-show-named-aside / ed-find-file / ed-apply / ed-goto-line
@@ -40,36 +44,59 @@ and forwards `UiEvent` records the loop folds."
 ;; boots the app, as root `def`s — ambient, so every process the app spawns streams
 ;; through them.
 
-(def apprun--script-forms
-  (list
-    '(require 'project)
-    '(require 'json)
-    ;; every spy/trace-fn entry, anywhere in the app -> one JSON line — the shared
-    ;; debugger tap
-    debugger/debugger-spy-tap-form
-    ;; the stats heartbeat: a tiny sibling process, hibernating between beats
-    (list 'def 'apprun--stats-ms *apprun-stats-ms*)
-    '(defn apprun--emit-stats (started)
-       (let (infos (keep process-info (list-processes)))
-         (println (json/json-encode
-                    {:event "stats"
-                     :procs (count infos)
-                     ;; reductions (work done) is the reliable live signal; :memory
-                     ;; only updates at a process's last receive, so it reads 0 for a
-                     ;; process that hasn't received yet
-                     :reductions (fold (fn (acc p) (+ acc (or (get p :reductions) 0))) 0 infos)
-                     :memory (fold (fn (acc p) (+ acc (or (get p :memory) 0))) 0 infos)
-                     :uptime-ms (- (now) started)}))))
-    '(defn apprun--beat (started)
-       (do
-         (apprun--emit-stats started)          ; emit at once, then every interval —
-         (receive (after apprun--stats-ms nil)) ; so telemetry shows immediately, even
-         (apprun--beat started)))               ; for an app that exits before 5s
-    '(spawn (apprun--beat (now)))
-    '(project/run-project '())))
+(defn apprun--run-forms (run-breaks)
+  "The forms that RUN the project. With no run breakpoints it's just
+`project/run-project`. With them, it replicates run-project's flow but installs a
+trace on each breakpointed symbol AFTER the entry module is required (so the project
+code is loaded and bound) and BEFORE the entry runs — `require` is idempotent, so the
+traces survive. Each traced call then streams into *Run* via the spy tap."
+  (if (empty? run-breaks)
+    (list '(project/run-project '()))
+    ;; force-load the whole project so the breakpointed syms are bound, install the
+    ;; traces, THEN run-project — its `require` is idempotent (the modules are already
+    ;; loaded), so it doesn't reload and wipe the traces. Each traced call streams
+    ;; into *Run* via the spy tap.
+    (append
+      (list '(require 'debug)
+        '(project/load-config)
+        '(let (root (project/project-find-root (cwd)))
+           (when root
+             (project/project-setup root)
+             (project/project-load-sources root))))
+      (map (fn (sym) `(when (bound? (quote ~sym)) (debug/trace-fn (quote ~sym)))) run-breaks)
+      (list '(project/run-project '())))))
 
-(defn apprun--script-source ()
-  (join "\n" (map pr-str apprun--script-forms)))
+(defn apprun--script-forms (run-breaks)
+  (append
+    (list
+      '(require 'project)
+      '(require 'json)
+      ;; every spy/trace-fn entry, anywhere in the app -> one JSON line — the shared
+      ;; debugger tap
+      debugger/debugger-spy-tap-form
+      ;; the stats heartbeat: a tiny sibling process, hibernating between beats
+      (list 'def 'apprun--stats-ms *apprun-stats-ms*)
+      '(defn apprun--emit-stats (started)
+         (let (infos (keep process-info (list-processes)))
+           (println (json/json-encode
+                      {:event "stats"
+                       :procs (count infos)
+                       ;; reductions (work done) is the reliable live signal; :memory
+                       ;; only updates at a process's last receive, so it reads 0 for a
+                       ;; process that hasn't received yet
+                       :reductions (fold (fn (acc p) (+ acc (or (get p :reductions) 0))) 0 infos)
+                       :memory (fold (fn (acc p) (+ acc (or (get p :memory) 0))) 0 infos)
+                       :uptime-ms (- (now) started)}))))
+      '(defn apprun--beat (started)
+         (do
+           (apprun--emit-stats started)          ; emit at once, then every interval —
+           (receive (after apprun--stats-ms nil)) ; so telemetry shows immediately, even
+           (apprun--beat started)))               ; for an app that exits before 5s
+      '(spawn (apprun--beat (now))))
+    (apprun--run-forms run-breaks)))
+
+(defn apprun--script-source (run-breaks)
+  (join "\n" (map pr-str (apprun--script-forms run-breaks))))
 
 ;; ---- the runner process ----------------------------------------------------------
 
@@ -167,16 +194,19 @@ dropped."
   "Run the project's entry point (C-c r r): `nest run` in a dedicated subprocess with
 the debug taps installed — app output, coloured spy/trace traffic and a stats
 heartbeat stream into *Run*."
-  (spit *apprun-script-path* (apprun--script-source))
-  (let (root (or (:project-root m) (cwd))
-        proc (spawn :apprun (procstream/procstream-loop (apprun--handlers)))
-        gen (inc (or (get-in m [:apprun :gen]) 0)))
-    (send proc [:run "nest" ["run" *apprun-script-path*] root gen])
-    (ed-show-named-aside
-      (message (assoc m :apprun {:root root :gen gen}) (str "running project in " root "…"))
-      *run-buffer*
-      (str "-*- run: " root " -*-\n\n")
-      :run-log)))
+  (let (run-breaks (or (:run-breaks m) '()))
+    (spit *apprun-script-path* (apprun--script-source run-breaks))
+    (let (root (or (:project-root m) (cwd))
+          proc (spawn :apprun (procstream/procstream-loop (apprun--handlers)))
+          gen (inc (or (get-in m [:apprun :gen]) 0)))
+      (send proc [:run "nest" ["run" *apprun-script-path*] root gen])
+      (ed-show-named-aside
+        (message (assoc m :apprun {:root root :gen gen})
+          (str "running project in " root "…"
+            (if (empty? run-breaks) "" (str " (" (count run-breaks) " breakpoint(s) traced)"))))
+        *run-buffer*
+        (str "-*- run: " root " -*-\n\n")
+        :run-log))))
 
 (defcommand cmd-run-show
   (m key)
