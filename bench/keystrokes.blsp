@@ -1,0 +1,78 @@
+;; Headless input-latency benchmark — no window needed. Times the exact
+;; per-keystroke path the live loop runs (`ed-update` = dispatch + post-step +
+;; span refresh, then `ed-view` = the pure frame render) over a large brood-mode
+;; buffer, point mid-file. This is the number the user feels as input lag.
+;;
+;;   nest run bench/keystrokes.blsp
+;;
+;; Rows: self-insert typing, Enter (newline + brood-indent), Backspace,
+;; C-n/C-p line movement (with scroll), C-f char movement, the bare frame
+;; render, and the full type+render cycle (= perceived keystroke latency).
+(defmodule keystroke-bench
+  (:use model)  ; ed-init / ed-set-buf / ed-current-buf
+  (:use-internals input)  ; ed-update — the live loop's fold
+  (:use-internals view)  ; ed-view — the pure frame render
+  (:use commands)  ; the editing commands the keys dispatch to
+  (:use modes)  ; brood-mode :fontify — without it the lexer path isn't measured
+  (:use editor/buffer))
+
+(def *cols* 120)
+(def *rows* 40)
+(def *reps* 200)
+(def *victim* "src/commands.blsp")  ; the largest file in the repo (~3.5k lines)
+
+(defn bench-model (text name)
+  "A model over a buffer of `text` named `name` (the suffix picks the mode),
+point mid-buffer (the worst realistic spot: plenty of text above for any
+scan-from-top cost)."
+  (let (buf (make-buffer text name name)
+        m (ed-init buf))
+    (ed-set-buf m (goto-char (ed-current-buf m) (quot (buffer-length buf) 2)))))
+
+(defn bench-row (label step m0)
+  "Run `step` (model -> model) *reps* times threading the model; print µs/op.
+Returns the final model so rows can chain without re-priming."
+  (let (t0 (now)
+        mn (fold (fn (m _i) (step m)) m0 (range *reps*))
+        t1 (now))
+    (println (str "  " label ": "
+               (quot (* 1000 (- t1 t0)) *reps*) " µs/op"
+               "  (" (- t1 t0) " ms / " *reps* ")"))
+    mn))
+
+(defn key-step (k)
+  "A bench step folding key `k` through the live update path."
+  (fn (m) (ed-update m k *cols* *rows*)))
+
+(defn run-rows (banner text name)
+  (let (m (bench-model text name))
+    (println (str banner " — " name
+               " (" (buffer-length (ed-current-buf m)) " chars), "
+               *cols* "x" *rows* ", " *reps* " reps"))
+    ;; One warmup frame so lazy caches (spans, layout) are primed like a live session.
+    (let (_ (ed-view m *cols* *rows*)
+          m (ed-update m :tick *cols* *rows*))
+      (bench-row "render (ed-view)      " (fn (m) (do (ed-view m *cols* *rows*) m)) m)
+      (bench-row "type (self-insert)    " (key-step "x") m)
+      (bench-row "type + render (felt)  "
+        (fn (m) (let (m2 (ed-update m "x" *cols* *rows*))
+                  (do (ed-view m2 *cols* *rows*) m2)))
+        m)
+      (bench-row "enter (indent)        " (key-step :enter) m)
+      (bench-row "backspace             " (key-step :backspace) m)
+      (let (m (bench-row "C-n (next-line)       " (key-step :ctrl-n) m))
+        (bench-row "C-p (previous-line)   " (key-step :ctrl-p) m))
+      (bench-row "C-f (forward-char)    " (key-step :ctrl-f) m)
+      nil)))
+
+(defn run-bench ()
+  (let (text (slurp *victim*))
+    ;; The real case: a large brood-mode buffer (fontify + indent + sexp services).
+    (run-rows "brood-mode" text *victim*)
+    ;; Control: the same text in text-mode — isolates mode services (fontify,
+    ;; indent) from the core dispatch + buffer + render cost.
+    (run-rows "text-mode " text "commands.txt")
+    ;; Floor: a small brood-mode buffer — what a fresh scratch file feels like.
+    (run-rows "small     " "(defn f (x)\n  (+ x 1))\n" "scratch.blsp")))
+
+(run-bench)
