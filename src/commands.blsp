@@ -32,6 +32,7 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
   ; web / lsp / proctree are deferred — required lazily inside their commands
   (:use keymaps)  ; ed-set-profile + vim-to-* — the emacs/vim keybinding profiles
   (:use lsp-requests)  ; the request-kind records + the LspRequest ability (fold impls below)
+  (:use results)  ; the results-buffer abstraction — line-loc vocabulary + ed-append-follow
   (:use model))  ; current-buffer accessors, the kill ring, message
 
 (require 'theme)     ; face-dired-* — the dired listing colours (qualified refs)
@@ -1156,13 +1157,16 @@ the header face when it isn't a row (and `()` for a blank trailing line)."
       :else (list [off (+ off len) theme/face-dired-header]))))
 
 (defn ed--dired-spans-acc (lines off acc)
-  "Tail-recursive: accumulate each line's spans, advancing the offset by the line length
-+ 1 (the stripped newline). Tail position so a long listing can't overflow the stack."
+  "Tail-recursive: accumulate each line's spans (prepended via `cons`, reversed once at
+the end), advancing the offset by the line length + 1 (the stripped newline). Tail
+position so a long listing can't overflow the stack; `cons`+`reverse` rather than
+`append acc` so fontifying a windowed slice is O(lines), not O(lines²) — `append` recopies
+the whole accumulator each line (same fix as testrun-fontify)."
   (if (empty? lines)
-    acc
+    (reverse acc)
     (ed--dired-spans-acc (rest lines)
       (+ off (string-length (first lines)) 1)
-      (append acc (ed--dired-line-spans (first lines) off)))))
+      (fold (fn (a span) (cons span a)) acc (ed--dired-line-spans (first lines) off)))))
 
 (defn dired-fontify (src)
   "The dired `:fontify` service: `[start end face]` colour spans for a rendered listing
@@ -2005,48 +2009,11 @@ pane; if the buffer is already visible, that pane is refreshed in place (press-t
     (if (nil? idx) (message m (str "no buffer named " nm)) (ed-select m idx))))
 
 ;; ---- visit-location: the shared report-row jump ------------------------------
-;; Every report buffer whose rows point at source (*Tests*, *Run*, *compilation*,
-;; occur, …) wants the same contract: RET or a mouse click on a row visits the
-;; location it names. One command serves them all, stacked in as the shared
-;; `modes/location-jump-layer`; a mode with an unusual row shape supplies its own
-;; `:line-loc` parser service (`(line-text) -> {:file :line :col}|nil`), everyone
-;; else gets the standard `file:line[:col]:` parser below.
-
-(defn loc--file-token? (file)
-  "Whether `file` looks like a source path rather than a host / clock field. A path
-separator is decisive; a dot counts only when the part after the LAST dot is a
-non-empty, non-numeric extension (`foo.blsp` yes; `0.0.0.0`, `127.0.0.1` no — an
-all-numeric tail is an IP octet, not an extension). Guards against `12:34:56`
-timestamps and `host:port` being read as `file:line` (a red log line + a jump to a
-bogus `<root>/12` on click)."
-  (and (> (string-length file) 0)
-    (or (includes? file "/")
-      (let (i (last-index-of file "."))
-        (and (>= i 0)
-          (let (ext (substring file (inc i) (string-length file)))
-            (and (> (string-length ext) 0)
-              (nil? (string->number ext)))))))))
-
-(defn loc--parse-token (token)
-  (let (parts (string-split (or token "") ":")
-        n (count parts))
-    (when (>= n 2)
-      (let (nums (filter int? (map string->number (rest parts)))
-            file (first parts))
-        (when (and (loc--file-token? file) (not (empty? nums)))
-          {:file file :line (first nums) :col (or (second nums) 1)})))))
-
-(defn loc-at-line (line)
-  "Parse a `file:line[:col]` location from a report row — the leading token (an
-indented failure line) or the trailing one (a labelled ✓/✗ row that carries its
-declaration site at the end). nil when the row names none."
-  ;; `trim`, not `triml`: `buffer-line-at` keeps the trailing newline, which would
-  ;; otherwise stick to a TRAILING location token (`12\n`) and fail to parse — the
-  ;; reason a ✓/✗ row (its `file:line` at the end) wouldn't jump.
-  (let (tokens (filter (fn (t) (not= t "")) (string-split (trim line) " ")))
-    (when (not (empty? tokens))
-      (or (loc--parse-token (first tokens))
-        (loc--parse-token (last tokens))))))
+;; The location vocabulary (parse a row → `{:file :line :col}`) and the read-only
+;; navigable layer now live in `src/results.blsp` (the results-buffer abstraction).
+;; The *command* stays here: it resolves the current row's location through the layer's
+;; `:line-loc` service (`results/line-loc-service`) and hands it to `ed-pop-to-file`,
+;; the pane/pool navigation below.
 
 ;; ---- next-error: jump to a source location from a results buffer -------------
 ;; The Emacs `next-error` / `display-buffer-other-window` discipline, as ONE
@@ -2087,33 +2054,10 @@ results-buffer 'visit source' routes through, so the behaviour is uniform."
       ;; brings it on screen this tick, as with `cmd-goto-definition`.
       (ed-apply m2 (fn (b) (ed-goto-line b line))))))
 
-(defn default-line-loc (buf line0)
-  "The default `:line-loc` service — parse `file:line[:col]` from the line's TEXT
-(`loc-at-line`). A mode with off-text locations (a test runner storing them by line)
-provides its own `:line-loc (buf line0) -> loc`."
-  (loc-at-line (buffer-line-at buf line0)))
-
-(defn line-loc-service (buf)
-  "The buffer's `:line-loc` service (`(buf line0) -> {:file :line :col}|nil`), or the
-default text parser. THE seam a results mode implements to become link-navigable."
-  (or (ed-mode-service buf :line-loc) default-line-loc))
-
-(defn line-link-loc (buf line0)
-  "The source location line `line0` links to, or — when it names none — the nearest
-one on a line ABOVE it (bounded 40): so a test's indented output/detail lines link
-to the test row above them. Drives BOTH the jump and the hover/cursor affordance."
-  (let (svc (line-loc-service buf))
-    (letrec (go (fn (i limit)
-                  (cond
-                    (or (< i 0) (<= limit 0)) nil
-                    else (let (loc (svc buf i))
-                           (if (nil? loc) (go (dec i) (dec limit)) loc)))))
-      (go line0 40))))
-
 (defcommand cmd-visit-location
   (m key)
   "Visit the source location named on the current report row (RET / mouse click —
-`modes/location-jump-layer`). Resolves the location of THIS line only (the mode's
+`results/location-jump-layer`). Resolves the location of THIS line only (the mode's
 `:line-loc`, default `loc-at-line`'s `file:line[:col]:`) — the same predicate that
 paints the pointer cursor + underline, so a click navigates exactly where the row
 reads as a link and a click on a non-link line does nothing. A relative path

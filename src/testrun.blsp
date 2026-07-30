@@ -24,6 +24,7 @@ suite's own output is visible rather than lost."
   (:use model)  ; UiEvent + message / ed-append-named / ed-buf-at
   (:use interactive)  ; defcommand
   (:use commands)  ; ed-show-named / ed-find-file / ed-apply / ed-goto-line
+  (:use results)  ; ed-append-follow / loc-at-line / default-line-loc — the results-buffer abstraction
   (:use editor/keymap)  ; keymap-bind — the *Tests* keys
   (:use editor/layers)  ; register-type-layers — the :test-menu buffer type
   (:use json))  ; json-parse — decode the runner's event lines
@@ -228,16 +229,17 @@ un-indented; its tests indent under it. Clickable via the off-text `:line-links`
 store (a describe header links to its source), not visible link text."
   (if (= group "") "(top level)" group))
 
-(defn testrun--append-link (m text loc)
-  "Append `text` (one logical line, +failure lines) to *Tests* and, when `loc` is
-non-nil, record the LINE the row lands on in the buffer's `:line-links` map — the
-off-text jump target the pointer/hover and click read (`:line-loc`), so the visible
-row stays clean (no file path). The line is the one CONTAINING the pre-append end
-offset (`rope-char->line`) — exact, unlike a line-count guess that a trailing
-newline throws off by one (which stranded links on blank rows)."
+(defn testrun--append-link (m text loc cols rows)
+  "Append `text` (one logical line, +failure lines) to *Tests* — following the tail in
+any pane at its bottom (`ed-append-follow`) — and, when `loc` is non-nil, record the LINE
+the row lands on in the buffer's `:line-links` map — the off-text jump target the
+pointer/hover and click read (`:line-loc`), so the visible row stays clean (no file path).
+The line is the one CONTAINING the pre-append end offset (`rope-char->line`) — exact,
+unlike a line-count guess that a trailing newline throws off by one (which stranded links
+on blank rows)."
   (let (idx0 (ed-buffer-index-by-name m *tests-buffer*)
         start-off (if (nil? idx0) 0 (buffer-length (ed-buf-at m idx0)))
-        m1 (ed-append-named m *tests-buffer* (str text "\n")))
+        m1 (ed-append-follow m *tests-buffer* (str text "\n") cols rows))
     (if (nil? loc)
       m1
       (let (idx (ed-buffer-index-by-name m1 *tests-buffer*)
@@ -367,9 +369,9 @@ superseded run (rapid re-runs) is dropped so it can't corrupt the fresh report."
             m2 (if (= group (get-in m1 [:testrun :last-group]))
                  m1
                  (testrun--append-link (assoc-in m1 [:testrun :last-group] group)
-                   (testrun-group-header group) (testrun--describe-loc m1 r))))
+                   (testrun-group-header group) (testrun--describe-loc m1 r) cols rows)))
         (testrun--annotate
-          (testrun--append-link m2 (testrun-result-lines r) (testrun--where->loc (get r :where)))
+          (testrun--append-link m2 (testrun-result-lines r) (testrun--where->loc (get r :where)) cols rows)
           r)))))
 
 (impl UiEvent test-summary-event
@@ -379,7 +381,7 @@ superseded run (rapid re-runs) is dropped so it can't corrupt the fresh report."
       (let (s (test-summary-event-summary e)
             line (str "\n" (get s :total) " tests, " (get s :passed) " passed, "
                    (get s :failed) " failed (" (get s :ms) " ms)\n"))
-        (message (ed-append-named m *tests-buffer* line)
+        (message (ed-append-follow m *tests-buffer* line cols rows)
           (str "tests: " (get s :passed) "/" (get s :total) " passed"
             (if (> (get s :failed) 0) (str ", " (get s :failed) " FAILED") "")))))))
 
@@ -387,7 +389,7 @@ superseded run (rapid re-runs) is dropped so it can't corrupt the fresh report."
   (ui-event-fold [e m textrows cols rows]
     (if (not (testrun--current? m (test-output-event-gen e)))
       m
-      (ed-append-named m *tests-buffer* (str "  | " (test-output-event-text e) "\n")))))
+      (ed-append-follow m *tests-buffer* (str "  | " (test-output-event-text e) "\n") cols rows))))
 
 (impl UiEvent test-done-event
   ;; Non-zero exit with no summary = the run itself broke (a load error, a crash) —
@@ -516,32 +518,33 @@ every other line takes its whole-line role face (`testrun--line-face`)."
 (defn testrun-fontify (src)
   "The *Tests* `:fontify`: per-part colour — the ✓/✗/· mark by verdict, the name
 readable (red on failure), the `(N ms)` dim, group headers mauve, output dim.
-Clickability is the pointer cursor + font underline the view draws from `:line-loc`."
-  (letrec (go (fn (lines off acc)
-                (if (empty? lines)
-                  acc
-                  (let (line (first lines))
-                    (go (rest lines) (+ off (string-length line) 1)
-                      (append acc (testrun--line-spans line off)))))))
-    (go (string-split src "\n") 0 '())))
+Clickability is the pointer cursor + font underline the view draws from `:line-loc`.
 
-(defn testrun-line-loc (buf line0)
-  "*Tests* `:line-loc`: the off-text `:line-links` location for a clean row/header,
-else the text parse (a failure detail line shows its real `file:line:col`) — so
-every result line is a clickable link (pointer + hover) to its source, with no
-visible link text on the clean rows."
-  (or (get (:line-links buf) line0)
-    (commands/default-line-loc buf line0)))
+Spans are `cons`'d onto a list (O(1) each) and `reverse`d once — NOT accumulated with
+`append`/`conj`, both of which recopy the whole accumulator per line and make this O(n²)
+in the window height. A live test run re-fontifies the visible window on every streamed
+append, so a linear fontify is what keeps a long *Tests* run from lagging as it fills."
+  (let (result (fold (fn (acc line)
+                       (let (spans (nth acc 0)
+                             off (nth acc 1))
+                         [(fold (fn (s span) (cons span s)) spans (testrun--line-spans line off))
+                          (+ off (string-length line) 1)]))
+                 [(list) 0]
+                 (string-split src "\n")))
+    (reverse (nth result 0))))
 
 (def test-menu-mode-layer
+  ;; :line-loc is the SHARED `results/line-links-loc` — it reads the off-text `:line-links`
+  ;; this module stores per row (`testrun--append-link`), the exact mechanism *git-status* now
+  ;; reuses. A failure-detail line with no stored link falls back to the text parse.
   {:name 'test-menu
    :keymap testrun/test-menu-keymap
    :fontify 'testrun/testrun-fontify
-   :line-loc 'testrun/testrun-line-loc
+   :line-loc 'results/line-links-loc
    :commands '("test-rerun")})
 
 ;; :test-menu stacks the jump/rerun keys over special-mode (read-only, no gutter)
 ;; over text-mode — the process list's shape.
 (register-type-layers :test-menu
-  (list 'testrun/test-menu-mode-layer 'modes/location-jump-layer
+  (list 'testrun/test-menu-mode-layer 'results/location-jump-layer
     'modes/special-mode-layer 'modes/text-mode-layer))

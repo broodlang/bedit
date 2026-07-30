@@ -117,13 +117,20 @@ single source of the viewport height the fontify window and its cache key are bu
 (def ed-fontify-backscan 200)  ; max lines of lead-in above a window for a safe restart
 (def ed-fontify-margin 32)  ; lines lexed above & below the viewport, reused on scroll
 
-(defn ed-window-spans (buf fontify restart lo hi)
-  "Absolute `[start end face]` syntax spans covering buffer lines `lo`..`hi-1` of `buf`.
-Fontifies a rope-slice of those lines (plus an `ed-fontify-backscan`-line lead-in) via
-the mode's `fontify` service rather than re-lexing the whole buffer. `restart` — the
-mode's optional `:fontify-restart` service (or nil) — pulls the slice start forward to a
-column-0 form so head-position context stays correct; the resulting spans are shifted
-into absolute coordinates (`highlight/shift-spans`) so the per-line renderer needs no change."
+(defn ed--window-src (buf restart lo hi)
+  "The `[src base]` the mode's `fontify` runs over for lines `lo`..`hi-1`: a rope-slice of
+that window plus a lead-in, trimmed forward to a restart point (`restart`, the mode's optional
+`:fontify-restart`, or nil) so head-position context stays correct. `base` is `src`'s absolute
+char offset. Factored out so the span cache can compare this fontify INPUT cheaply (a
+rope-slice) to decide whether a re-fontify is even needed — far cheaper than re-running
+`fontify` — without duplicating the window arithmetic.
+
+The lead-in is `ed-fontify-backscan` lines: a restart mode searches that range for a column-0
+form and TRIMS the front (so its fontified src stays small), while a no-restart mode with
+cross-line state (markdown's fenced code blocks) needs it as raw CONTEXT — without it a fence
+opening more than the margin above the viewport is mis-coloured, and typing above shifts the
+fence across that boundary and flips the colouring. So the lead-in is kept for correctness; the
+markdown per-lex cost is addressed by speeding `markdown-spans`, not by shrinking its window."
   (let (rope (buffer-rope buf)
         nlines (buffer-line-count buf)
         last-line (min (dec nlines) (dec hi))
@@ -135,28 +142,49 @@ into absolute coordinates (`highlight/shift-spans`) so the per-line renderer nee
         rel (if (nil? restart) 0 (restart chunk (- (rope-line->char rope lo) win-start)))
         base (+ win-start rel)
         src (if (= rel 0) chunk (substring chunk rel (string-length chunk))))
+    [src base]))
+
+(defn ed-window-spans (buf fontify restart lo hi)
+  "Absolute `[start end face]` syntax spans covering buffer lines `lo`..`hi-1` of `buf` —
+`fontify` run over the windowed `ed--window-src` (not the whole buffer), the spans shifted
+into absolute coordinates (`highlight/shift-spans`) so the per-line renderer needs no change."
+  (let ([src base] (ed--window-src buf restart lo hi))
     (shift-spans (fontify src) base)))
 
-(defn ed--band-covers? (entry buf top vrows)
+(defn ed--band-covers? (entry buf top vrows restart)
   "True if cached span `entry` still serves a pane showing `buf` at scroll `top` over
-`vrows` rows: same rope (no edit since) and its `[blo bhi)` line band contains the
-viewport (clamped to EOF, since the last screen rows can sit past the last line)."
+`vrows` rows: its `[blo bhi)` line band contains the viewport (clamped to EOF, since the
+last screen rows can sit past the last line) AND its spans are still valid — either the rope
+is identical (the O(1) fast path: point moved, nothing changed) OR the rope changed only
+OUTSIDE this band, so the exact fontify input (`ed--window-src`) is byte-for-byte the same.
+The latter is what a streaming *append* hits — a results buffer grows below a stationary
+viewport, so re-slicing + comparing the band (cheap) beats re-fontifying it (dear) on every
+one of hundreds of appended lines."
   (and entry
-    (= (:rope entry) (buffer-rope buf))
     (<= (:blo entry) top)
-    (>= (:bhi entry) (min (buffer-line-count buf) (+ top vrows)))))
+    (>= (:bhi entry) (min (buffer-line-count buf) (+ top vrows)))
+    (or (= (:rope entry) (buffer-rope buf))
+      ;; rope changed: reuse only if this band's fontify input is unchanged AND the band
+      ;; still lies within the buffer (a shrink would make the line range slice past EOF).
+      (and (<= (:bhi entry) (buffer-line-count buf))
+        (= [(:src entry) (:base entry)]
+          (ed--window-src buf restart (:blo entry) (:bhi entry)))))))
 
 (defn ed--band-for (buf fontify restart top vrows)
   "A fresh `:span-cache` entry for `buf`'s viewport `[top, top+vrows)`: spans lexed over
 that window widened by `ed-fontify-margin` lines each side (so a later small scroll
-reuses it), tagged with the rope and the `[blo bhi)` lines they cover."
+reuses it), tagged with the rope, the `[blo bhi)` lines they cover, and the exact fontify
+input (`:src`/`:base`) so `ed--band-covers?` can revalidate cheaply after an off-band edit."
   (let (nlines (buffer-line-count buf)
         blo (max 0 (- top ed-fontify-margin))
-        bhi (min nlines (+ top vrows ed-fontify-margin)))
+        bhi (min nlines (+ top vrows ed-fontify-margin))
+        [src base] (ed--window-src buf restart blo bhi))
     {:rope (buffer-rope buf)
      :blo blo
      :bhi bhi
-     :spans (ed-window-spans buf fontify restart blo bhi)}))
+     :src src
+     :base base
+     :spans (shift-spans (fontify src) base)}))
 
 (defn ed-pane-spans (m pane buf top vrows)
   "The `[start end face]` syntax spans for `pane`'s viewport — from the model's
@@ -166,11 +194,11 @@ next frame). `nil` when the buffer's mode offers no `:fontify` service."
   (let (fontify (ed-mode-service buf :fontify))
     (if (nil? fontify)
       nil
-      (let (bi (get-in pane [:payload :buffer])
-            entry (get-in m [:span-cache bi]))
-        (if (ed--band-covers? entry buf top vrows)
+      (let (entry (get-in m [:span-cache (:path pane)])
+            restart (ed-mode-service buf :fontify-restart))
+        (if (ed--band-covers? entry buf top vrows restart)
           (:spans entry)
-          (ed-window-spans buf fontify (ed-mode-service buf :fontify-restart) top (+ top vrows)))))))
+          (ed-window-spans buf fontify restart top (+ top vrows)))))))
 
 (defn ed-viewport (m cols rows)
   "[textrows textcols] for the selected pane — a single `ed-body-layout` call covers
@@ -184,33 +212,118 @@ both dimensions, so `ed-update` doesn't pay for two independent layout traversal
     [(max 1 (quot (dec h) s))
      (max 1 (- (quot (dec w) s) gw))]))
 
+;; ---- the gutter-cell cache (same discipline as the span cache) ---------------
+;; The line-number gutter rebuilds every visible cell each frame — per line a mode
+;; service call, git-status/mark lookups and interpreted string padding — yet during
+;; plain typing its output is bit-identical frame to frame (it changes only on scroll,
+;; a line-count change, a git/mark refresh, or zoom). So the CELLS (the `[text face]`
+;; chunk lists, pure data — no render ops, so no view dependency) are cached per pane
+;; path and reconciled here; `view/ed-gutter-ops` just positions them.
+
+(defn ed--gutter-key (buf gw)
+  "Everything a single line's gutter cell depends on BESIDES its line number. Two
+buffers producing equal keys produce equal cells for the same line: the number column
+is a function of `gw`/line-count and file-backing (a file buffer prepends the diff
+bar), the bar of the git line-status cache, and the margin marks of the break/test/
+describe maps (with the rope==marks-rope currency bit that dims stale verdicts).
+Deliberately EXCLUDES the viewport (`top`/`vh`): cells are per absolute line, so a
+scroll reuses the overlap of the previous window (`ed--gutter-cells`) instead of
+recomputing every visible cell per scrolled line — the held-C-n case."
+  [gw (buffer-line-count buf)
+   (and (buffer-file buf) true)
+   (:git-status-lines buf) (:git-line-status buf)
+   (:debug-break-lines buf) (:test-marks buf) (:describe-marks buf)
+   (:test-marks-count buf)
+   (= (buffer-rope buf) (:test-marks-rope buf))])
+
+(defn ed--gutter-cells (buf cell top vh gw old)
+  "The mode's `:gutter-cell` chunks for each visible line `top`..`top+vh-1` (clamped
+to EOF), as a vector in line order — the expensive per-line work the cache holds. An
+`old` entry with the same content key (`ed--gutter-key`, checked by the caller) donates
+the cells its window shares with this one — a scroll recomputes only the lines that
+slid into view, not the whole column."
+  (let (last-line (min (dec (buffer-line-count buf)) (dec (+ top vh)))
+        otop (or (:top old) 0)
+        ocells (or (:cells old) [])
+        on (count ocells))
+    (into []
+      (map (fn (line)
+             (let (oi (- line otop))
+               (if (and (>= oi 0) (< oi on))
+                 (nth ocells oi)
+                 (cell buf line gw))))
+        (range top (inc last-line))))))
+
+(defn ed-pane-gutter-cells (m pane buf top vh gw)
+  "The gutter cells for `pane`'s viewport — from the model's `:gutter-cache` when its
+content key and window still match, else freshly computed (the cold/uncovered fallback;
+`ed-refresh-spans` caches it for next frame). `nil` when the gutter is hidden or the
+mode offers none."
+  (let (cell (ed-mode-service buf :gutter-cell))
+    (if (or (<= gw 0) (nil? cell))
+      nil
+      (let (entry (get-in m [:gutter-cache (:path pane)]))
+        (if (and entry
+              (= (:top entry) top)
+              (= (:vh entry) vh)
+              (= (:key entry) (ed--gutter-key buf gw)))
+          (:cells entry)
+          (ed--gutter-cells buf cell top vh gw nil))))))
+
 (defn ed-refresh-spans (m cols rows)
-  "Refresh the per-buffer fontify `:span-cache` for every visible pane whose mode has a
-`:fontify` service — but only where the cached band no longer covers the pane's viewport
-(the rope changed, or it scrolled past the margin). A still-covering band costs nothing.
-Keyed by pool buffer index, so two panes on the same buffer share the work; a stale
-entry from a killed/re-pointed buffer is harmless (the rope check forces a recompute).
-Run by `input/ed-update` after each event so the pure `view` just reads the result.
-Also caches the layout as `:_lc [cols rows layout]` so `ed-view` can skip its own call."
+  "Refresh the fontify `:span-cache` (and the `:gutter-cache`) for every visible pane —
+but only where the cached entry no longer serves the pane's viewport (the rope changed,
+or it scrolled past the margin). A still-covering band / still-matching gutter key costs
+nothing.
+
+Keyed by PANE PATH, not buffer index: several panes can show the same buffer at DIFFERENT
+scroll positions, each needing its own cached band. Keying by buffer let a single entry serve
+them all — so each pane's refresh invalidated the others', and N panes on one big file
+re-fontified N bands EVERY event (the 'open 3, performance tanks' cliff). The maps are rebuilt
+fresh each call — reusing a still-valid entry from the old cache, and GC'ing panes that
+closed (a stale pane path never accumulates). Run by `input/ed-update` after each event so the
+pure `view` just reads the result; also caches the layout as `:_lc`."
   (let (layout (ed-body-layout m cols rows)
-        panes (:panes layout))
+        panes (:panes layout)
+        old (or (:span-cache m) {})
+        oldg (or (:gutter-cache m) {})
+        caches (fold (fn (acc pane)
+                       (let ([sc gc] acc
+                             key (:path pane)
+                             buf (ed-buf-at m (get-in pane [:payload :buffer]))
+                             fontify (ed-mode-service buf :fontify)
+                             sc2 (if (nil? fontify)
+                                   sc
+                                   (let (top (ed-pane-top pane buf)
+                                         vrows (ed-pane-vrows pane)
+                                         restart (ed-mode-service buf :fontify-restart)
+                                         entry (get old key))
+                                     (assoc sc key
+                                       (if (ed--band-covers? entry buf top vrows restart)
+                                         entry
+                                         (ed--band-for buf fontify restart top vrows)))))
+                             cell (ed-mode-service buf :gutter-cell)
+                             gw (ed-gutter-width buf (ed-gutter-shown? buf pane))
+                             gc2 (if (or (<= gw 0) (nil? cell))
+                                   gc
+                                   (let (top (ed-pane-top pane buf)
+                                         vh (ed-pane-vrows pane)
+                                         gkey (ed--gutter-key buf gw)
+                                         gentry (get oldg key)
+                                         same? (and gentry (= (:key gentry) gkey)))
+                                     (assoc gc key
+                                       (if (and same? (= (:top gentry) top) (= (:vh gentry) vh))
+                                         gentry
+                                         ;; content key matches but the window moved: shift —
+                                         ;; reuse the overlapping lines' cells, compute the rest
+                                         {:key gkey :top top :vh vh
+                                          :cells (ed--gutter-cells buf cell top vh gw
+                                                   (if same? gentry nil))})))))
+                         [sc2 gc2]))
+                 [{} {}] panes))
     (assoc m
-      :span-cache
-      (fold (fn (cache pane)
-              (let (bi (get-in pane [:payload :buffer])
-                    buf (ed-buf-at m bi)
-                    fontify (ed-mode-service buf :fontify))
-                (if (nil? fontify)
-                  cache
-                  (let (top (ed-pane-top pane buf)
-                        vrows (ed-pane-vrows pane))
-                    (if (ed--band-covers? (get cache bi) buf top vrows)
-                      cache
-                      (assoc cache
-                        bi
-                        (ed--band-for buf fontify (ed-mode-service buf :fontify-restart) top vrows)))))))
-        (or (:span-cache m) {})
-        panes)
+      :span-cache (first caches)
+      :gutter-cache (second caches)
       :_lc [cols rows layout])))
 
 ;; ---- mouse: select / move-point / scrollbar / drag-resize -------------------
