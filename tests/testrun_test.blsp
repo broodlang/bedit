@@ -6,20 +6,22 @@
   (:use test)
   (:use model)
   (:use editor/buffer)
-  (:use-internals testrun))
+  (:use-internals testrun)
+  (:use-internals view))
 
 (defn trt-model () (ed-init (make-buffer "x")))
 
 (describe "testrun — rendering (pure)"
-  (test "a passing result renders one indented ✓ row (name only) carrying its site"
+  (test "a passing result renders one indented ✓ row (name only, no visible path)"
     (let (lines (testrun-result-lines {:group "math" :name "adds" :passed true :ms 3
                                        :where "tests/math_test.blsp:7"}))
       (is (includes? lines "  ✓ adds"))      ; indented under its describe header
       (is (not (includes? lines "›")))        ; the group is the header, not the row
       (is (includes? lines "(3 ms)"))
-      ;; the row itself is a jump target through the shared parser
+      ;; the row is CLEAN — the jump location is stored off-text, not shown
+      (is (nil? (commands/loc-at-line lines)))
       (assert= {:file "tests/math_test.blsp" :line 7 :col 1}
-        (commands/loc-at-line lines))))
+        (testrun/testrun--where->loc "tests/math_test.blsp:7"))))
   (test "a failing result renders its ✗ row plus file:line:col failure lines"
     (let (lines (testrun-result-lines
                   {:group "math" :name "adds" :passed false :ms 1
@@ -30,9 +32,8 @@
       (is (includes? lines "actual: 2"))))
   (test "the describe header is the group; ungrouped falls back to (top level)"
     (is (includes? (testrun-result-lines {:group "" :name "solo" :passed true :ms 0}) "  ✓ solo"))
-    (assert= "math" (testrun-group-header "math" nil))
-    (is (includes? (testrun-group-header "math" "tests/x.blsp:5") "tests/x.blsp:5"))
-    (assert= "(top level)" (testrun-group-header "" nil))))
+    (assert= "math" (testrun-group-header "math"))
+    (assert= "(top level)" (testrun-group-header ""))))
 
 (describe "testrun — stdout line decoding (pure)"
   (test "JSON events classify; dot-noise drops; prints pass through"
@@ -206,29 +207,42 @@
           b (ed-buf-at one 0))
       (assert= "◔" (first (modes/gutter-mark-for b 1))))))
 
-(describe "location jump — click an output line jumps to the test above"
-  (test "loc-at-or-above falls back to the nearest location row above"
-    (let (b (make-buffer (str "✗ g › n  (1 ms)  tests/x_test.blsp:12\n"
-                           "    tests/x_test.blsp:13:5: assert: boom\n"
+(describe "location jump — a clickable line resolves, output falls back above"
+  (test "line-link-loc uses the default text parser and walks up for a locationless line"
+    (let (b (make-buffer (str "    tests/x_test.blsp:13:5: assert: boom\n"
                            "        actual: 3\n"
                            "  | some stdout from the test")))
-      ;; the dim output line (3, 0-based) names no location -> nearest above (the
-      ;; detail line 1 carries one; the ✗ row line 0 too)
-      (assert= 13 (:line (commands/loc-at-or-above b commands/loc-at-line 3)))
-      ;; on the ✗ row itself, its own trailing location
-      (assert= 12 (:line (commands/loc-at-or-above b commands/loc-at-line 0)))
+      ;; line 0 has a location; the dim output lines below name none -> walk up to it
+      (assert= 13 (:line (commands/line-link-loc b 0)))
+      (assert= 13 (:line (commands/line-link-loc b 2)))    ; output line -> nearest above
       ;; nothing above -> nil
-      (is (nil? (commands/loc-at-or-above (make-buffer "plain text\nmore text") commands/loc-at-line 1))))))
+      (is (nil? (commands/line-link-loc (make-buffer "plain text\nmore text") 1))))))
 
 
-(describe "results styling — file:line renders as an underlined link"
-  (test "loc-token-span finds just the location token's range"
-    (assert= [18 37] (commands/loc-token-span "  ✓ adds  (3 ms)  tests/x_test.blsp:7"))
-    (is (nil? (commands/loc-token-span "  ✓ adds  (3 ms)"))))
-  (test "fontify-results overlays a link span (underlined) on the location"
-    (let (spans (modes/fontify-results "  ✓ adds  tests/x_test.blsp:7" testrun/testrun--line-face)
-          link (find (fn (sp) (= (:underline (nth sp 2)) true)) spans))
-      (is (not (nil? link)))                        ; a link span exists
-      (assert= modes/face-source-link (nth link 2)) ; the blue underlined link face
-      ;; a green base span precedes it (the ✓ row colour)
-      (is (any? (fn (sp) (= (nth sp 2) testrun/test-face-pass)) spans)))))
+
+(describe "link affordance — pointer cursor + hover on clickable rows"
+  ;; a *Tests*-typed buffer with off-text links on lines 0 and 2 (its :line-loc reads them)
+  (defn linky-buf ()
+    (model/ed-stamp
+      (assoc (editor/layers/set-buffer-type
+               (make-buffer "web/req-log\n  ✓ start\n  ✗ done\n") :test-menu)
+        :line-links {0 {:file "a.blsp" :line 3 :col 1}
+                     2 {:file "a.blsp" :line 9 :col 1}})))
+  (defn linky-pane () {:payload {:buffer 0} :rect [0 0 40 20] :selected true})
+  (test "line-link-loc resolves a stored row and clears an unlinked one"
+    (let (b (linky-buf))
+      (assert= 3 (:line (commands/line-link-loc b 0)))
+      (assert= 9 (:line (commands/line-link-loc b 2)))))
+  (test "the view emits a :pointer cursor-zone over each clickable line"
+    (let (b (linky-buf)
+          m {:buffers [b] :link-hover nil}
+          ops (view/ed--pane-link-ops m (linky-pane) b 0 20 0 0 40 0 1)
+          zones (filter (fn (op) (and (vector? op) (= (first op) :cursor-zone))) ops))
+      (assert= 2 (count zones))                          ; one per linked line
+      (is (any? (fn (z) (= (last z) :pointer)) zones)))) ; the hand shape
+  (test "the hovered clickable line gets a subtle highlight rect"
+    (let (b (linky-buf)
+          m {:buffers [b] :link-hover {:buffer 0 :line 0}}
+          ops (view/ed--pane-link-ops m (linky-pane) b 0 20 0 0 40 0 1)
+          rects (filter (fn (op) (and (vector? op) (= (first op) :rect))) ops))
+      (is (not (empty? rects))))))
