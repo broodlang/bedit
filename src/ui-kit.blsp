@@ -1,0 +1,169 @@
+(defmodule ui-kit
+  "A small widget kit over the `editor/display` render ops. A **widget** is a pure function
+`(area ctx) -> {:ops … :zones …}` that emits its paint AND its interaction zones in ONE
+pass — so the hit-test is the zone list (`editor/display`'s `zone-at`), never a parallel
+function that can drift out of sync. Styling is by SEMANTIC ROLE: the caller supplies a
+`:theme` role→colour map in `ctx`, so the kit is theme-agnostic and the SAME widget renders
+on both backends (the `card-*` primitives lower by `ctx`'s `:gui?` — rounded sub-cell in the
+GUI, flat cells in the terminal). This is the shared shape behind the context menu, the
+completion popup, Plume and which-key.
+
+  area = [col row w h]   (a cell rect, same order as `zone`)
+  ctx  = {:gui? bool :theme {<role> <colour> …}}
+
+Roles the kit reads: :surface :on-surface :muted :selection :on-selection :border.
+
+Dependency-light on purpose (only `editor/display`): the canonical home is
+`../brood/std/editor/ui-kit.blsp` — promoting is a move + a `system.rs` registration."
+  (:use editor/display))  ; text / rect / frect / card-surface / card-pill / zone
+
+;; ---- style: semantic roles, one struct, dual lowering -----------------------
+
+(defn ui-color (theme role)
+  "A semantic role → a concrete colour via the caller's theme map, or nil (the primitive
+then omits that channel)."
+  (get theme role))
+
+(defn ui-face (theme style)
+  "The `{:fg :bg :bold}` face for a style — its `:fg`/`:bg` roles resolved against `theme`.
+Backend-neutral; borders/radius are the panel/pill's job, not the face's."
+  (merge
+    (merge
+      (if (:fg style) {:fg (ui-color theme (:fg style))} {})
+      (if (:bg style) {:bg (ui-color theme (:bg style))} {}))
+    (if (:bold style) {:bold true} {})))
+
+;; ---- geometry ---------------------------------------------------------------
+
+(defn ui-pad-amount (pad side)
+  "The padding for `side` (0=top 1=right 2=bottom 3=left) from `pad` — an int (all sides)
+or a `[t r b l]` vector."
+  (cond
+    (nil? pad) 0
+    (int? pad) pad
+    else (nth pad side 0)))
+
+(defn ui-pad (area pad)
+  "Shrink rect `area` [col row w h] by `pad` (an int or `[t r b l]`)."
+  (let ([col row w h] area
+        t (ui-pad-amount pad 0) r (ui-pad-amount pad 1)
+        b (ui-pad-amount pad 2) l (ui-pad-amount pad 3))
+    [(+ col l) (+ row t) (max 0 (- w l r)) (max 0 (- h t b))]))
+
+(defn ui-clamp (area cols rows)
+  "Shift rect `area` [col row w h] so it stays fully on the `cols`×`rows` screen — a popup
+near an edge slides into view (the `card-rect` discipline, shared by render + hit-test)."
+  (let ([col row w h] area)
+    [(max 0 (min (- cols w) col)) (max 0 (min (- rows h) row)) w h]))
+
+(defn ui-in-rect? (area col row)
+  "Whether cell `(col, row)` is inside rect `area` [col row w h]."
+  (let ([c r w h] area)
+    (and (>= col c) (< col (+ c w)) (>= row r) (< row (+ r h)))))
+
+;; ---- render results ---------------------------------------------------------
+
+(defn ui-empty () "The empty render result." {:ops [] :zones []})
+
+(defn ui-merge (a b)
+  "Concatenate two render results (`{:ops :zones}`), `a` painted under `b`."
+  {:ops (append (:ops a) (:ops b)) :zones (append (:zones a) (:zones b))})
+
+(defn ui-stack (results)
+  "Merge a sequence of render results in paint order (first under last)."
+  (fold ui-merge (ui-empty) results))
+
+;; ---- list layout: divider expansion (shared by measure + render) ------------
+
+(defn ui-list-rows (items rowfn selected)
+  "Materialise `items` into screen rows: `(rowfn item i (= i selected))` yields a row map,
+and a row flagged `:sep` gets a divider screen-row ABOVE it. Returns a vector of
+`{:kind :divider}` / `{:kind :item :index i :selected bool :row <rowmap>}` — the one layout
+both the measure and the render read, so a divider shifts item rows identically."
+  (fold (fn (acc i)
+          (let (r (rowfn (nth items i) i (= i selected))
+                acc2 (if (:sep r) (conj acc {:kind :divider}) acc))
+            (conj acc2 {:kind :item :index i :selected (= i selected) :row r})))
+    [] (range (count items))))
+
+(defn ui-list-measure (items rowfn selected)
+  "`{:w :h}` for a list: inner width (widest `label` + gap + `key`, clamped [12, 44]) and
+height in screen rows (items + dividers)."
+  (let (srows (ui-list-rows items rowfn selected)
+        w (fold (fn (acc sr)
+                  (if (= (:kind sr) :item)
+                    (let (r (:row sr))
+                      (max acc (+ 3 (string-length (:label r)) (string-length (or (:key r) "")))))
+                    acc))
+             0 srows))
+    {:w (min 44 (max 12 w)) :h (count srows)}))
+
+;; ---- widgets: panel + list --------------------------------------------------
+
+(defn ui-row-ops (rr col w r sel? theme style gui?)
+  "One list row's paint: a full-width selection highlight (a rounded pill in the GUI, a
+solid bar in the terminal) when `sel?`, then the `:label` left + the `:key` right-aligned +
+dim, the label dimmed when `:enabled` is false."
+  (let (key (or (:key r) "")
+        kcol (+ col 1 (max 0 (- w (string-length key))))
+        label-face (cond
+                     sel? (ui-face theme {:fg :on-selection :bold true})
+                     (:enabled r) (ui-face theme {:fg :on-surface})
+                     else (ui-face theme {:fg :muted}))
+        key-face (if sel? (ui-face theme {:fg :on-selection}) (ui-face theme {:fg :muted}))
+        hl (cond
+             (not sel?) []
+             gui? [(card-pill rr col w {:bg (ui-color theme :selection)})]
+             else [(rect rr col w 1 (ui-face theme {:bg :selection}))])
+        label [(text rr (+ col 1) (:label r) label-face)]
+        key-op (if (= key "") [] [(text rr kcol key key-face)]))
+    (append hl (append label key-op))))
+
+(defn ui-list (spec)
+  "A vertical selectable list — the shared widget behind the context menu, the completion
+popup, Plume and which-key. Returns a widget fn `(area ctx) -> {:ops :zones}`.
+
+`spec`:
+  :items     a vector of row values
+  :selected  the selected index (or nil)
+  :row       `(item i selected?) -> {:label :key :enabled :sep}` — the row's content;
+             `:sep true` draws a divider rule above the row and gets no click zone
+  :tag       the zone id tag — a click on enabled row `i` yields the zone id `[tag i]`
+  :style     a style whose fg/bg roles paint the rows
+
+Each row emits its paint AND (for an enabled item) its click zone in the same step, so the
+returned `:zones` ARE the hit-test (`zone-at`) and the pointer-shape source
+(`zone-cursor-ops`) — there is no separate hit-test to fall out of sync."
+  (fn (area ctx)
+    (let ([col row w h] area
+          theme (:theme ctx) gui? (:gui? ctx)
+          srows (ui-list-rows (:items spec) (:row spec) (:selected spec))
+          tag (:tag spec) style (:style spec))
+      (ui-stack
+        (map (fn (si)
+               (let (sr (nth srows si) rr (+ row si))
+                 (if (= (:kind sr) :divider)
+                   {:ops [(text rr (+ col 1) (string-repeat "─" (max 0 (- w 1)))
+                            (ui-face theme {:fg :muted}))]
+                    :zones []}
+                   (let (r (:row sr))
+                     {:ops (ui-row-ops rr col w r (:selected sr) theme style gui?)
+                      :zones (if (:enabled r)
+                               [(zone [col rr w 1] [tag (:index sr)] :pointer)]
+                               [])}))))
+          (range (count srows)))))))
+
+(defn ui-panel (area ctx style body)
+  "A raised floating card at `area`: the `card-surface` (a rounded frect + a hairline
+border in the GUI when `style` has a truthy `:border`, a flat filled panel in the terminal —
+it already lowers by `:gui?`), then the `body` widget rendered in the padded inner area.
+Surfaces + hairlines, never a shadow (dark-UI chrome — see docs/ui-chrome.md)."
+  (let ([col row w h] area
+        theme (:theme ctx)
+        opts (if (:border style)
+               {:border (ui-color theme :border) :radius (or (:radius style) 0.5)}
+               {:radius (or (:radius style) 0.5)})
+        surface (card-surface row col w h (ui-face theme style) (:gui? ctx) opts)
+        inner (ui-pad area (:pad style))
+        body-res (body inner ctx))
+    {:ops (append surface (:ops body-res)) :zones (:zones body-res)}))
