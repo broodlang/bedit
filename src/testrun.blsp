@@ -153,9 +153,10 @@ records, stderr forwards as plain output, the exit becomes the done event."
    :on-done (fn (code gen) (send (testrun--editor) (test-done-event code gen)))})
 
 (defn testrun--clear-marks (m)
-  "Drop every buffer's `:test-marks` — a fresh run's verdicts replace the last run's."
+  "Drop every buffer's test verdict marks (per-test + describe rollup) — a fresh
+run's verdicts replace the last run's."
   (assoc m :buffers
-    (into [] (map (fn (b) (dissoc b :test-marks :test-marks-count :test-marks-rope))
+    (into [] (map (fn (b) (dissoc b :test-marks :test-marks-count :test-marks-rope :describe-marks))
                (:buffers m)))))
 
 (defn testrun-start (m specs root label)
@@ -244,12 +245,46 @@ to the `(test`/`(describe` head it belongs to."
              line0
              (testrun--test-head-line b (dec line0))))))
 
+(defn testrun--describe-head-line (b line0)
+  "The 0-based `(describe …)` head at or above `line0`, or nil — the enclosing block
+of the test at `line0`."
+  (cond
+    (< line0 0) nil
+    (starts-with? (triml (buffer-line-at b line0)) "(describe") line0
+    else (testrun--describe-head-line b (dec line0))))
+
+(defn testrun--describe-test-total (b describe-line)
+  "How many `(test …)` forms sit syntactically under the describe at `describe-line`
+— counted from its body to the next top-level form (a `(` at column 0). Lets the
+rollup tell 'all ran' from 'some ran' (a line-filtered single-test run)."
+  (letrec (go (fn (i n)
+                (if (>= i (buffer-line-count b))
+                  n
+                  (let (raw (buffer-line-at b i)
+                        t (triml raw))
+                    (cond
+                      (starts-with? raw "(") n  ; the next top-level form ends the block
+                      (or (starts-with? t "(test ") (starts-with? t "(test\"")) (go (inc i) (inc n))
+                      else (go (inc i) n))))))
+    (go (inc describe-line) 0)))
+
+(defn testrun--bump-describe (b describe-line verdict)
+  "Accumulate one child verdict into the describe's rollup tally (`:describe-marks
+{line {:pass :fail :skip :total}}`) — `:total` computed once from the buffer."
+  (let (marks (or (:describe-marks b) {})
+        cur (or (get marks describe-line)
+              {:pass 0 :fail 0 :skip 0 :total (testrun--describe-test-total b describe-line)})
+        slot (cond (= verdict :skipped) :skip verdict :pass else :fail))
+    (assoc b :describe-marks (assoc marks describe-line (update cur slot inc)))))
+
 (defn testrun--annotate (m r)
   "Stamp a finished test's verdict into its buffer's margin (`:test-marks
-{0-based-line passed?}`, drawn by `modes/gutter-mark-for`): ✓/✗ on the test's
+{0-based-line passed?}`, drawn by `modes/gutter-mark-for`): ✓/✗/· on the test's
 `(test …)` head line (`testrun--test-head-line` resolves it from `:where`, which
-points at the first body form), dimmed by the gutter once the buffer is edited. A
-test with no recorded position, or whose file isn't open, marks nothing."
+points at the first body form) AND rolled up onto the enclosing `(describe …)` head
+(`:describe-marks` — ✓ all-pass, a mixed icon on any failure, a partial icon when
+only some of the describe's tests ran). Dimmed by the gutter once the buffer is
+edited. A test with no recorded position, or whose file isn't open, marks nothing."
   (let (where (or (get r :where) ""))
     (if (= where "")
       m
@@ -260,13 +295,15 @@ test with no recorded position, or whose file isn't open, marks nothing."
         (if (nil? idx)
           m
           (let (b (ed-buf-at m idx)
-                head (testrun--test-head-line b (dec line))
-                verdict (cond (get r :skipped) :skipped (get r :passed) true else false))
-            (update m :buffers assoc idx
-              (assoc b
-                :test-marks (assoc (or (:test-marks b) {}) (max 0 head) verdict)
-                :test-marks-count (buffer-line-count b)
-                :test-marks-rope (buffer-rope b)))))))))
+                head (max 0 (testrun--test-head-line b (dec line)))
+                verdict (cond (get r :skipped) :skipped (get r :passed) true else false)
+                desc (testrun--describe-head-line b head)
+                b1 (assoc b
+                     :test-marks (assoc (or (:test-marks b) {}) head verdict)
+                     :test-marks-count (buffer-line-count b)
+                     :test-marks-rope (buffer-rope b))
+                b2 (if (nil? desc) b1 (testrun--bump-describe b1 desc verdict)))
+            (update m :buffers assoc idx b2)))))))
 
 (defn testrun--current? (m gen)
   "Whether `gen` is the run the model is currently showing — a straggler from a
