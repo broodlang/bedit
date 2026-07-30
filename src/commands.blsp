@@ -20,7 +20,7 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
   (:use editor/pane)  ; the pane-tree ops behind the split/other/delete commands
   (:use panes)  ; ed-toggle-line-numbers — the line-number gutter toggle (C-x l)
   (:use complete-at-point)  ; cmd-complete / complete-word-char? — TAB indent-or-complete
-  (:use completion)  ; completion-box-rect — the right-click menu's hit-test box geometry
+  (:use completion)  ; context-menu-width / context-menu-rows — the right-click menu's shared geometry
   (:use isearch)  ; incremental search + query-replace (the modal mini-loops)
   (:use mincomplete)  ; ed-complete-name / ed-complete-path — minibuffer prompt completion
   (:use collab)  ; follow / participants / unfollow — the shared-session commands (C-x f)
@@ -446,6 +446,16 @@ Otherwise cons a fresh entry. The new ring head is also mirrored to the OS clipb
         tail (if coalesce? (rest ring) ring))
     (when (:os-clipboard m) (try (clipboard-set! head) (catch e nil)))
     (assoc m :kill-ring (take ed-kill-ring-max (cons head tail)))))
+
+(defn ed-drag-copy (m)
+  "Emacs `mouse-drag-copy-region`: when a mouse drag-select ends with a real region,
+copy it to the kill ring — and thus the OS clipboard (`ed-push-kill`) — WITHOUT clearing
+it, so releasing a highlight makes it immediately paste-able in any buffer, read-only or
+not. Silent (no echo — a drag shouldn't spam the echo area). A plain click selects
+nothing, so it's a no-op. Coalescing is suppressed (`:last-command` cleared) so the
+selection is its own entry, never appended to a prior kill."
+  (let (text (buffer-region (ed-current-buf m)))
+    (if (nil? text) m (ed-push-kill (assoc m :last-command nil) text true))))
 
 (defn ed-kill-span (m move)
   "Kill from point to where `move` (a `buffer -> buffer` point move) lands: push
@@ -1672,13 +1682,38 @@ motion (Emacs shift-select). Bound to every `:shift-*` key; `key` picks the moti
       (message m *no-region-message*)
       (ed-edit (ed-push-kill m text true) delete-region))))
 
+(defn ed--link-at-point (m)
+  "The source location the current line of the current buffer links to (a results
+buffer's `:line-loc`, resolved for indented detail lines like the click does), or nil
+for an ordinary buffer / a non-link line."
+  (let (buf (ed-current-buf m))
+    (when (ed-mode-service buf :line-loc)
+      (line-link-loc buf (buffer-current-line buf)))))
+
+(defn ed--link-abs-string (m loc)
+  "Format `loc` as an absolute `path:line` — the paste-able jump target, the file made
+absolute against the project root (or cwd) when it isn't already."
+  (let (path (:file loc)
+        resolved (if (starts-with? path "/") path
+                   (str (or (:project-root m) (cwd)) "/" path)))
+    (str resolved ":" (:line loc))))
+
 (defcommand cmd-copy-region
   (m key)
-  "Push the region's text onto the kill ring without deleting it (M-w)."
-  (let (text (buffer-region (ed-current-buf m)))
-    (if (nil? text)
-      (message m "no region")
-      (message (ed-apply (ed-push-kill m text true) clear-mark) "region copied"))))
+  "Push the region's text onto the kill ring without deleting it (M-w). With no region,
+on a results buffer's link line it copies the whole link — the link's absolute
+`path:line` — so Copy on a link grabs the link, matching the browser's 'copy link'."
+  (let (buf (ed-current-buf m)
+        text (buffer-region buf))
+    (cond
+      (not (nil? text))
+      (message (ed-apply (ed-push-kill m text true) clear-mark) "region copied")
+      else
+      (let (loc (ed--link-at-point m))
+        (if (nil? loc)
+          (message m "no region")
+          (let (link (ed--link-abs-string m loc))
+            (message (ed-push-kill m link true) (str "link copied: " link))))))))
 
 (defn ed--adopt-clipboard (m)
   "If the OS clipboard holds text that isn't already the kill-ring head (i.e. something
@@ -1734,57 +1769,102 @@ reports that the previous command was not a yank."
           :yank
           {:start (:start y) :end (buffer-point b2) :index idx})))))
 
-;; ---- right-click context menu (Copy / Cut / Paste) --------------------------
+;; ---- right-click context menu (a standard dropdown) -------------------------
 ;; A modal overlay on `:menu` listing actions that run the *same* commands as the
-;; keyboard (so Copy is exactly M-w, Cut C-w, Paste C-y — and thus the same OS-clipboard
-;; sync). Opened by a right-press (input/ed--ev-mouse), navigated by arrows + Enter (the
-;; `:menu` transient handler in input) or clicked (input/ed--menu-mouse). The model field
-;; carries the item *labels* so the view renders without depending on this module; the
-;; `:run` command fn is read back here. Items are a plain list — a future feature just
-;; adds an entry.
+;; keyboard (so Copy is exactly M-w, Cut C-w, Paste C-y, Select All C-x h — and thus the
+;; same OS-clipboard sync). Opened by a right-press (input/ed--ev-mouse), navigated by
+;; arrows + Enter (the `:menu` overlay handler in input), hovered + clicked by the mouse.
+;; Items are maps `{:label :key :run :enabled :sep}` — enabled/disabled computed when the
+;; menu opens so it reflects the current region / clipboard, like a native menu. The view
+;; renders from the item maps + the shared geometry (completion/context-menu-*); the `:run`
+;; command fn is only read back here.
 
-(def ed-menu-items
-  (list {:label "Copy" :run cmd-copy-region}
-    {:label "Cut" :run cmd-kill-region}
-    {:label "Paste" :run cmd-yank}))
+(defn ed-menu-items-for (m)
+  "The context-menu items for the current model — each with its keyboard shortcut and
+whether it applies now (`:enabled`; a disabled item renders dimmed and won't run). `:sep`
+marks a divider drawn above the item (the group break before Select All). Copy is enabled
+by a region OR a link under point; Cut by a region; Paste by a non-empty kill ring."
+  (let (has-region (not (nil? (buffer-region (ed-current-buf m))))
+        has-link (not (nil? (ed--link-at-point m)))
+        has-clip (not (empty? (:kill-ring m))))
+    (list {:label "Copy" :key "M-w" :run cmd-copy-region :enabled (or has-region has-link)}
+      {:label "Cut" :key "C-w" :run cmd-kill-region :enabled has-region}
+      {:label "Paste" :key "C-y" :run cmd-yank :enabled has-clip}
+      {:label "Select All" :key "C-x h" :run cmd-mark-whole-buffer :enabled true :sep true})))
+
+(defn ed--menu-enabled (items)
+  "The indices of the enabled items — navigation and the initial selection land only on
+these (disabled items and the divider are skipped)."
+  (filter (fn (i) (:enabled (nth items i))) (range (count items))))
 
 (defn ed-open-menu (m row col)
-  "Open the Copy/Cut/Paste context menu anchored at screen cell `[row col]` (point and
-the region are left untouched, so Copy/Cut act on the current selection)."
-  (assoc m :menu {:row row :col col :sel 0 :items ed-menu-items}))
+  "Open the context menu anchored at screen cell `[row col]` (point and the region are
+left untouched, so Copy/Cut act on the current selection). Selection starts on the first
+enabled item."
+  (let (items (ed-menu-items-for m)
+        enabled (ed--menu-enabled items))
+    (assoc m :menu {:row row :col col :items items
+                    :sel (if (empty? enabled) 0 (first enabled))})))
 
 (defn ed-close-menu (m) "Dismiss the context menu." (dissoc m :menu))
 
 (defn ed-menu-move (m d)
-  "Move the menu selection by `d` rows, wrapping (arrow-key navigation)."
-  (let (menu (:menu m) n (count (:items menu)))
-    (assoc m :menu (assoc menu :sel (mod (+ (:sel menu) d) n)))))
+  "Move the selection by `d` among the ENABLED items, wrapping — disabled items and the
+divider are skipped (arrow-key navigation)."
+  (let (menu (:menu m)
+        items (:items menu)
+        enabled (ed--menu-enabled items))
+    (if (empty? enabled)
+      m
+      (let (cur (:sel menu)
+            pos (or (index-of enabled cur) 0)
+            nxt (nth enabled (mod (+ pos d) (count enabled))))
+        (assoc m :menu (assoc menu :sel nxt))))))
 
 (defn ed-menu-run (m)
-  "Run the selected menu item's command (`key` = nil) on the model with the menu closed
-— so the command sees no `:menu` and its effect (copy/cut/paste) is the real edit."
+  "Run the selected item's command (`key` = nil) with the menu closed — so the command
+sees no `:menu` and its copy/cut/paste is the real edit. A disabled item is a no-op."
   (let (menu (:menu m)
         item (nth (:items menu) (:sel menu)))
-    ((:run item) (ed-close-menu m) nil)))
+    (if (:enabled item)
+      ((:run item) (ed-close-menu m) nil)
+      m)))
 
 (defn ed-menu-hit (m cols rows row col)
-  "The menu item index under screen cell `[row col]`, or nil when the click is outside
-the open menu's card (so the caller dismisses it). Uses the *same* clamped card rect the
-renderer draws (`completion-box-rect`): the frameless card has item `i` at box row `mr+i`,
-the card `w+2` cells wide."
+  "The screen row under cell `[row col]` — `[:item i it]` or `[:sep]` — or nil when the
+click is outside the card. Uses the same clamped geometry the renderer draws
+(completion/context-menu-width + context-menu-rows), so items are clickable where shown."
   (let (menu (:menu m)
-        labels (map :label (:items menu))
-        [mr mc w n] (completion-box-rect (:row menu) (:col menu) labels cols rows))
-    (if (and (>= row mr) (< row (+ mr n)) (>= col mc) (< col (+ mc w 2)))
-      (- row mr)
+        items (:items menu)
+        w (context-menu-width items)
+        srows (context-menu-rows items)
+        h (count srows)
+        cw (+ w 2)
+        mr (max 0 (min (- rows h) (:row menu)))
+        mc (max 0 (min (- cols cw) (:col menu))))
+    (if (and (>= row mr) (< row (+ mr h)) (>= col mc) (< col (+ mc cw)))
+      (nth srows (- row mr))
       nil)))
 
 (defn ed-menu-click (m cols rows row col)
-  "Fold a click into the open menu: run the item under it, else dismiss it."
-  (let (i (ed-menu-hit m cols rows row col))
-    (if (nil? i)
-      (ed-close-menu m)
-      (ed-menu-run (assoc m :menu (assoc (:menu m) :sel i))))))
+  "Fold a click into the open menu: run the enabled item under it; ignore a divider or a
+disabled item (menu stays open); dismiss on a click outside."
+  (let (hit (ed-menu-hit m cols rows row col))
+    (cond
+      (nil? hit) (ed-close-menu m)
+      (= (first hit) :sep) m
+      else (let (i (second hit) it (nth (:items (:menu m)) i))
+             (if (:enabled it)
+               (ed-menu-run (assoc m :menu (assoc (:menu m) :sel i)))
+               m)))))
+
+(defn ed-menu-hover (m cols rows row col)
+  "Standard dropdown hover: as the pointer moves over the open menu, select the enabled
+item under it. Leaves the selection put over a divider, a disabled item, or outside."
+  (let (hit (ed-menu-hit m cols rows row col))
+    (if (and hit (= (first hit) :item) (:enabled (nth (:items (:menu m)) (second hit))))
+      (assoc m :menu (assoc (:menu m) :sel (second hit)))
+      m)))
 
 ;; ---- multiple buffers -------------------------------------------------------
 
