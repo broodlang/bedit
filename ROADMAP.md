@@ -321,6 +321,23 @@ A batch of everyday Emacs commands + discoverability, all on existing primitives
 Prime-directive items: capabilities the editor wants that belong in **Brood** (`../brood`),
 not hacked in here. Recorded as suggestions; implement upstream.
 
+- ⬜ **Line-level breakpoints — a source-position-addressed break**. Today the gutter
+  breaks at the **function boundary** only (`break-fn`, ADR-184: rebind the whole
+  function), so `brood-gutter-click` resolves any click up to the enclosing `(defn …)`.
+  Breaking on an *arbitrary line* needs a break addressed by `file:line:col`, which
+  Brood can't express: `spy`/node instrumentation (`std/prelude` `spy--walk`) addresses
+  nodes by s-expression **shape**, not source position, and while the reader knows
+  positions (`source-location` per def, error `pos` per form) that info isn't threaded
+  onto every sub-form. **The gap:** give forms retained source spans (a reader change +
+  a `(form-location form)` accessor), then a `break-at` that parks when evaluation
+  reaches the node at a span — reusing the existing `stepping-sink` node machinery.
+  Editor side (small, once the primitive lands): map the clicked gutter line to its
+  enclosing sub-form's span and register the break through the same `:run-breaks` →
+  `C-c r` path project breakpoints already use. Pays off beyond debugging (precise
+  error highlighting, structural nav). A pragmatic no-kernel version — spy-wrap the
+  body and gate the park on a structural sub-form match — is possible but heuristic
+  (identical sub-forms misfire; whole-fn spy is slow), so the real fix is the span
+  primitive. Scoped 2026-07-30.
 - ⬜ **Module cache for fast startup** (the big one). Cold start is **~680ms of module
   load** — Brood re-reads, parses, macro-expands and evals the *entire* editor + `std`
   source on every launch (there's no compiled-module cache). Measured 2026-06-16, ruling
