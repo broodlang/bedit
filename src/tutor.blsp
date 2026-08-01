@@ -227,12 +227,30 @@ solves (`:tutor-passed`), so hub progress survives leaving a lesson."
         label (str "━━ Brood Tutorial · " crumb " — " pos "/" n ": " title " "))
     (str label (string-repeat "━" (max 2 (- *tutor-box-width* (display-width label)))))))
 
-(defn tutor--open-line (title)
-  (let (head (str "╭─ " title " "))
-    (str head (string-repeat "─" (max 2 (- *tutor-box-width* (display-width head)))))))
+;; A box's RULE character says what is inside it: a solid `─` for Brood code, a dashed
+;; `┄` for plain text. That distinction has to be legible from the buffer text alone,
+;; because `:fontify` is a text-only service and the region parser has no lesson data —
+;; so it rides on the rule rather than on a field only the model can see. Both still
+;; open with `╭` and close with `╰`, so region parsing is untouched.
+(def *tutor-rule-code* "─")
+(def *tutor-rule-text* "┄")
 
-(defn tutor--close-line ()
-  (str "╰" (string-repeat "─" (dec *tutor-box-width*))))
+(defn tutor--rule (kind) (if (= kind :text) *tutor-rule-text* *tutor-rule-code*))
+
+(defn tutor--open-line (title &optional (kind :code))
+  (let (rule (tutor--rule kind)
+        head (str "╭" rule " " title " "))
+    (str head (string-repeat rule (max 2 (- *tutor-box-width* (display-width head)))))))
+
+(defn tutor--close-line (&optional (kind :code))
+  (str "╰" (string-repeat (tutor--rule kind) (dec *tutor-box-width*))))
+
+(defn tutor--region-kind (text region)
+  "`:text` or `:code` for a box, read off its opening line's rule character — the one
+piece of lesson data the pure text services need, so it is carried IN the text."
+  (let (lines (string-split text "\n")
+        open-line (nth lines (:open-line region 0) ""))
+    (if (starts-with? open-line (str "╭" *tutor-rule-text*)) :text :code)))
 
 (def tutor--footer-template
   "  [ {{next-box}}/{{prev-box}} box · {{next-lesson}}/{{prev-lesson}} lesson · {{contents}} contents · {{reset-box}} reset box ]")
@@ -243,9 +261,10 @@ editable, evaluable Brood (the reader ignores leading whitespace)."
   (join "\n" (map (fn (l) (str tutor/*tutor-box-margin* l)) (string-split code "\n"))))
 
 (defn tutor--playground-lines (pg)
-  (append (list (tutor--open-line (:title pg "Try it")))
-    (append (string-split (tutor--margined (:code pg)) "\n")
-      (list (tutor--close-line) ""))))
+  (let (kind (:kind pg :code))
+    (append (list (tutor--open-line (:title pg "Try it") kind))
+      (append (string-split (tutor--margined (:code pg)) "\n")
+        (list (tutor--close-line kind) "")))))
 
 (defn tutor--rendered-playgrounds (lesson keyset)
   ;; the lesson's playgrounds with every templated string rendered for the profile
@@ -253,7 +272,15 @@ editable, evaluable Brood (the reader ignores leading whitespace)."
          (-> pg
            (assoc :title (tutor--render-str (:title pg "Try it") keyset))
            (assoc :code (tutor--render-str (:code pg) keyset))
-           (assoc :hint (tutor--render-str (:hint pg) keyset))))
+           (assoc :hint (tutor--render-str (:hint pg) keyset))
+           (assoc :kind (:kind pg :code))
+           ;; a prose ANSWER may name a key or the profile too ("my keys are emacs"),
+           ;; so the expectation renders with everything else — an unrendered `{{…}}`
+           ;; here would be an exercise that can never be solved
+           (assoc :expect (if (get-in pg [:expect :text])
+                            (assoc (:expect pg)
+                              :text (tutor--render-str (get-in pg [:expect :text]) keyset))
+                            (:expect pg)))))
     (or (:playgrounds lesson) [])))
 
 (defn tutor-lesson-text (idx profile)
@@ -421,6 +448,29 @@ content line."
       (= alive 0) ""
       (= alive 1) "  ⚙ 1 process still running"
       else (str "  ⚙ " alive " processes still running"))))
+
+(defn tutor--normalize-answer (s)
+  ;; Compare what the reader SEES. The box margin, a stray double space left behind by
+  ;; a deleted word, trailing whitespace — none of those are part of a prose answer, so
+  ;; each line collapses to its words. Line breaks stay significant: removing a line is
+  ;; a real edit and an exercise may ask for it.
+  (trim (join "\n"
+          (map (fn (line) (join " " (filter (fn (w) (not= w "")) (string-split line " "))))
+            (string-split (or s "") "\n")))))
+
+(defn tutor--text-verdict (pg src)
+  "The note for a TEXT box, or nil for a practice box with nothing to check.
+
+A prose box has no value to evaluate, so its exercise is checked against the text
+itself (`:expect {:text …}`) — which makes the check pure and instant: no sandbox
+round trip, the ✓ lands on the same keystroke."
+  (let (want (get-in pg [:expect :text])
+        hint (if (:hint pg) (str "   — hint: " (:hint pg)) ""))
+    (cond
+      (nil? want) nil
+      (= (tutor--normalize-answer src) (tutor--normalize-answer want))
+      {:kind :pass :text "✓ that's it"}
+      else {:kind :fail :text (str "✗ not yet" hint)})))
 
 (defn tutor--verdict (pg reply)
   "The note for playground data `pg` answered by `reply` (a decoded eval-server
@@ -692,7 +742,8 @@ the same line, on their own line otherwise."
                               acc
                               (assoc acc k (dissoc v :warn)))))
                     {} (or (results/eol-notes-any b) {}))
-            warns (tutor--session-warnings text (tutor-regions text))
+            warns (tutor--session-warnings text
+                    (filter (fn (r) (= (tutor--region-kind text r) :code)) (tutor-regions text)))
             merged (fold (fn (acc kv) (tutor--merge-warning acc (second kv))) notes warns))
         (tutor--bufset-buf m
           (fn (bb) (editor/buffer/annotate bb :eol-notes merged)))))))
@@ -750,8 +801,21 @@ Reading order is dependency order here, which is what a tutorial should teach."
                                src (get srcs i)
                                pg (nth pgs i {})
                                old (get old-notes i)
-                               state (if (< i from) :carry (tutor--parse-state src)))
+                               state (cond
+                                       (< i from) :carry
+                                       ;; prose: never parsed, never sent to the sandbox
+                                       (= (:kind pg) :text) :text
+                                       else (tutor--parse-state src)))
                            (match state
+                             ;; a prose box answers locally and instantly, or says nothing
+                             (:text (let (note (tutor--text-verdict pg src))
+                                      (if (nil? note)
+                                        acc
+                                        ;; a solved prose exercise counts on the contents
+                                        ;; page exactly like an evaluated one — same
+                                        ;; bookkeeping, just no round trip to get there
+                                        [(tutor--remember-pass (tutor--set-note m1 i note) i pg note)
+                                         next-id pending])))
                              ;; above the edit: unaffected, so keep the verdict as it is
                              (:carry (if old
                                        [(tutor--set-note m1 i (dissoc old :line)) next-id pending]
@@ -890,6 +954,32 @@ re-renders for the new keys instead of being compared against the old skeleton."
 
 ;; ---- rendering a lesson into the pool -------------------------------------------
 
+(defn tutor--page-of (m)
+  "The page currently on screen, as a value: `[:contents]` or `[:lesson n]`. What the
+back stack remembers."
+  (if (tutor-contents? m) [:contents] [:lesson (get-in m [:tutor :lesson] 0)]))
+
+(def *tutor-history-limit* 50)
+
+(defn tutor--push-history (m)
+  "Remember the page we are LEAVING, so `cmd-tutorial-back` can return to it.
+
+Called from the navigation commands rather than from `tutor--show`, deliberately: the
+tutorial re-renders itself on every profile switch and on every group-complete banner,
+and pushing there would fill the stack with pages you never went to."
+  ;; most-recent-FIRST: `conj` prepends on a list, so push/peek/pop are conj/first/rest
+  ;; and the cap drops the oldest pages by construction
+  (let (page (tutor--page-of m)
+        stack (get-in m [:tutor :history] '()))
+    (assoc-in m [:tutor :history]
+      (take *tutor-history-limit* (conj stack page)))))
+
+(defn tutor--goto-page (m page)
+  (match page
+    ([:contents] (tutor--show-contents m ""))
+    ([:lesson n] (tutor--show m n))
+    (_ m)))
+
 (defn tutor--show (m idx)
   "Render lesson `idx` into *Tutorial* (creating or replacing it), re-stash the
 buffer fields the upsert wiped (the git-status discipline), park point in the
@@ -971,7 +1061,8 @@ pick). The eval sandbox starts spawning here, so its boot hides behind reading."
   "The next lesson (C-c C-n). At a SECTION's last lesson this lands on the contents
 hub instead of running into the next section — finishing a section is a moment to
 choose what to learn next, which is the whole point of the sections."
-  (let (cur (get-in m [:tutor :lesson] 0))
+  (let (cur (get-in m [:tutor :lesson] 0)
+        m (tutor--push-history m))
     (cond
       (tutor-contents? m) (message m "you're on the contents page — RET enters a section")
       (tutor--group-last? cur)
@@ -984,26 +1075,39 @@ choose what to learn next, which is the whole point of the sections."
       else (tutor--show m (inc cur)))))
 
 (defcommand cmd-tutorial-prev (m key)
-  "The previous lesson (C-c C-p) — stops at the section's first lesson, stepping back
-to the contents hub rather than into the previous section."
-  (let (cur (get-in m [:tutor :lesson] 0)
-        [pos n] (tutor--group-position cur))
-    (cond
-      (tutor-contents? m) (message m "you're on the contents page — RET enters a section")
-      (= pos 1) (tutor--show-contents m "")
-      else (tutor--show m (dec cur)))))
+  "Back to the previous PAGE (C-c C-p) — wherever you actually came from, including
+back off the contents hub onto the lesson you were reading.
+
+It used to mean \"the previous lesson\", which dead-ended twice: at a section's first
+lesson it stepped sideways to the contents hub, and on the hub itself it did nothing
+at all — so finishing a section (which lands you on the hub) stranded you with no way
+back to what you had just read. A back stack has no such edges.
+
+With an empty stack — you opened the tutorial straight onto this page — it falls back
+to the sequential previous lesson, so back always does something sensible."
+  (let (stack (get-in m [:tutor :history] '()))
+    (if (empty? stack)
+      (let (cur (get-in m [:tutor :lesson] 0)
+            [pos n] (tutor--group-position cur))
+        (cond
+          (tutor-contents? m) (tutor--show m cur)          ; the lesson behind the hub
+          (= pos 1) (tutor--show-contents m "")
+          else (tutor--show m (dec cur))))
+      (tutor--goto-page (assoc-in m [:tutor :history] (rest stack))
+        (first stack)))))
 
 (defcommand cmd-tutorial-contents (m key)
   "Show the contents hub (C-c C-t) — the section index, with what you've solved so
-far. Available from any lesson."
-  (tutor--show-contents m ""))
+far. Available from any lesson, and C-c C-p comes straight back here from it."
+  (tutor--show-contents (tutor--push-history m) ""))
 
 (defcommand cmd-tutorial-enter-section (m key)
   "Enter the section named on the contents line at point (RET or click): its first
 lesson. A line that names no section is left alone."
   (let (b (ed-current-buf m)
         group (tutor-contents-section-at b (buffer-current-line b))
-        idxs (when group (tutor--group-indices group)))
+        idxs (when group (tutor--group-indices group))
+        m (if group (tutor--push-history m) m))
     (cond
       (and (nil? group) (tutor-contents? m))
       (message m "put the cursor on a ▸ entry and press RET")
@@ -1130,12 +1234,19 @@ its child runtime down with it. Reopening the tutorial spawns a fresh pair."
 
 (defn tutor-indent (text bol)
   "The tutor `:indent` service: brood-mode's sexp indenter, floored at the box
-margin inside a box — TAB/RET keep code off the box's left edge instead of
-flattening the margin away."
-  (let (col (modes/brood-indent text bol))
-    (if (tutor--region-at (tutor-regions text) bol)
-      (max (string-length tutor/*tutor-box-margin*) col)
-      col)))
+margin inside a code box — TAB/RET keep code off the box's left edge instead of
+flattening the margin away.
+
+A PROSE box has no sexp structure to follow, so it indents to the margin flat.
+Running the Lisp indenter over English invents columns from whatever brackets and
+quotes the sentence happens to contain — a line ending in a question mark or an
+apostrophe would drift."
+  (let (region (tutor--region-at (tutor-regions text) bol)
+        margin (string-length tutor/*tutor-box-margin*))
+    (cond
+      (nil? region) (modes/brood-indent text bol)
+      (= (tutor--region-kind text region) :text) margin
+      else (max margin (modes/brood-indent text bol)))))
 
 ;; ---- fontify ---------------------------------------------------------------------
 
@@ -1155,10 +1266,14 @@ brood highlighter with its spans shifted into place. Pure over the text — the
 band cache applies unchanged."
   (append
     (modes/fontify-line-faces src tutor/tutor--line-face)
+    ;; only CODE boxes go through the Brood highlighter — running it over prose paints
+    ;; stray keyword/string faces on ordinary words (`:` and `"` occur in English too)
     (mapcat (fn (r)
-              (let (spans (editor/highlight/highlight-spans
-                            (substring src (:start r) (:end r))))
-                (map (fn (s) (let ([a b f] s) [(+ a (:start r)) (+ b (:start r)) f])) spans)))
+              (if (= (tutor--region-kind src r) :text)
+                '()
+                (let (spans (editor/highlight/highlight-spans
+                              (substring src (:start r) (:end r))))
+                  (map (fn (s) (let ([a b f] s) [(+ a (:start r)) (+ b (:start r)) f])) spans))))
       (tutor-regions src))))
 
 ;; ---- the modeline chip (the first user of the layer :modeline seam) ---------------
