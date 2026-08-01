@@ -215,12 +215,10 @@ solves (`:tutor-passed`), so hub progress survives leaving a lesson."
 ;; ---- the lesson render (pure: lesson index -> buffer text) -------------------
 
 (defn tutor--heading (idx title)
-  ;; the product name stays on every page — a lesson should say what it belongs to,
-  ;; not just where it sits ("Brood Tutorial · Navigation — 1/3: Moving around")
+  ;; the product name, then the breadcrumb: a lesson should say what it belongs to, not
+  ;; just where it sits ("Brood Tutorial · Navigation — 1/3: Moving around")
   (let ([pos n] (tutor--group-position idx)
         [sid sub] (tutor--group-of idx)
-        ;; the product name stays on every page, then the breadcrumb: a lesson should
-        ;; say what it belongs to, not just where it sits
         crumb (if sub
                 (str (:title (tutor--section sid)) " › " (tutor--group-title [sid sub]))
                 (:title (tutor--section sid)))
@@ -244,13 +242,6 @@ solves (`:tutor-passed`), so hub progress survives leaving a lesson."
 
 (defn tutor--close-line (&optional (kind :code))
   (str "╰" (string-repeat (tutor--rule kind) (dec *tutor-box-width*))))
-
-(defn tutor--region-kind (text region)
-  "`:text` or `:code` for a box, read off its opening line's rule character — the one
-piece of lesson data the pure text services need, so it is carried IN the text."
-  (let (lines (string-split text "\n")
-        open-line (nth lines (:open-line region 0) ""))
-    (if (starts-with? open-line (str "╭" *tutor-rule-text*)) :text :code)))
 
 (def tutor--footer-template
   "  [ {{next-box}}/{{prev-box}} box · {{next-lesson}}/{{prev-lesson}} lesson · {{contents}} contents · {{reset-box}} reset box ]")
@@ -354,18 +345,30 @@ header line names no group — you enter its subsections, not the section."
   (or (tutor--contents-title-at buf line0)
     (when (> line0 0) (tutor--contents-title-at buf (dec line0)))))
 
+(defn tutor--install-page (m text contents? tutor-fields)
+  "Install a rendered page into *Tutorial*: show `text`, re-stash EVERY buffer field
+the rebuild wipes, and merge `tutor-fields` onto the model's `:tutor` map. Callers
+park point themselves — that is the only part that differs between pages.
+
+One place does the re-stash because `ed-show-named` rebuilds the buffer and drops its
+custom fields, and all three renderers (a lesson, the hub, a profile re-render) need
+the same three back. When each did it inline the profile re-render forgot
+`:tutor-contents?`, and the hub started behaving like a lesson: RET fell through to
+newline-and-indent, and the guard offered to send you to a box the page does not have."
+  (let (m1 (ed-show-named m tutor/*tutor-buffer-name* text :tutor)
+        m2 (tutor--bufset m1 {:tutor-skeleton (tutor-skeleton text)
+                              :tutor-contents? contents?
+                              :tutor-profile (:profile m :emacs)}))
+    (update m2 :tutor merge tutor-fields)))
+
 (defn tutor--show-contents (m &optional (banner ""))
   "Render the contents hub into *Tutorial* (`banner` is an optional one-line note,
 e.g. a group-complete message) and park point on the first ▸ entry."
   (let (text (tutor--contents-text m banner)
-        m1 (ed-show-named m tutor/*tutor-buffer-name* text :tutor)
-        m2 (tutor--bufset m1 {:tutor-skeleton (tutor-skeleton text)
-                              :tutor-contents? true
-                              :tutor-profile (:profile m :emacs)})
-        m3 (update m2 :tutor merge {:pending {}})
-        first-line (find (fn (i) (tutor-contents-section-at (ed-current-buf m2) i))
-                     (range (buffer-line-count (ed-current-buf m2)))))
-    (ed-apply m3 (fn (b) (if first-line (commands/ed-goto-line b (inc first-line)) b)))))
+        m1 (tutor--install-page m text true {:pending {}})
+        first-line (find (fn (i) (tutor-contents-section-at (ed-current-buf m1) i))
+                     (range (buffer-line-count (ed-current-buf m1)))))
+    (ed-apply m1 (fn (b) (if first-line (commands/ed-goto-line b (inc first-line)) b)))))
 
 (defn tutor-contents? (m)
   (:tutor-contents? (ed-current-buf m)))
@@ -380,9 +383,20 @@ e.g. a group-complete message) and park point on the first ▸ entry."
 (def *tutor-close* "╰")  ; …and closes on the next line starting with this
 
 (defn tutor-regions (text)
-  "The playground regions of `text` — `{:start :end :open-line :close-line}` per box,
-in order (`formbuf/delimited-regions`)."
-  (editor/formbuf/delimited-regions text tutor/*tutor-open* tutor/*tutor-close*))
+  "The playground regions of `text` — `{:start :end :open-line :close-line :kind}` per
+box, in order (`formbuf/delimited-regions`, plus the kind read off each opening line's
+rule character).
+
+The kind is attached HERE rather than offered as a `(text region)` lookup so that no
+consumer can forget to ask and none pays to ask twice: the fontifier, the indenter and
+the checker filter all need it, and each was re-splitting the whole buffer per box to
+get it. One split per parse, and a region now carries everything about itself."
+  (let (lines (string-split text "\n")
+        text-rule (str tutor/*tutor-open* tutor/*tutor-rule-text*))
+    (map (fn (r)
+           (assoc r :kind
+             (if (starts-with? (nth lines (:open-line r 0) "") text-rule) :text :code)))
+      (editor/formbuf/delimited-regions text tutor/*tutor-open* tutor/*tutor-close*))))
 
 (defn tutor-skeleton (text)
   "Everything of `text` OUTSIDE the boxes — what the render stashes and the guard
@@ -458,6 +472,10 @@ content line."
           (map (fn (line) (join " " (filter (fn (w) (not= w "")) (string-split line " "))))
             (string-split (or s "") "\n")))))
 
+(defn tutor--hint-suffix (pg)
+  ;; a miss earns the lesson's hint, in one voice for both kinds of box
+  (if (:hint pg) (str "   — hint: " (:hint pg)) ""))
+
 (defn tutor--text-verdict (pg src)
   "The note for a TEXT box, or nil for a practice box with nothing to check.
 
@@ -465,7 +483,7 @@ A prose box has no value to evaluate, so its exercise is checked against the tex
 itself (`:expect {:text …}`) — which makes the check pure and instant: no sandbox
 round trip, the ✓ lands on the same keystroke."
   (let (want (get-in pg [:expect :text])
-        hint (if (:hint pg) (str "   — hint: " (:hint pg)) ""))
+        hint (tutor--hint-suffix pg))
     (cond
       (nil? want) nil
       (= (tutor--normalize-answer src) (tutor--normalize-answer want))
@@ -478,7 +496,7 @@ reply map): plain result `·`, exercise `✓`/`✗` (with the hint on a miss), e
 timeout `✗`. A slow evaluation carries its duration and one that left processes
 running says so — the two things a value alone can't tell you."
   (let (expect (get-in pg [:expect :value])
-        hint (if (:hint pg) (str "   — hint: " (:hint pg)) "")
+        hint (tutor--hint-suffix pg)
         extra (str (tutor--slow-note reply) (tutor--proc-note reply)))
     (cond
       ;; `:error?` marks "the code ran and blew up" as opposed to "it ran fine but gave
@@ -585,18 +603,18 @@ closes it (`= 6`); anything else renders flat."
             entries))
     (reverse (second r))))
 
-(defn tutor--workings-text (pg reply)
+(defn tutor--workings-text (reply)
   (join "\n"
     (append (list (str "The workings — every traced call and return, innermost nested:") "")
       (tutor--workings-lines (or (:spy reply) ())))))
 
-(defn tutor--show-workings (m pg reply)
+(defn tutor--show-workings (m reply)
   ;; only when the reply actually traced something; shown aside so the tutorial
   ;; pane is never replaced ("must not clobber the tutorial")
   (if (empty? (or (:spy reply) ()))
     m
     (ed-show-named-aside m tutor/*tutor-workings-name*
-      (tutor--workings-text pg reply) :tutor-workings)))
+      (tutor--workings-text reply) :tutor-workings)))
 
 (defn tutor--remember-pass (m region-idx pg note)
   ;; A solved exercise is remembered on the MODEL as `[lesson-idx region-idx]`, so
@@ -613,7 +631,7 @@ closes it (`= 6`); anything else renders flat."
   (let (note (tutor--verdict pg reply))
     (tutor--show-workings
       (tutor--remember-pass (tutor--set-note m region-idx note) region-idx pg note)
-      pg reply)))
+      reply)))
 
 (defn tutor--region-srcs (text regions)
   "`{region-idx -> source}` for `regions` — what each box currently holds."
@@ -743,7 +761,7 @@ the same line, on their own line otherwise."
                               (assoc acc k (dissoc v :warn)))))
                     {} (or (results/eol-notes-any b) {}))
             warns (tutor--session-warnings text
-                    (filter (fn (r) (= (tutor--region-kind text r) :code)) (tutor-regions text)))
+                    (filter (fn (r) (= (:kind r) :code)) (tutor-regions text)))
             merged (fold (fn (acc kv) (tutor--merge-warning acc (second kv))) notes warns))
         (tutor--bufset-buf m
           (fn (bb) (editor/buffer/annotate bb :eol-notes merged)))))))
@@ -988,15 +1006,10 @@ first box, and remember the lesson on the model. The fresh buffer has no
 every box shows its result before you've touched it."
   (let (n (count tutor-lessons)
         i (max 0 (min (dec n) idx))
-        profile (:profile m :emacs)
-        text (tutor-lesson-text i profile)
-        m1 (ed-show-named m tutor/*tutor-buffer-name* text :tutor)
-        m2 (tutor--bufset m1 {:tutor-skeleton (tutor-skeleton text)
-                              :tutor-contents? false   ; a lesson page, not the hub
-                              :tutor-profile profile})
-        m3 (update m2 :tutor merge {:lesson i :pending {}})
+        text (tutor-lesson-text i (:profile m :emacs))
+        m1 (tutor--install-page m text false {:lesson i :pending {}})
         first-region (first (tutor-regions text)))
-    (ed-apply m3 (fn (b)
+    (ed-apply m1 (fn (b)
                    (goto-char b (if first-region
                                   (min (+ (:start first-region)
                                          (string-length tutor/*tutor-box-margin*))
@@ -1026,18 +1039,10 @@ back in) and the cursor's box. Notes clear; the next idle beat re-evaluates."
         text (if contents?
                (tutor--contents-text m "")
                (tutor--splice-boxes (tutor-lesson-text i profile) old-text))
-        m1 (ed-show-named m tutor/*tutor-buffer-name* text :tutor)
-        ;; `ed-show-named` rebuilds the buffer, so EVERY field it carries must be
-        ;; re-stashed — including which kind of page this is. Losing `:tutor-contents?`
-        ;; left the hub looking like a lesson: RET fell through to newline-and-indent
-        ;; and the guard answered "edit inside a ╭─ box" on a page that has none.
-        m2 (tutor--bufset m1 {:tutor-skeleton (tutor-skeleton text)
-                              :tutor-contents? contents?
-                              :tutor-profile profile})
-        m3 (update m2 :tutor merge {:pending {}})
+        m1 (tutor--install-page m text contents? {:pending {}})
         regions (tutor-regions text)
         target (if cur-idx (nth regions cur-idx nil) (first regions)))
-    (ed-apply m3 (fn (bb)
+    (ed-apply m1 (fn (bb)
                    (goto-char bb (if target
                                    (min (+ (:start target) off) (:end target))
                                    0))))))
@@ -1245,7 +1250,7 @@ apostrophe would drift."
         margin (string-length tutor/*tutor-box-margin*))
     (cond
       (nil? region) (modes/brood-indent text bol)
-      (= (tutor--region-kind text region) :text) margin
+      (= (:kind region) :text) margin
       else (max margin (modes/brood-indent text bol)))))
 
 ;; ---- fontify ---------------------------------------------------------------------
@@ -1269,7 +1274,7 @@ band cache applies unchanged."
     ;; only CODE boxes go through the Brood highlighter — running it over prose paints
     ;; stray keyword/string faces on ordinary words (`:` and `"` occur in English too)
     (mapcat (fn (r)
-              (if (= (tutor--region-kind src r) :text)
+              (if (= (:kind r) :text)
                 '()
                 (let (spans (editor/highlight/highlight-spans
                               (substring src (:start r) (:end r))))
