@@ -108,6 +108,11 @@ src/procstream.blsp         the shared streaming-subprocess worker (testrun's :t
                             apprun's :apprun ride it): line-buffered stdout -> handler fns
 src/isearch.blsp            incremental search + query-replace (C-s/C-r/M-%) modal mini-loops
 src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
+src/sandbox.blsp            the persistent eval sandbox: one `nest run` child on std's
+                            eval-server (ADR-198), pr-str-line protocol, watchdog + respawn
+src/tutor.blsp              the interactive Brood tutorial (C-h t): playground boxes that
+                            eval-on-type in the sandbox — ✓/✗ gutter, ghost results, prose guard
+src/tutor-lessons.blsp      the tutorial's CONTENT only — the lessons vector (grow the course here)
 src/compile.blsp            M-x compile: run a build in the project root, C-x ` next-error
 src/projects.blsp           project root + file walk (find-file-in-project)
 src/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e)

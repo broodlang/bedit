@@ -8,6 +8,7 @@
   (:use commands)
   (:use keymaps)
   (:use editor/buffer)
+  (:use editor/keymap)  ; keymap-bind / keymap-where-is — the help-text lookups below
   (:use test))
 
 (defn m-of (text) (ed-init (make-buffer text)))
@@ -31,9 +32,22 @@
         (assert= (:profile e) :emacs)
         (is (nil? (:edit-state e))))))
 
-  (test "the mode line shows the vim modal indicator, nothing under emacs"
-    (assert= (view/ed--edit-state-label (vim-of "abc")) "  <N>")
+  (test "the mode line NAMES the typing mode, nothing under emacs"
+    (assert= (view/ed--edit-state-label (vim-of "abc")) "NORMAL")
+    (assert= (view/ed--edit-state-label (press (vim-of "abc") (list "i"))) "INSERT")
+    (assert= (view/ed--edit-state-label (press (vim-of "abc") (list "v"))) "VISUAL")
     (assert= (view/ed--edit-state-label (m-of "abc")) ""))
+
+  (test "the mode chip is coloured by state (insert reads as 'keys go in the buffer')"
+    (assert= (:fg (view/ed--edit-state-face (press (vim-of "abc") (list "i")))) *green*)
+    (assert= (:fg (view/ed--edit-state-face (press (vim-of "abc") (list "v")))) *mauve*)
+    (assert= (:fg (view/ed--edit-state-face (vim-of "abc"))) *subtext*))
+
+  (test "the chip reaches the rendered status bar segments"
+    (let (m (vim-of "abc")
+          pane {:selected true :payload {:buffer 0 :top 0} :rect [0 0 80 24]}
+          segs (view/ed-statusbar-segments m pane (cur m)))
+      (is (find (fn (s) (= (:text s) "NORMAL")) segs))))
 
   (test "the caret shape: block in normal/visual + the Emacs default, bar in vim insert"
     (assert= (view/ed--cursor-style (vim-of "abc")) :block)                       ; normal
@@ -66,6 +80,46 @@
     (let (m (vim-of "a\nb\nc"))
       (assert= (buffer-current-line (cur (press m (list "G")))) 2)
       (assert= (buffer-current-line (cur (press (press m (list "G")) (list "g" "g")))) 0))))
+
+(describe "modal command state never types (mode layers outrank the profile)"
+  ;; REGRESSION: a buffer's mode layer wins over the model's profile, so brood-mode's
+  ;; `:enter → cmd-newline-and-indent` used to insert a newline in vim NORMAL mode.
+  ;; `commands/ed-vim-command-mode?` makes such an editing binding a motion instead.
+  (defn blsp-vim (text)
+    (ed-set-profile
+      (ed-init (editor/layers/init-buffer-layers
+                 (editor/layers/set-buffer-type (make-buffer text "f.blsp") :brood)))
+      :vim))
+
+  (test "ed-vim-command-mode? is true in normal/visual, false in insert and in emacs"
+    (is (ed-vim-command-mode? (vim-of "abc")))
+    (is (ed-vim-command-mode? (press (vim-of "abc") (list "v"))))
+    (is (not (ed-vim-command-mode? (press (vim-of "abc") (list "i")))))
+    (is (not (ed-vim-command-mode? (m-of "abc")))))
+
+  (test "RET in a brood buffer in NORMAL mode moves down, never inserts"
+    (let (m (blsp-vim "(defn f (x)\n  x)")
+          after (press m (list :enter)))
+      (assert= (buffer-text (cur after)) (buffer-text (cur m)))       ; nothing typed
+      (assert= (buffer-current-line (cur after)) 1)))                 ; moved down instead
+
+  (test "RET in INSERT mode still inserts and indents"
+    (let (m (press (blsp-vim "(defn f (x)") (list "A"))               ; A → append at EOL, insert
+          after (press m (list :enter)))
+      (is (not= (buffer-text (cur after)) (buffer-text (cur m))))
+      (is (includes? (buffer-text (cur after)) "\n"))))
+
+  (test "RET in a PLAIN buffer in normal mode is a motion too (vim binds it)"
+    (let (m (vim-of "one\ntwo")
+          after (press m (list :enter)))
+      (assert= (buffer-text (cur after)) "one\ntwo")
+      (assert= (buffer-current-line (cur after)) 1)))
+
+  (test "under emacs, RET in a brood buffer inserts and indents as always"
+    (let (m (ed-init (editor/layers/init-buffer-layers
+                       (editor/layers/set-buffer-type (make-buffer "(defn f (x)" "f.blsp") :brood)))
+          after (press m (list :enter)))
+      (is (not= (buffer-text (cur after)) (buffer-text (cur m)))))))
 
 (describe "vim insert mode"
   (test "i enters insert; typing self-inserts; Esc returns to normal"
@@ -158,3 +212,85 @@
       (is (nil? (:vim-pending m)))
       ;; after Esc, a plain motion moves once (the pending 2d is gone)
       (assert= (buffer-point (cur (press m (list "l")))) 1))))
+
+;; ---- key-accurate help text: ask the keymap, don't hardcode -------------------
+;; `keymap-where-is` (std) + `ed-where-is` / `ed-command-keys` (model): the seam any
+;; buffer's help text uses so documentation follows the user's real bindings.
+
+(describe "ed-where-is"
+  (test "renders the bound key of a command, Emacs-labelled"
+    (assert= (ed-where-is (profile-keymap :emacs) 'commands/cmd-forward-char) "C-f")
+    (assert= (ed-where-is (profile-keymap :emacs) 'commands/cmd-save) "C-x C-s"))
+
+  (test "an unbound command falls back to the literal given"
+    (assert= (ed-where-is (profile-keymap :emacs) 'commands/cmd-no-such-thing "?!") "?!")
+    (assert= (ed-where-is (profile-keymap :emacs) 'commands/cmd-no-such-thing) nil))
+
+  (test "a nil command means grammar, not a binding — the literal stands"
+    ;; vim routes every motion through one command, so its keys have no lookup
+    (assert= (ed-where-is (profile-keymap :vim) nil "h") "h"))
+
+  (test "the pick is deterministic: shortest sequence, then label order"
+    ;; cmd-next-line is on both C-n and Down in the emacs profile
+    (assert= (ed-where-is (profile-keymap :emacs) 'commands/cmd-next-line) "C-n")
+    ;; a chord loses to a single key for the same command
+    (let (km (-> {} (keymap-bind [:ctrl-c "z"] 'zap) (keymap-bind [:f5] 'zap)))
+      (assert= (ed-where-is km 'zap) "f5"))))
+
+(describe "ed-command-keys (the help-text vocabulary)"
+  (test "builds a name → key map from specs, mixing lookups and literals"
+    (let (v (ed-command-keys (profile-keymap :emacs)
+              {:fwd ['commands/cmd-forward-char "C-f"]
+               :save ['commands/cmd-save "C-x C-s"]
+               :grammar [nil "l"]
+               :missing ['commands/cmd-nope "fallback!"]}))
+      (assert= (:fwd v) "C-f")
+      (assert= (:save v) "C-x C-s")
+      (assert= (:grammar v) "l")
+      (assert= (:missing v) "fallback!")))
+
+  (test "THE PAYOFF: a rebinding shows through — help text can't go stale"
+    ;; bind forward-char to F9 in a derived keymap; the vocabulary follows the
+    ;; binding rather than repeating a hardcoded "C-f"
+    (let (rebound (keymap-bind (profile-keymap :emacs) [:f9] 'commands/cmd-forward-char)
+          v (ed-command-keys rebound {:fwd ['commands/cmd-forward-char "C-f"]}))
+      ;; f9 is a single key, and "C-f" sorts before "f9"… so assert the SET instead:
+      (is (includes? (list "C-f" "f9") (:fwd v)))
+      ;; on a keymap where ONLY f9 is bound, the answer is unambiguous
+      (assert= (ed-command-keys (keymap-bind {} [:f9] 'commands/cmd-forward-char)
+                 {:fwd ['commands/cmd-forward-char "C-f"]})
+        {:fwd "f9"}))))
+
+(describe "ed-substitute-command-keys (the low-ceremony form)"
+  (test "a hole becomes the key actually bound to that command"
+    (assert= (ed-substitute-command-keys (profile-keymap :emacs)
+               "press \\[commands/cmd-save] to save")
+      "press C-x C-s to save"))
+
+  (test "several holes in one string, and text around them survives"
+    (assert= (ed-substitute-command-keys (profile-keymap :emacs)
+               "\\[commands/cmd-forward-char] forward · \\[commands/cmd-backward-char] back")
+      "C-f forward · C-b back"))
+
+  (test "an unbound command falls back to run-it-by-name — never a lie, never a blank"
+    (assert= (ed-substitute-command-keys {} "run \\[commands/cmd-tutorial]")
+      "run M-x tutorial"))
+
+  (test "…and the fallback's PROMPT KEY AND SEPARATOR are looked up too (vim has no M-x)"
+    ;; nothing binds cmd-dired in the vim profile, so it falls back — and you type
+    ;; `:dired` with no space, where emacs is `M-x dired` with one. The separator is
+    ;; part of the answer, not decoration.
+    (assert= (ed-substitute-command-keys (profile-keymap :vim) "\\[commands/cmd-dired] browses")
+      ":dired browses")
+    (assert= (ed-substitute-command-keys (profile-keymap :emacs) "\\[commands/cmd-no-such] runs")
+      "M-x no-such runs"))
+
+  (test "the same text renders each profile's own keys"
+    (let (t "\\[commands/cmd-isearch-forward] searches")
+      (assert= (ed-substitute-command-keys (profile-keymap :emacs) t) "C-s searches")
+      (assert= (ed-substitute-command-keys (profile-keymap :vim) t) "/ searches")))
+
+  (test "text with no holes is returned untouched; an unterminated hole is left alone"
+    (assert= (ed-substitute-command-keys (profile-keymap :emacs) "plain text") "plain text")
+    (is (includes? (ed-substitute-command-keys (profile-keymap :emacs) "oops \\[unclosed")
+          "\\[unclosed"))))

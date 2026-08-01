@@ -30,6 +30,7 @@ it never hits the console.
 pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
   (:use editor/buffer)  ; make-buffer / insert / end-of-buffer / buffer-name / accessors
   (:use editor/layers)  ; init-buffer-layers (stamp a buffer's mode) + active-layers (mode line)
+  (:use editor/keymap)  ; keymap-where-is — command → the key actually bound to it (help text)
   (:use editor/pane)  ; the pane-tree layout: pane-single / selected payload / update / map
   (:use completion)  ; completion-rank-incremental — the minibuffer's narrowable fuzzy rank
   (:use log)  ; backend — the log-routing backends (one filtered backend per buffer)
@@ -55,6 +56,10 @@ pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
 ;; lists, small find-file) re-rank synchronously per keystroke — instant, no lag.
 
 (def *diag-debounce-ms* 120)
+;; The tutorial's eval-on-type debounce (`:tutor-eval`): a shade slower than the diag
+;; beat — each firing round-trips the whole lesson to the sandbox subprocess, so it
+;; waits for a real pause, not a fast typist's inter-key gap.
+(def *tutor-eval-debounce-ms* 250)
 ;; The idle beat (`:idle-recompute`) armed after activity settles — Emacs's idle-timer
 ;; model. It drives everything deferred off the per-key path: the eldoc hint, the advisory
 ;; type-check, the **minibuffer completion re-rank** for a large source (find-file / M-x —
@@ -315,15 +320,16 @@ re-fires iff the buffer moved on while the check ran, so the next idle tick rela
 (defn ed-gitdiff-stale? (m)
   "True when the current buffer wants a diff-hl recompute: diff-hl is on (`:diff-hl?`,
 default true), it's a file buffer, and its **rope differs from the one the cached gutter was
-computed for** (`:git-status-rope`) — its first view (no cache), or any edit since. An O(1)
-rope-handle compare (like `ed-diag-stale?`), so plain motion costs nothing but a text change
+computed for** — its first view (no annotation at all), or any edit since. An O(1)
+rope-handle compare (`annotation`'s `:stale?`), so plain motion costs nothing but a text change
 re-arms the diff, so the change bars follow edits instead of freezing at their old lines until
 a save (the 'bars drift the further down you scroll' symptom). No size cap — the recompute
 runs OFF the loop (`ed-launch-gitdiff`), so a large file no longer blocks it."
   (and (:diff-hl? m true)
     (let (b (ed-current-buf m))
       (and (buffer-file b)
-        (not (= (buffer-rope b) (:git-status-rope b)))))))
+        (let (a (editor/buffer/annotation b :git-line-status))
+          (or (nil? a) (:stale? a)))))))
 
 (defn ed-launch-gitdiff (m)
   "Recompute the current buffer's diff-hl gutter when stale, OFF THE LOOP — mirroring
@@ -343,10 +349,7 @@ with file size and blocks the loop — the very failure the user hit on a 12k-li
     (:gitdiff-proc m) m
     (not (bound? 'gitdiff/gitdiff-status)) m
     (nil? (whereis :editor))
-      (let (b (ed-current-buf m))
-        (ed-set-buf m (assoc (gitdiff/gitdiff-annotate b)
-                        :git-status-rope (buffer-rope b)
-                        :git-status-lines (buffer-line-count b))))
+      (ed-set-buf m (gitdiff/gitdiff-annotate (ed-current-buf m)))
     :else
       (let (b (ed-current-buf m)
             path (buffer-file b)
@@ -366,11 +369,10 @@ Mirrors `ed-apply-diag`."
         idx (index-where (fn (b) (= (buffer-rope b) rope)) (:buffers m1)))
     (if (< idx 0)
       m1
+      ;; stamp the result onto the buffer we diffed (found BY ROPE, so a mid-flight
+      ;; buffer switch still lands on the right one)
       (update m1 :buffers assoc idx
-        (assoc (nth (:buffers m1) idx)
-          :git-line-status (or result {})
-          :git-status-rope rope
-          :git-status-lines (buffer-line-count (nth (:buffers m1) idx)))))))
+        (editor/buffer/annotate (nth (:buffers m1) idx) :git-line-status (or result {}))))))
 
 
 (defn ed-layer-modeline-segments (m buf)
@@ -523,8 +525,14 @@ flag once no prefix is pending (what `ed--which-key-arm` used to do)."
         ;; trigger for the gutter — see `input/ed--timer-fire :cursor-blink`.)
         recompute? (or (ed-gitdiff-stale? m) (ed-web-dirty? m)
                      (and (not held) (or (ed-eldoc-stale? m) (ed-diag-stale? m) (mb-cands-stale? m))))
+        ;; the tutorial's eval-on-type debounce (its own timer, tunable apart from
+        ;; :idle-recompute); tutor is deferred-loaded — bound?-guarded + late-bound
+        ;; (`eval`), the keymap idiom, so this core file never links it eagerly
+        tutor-stale? (and (not held) (bound? 'tutor/ed-tutor-stale?)
+                       ((eval 'tutor/ed-tutor-stale?) m))
         idle (merge
                (if recompute? {:idle-recompute {:after *diag-debounce-ms* :idle? true}} {})
+               (if tutor-stale? {:tutor-eval {:after *tutor-eval-debounce-ms* :idle? true}} {})
                (if held
                  {}
                  (merge
@@ -533,7 +541,7 @@ flag once no prefix is pending (what `ed--which-key-arm` used to do)."
                    (if (and (member? (:this-command m) *typing-commands*) (not (:undo-break m)))
                      {:undo-pause {:after *undo-pause-ms* :idle? true}} {}))))
         managed (merge {:cursor-blink {:every *blink-ms* :idle? true}} idle)
-        kept (dissoc (or (:timers m) {}) :cursor-blink :idle-recompute :which-key :undo-pause))
+        kept (dissoc (or (:timers m) {}) :cursor-blink :idle-recompute :which-key :undo-pause :tutor-eval))
     (assoc m :timers (merge kept managed))))
 
 ;; ---- overlay scrollbar fade (macOS-style auto-hide) -------------------------
@@ -598,6 +606,81 @@ symbol's name with the module path and `cmd-` prefix stripped (`commands/cmd-fin
 (defn ed-keys-label (keys)
   "A space-joined Emacs label for a key sequence (`[:ctrl-x :ctrl-e]` → `C-x C-e`)."
   (join " " (map ed-key-label keys)))
+
+;; ---- key-accurate help text: ask the keymap, don't hardcode -------------------
+;; Any text that tells the user which key to press goes stale the moment a key is
+;; rebound (or the profile switches). So text names the COMMAND and the renderer
+;; asks the live keymap what runs it — Emacs's `substitute-command-keys`, over
+;; std's `keymap-where-is`. `ed-command-keys` builds the vocabulary; pair it with
+;; `template/render`'s `{{name}}` holes and prose follows the user's own bindings.
+
+(defn ed-where-is (km command &optional fallback)
+  "The Emacs-style label of the key sequence bound to `command` in keymap `km`
+(`\"C-x C-e\"`), or `fallback` when nothing is — including when `command` is **nil**,
+the \"this key is grammar, not a binding, so document the literal\" case (a modal
+profile routing many keys through one command). With several bindings the choice is
+**deterministic** — the shortest sequence, then the alphabetically-first label (so
+`C-n` beats `down`, and re-rendering never reshuffles) rather than whatever the
+map's hash order happens to yield."
+  (let (labels (if (nil? command) '() (map ed-keys-label (keymap-where-is km command)))
+        ;; a `[key-count label]` sort key: structural order compares the number
+        ;; first (shortest chord wins), then the label as text — deterministic
+        ;; without needing a string comparator (`<` is numeric in Brood).
+        best (first (sort-by (fn (l) [(count (string-split l " ")) l]) labels)))
+    (or best fallback)))
+
+(defn ed--run-by-name (km name)
+  ;; "how you'd run `name` with no key bound": the profile's command-prompt key plus
+  ;; the name. The SEPARATOR is part of the answer, not decoration — vim's prompt is
+  ;; `:` and you type `:save` with no space, while emacs' is a chord and you type
+  ;; `M-x save` with one. A hardcoded space made the vim rendering wrong in exactly
+  ;; the way a hardcoded "M-x" would have.
+  (let (prompt (ed-where-is km 'commands/cmd-execute-extended-command "M-x")
+        sep (if (= 1 (string-length prompt)) "" " "))
+    (str prompt sep name)))
+
+(defn ed--subst-hole (km hole)
+  ;; One `\\[command]` hole -> the key bound to it, else how to run it by name.
+  (let (sym (symbol (trim hole)))
+    (or (ed-where-is km sym)
+      (ed--run-by-name km (ed-cmd-label sym)))))
+
+(defn ed-substitute-command-keys (km text)
+  "Emacs's `substitute-command-keys`: replace every `\\[command]` hole in `text` with
+the key sequence bound to that command in `km`, or `M-x <name>` when it has none.
+
+The low-ceremony half of key-accurate help text: `ed-command-keys` is right when the
+same key is named many times (a vocabulary worth declaring), this is right for the
+one-off mentions that would otherwise be hardcoded — a welcome message, a mode's
+help header, a commit buffer's instructions. Either way the text follows the user's
+real bindings instead of contradicting them."
+  (let (parts (string-split text "\\["))
+    (if (= (count parts) 1)
+      text
+      (str (first parts)
+        (apply str
+          (map (fn (part)
+                 (let (close (index-of part "]"))
+                   (if (< close 0)
+                     (str "\\[" part)              ; unterminated: leave it alone
+                     (str (ed--subst-hole km (substring part 0 close))
+                       (substring part (inc close) (string-length part))))))
+            (rest parts)))))))
+
+(defn ed-command-keys (km specs)
+  "A `{name → key-label}` vocabulary derived from the live keymap `km`: `specs` is
+`{name [command-sym fallback]}` (the fallback covers a command the profile doesn't
+bind — e.g. a modal grammar key that isn't a command at all). The data half of
+key-accurate help text: render prose with `{{name}}` holes against this and a
+rebinding updates the documentation instead of contradicting it.
+
+    (template/render \"press {{save}} to save\"
+      (ed-command-keys km {:save ['commands/cmd-save-buffer \"C-x C-s\"]}))"
+  (fold (fn (acc kv)
+          (let ([name spec] kv
+                [command fallback] spec)
+            (assoc acc name (ed-where-is km command fallback))))
+    {} specs))
 
 (defn ed-doc (sym)
   "The docstring of command `sym` via the `doc` primitive. Tries it as given (a qualified

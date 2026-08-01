@@ -24,7 +24,9 @@ self-editing editor)."
   (:use interactive)  ; current-prefix-arg / prefix-consuming? — the prefix-arg seam
   (:use editor/keymap)  ; keymap-step — the std chord dispatcher
   (:use editor/ui)  ; overlay-route — the shared modal-overlay dispatch fallthrough
-  (:use bshell)  ; the project shell (C-x p e): bshell-enforce-boundary on every key + event handlers
+  ; bshell is loaded below with a bare `require`: its event handlers register at load,
+  ; and its per-key prompt guard rides the generic `:post-key` layer facet now — nothing
+  ; here refers to its names anymore
   ; compile is loaded below with a bare `require`: its defcommands + UiEvent impls
   ; register at load, but nothing here refers to its names anymore
   (:use hosted)  ; hosted-step — the loop-tail content propagate for process-backed slots
@@ -36,6 +38,7 @@ self-editing editor)."
 ;; Loading `modes` defines the layers and registers the default (text-mode); the
 ;; bindings live there, as data, not here.
 (require 'modes)
+(require 'bshell)  ; the project shell (C-x p e): its event handlers register at load
 (require 'compile)  ; M-x compile + C-x ` next-error — loads its defcommands + UiEvent impls
 (require 'git)  ; git-cache-status on the idle beat (loaded eagerly by the project loader anyway)
 (require 'editor/lineedit)  ; the minibuffer drives lineedit's pure one-line editor core
@@ -56,6 +59,17 @@ created anywhere get their mode here, lazily, so dispatch always has a keymap."
 model's **profile** layers (`scope-keymap`), the buffer winning. The profile (emacs/vim
 — `keymaps`) lives on the model scope; the mode (brood/text/…) on the buffer."
   (scope-keymap (list (ed-current-buf m) m)))
+
+(defn ed--post-key-guards (m-before m key)
+  "Run the current buffer's mode `:post-key` guards over the just-dispatched model
+(layers §7): each guard is `(m-before m-after key) -> model`, collected highest
+precedence first, each seeing the previous guard's result. The model is immutable,
+so a guard vetoes what the key did by returning `m-before` — how bshell keeps
+point out of its prompt and the tutorial protects its prose without this dispatch
+path naming either. Guards are fn symbols, resolved late (hot-swappable)."
+  (fold (fn (mm g) ((if (symbol? g) (eval g) g) m-before mm key))
+    m
+    (layer-collect (ed-current-buf m) :post-key)))
 
 ;; ---- dispatch (the chord state machine is keymap-step; echo policy is ours) --
 ;; The echo-area key label is `model/ed-key-label` (shared with which-key + describe-key),
@@ -596,7 +610,9 @@ group); `:cursor-blink` toggles the caret. An unknown name is a no-op."
                                                  (:held-key m)
                                                  textrows
                                                  textcols
-                                                 {:every (ed-repeat-rate m)})
+                                                 ;; :idle? — see the fresh-press arm in
+                                                 ;; ed-update for why both specs carry it
+                                                 {:every (ed-repeat-rate m) :idle? true})
                            else (ed--repeat-clear m))
     ;; the idle debounce: eldoc + diagnostics + a large completion source's candidate re-rank,
     ;; plus the off-the-loop diff-hl launch and the debounced web-mirror push — all the work
@@ -611,6 +627,12 @@ group); `:cursor-blink` toggles the caret. An unknown name is a no-op."
         m2))
     (= name :which-key) (ed-which-key-reveal m)
     (= name :undo-pause) (ed-break-undo-run m)
+    ;; the tutorial's eval-on-type: typing in *Tutorial* settled — re-evaluate the
+    ;; lesson's playgrounds in the sandbox (tutor is deferred-loaded: bound?-guarded
+    ;; + late-bound, the keymap idiom)
+    (= name :tutor-eval) (if (bound? 'tutor/ed-tutor-launch)
+                           ((eval 'tutor/ed-tutor-launch) m)
+                           m)
     ;; The blink tick fires reliably whenever the editor is idle — it is NOT gated by the
     ;; held-key state the way `:idle-recompute` is — so we also refresh the diff-hl gutter
     ;; here. `ed-launch-gitdiff` is a no-op unless the buffer changed since its last diff, so
@@ -926,20 +948,37 @@ owns it, else through the keymap (`ed-dispatch`)."
                            ;; (`UiEvent`, see model.blsp — no handler table to consult).
                            (ui-event? input) (ui-event-fold input m0 textrows cols rows)
                            ;; an inbound async/system event (`[:tag …]`) → its registered handler.
-                           (ed-system-event? input) ((eval (get ed--event-handlers (first input))) m0
-                                                      input
-                                                      textrows
-                                                      cols
-                                                      rows)
+                           ;; A MOUSE gesture can edit the buffer (context-menu Paste/Cut, a
+                           ;; drag-kill), so the buffer's `:post-key` guards apply to it exactly
+                           ;; as to a key — without this, a right-click Paste bypassed the
+                           ;; tutorial's prose protection. Other system events (task replies,
+                           ;; subprocess lines) never edit interactively and skip the guards.
+                           (ed-system-event? input)
+                           (let (folded ((eval (get ed--event-handlers (first input))) m0
+                                          input
+                                          textrows
+                                          cols
+                                          rows))
+                             (if (= (first input) :mouse)
+                               (ed--post-key-guards m0 folded input)
+                               folded))
                            ;; otherwise a key: for a plain cursor-movement key, first pull point
                            ;; back into view if the user scrolled it off-screen (so the move resumes
                            ;; from what's visible instead of snapping the view to the off-screen
                            ;; cursor) — skipped while a transient overlay owns input, and NOT for other
                            ;; commands (recenter/goto/search act on the real point). Then route through
-                           ;; the keymap and arm held-key repeat if it's repeatable.
-                           ;; A bshell buffer keeps the cursor out of its read-only prompt
-                           ;; (`bshell-enforce-boundary`): a no-op in every other buffer.
-                           else (bshell-enforce-boundary
+                           ;; the keymap and arm held-key repeat if it's repeatable, and let the
+                           ;; buffer's mode `:post-key` guards veto/repair what the key did (bshell's
+                           ;; prompt boundary, the tutorial's read-only prose — layers §7).
+                           ;; The repeat delay is `:idle? true` — it counts from the LAST
+                           ;; real input, not from when the timer first appeared. During
+                           ;; rollover typing (press b while a is still down) the timer
+                           ;; NAME never leaves `:timers`, so a plain `{:after …}` stayed
+                           ;; anchored to the burst's FIRST key: the delay budget eroded
+                           ;; to nothing mid-burst and the current key machine-gunned at
+                           ;; the repeat rate. Idle anchoring = true typematic: repeat
+                           ;; starts `delay` after the newest press, whatever came before.
+                           else (ed--post-key-guards m0
                                   (ed-repeat-key-step
                                     (if (and (member? input *view-resume-keys*)
                                           (nil? (overlay-active ed--transient-handlers m0)))
@@ -948,7 +987,8 @@ owns it, else through the keymap (`ed-dispatch`)."
                                     input
                                     textrows
                                     textcols
-                                    {:after (ed-repeat-delay m0)})))
+                                    {:after (ed-repeat-delay m0) :idle? true})
+                                  input))
                          input)
                        cols
                        rows))
