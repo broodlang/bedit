@@ -28,6 +28,7 @@ receives `[:bshell-run line]`, runs it, and forwards each chunk as a `bshell-out
   (:use editor/highlight)  ; highlight-spans / shift-spans / bracket-match — Brood input services
   (:use editor/buffer))  ; make-buffer / insert / end-of-buffer / buffer-length / goto-char
 
+(require 'editor/formbuf)  ; guard-clamp / tail-region — the prompt boundary
 (require 'ansi)  ; ansi/strip-ansi — shared ANSI escape stripping (std/ansi.blsp)
 (require 'modes)  ; fontify + gutter faces
 
@@ -167,6 +168,14 @@ buffer under `:bshell-proc`). `(bshell-shutdown pid)` stops it."
 (defn bshell-shutdown (pid)
   "Stop a shell process: kill any running child and end the process."
   (send pid [:shutdown]))
+
+(defn bshell-on-close (buf)
+  "The bshell layer's `:on-close` hook (fired by `commands/cmd-kill-buffer` via
+`close-context`): the shell buffer is going away, so stop the worker it owns and
+whatever child it was running. Without this, `C-x k` on a `*shell: …*` buffer left
+both alive until the editor exited — the layers `:on-close` seam exists precisely
+for a mode that spawned something."
+  (do (when (:bshell-proc buf) (bshell-shutdown (:bshell-proc buf))) buf))
 
 ;; ---- buffer plumbing --------------------------------------------------------
 
@@ -368,20 +377,30 @@ last newline before `istart`)."
     (if (< nl 0) 0 (+ nl 1))))
 
 (defn bshell-enforce-boundary (m)
-  "Pull point out of the prompt if it landed there. In a bshell buffer, if point sits in the
-prompt portion of the input line — left of the input start but on that same line (e.g. after
-pressing Down from a line above, which keeps the column) — move it to the input start. A
-no-op in any other buffer and when point is in the output *above* the input line, so output
-stays freely navigable/scrollable/selectable. Run after every keystroke (`input`), so no key
-can leave the cursor behind the prompt."
+  "Pull point out of the prompt if it landed there — `formbuf/guard-clamp` over the
+one editable region a shell buffer has (`formbuf/tail-region` from the input start:
+everything after the prompt is yours). The `:clamp` policy rather than `:veto`
+because a shell's generated part is legitimately navigable — you scroll and select
+output freely; only *typing* position is constrained. A no-op in any other buffer."
   (let (b (ed-current-buf m))
     (if (not (bshell-buffer? b))
       m
-      (let (p (buffer-point b)
-            istart (or (:bshell-input-start b) 0))
-        (if (and (< p istart) (>= p (bshell--input-line-start (buffer-text b) istart)))
-          (ed-set-buf m (goto-char b istart))
+      (let (istart (or (:bshell-input-start b) 0)
+            line-start (bshell--input-line-start (buffer-text b) istart))
+        ;; Only the prompt PORTION of the input line is out of bounds: point in the
+        ;; output above it stays put, so the scrollback keeps its own cursor.
+        (if (and (< (buffer-point b) istart) (>= (buffer-point b) line-start))
+          (editor/formbuf/guard-clamp m
+            (fn (mm) (buffer-text (ed-current-buf mm)))
+            (fn (mm) (buffer-point (ed-current-buf mm)))
+            (fn (mm p) (ed-set-buf mm (goto-char (ed-current-buf mm) p)))
+            (fn (text) (editor/formbuf/tail-region text istart)))
           m)))))
+
+(defn bshell-post-key (m-before m key)
+  "The bshell layer's `:post-key` guard (layers §7): repair, don't veto — point is
+clamped out of the prompt rather than the keystroke undone, so `m-before` is unused."
+  (bshell-enforce-boundary m))
 
 ;; ---- command history (↑/↓ recall, like the Brood REPL; per buffer) ----------
 

@@ -1,0 +1,1083 @@
+;; The interactive Brood tutorial (`src/tutor.blsp`) — pure model tests: the box
+;; parser and skeleton, the lesson render + re-stash across navigation, the
+;; :post-key prose guard through real `ed-update` dispatch, the parse gate
+;; (E0002 = mid-typing = silence), the eval triple's headless sync fallback
+;; (verdicts land as notes without a sandbox), stale-reply dropping, and the
+;; playground commands (TAB / reset). No window, no subprocess — the sandboxed
+;; path is covered by tests/sandbox_test.blsp.
+
+(defmodule tutor-test
+  (:use test)
+  (:use model)
+  (:use commands)
+  (:use input)
+  (:use editor/buffer)
+  (:use-internals tutor)
+  (:use-internals view)  ; ed--tutor-note-ops — the ghost-text ops
+  (:use-internals modes) ; mark--note-glyph — the gutter glyph mapping
+  (:use tutor-lessons))
+
+;; A model showing the tutorial at lesson 0, headless (no :editor process, so
+;; cmd-tutorial starts no sandbox and evals fall back to in-image eval-capturing).
+(defn tut-model () (tutor/cmd-tutorial (ed-init (make-buffer "")) nil))
+(defn tut-buf (m) (ed-current-buf m))
+(defn tut-text (m) (buffer-text (tut-buf m)))
+(defn tut-regions (m) (tutor-regions (tut-text m)))
+(defn tut-notes (m) (or (results/eol-notes (tut-buf m)) {}))
+(defn tut-note-texts (m) (sort (map (fn (kv) (let ([_ n] kv) (:text n))) (tut-notes m))))
+(defn key-into (m k) (ed-update m k 80 24))
+;; look lessons up by TITLE, never by index — the course gets reordered, and an
+;; index-keyed test just breaks somewhere unrelated when it does
+(defn lesson-idx (title)
+  (find (fn (i) (= (:title (nth tutor-lessons i)) title)) (range (count tutor-lessons))))
+(defn nav-count () (count (tutor/tutor--group-indices [:navigation nil])))
+
+;; ---- the box parser -----------------------------------------------------------
+
+(describe "tutor-regions (the one reader of the box syntax)"
+  (test "no boxes, no regions"
+    (assert= (tutor-regions "just prose\nno boxes here") ())
+    (assert= (tutor-regions "") ()))
+
+  (test "one box: content strictly between the delimiter lines, half-open"
+    (let (text "prose\n╭─ Try ──\n(+ 1 2)\n╰────\ntail"
+          r (first (tutor-regions text)))
+      (assert= (substring text (:start r) (:end r)) "(+ 1 2)")
+      (assert= (:open-line r) 1)
+      (assert= (:close-line r) 3)))
+
+  (test "several boxes, in order; multi-line content"
+    (let (text "╭─ a ──\n(defn f (x)\n  x)\n╰──\n\n╭─ b ──\n(f 1)\n╰──"
+          rs (tutor-regions text))
+      (assert= (count rs) 2)
+      (assert= (substring text (:start (first rs)) (:end (first rs))) "(defn f (x)\n  x)")
+      (assert= (substring text (:start (second rs)) (:end (second rs))) "(f 1)")))
+
+  (test "an empty box is empty, not inverted"
+    (let (text "╭─ a ──\n╰──"
+          r (first (tutor-regions text)))
+      (assert= (:start r) (:end r))))
+
+  (test "an unclosed box yields no region"
+    (assert= (tutor-regions "╭─ a ──\n(+ 1 2)") ())))
+
+(describe "tutor-skeleton (what the prose guard compares)"
+  (test "box content never reaches the skeleton"
+    (let (a "p\n╭─ t ──\n(+ 1 2)\n╰──\nq"
+          b "p\n╭─ t ──\n(completely different)\n╰──\nq")
+      (assert= (tutor-skeleton a) (tutor-skeleton b))))
+  (test "prose, delimiters and box COUNT all do"
+    (let (a "p\n╭─ t ──\nx\n╰──\nq")
+      (is (not= (tutor-skeleton a) (tutor-skeleton (replace a "p\n" "P\n"))))
+      (is (not= (tutor-skeleton a) (tutor-skeleton (replace a "╰──" "╰─x")))))))
+
+;; ---- render + open + navigation -------------------------------------------------
+
+(describe "the *Tutorial* buffer"
+  (test "cmd-tutorial opens lesson 1, typed :tutor, point in the first box"
+    (let (m (tut-model)
+          b (tut-buf m))
+      (assert= (buffer-name b) "*Tutorial*")
+      (is (includes? (tut-text m) (str "Brood Tutorial · Navigation — 1/" (nav-count))))
+      (is (not (nil? (:tutor-skeleton b))))          ; the guard's stash
+      ;; point parks in the first box, past its margin
+      (assert= (buffer-point b) (+ (:start (first (tut-regions m))) 2))))
+
+  (test "re-invoking cmd-tutorial resumes — playground edits survive"
+    (let (m (tut-model)
+          edited (ed-edit m (fn (b) (insert b "(noted)")))
+          again (tutor/cmd-tutorial edited nil))
+      (is (includes? (tut-text again) "(noted)"))))
+
+  (test "C-c C-n advances within the section; C-c C-p returns"
+    (let (m (tut-model)
+          m2 (tutor/cmd-tutorial-next m nil))
+      (is (includes? (tut-text m2) (str "Navigation — 2/" (nav-count))))
+      ;; the fresh render re-stashed a matching skeleton — the guard passes
+      (assert= (:tutor-skeleton (tut-buf m2)) (tutor-skeleton (tut-text m2)))
+      (is (includes? (tut-text (tutor/cmd-tutorial-prev m2 nil)) (str "Navigation — 1/" (nav-count))))))
+
+  (test "every lesson renders under BOTH profiles, parses back box-for-box"
+    (dolist (prof (list :emacs :vim))
+      (dotimes (i (count tutor-lessons))
+        (let (text (tutor-lesson-text i prof))
+          (assert= (count (tutor-regions text))
+            (count (:playgrounds (nth tutor-lessons i))))
+          ;; no unrendered {{hole}} survives a render
+          (is (not (includes? text "{{"))))))))
+
+;; ---- the :post-key prose guard (through real dispatch) ---------------------------
+
+(describe "the prose guard"
+  (test "typing INSIDE a box is an ordinary edit"
+    (let (m (tut-model)
+          m2 (key-into m "1"))
+      (is (not= (tut-text m2) (tut-text m)))))
+
+  (test "typing in the prose is undone whole — text and point"
+    (let (m (ed-apply (tut-model) (fn (b) (goto-char b 0)))
+          m2 (key-into m "x"))
+      (assert= (tut-text m2) (tut-text m))
+      (assert= (buffer-point (tut-buf m2)) 0)))
+
+  (test "backspacing a box delimiter from inside the box is undone"
+    ;; point at a box's first char: backspace would eat the ╭ line's newline
+    (let (m0 (tut-model)
+          r (first (tut-regions m0))
+          m (ed-apply m0 (fn (b) (goto-char b (:start r))))
+          m2 (key-into m :backspace))
+      (assert= (tut-text m2) (tut-text m)))))
+
+;; ---- the parse gate ---------------------------------------------------------------
+
+(describe "tutor--parse-state (the on-type gate)"
+  (test "blank says nothing" (assert= (tutor/tutor--parse-state "  \n") :blank))
+  (test "mid-typing (reader E0002) reports WHAT it is waiting for"
+    ;; it used to return a bare :incomplete and the box showed nothing — a half-typed
+    ;; form is not a mistake, but it isn't nothing either
+    (let (s (tutor/tutor--parse-state "(defn f (x)"))
+      (assert= (first s) :incomplete)
+      (is (includes? (second s) "unclosed list"))))
+  (test "a real syntax error reports without a round-trip"
+    (let (s (tutor/tutor--parse-state "(+ 1 2))"))
+      (assert= (first s) :err)))
+  (test "a complete form is ready" (assert= (tutor/tutor--parse-state "(+ 1 2)") :ok)))
+
+;; ---- eval-on-type, headless sync fallback -----------------------------------------
+
+(describe "ed-tutor-launch (headless: in-image fallback)"
+  (test "stale until launched, then quiet until the text moves"
+    (let (m (tut-model))
+      (is (ed-tutor-stale? m))
+      (let (m2 (ed-tutor-launch m))
+        (is (not (ed-tutor-stale? m2)))
+        (is (ed-tutor-stale? (ed-edit m2 (fn (b) (insert b " "))))))))
+
+  (test "lesson 1's templates verdict: the try-box informs, the exercise misses with the hint"
+    (let (m (ed-tutor-launch (tut-model))
+          notes (tut-note-texts m))
+      (assert= (count notes) 2)
+      (is (find (fn (t) (starts-with? t "=> \"my keys")) notes))
+      (is (find (fn (t) (and (includes? t "✗ expected 42, got 41") (includes? t "hint:")))
+            notes))))
+
+  (test "fixing the exercise turns the note into a ✓"
+    (let (m (tut-model)
+          r (second (tut-regions m))
+          fixed (ed-edit m (fn (b)
+                             (insert (delete-region (assoc (goto-char b (:start r)) :mark (:end r)))
+                               "(* 6 7)")))
+          m2 (ed-tutor-launch fixed)
+          notes (tut-note-texts m2))
+      (is (find (fn (t) (= t "✓ 42")) notes))))
+
+  (test "an incomplete box keeps its previous note, re-anchored (silence while mid-form)"
+    (let (m (ed-tutor-launch (tut-model))
+          r (second (tut-regions m))
+          ;; truncate the exercise to an open paren — mid-typing
+          broken (ed-edit m (fn (b)
+                              (insert (delete-region (assoc (goto-char b (:start r)) :mark (:end r)))
+                                "(+ 40")))
+          m2 (ed-tutor-launch broken))
+      ;; the old ✗ is REPLACED by what the reader wants: carrying it left a verdict
+      ;; standing beside text that can no longer produce it
+      (is (not (find (fn (t) (includes? t "✗ expected 42")) (tut-note-texts m2))))
+      (is (find (fn (t) (includes? t "⋯ unclosed list")) (tut-note-texts m2)))))
+
+  (test "REGRESSION: an edit that shifts lines strands no phantom note (region-keyed rebuild)"
+    (let (m (ed-tutor-launch (tut-model))
+          lines-before (sort (map (fn (kv) (:line (second kv))) (tut-notes m)))
+          ;; grow box 1 by a line: newline inside it shifts everything below down
+          grown (ed-edit m (fn (b) (insert (goto-char b (:start (first (tut-regions m)))) "\n")))
+          m2 (ed-tutor-launch grown)
+          notes (tut-notes m2)
+          lines-after (sort (map (fn (kv) (:line (second kv))) notes)))
+      (assert= (count notes) 2)                       ; one per box, structurally
+      ;; both anchors moved down one line — and NOTHING remains at the old lines
+      (assert= lines-after (map inc lines-before))))
+
+  (test "a note dims out via the rope stamp (staleness is detectable)"
+    (let (m (ed-tutor-launch (tut-model))
+          b (tut-buf m))
+      (is (not (results/eol-notes-stale? b)))
+      (let (m2 (ed-edit m (fn (bb) (insert bb "1"))))
+        (is (results/eol-notes-stale? (tut-buf m2)))))))
+
+;; ---- reply application (the async half, folded purely) ----------------------------
+
+(describe "tutor-apply-reply"
+  (test "an unknown id is dropped"
+    (let (m (tut-model))
+      (assert= (tut-notes (tutor/tutor-apply-reply m {:id 999 :ok true :value "1"})) {})))
+
+  (test "a reply whose rope moved since the send is dropped (and unpended)"
+    (let (m (tut-model)
+          rope (buffer-rope (tut-buf m))
+          pended (update m :tutor merge {:pending {7 {:region 0 :rope rope}}})
+          moved (ed-edit pended (fn (b) (insert b "x")))
+          m2 (tutor/tutor-apply-reply moved {:id 7 :ok true :value "3"}))
+      (assert= (tut-notes m2) {})
+      (assert= (get-in m2 [:tutor :pending]) {})))
+
+  (test "a current reply lands as the box's note"
+    (let (m (tut-model)
+          rope (buffer-rope (tut-buf m))
+          pended (update m :tutor merge {:pending {7 {:region 0 :rope rope}}})
+          m2 (tutor/tutor-apply-reply pended {:id 7 :ok true :value "3" :output ""}))
+      (is (find (fn (t) (= t "=> 3")) (tut-note-texts m2)))))
+
+  (test "a timeout reply is a ✗ that names the restart key"
+    (let (m (tut-model)
+          rope (buffer-rope (tut-buf m))
+          pended (update m :tutor merge {:pending {7 {:region 0 :rope rope}}})
+          m2 (tutor/tutor-apply-reply pended {:id 7 :ok false :timeout true}))
+      (is (find (fn (t) (includes? t "timed out")) (tut-note-texts m2))))))
+
+;; ---- playground commands ------------------------------------------------------------
+
+(describe "playground commands"
+  (test "M-n hops to the next box and wraps"
+    (let (m (tut-model)
+          rs (tut-regions m)
+          m2 (key-into m :alt-n))
+      (assert= (buffer-point (tut-buf m2)) (+ (:start (second rs)) 2))
+      (assert= (buffer-point (tut-buf (key-into m2 :alt-n))) (+ (:start (first rs)) 2))))
+
+  (test "C-c C-r restores the box at point to its template"
+    (let (m (tut-model)
+          r (first (tut-regions m))
+          template (substring (tut-text m) (:start r) (:end r))
+          mangled (ed-edit m (fn (b)
+                               (insert (delete-region (assoc (goto-char b (:start r)) :mark (:end r)))
+                                 "(garbage)")))
+          m2 (tutor/cmd-tutorial-reset-playground mangled nil)
+          r2 (first (tut-regions m2)))
+      (assert= (substring (tut-text m2) (:start r2) (:end r2)) template)))
+
+  (test "C-c C-r outside any box explains itself"
+    (let (m (ed-apply (tut-model) (fn (b) (goto-char b 0)))
+          m2 (tutor/cmd-tutorial-reset-playground m nil))
+      (assert= (tut-text m2) (tut-text m)))))
+
+;; ---- feedback rendering (gutter mark / ghost text / echo / modeline chip) ---------
+
+(describe "feedback rendering"
+  (test "the gutter marks a box's verdict line — dimming once the text moves"
+    (let (m (ed-tutor-launch (tut-model))
+          b (tut-buf m)
+          fail-line (first (sort (keep (fn (kv) (when (= (:kind (second kv)) :fail) (:line (second kv))))
+                                   (tut-notes m)))))
+      (assert= (modes/gutter-mark-for b fail-line) ["✗" modes/gutter-face-test-fail])
+      ;; an edit dims the mark (rope stamp), an inserted line blanks it (count)
+      (let (dimmed (tut-buf (ed-edit m (fn (bb) (insert bb "1")))))
+        (assert= (modes/gutter-mark-for dimmed fail-line) ["✗" modes/gutter-face-test-stale]))
+      (let (shifted (tut-buf (ed-edit m (fn (bb) (insert (goto-char bb 0) "\n")))))
+        (assert= (modes/gutter-mark-for shifted fail-line) nil))))
+
+  (test "ghost text ops paint the note past the line's end"
+    (let (m (ed-tutor-launch (tut-model))
+          b (tut-buf m)
+          ops (view/ed--eol-note-ops b 0 200 0 0 120 4 1 0))
+      (assert= (count ops) 2)                       ; one per noted box
+      (is (includes? (pr-str ops) "expected 42"))))
+
+  (test "no notes, no ops — an ordinary buffer costs a field lookup"
+    (assert= (view/ed--eol-note-ops (make-buffer "plain") 0 24 0 0 80 4 1 0) ()))
+
+  (test "the echo line shows the full note at point, silenced when stale"
+    (let (m (ed-tutor-launch (tut-model))
+          note-line (first (sort (map (fn (kv) (:line (second kv))) (tut-notes m))))
+          at (ed-apply m (fn (b) (commands/ed-goto-line b (inc note-line)))))
+      (is (string? (view/ed-eol-note-on-line (tut-buf at))))
+      (let (edited (ed-edit at (fn (b) (insert b "1"))))
+        (assert= (view/ed-eol-note-on-line (tut-buf edited)) nil))))
+
+  (test "the modeline chip counts the lesson and the exercises passed"
+    (let (m (ed-tutor-launch (tut-model)))
+      (assert= (tutor/tutor-modeline m (tut-buf m)) (str "Navigation 1/" (nav-count) " · ✓ 0/1"))
+      (let (r (second (tut-regions m))
+            fixed (ed-edit m (fn (b)
+                               (insert (delete-region (assoc (goto-char b (:start r)) :mark (:end r)))
+                                 "(* 6 7)")))
+            m2 (ed-tutor-launch fixed))
+        (assert= (tutor/tutor-modeline m2 (tut-buf m2)) (str "Navigation 1/" (nav-count) " · ✓ 1/1")))))
+
+  (test "the whole view renders a tutorial frame without throwing"
+    (let (m (ed-tutor-launch (tut-model))
+          f (view/ed-view m 100 30))
+      (is (not (includes? (pr-str f) "render error"))))))
+
+;; ---- review-fix regressions + the new keys -----------------------------------------
+
+(describe "guard resilience (the veto must never brick the buffer)"
+  (test "pre-existing prose damage doesn't veto later keys — navigation still works"
+    ;; damage the prose OUTSIDE dispatch (what a hypothetical bypass would leave);
+    ;; the guard must see the damage predates the key and let the key through
+    (let (m (tut-model)
+          damaged (ed-edit (ed-apply m (fn (b) (goto-char b 0))) (fn (b) (insert b "XX")))
+          moved (key-into damaged :right))
+      ;; the arrow key was NOT undone: point moved off 0
+      (is (> (buffer-point (tut-buf moved)) 0))
+      ;; and the damage (not the key) is still there — nothing silently reverted
+      (is (includes? (tut-text moved) "XX"))))
+
+  (test "a keystroke that causes fresh damage is still vetoed"
+    (let (m (ed-apply (tut-model) (fn (b) (goto-char b 0)))
+          m2 (key-into m "x"))
+      (assert= (tut-text m2) (tut-text m)))))
+
+(describe "box navigation and TAB"
+  (test "M-n hops to the next box; M-p and S-TAB hop back"
+    (let (m (tut-model)
+          rs (tut-regions m)
+          m2 (key-into m :alt-n))
+      (assert= (buffer-point (tut-buf m2)) (+ (:start (second rs)) 2))
+      (assert= (buffer-point (tut-buf (key-into m2 :alt-p))) (+ (:start (first rs)) 2))
+      (assert= (buffer-point (tut-buf (key-into m2 :back-tab))) (+ (:start (first rs)) 2))))
+
+  (test "TAB in the prose is a no-op with a pointer, never an edit or a hop"
+    (let (m (ed-apply (tut-model) (fn (b) (goto-char b 0)))
+          m2 (key-into m :tab))
+      (assert= (tut-text m2) (tut-text m))
+      (assert= (buffer-point (tut-buf m2)) 0)))
+
+  (test "TAB on an out-of-indent box line indents it (like every .blsp buffer)"
+    ;; make box 2's form span two lines with the closer at column 0 — TAB should
+    ;; pull the second line to its sexp indentation, not leave the box
+    (let (m (tut-model)
+          r (second (tut-regions m))
+          split (ed-edit m (fn (b)
+                             (insert (delete-region (assoc (goto-char b (:start r)) :mark (:end r)))
+                               "(+ 40\n1)")))
+          rs (tutor-regions (tut-text split))
+          r2 (second rs)
+          ;; point on the second line of the box (the "1)" line)
+          at (ed-apply split (fn (b) (goto-char b (- (:end r2) 1))))
+          m2 (key-into at :tab))
+      (is (not= (tut-text m2) (tut-text at)))               ; the line moved
+      (is (includes? (tut-text m2) "(+ 40\n  1)"))))        ; to sexp indentation
+
+  (test "TAB never navigates from inside a box (deterministic)"
+    ;; on a correctly-indented box line TAB completes/indents — point must NOT
+    ;; leave the box (the old adaptive TAB hopped here)
+    (let (m (tut-model)
+          m2 (key-into m :tab))
+      (is (not (nil? (tutor/tutor--region-at (tut-regions m2) (buffer-point (tut-buf m2))))))))
+
+  (test "RET inside a box auto-indents the new line (relative to the margined form)"
+    (let (m (tut-model)
+          r (second (tut-regions m))          ; lesson 1's exercise box: "  (+ 40 1)"
+          at (ed-apply m (fn (b) (goto-char b (+ (:start r) 7))))
+          m2 (key-into at :enter))
+      (is (includes? (tut-text m2) "(+ 40\n    1)"))))
+
+  (test "M-p from the first box wraps to the last"
+    (let (m (tut-model)
+          rs (tut-regions m)
+          m2 (key-into m :alt-p))
+      (assert= (buffer-point (tut-buf m2)) (+ (:start (last rs)) 2)))))
+
+(describe "the workings pane (traced boxes)"
+  (test "a traced sync eval opens *Workings* aside with the call cascade"
+    ;; lesson 7 (Functions) traces `double`/`triple`; render it and launch headless
+    (let (m (ed-tutor-launch (tutor/tutor--show (ed-init (make-buffer "")) (lesson-idx "Functions")))
+          wi (ed-buffer-index-by-name m "*Workings*"))
+      (is (not (nil? wi)))
+      (let (wtext (buffer-text (ed-buf-at m wi)))
+        (is (includes? wtext "The workings"))
+        (is (includes? wtext "triple 14"))
+        (is (includes? wtext "= ")))))
+
+  (test "an untraced lesson opens no workings pane"
+    (let (m (ed-tutor-launch (tut-model)))
+      (assert= (ed-buffer-index-by-name m "*Workings*") nil)))
+
+  (test "the workings lines nest calls and returns"
+    (assert= (tutor/tutor--workings-lines
+               (list {:kind "call" :fn "fac" :args "(2)"}
+                 {:kind "call" :fn "fac" :args "(1)"}
+                 {:kind "return" :fn "fac" :value "1"}
+                 {:kind "return" :fn "fac" :value "2"}))
+      (list "fac 2" "  fac 1" "  = 1" "= 2"))))
+
+(describe "per-box cursor memory"
+  (test "each box remembers its own point across hops"
+    (let (m (tut-model)
+          rs (tut-regions m)
+          ;; move 5 chars into box 1, hop to box 2, then hop back
+          in1 (ed-apply m (fn (b) (goto-char b (+ (:start (first rs)) 5))))
+          at2 (key-into in1 :alt-n)
+          back (key-into at2 :alt-p))
+      ;; box 2: first visit lands past its margin
+      (assert= (buffer-point (tut-buf at2)) (+ (:start (second rs)) 2))
+      (assert= (buffer-point (tut-buf back)) (+ (:start (first rs)) 5))))  ; box 1 remembered
+
+  (test "a remembered offset clamps to the box's current size"
+    (let (m (tut-model)
+          rs (tut-regions m)
+          ;; park DEEP in box 1, hop away (stores the deep offset), shrink box 1,
+          ;; park in box 2 WITHOUT a hop (no memory update), then hop back: the
+          ;; stored deep offset must clamp inside the now-tiny box
+          deep (ed-apply m (fn (b) (goto-char b (:end (first rs)))))
+          away (key-into deep :alt-n)
+          shrunk (ed-edit away (fn (b)
+                                 (insert (delete-region (assoc (goto-char b (:start (first rs)))
+                                                          :mark (:end (first rs))))
+                                   "(x)")))
+          rs2 (tut-regions shrunk)
+          in2 (ed-apply shrunk (fn (b) (goto-char b (:start (second rs2)))))
+          back (key-into in2 :alt-p))
+      (is (<= (buffer-point (tut-buf back)) (:end (first rs2))))
+      (is (>= (buffer-point (tut-buf back)) (:start (first rs2)))))))
+
+(describe "profile-dynamic lessons"
+  (test "the same lesson teaches each profile its own keys"
+    ;; lesson 2 (Moving around) names the motion keys; lesson 1 is the keys CHOICE
+    (let (emacs-text (tutor-lesson-text (lesson-idx "Moving around") :emacs)
+          vim-text (tutor-lesson-text (lesson-idx "Moving around") :vim))
+      (is (includes? emacs-text "C-f / C-b"))
+      (is (includes? vim-text "h / l"))
+      (is (includes? vim-text "INSERT mode"))
+      (is (not (includes? emacs-text "INSERT mode")))))
+
+  (test "the keys CHOICE is the tutorial's first lesson, not a prompt"
+    (let (text (tutor-lesson-text 0 :emacs))
+      (is (includes? text "Choose your keys"))
+      (is (includes? text "M-x vim-mode"))          ; rendered for the active profile
+      (is (includes? (tutor-lesson-text 0 :vim) ": vim-mode"))))
+
+  (test "switching profiles re-renders the open lesson in place, keeping box edits"
+    (let (m (tut-model)
+          r (first (tut-regions m))
+          ;; the user's code in box 1 must survive the switch
+          edited (ed-edit m (fn (b)
+                              (insert (delete-region (assoc (goto-char b (:start r)) :mark (:end r)))
+                                "  (my-marker)")))
+          switched (commands/cmd-vim-mode edited nil)
+          ;; the next dispatched key trips the guard's profile check
+          m2 (key-into switched :down))
+      (is (includes? (tut-text m2) ": vim-mode"))       ; vim's prompt key, rendered live
+      (is (includes? (tut-text m2) "(my-marker)"))      ; the box edit survived
+      ;; the re-render re-stashed: the guard passes and the skeleton matches
+      (assert= (:tutor-skeleton (tut-buf m2)) (tutor-skeleton (tut-text m2)))))
+
+  (test "verdict hints render for the active profile"
+    ;; lesson 4 (Editing)'s exercise hint is a template; under vim it should
+    ;; speak dd/o — exercise the sync-fallback path end to end
+    (let (m (ed-tutor-launch (assoc (tutor/tutor--show (ed-init (make-buffer "")) (lesson-idx "Editing")) :profile :vim))
+          fail-notes (keep (fn (kv) (when (= (:kind (second kv)) :fail) (:text (second kv))))
+                       (tut-notes m)))
+      (is (find (fn (t) (includes? t "dd the SECOND line")) fail-notes)))))
+
+;; ---- sections + the contents hub ------------------------------------------------
+
+(describe "sections"
+  (test "every lesson belongs to a registered section, and sections are contiguous"
+    (dotimes (i (count tutor-lessons))
+      (let ([sid sub] (tutor/tutor--group-of i))
+        (is (not (nil? sid)))
+        (is (find (fn (s) (= (:id s) sid)) tutor-sections))))
+    ;; contiguity: every GROUP's indices are consecutive
+    (doseq (e (tutor/tutor--groups))
+      (when (:group e)
+        (let (idxs (tutor/tutor--group-indices (:group e)))
+          (is (not (empty? idxs)))
+          (assert= idxs (range (first idxs) (+ (first idxs) (count idxs))))))))
+
+  (test "the heading names the section and the position WITHIN it"
+    (assert= (tutor/tutor--group-position 0) [1 (nav-count)])      ; Navigation 1/3
+    (assert= (tutor/tutor--group-position 2) [3 (nav-count)])      ; Navigation 3/3
+    (is (includes? (tutor-lesson-text 0 :emacs) (str "Navigation — 1/" (nav-count))))
+    (is (includes? (tutor-lesson-text (lesson-idx "Editing") :emacs)
+            (str "Editing — 1/" (count (tutor/tutor--group-indices [:editing nil]))))))
+
+  (test "the first lesson opens in Navigation, not on the hub"
+    (let (m (tut-model))
+      (is (not (tutor/tutor-contents? m)))
+      (assert= (first (tutor/tutor--group-of (get-in m [:tutor :lesson] 0))) :navigation))))
+
+(describe "the contents hub"
+  (test "finishing a section lands on the hub with a completion banner"
+    (let (m (tut-model)
+          last-nav (tutor/tutor--show m (last (tutor/tutor--group-indices [:navigation nil])))
+          hub (tutor/cmd-tutorial-next last-nav nil))
+      (is (tutor/tutor-contents? hub))
+      (is (includes? (tut-text hub) "Navigation complete"))
+      (is (includes? (tut-text hub) "Where next?"))))
+
+  (test "the hub lists every entry with its lesson count, and the .blsp one by name"
+    (let (hub (tutor/cmd-tutorial-contents (tut-model) nil))
+      (doseq (e (tutor/tutor--groups))
+        (is (includes? (tut-text hub) (:title e))))
+      (is (includes? (tut-text hub) "The Brood language (.blsp)"))   ; the section header
+      (is (includes? (tut-text hub) "Values & expressions"))          ; its subsections
+      (is (includes? (tut-text hub) "Processes"))
+      (is (includes? (tut-text hub) "(3 lessons)"))))
+
+  (test "a hub line resolves to its section (the link affordance) — prose lines don't"
+    (let (hub (tutor/cmd-tutorial-contents (tut-model) nil)
+          b (tut-buf hub)
+          hits (keep (fn (i) (tutor/tutor-contents-section-at b i))
+                 (range (buffer-line-count b))))
+      ;; each entry is two lines tall (title + blurb) and both resolve, so landing
+      ;; anywhere in an entry works
+      ;; two lines per clickable entry (▸ title + blurb); headers name no group
+      (assert= (count hits) (* 2 (count (filter :group (tutor/tutor--groups)))))
+      (assert= (first hits) [:navigation nil])
+      (is (includes? hits [:language :functions]))))
+
+  (test "a blurb line resolves to its section, so RET works anywhere in the entry"
+    (let (hub (tutor/cmd-tutorial-contents (tut-model) nil)
+          b (tut-buf hub)
+          title-line (find (fn (i) (= (tutor/tutor--contents-title-at b i) [:language :functions]))
+                       (range (buffer-line-count b)))
+          on-blurb (ed-apply hub (fn (bb) (commands/ed-goto-line bb (+ 2 title-line))))
+          entered (key-into on-blurb :enter))
+      (assert= (first (tutor/tutor--group-of (get-in entered [:tutor :lesson] 0))) :language)))
+
+  (test "RET on a non-section line says what to do instead of silently doing nothing"
+    (let (hub (tutor/cmd-tutorial-contents (tut-model) nil)
+          on-header (ed-apply hub (fn (bb) (commands/ed-goto-line bb 1)))
+          after (key-into on-header :enter))
+      (is (tutor/tutor-contents? after))                 ; still on the hub
+      (is (includes? (:echo after) "▸ entry"))))
+
+  (test "RET on a hub line enters that section's FIRST lesson"
+    (let (hub (tutor/cmd-tutorial-contents (tut-model) nil)
+          b (tut-buf hub)
+          ;; find the .blsp section's line and put point there
+          line (find (fn (i) (= (tutor/tutor-contents-section-at b i) [:language :basics]))
+                 (range (buffer-line-count b)))
+          on-it (ed-apply hub (fn (bb) (commands/ed-goto-line bb (inc line))))
+          entered (key-into on-it :enter))
+      (is (not (tutor/tutor-contents? entered)))
+      (assert= (first (tutor/tutor--group-of (get-in entered [:tutor :lesson] 0))) :language)
+      (is (includes? (tut-text entered) "Values & expressions — 1/3"))))
+
+  (test "the hub is read-only: typing on it is vetoed like prose"
+    (let (hub (tutor/cmd-tutorial-contents (tut-model) nil)
+          typed (key-into hub "x"))
+      (assert= (tut-text typed) (tut-text hub))))
+
+  (test "C-c C-t reaches the hub from any lesson, and C-c C-p from a section's first"
+    (let (m (tutor/tutor--show (tut-model) (lesson-idx "Everything is an expression")))
+      (is (tutor/tutor-contents? (key-into (key-into m :ctrl-c) :ctrl-t)))
+      ;; C-c C-p at a section's first lesson steps back to the hub
+      (let (first-of-section (tutor/tutor--show m (first (tutor/tutor--group-indices [:language :basics]))))
+        (is (tutor/tutor-contents? (tutor/cmd-tutorial-prev first-of-section nil))))))
+
+  (test "the modeline names the hub, and a lesson names its section"
+    (let (hub (tutor/cmd-tutorial-contents (tut-model) nil)
+          lesson (tut-model))
+      (is (includes? (tutor/tutor-modeline hub (tut-buf hub)) "Tutorial contents"))
+      (is (includes? (tutor/tutor-modeline lesson (tut-buf lesson)) (str "Navigation 1/" (nav-count))))))
+
+  (test "solved exercises persist on the model, so hub progress survives leaving"
+    (let (m (tut-model)
+          r (second (tut-regions m))
+          fixed (ed-edit m (fn (b)
+                             (insert (delete-region (assoc (goto-char b (:start r)) :mark (:end r)))
+                               "  (+ 40 2)")))
+          evaled (ed-tutor-launch fixed)
+          hub (tutor/cmd-tutorial-contents evaled nil))
+      ;; the pass is remembered on the model…
+      (is (not (empty? (get-in evaled [:tutor :passed]))))
+      ;; …and shows as progress on the hub (1 of Navigation's exercises)
+      (assert= (first (tutor/tutor--group-passed hub [:navigation nil])) 1))))
+
+(describe "the command-prompt key is derived (vim has no M-x)"
+  (test "emacs renders M-x, vim renders : — from the real bindings"
+    (assert= (:kcmd (tutor/tutor--keyset :emacs)) "M-x")
+    (assert= (:kcmd (tutor/tutor--keyset :vim)) ":"))
+  (test "the keys lesson tells each profile the truth about its prompt key"
+    (let (e (tutor-lesson-text (lesson-idx "Choose your keys") :emacs)
+          v (tutor-lesson-text (lesson-idx "Choose your keys") :vim))
+      (is (includes? e "M-x vim-mode"))
+      (is (includes? v ": vim-mode"))
+      (is (not (includes? v "M-x vim-mode"))))))
+
+(describe "review regressions"
+  (test "the hub STAYS the hub across a profile switch (RET must keep working)"
+    (let (hub (tutor/cmd-tutorial-contents (tut-model) nil)
+          switched (key-into (keymaps/ed-set-profile hub :vim) :down)
+          b (tut-buf switched))
+      (is (:tutor-contents? b))                              ; the flag survived
+      (is (includes? (tut-text switched) "contents"))         ; and so did the page
+      ;; …so RET still enters a section rather than being vetoed as prose
+      (let (line (find (fn (i) (= (first (or (tutor/tutor-contents-section-at b i) [])) :language))
+                   (range (buffer-line-count b)))
+            entered (key-into (ed-apply switched (fn (bb) (commands/ed-goto-line bb (inc line))))
+                      :enter))
+        (assert= (first (tutor/tutor--group-of (get-in entered [:tutor :lesson] 0))) :language))))
+
+  (test "the modeline service does NOT derive the key vocabulary (it runs every frame)"
+    ;; a cheap proxy for the perf fix: 200 modeline calls must stay well under the
+    ;; cost of 200 keyset derivations (which was ~4ms EACH)
+    (let (m (tut-model)
+          b (tut-buf m)
+          t0 (now)
+          _ (dotimes (i 200) (tutor/tutor-modeline m b))
+          elapsed (- (now) t0))
+      (is (< elapsed 200)))))                                 ; i.e. < 1ms per frame
+
+;; ---- subsections + the new content ----------------------------------------------
+
+(describe "subsections"
+  (test "the .blsp section is split into ordered subsections, all populated"
+    (let (lang (tutor/tutor--section :language)
+          subs (:subsections lang))
+      (assert= (map :id subs) (list :basics :functions :matching :processes))
+      (doseq (x subs)
+        (is (not (empty? (tutor/tutor--group-indices [:language (:id x)])))))))
+
+  (test "a lesson in a subsection numbers within it, and the heading shows the crumb"
+    (let (fn-idx (first (tutor/tutor--group-indices [:language :functions])))
+      (assert= (tutor/tutor--group-position fn-idx) [1 4])
+      (is (includes? (tutor-lesson-text fn-idx :emacs)
+            "Brood Tutorial · The Brood language (.blsp) › Functions & data — 1/4"))))
+
+  (test "finishing a SUBSECTION returns to the hub, not into the next one"
+    (let (idxs (tutor/tutor--group-indices [:language :basics])
+          last-basics (tutor/tutor--show (tut-model) (last idxs))
+          after (tutor/cmd-tutorial-next last-basics nil))
+      (is (tutor/tutor-contents? after))
+      (is (includes? (tut-text after) "Values & expressions complete"))))
+
+  (test "the hub nests subsections under their section header"
+    (let (hub (tutor/cmd-tutorial-contents (tut-model) nil)
+          text (tut-text hub)
+          ;; the section header names the topic and is NOT a ▸ entry
+          header-line (find (fn (i) (includes? (buffer-line-at (tut-buf hub) i)
+                                      "The Brood language (.blsp)"))
+                        (range (buffer-line-count (tut-buf hub)))))
+      (is (nil? (tutor/tutor--contents-title-at (tut-buf hub) header-line)))
+      ;; its subsections are indented ▸ entries that DO resolve
+      (is (includes? text "    ▸ Functions & data"))
+      (is (includes? text "  ▸ Navigation"))))
+
+  (test "every group is reachable from the hub"
+    (let (hub (tutor/cmd-tutorial-contents (tut-model) nil)
+          b (tut-buf hub)
+          reachable (into #{} (keep (fn (i) (tutor/tutor-contents-section-at b i))
+                                (range (buffer-line-count b)))))
+      (doseq (e (tutor/tutor--groups))
+        (when (:group e) (is (contains? reachable (:group e))))))))
+
+(describe "the new lessons all evaluate"
+  ;; every shipped box must at least PARSE and run; each exercise must be solvable
+  ;; (its hint is the fix, so the shipped code is expected to miss — but never to
+  ;; error), and every :expect must be reachable.
+  (test "every playground parses AFTER rendering, under both profiles"
+    ;; lesson code is a template ({{motion-keys}} …), so it is the RENDERED text that
+    ;; must parse — and it must parse for either keybinding profile
+    (dolist (prof (list :emacs :vim))
+      (let (keyset (tutor/tutor--keyset prof))
+        (dotimes (i (count tutor-lessons))
+          (doseq (pg (tutor/tutor--rendered-playgrounds (nth tutor-lessons i) keyset))
+            (assert= (tutor/tutor--parse-state (:code pg)) :ok))))))
+
+  (test "every shipped box evaluates without erroring (a miss is fine, a crash isn't)"
+    (dotimes (i (count tutor-lessons))
+      (let (m (ed-tutor-launch (tutor/tutor--show (ed-init (make-buffer "")) i)))
+        (doseq (kv (or (results/eol-notes (tut-buf m)) {}))
+          (let (note (second kv))
+            ;; a ✗ from an unmet :expect is expected; a reader/eval error is not
+            (is (not (includes? (:text note) "✗ error")))
+            (is (not (includes? (:text note) "unbound"))))))))
+
+  (test "the processes subsection has more than one lesson now"
+    (is (> (count (tutor/tutor--group-indices [:language :processes])) 1)))
+
+  (test "pattern matching, errors and the editor finale are in the course"
+    (let (titles (map :title tutor-lessons))
+      (is (includes? titles "Matching on shape"))
+      (is (includes? titles "Destructuring"))
+      (is (includes? titles "When things go wrong"))
+      (is (includes? titles "A process that remembers"))
+      (is (includes? titles "When a process dies"))
+      (is (includes? titles "Evaluate anything, anywhere")))))
+
+;; ---- selective re-evaluation: from the edited box DOWNWARD ------------------------
+
+(describe "which boxes re-evaluate"
+  (defn set-box (m i src)
+    (let (r (nth (tut-regions m) i))
+      (ed-edit m (fn (b)
+                   (insert (delete-region (assoc (goto-char b (:start r)) :mark (:end r)))
+                     src)))))
+
+  (test "the first launch evaluates every box (the session has to be seeded)"
+    (let (m (ed-tutor-launch (tut-model)))
+      (assert= (count (tut-notes m)) 2)
+      ;; and each box's evaluated source is remembered
+      (assert= (count (:tutor-srcs (tut-buf m))) 2)))
+
+  (test "editing a box re-evaluates it — and its verdict changes"
+    (let (m (ed-tutor-launch (tut-model))
+          fixed (ed-tutor-launch (set-box m 1 "  (+ 40 2)")))
+      (is (find (fn (t) (= t "✓ 42")) (tut-note-texts fixed)))))
+
+  (test "a box ABOVE the edit is not re-sent, but keeps its note (re-anchored)"
+    (let (m (ed-tutor-launch (tut-model))
+          before (:text (get (tut-notes m) 0))
+          ;; edit box 1 (below box 0) and grow it by a line so anchors must move
+          m2 (ed-tutor-launch (set-box m 1 "  (+ 40\n     2)"))
+          note0 (get (tut-notes m2) 0))
+      (assert= (:text note0) before)                      ; the same verdict
+      (assert= (:line note0) (:line (get (tut-notes m) 0))) ; box 0 didn't move
+      ;; box 0's source stamp is unchanged, box 1's is the new text
+      (assert= (get (:tutor-srcs (tut-buf m2)) 0) (get (:tutor-srcs (tut-buf m)) 0))
+      (is (includes? (get (:tutor-srcs (tut-buf m2)) 1) "(+ 40"))))
+
+  (test "editing an EARLIER box re-evaluates the later ones too (they may depend on it)"
+    ;; a two-box lesson where box 2 calls what box 1 defines: change the definition
+    ;; and the dependent box's result must follow
+    (let (m (ed-tutor-launch (tutor/tutor--show (ed-init (make-buffer "")) (lesson-idx "Functions")))  ; Functions
+          call-note (fn (mm) (:text (get (tut-notes mm) 1)))
+          before (call-note m)
+          m2 (ed-tutor-launch (set-box m 0 "  (defn double (x) (* 10 x))")))
+      (assert= before "=> 42")                            ; (double 21) with *2
+      (assert= (call-note m2) "=> 210")))                 ; …and with *10, refreshed
+
+  (test "a launch with nothing changed sends nothing and keeps every note"
+    (let (m (ed-tutor-launch (tut-model))
+          again (ed-tutor-launch m))
+      (assert= (tut-note-texts again) (tut-note-texts m))
+      (assert= (get-in again [:tutor :pending]) {})       ; nothing in flight
+      (assert= (get-in again [:tutor :next-id]) (get-in m [:tutor :next-id]))))
+
+  (test "mid-typing replaces the previous note with the reader's reason, and never clears"
+    (let (m (ed-tutor-launch (tut-model))
+          typing (ed-tutor-launch (set-box m 1 "  (+ 40"))
+          note (get (tut-notes typing) 1))
+      (is (not (nil? note)))                                  ; still something on the line
+      (assert= (:kind note) :incomplete)
+      (is (includes? (:text note) "unclosed list"))
+      (is (not (includes? (:text note) "expected 42")))))     ; the old verdict is gone
+
+  (test "boxes ABOVE the edit keep their verdicts while one below is mid-typed"
+    ;; only the edited box loses its result — the carry path is untouched by this change
+    (let (m (ed-tutor-launch (tut-model))
+          before (:text (get (tut-notes m) 0))
+          typing (ed-tutor-launch (set-box m 1 "  (+ 40")))
+      (assert= (:text (get (tut-notes typing) 0)) before))))
+
+;; ---- running indicator + process/timing visibility --------------------------------
+
+(describe "the running indicator"
+  (test "a box sent to the sandbox shows as in-flight, not as a stale verdict"
+    ;; the async path needs a live :editor, so drive tutor--set-note the way launch does
+    (let (m (ed-tutor-launch (tut-model))
+          running (tutor/tutor--set-note m 0 {:kind :running :text "⋯ evaluating…"})
+          b (tut-buf running))
+      (assert= (:kind (get (results/eol-notes b) 0)) :running)
+      ;; the gutter shows ⋯ and does NOT pretend it's a pass/fail
+      (let (line (:line (get (results/eol-notes b) 0)))
+        (assert= (first (modes/gutter-mark-for b line)) "⋯"))
+      ;; the ghost text renders it dim + italic (pending, not a result)
+      (let (face (view/ed--eol-note-face :running false))
+        (is (:italic face)))))
+
+  (test "the modeline counts boxes in flight"
+    (let (m (tut-model)
+          pending (update m :tutor merge {:pending {1 {:region 0} 2 {:region 1}}}))
+      (is (includes? (tutor/tutor-modeline pending (tut-buf pending)) "⋯ 2 evaluating"))
+      (is (not (includes? (tutor/tutor-modeline m (tut-buf m)) "evaluating"))))))
+
+(describe "process + timing visibility in a verdict"
+  (test "a result that left a process running says so"
+    (let (note (tutor/tutor--verdict {} {:ok true :value ":spawned" :procs {:alive 1}}))
+      (is (includes? (:text note) "⚙ 1 process still running"))))
+
+  (test "several surviving processes pluralise"
+    (let (note (tutor/tutor--verdict {} {:ok true :value ":x" :procs {:alive 3}}))
+      (is (includes? (:text note) "⚙ 3 processes still running"))))
+
+  (test "a clean evaluation says nothing about processes"
+    (let (note (tutor/tutor--verdict {} {:ok true :value "42" :procs {:alive 0}}))
+      (assert= (:text note) "=> 42")))
+
+  (test "a slow result carries its duration; a fast one doesn't"
+    (is (includes? (:text (tutor/tutor--verdict {} {:ok true :value "42" :ms 900})) "(900ms)"))
+    (is (not (includes? (:text (tutor/tutor--verdict {} {:ok true :value "42" :ms 3})) "ms)"))))
+
+  (test "a passing exercise still reads as a pass with the extras appended"
+    (let (note (tutor/tutor--verdict {:expect {:value "42"}}
+                 {:ok true :value "42" :ms 800 :procs {:alive 1}}))
+      (assert= (:kind note) :pass)
+      (is (starts-with? (:text note) "✓ 42"))
+      (is (includes? (:text note) "800ms"))
+      (is (includes? (:text note) "⚙ 1 process")))))
+
+;; ---- REGRESSION: a sandbox restart must actually re-evaluate ----------------------
+
+(describe "sandbox restart"
+  (test "ready clears BOTH eval stashes, so the whole lesson re-runs on a fresh session"
+    ;; the child image is empty after a restart; leaving `:tutor-srcs` behind made
+    ;; `tutor--first-changed` say "nothing changed", so no box was re-sent and the
+    ;; next keystroke hit `unbound symbol` for a def that was never replayed
+    (let (m (ed-tutor-launch (tut-model))
+          b (tut-buf m))
+      (is (> (count (or (:tutor-srcs b) {})) 0))          ; stamped by the launch
+      (let (ready (tutor/tutor-sandbox-ready m 2)
+            rb (tut-buf ready))
+        (assert= (or (:tutor-srcs rb) {}) {})              ; …cleared on ready
+        (assert= (:tutor-eval-rope rb) nil)
+        ;; and the very next launch starts from box 0 again
+        (let (regions (tut-regions ready)
+              srcs (tutor/tutor--region-srcs (tut-text ready) regions))
+          (assert= (tutor/tutor--first-changed srcs (or (:tutor-srcs rb) {}) (count regions)) 0)))))
+
+  (test "ready also drops stale in-flight ids (their replies belong to the dead session)"
+    (let (m (update (tut-model) :tutor merge {:pending {7 {:region 0}}})
+          ready (tutor/tutor-sandbox-ready m 3))
+      (assert= (get-in ready [:tutor :pending]) {})
+      (assert= (get-in ready [:tutor :sandbox-gen]) 3))))
+
+(describe "the running indicator's lifecycle"
+  (test "a box above the edit keeps its in-flight id, so its ⋯ can still resolve"
+    ;; carrying the note but dropping the pending entry stranded `⋯ evaluating…`
+    ;; permanently: the reply arrived and was discarded as unknown
+    (let (m (ed-tutor-launch (tut-model))
+          rope (buffer-rope (tut-buf m))
+          ;; pretend box 0 is in flight, then edit box 1 (below it) and re-launch
+          pending (update m :tutor merge {:pending {99 {:region 0 :rope rope}}})
+          r (second (tut-regions pending))
+          edited (ed-edit pending (fn (b)
+                                    (insert (delete-region (assoc (goto-char b (:start r)) :mark (:end r)))
+                                      "  (+ 40 2)")))
+          m2 (ed-tutor-launch edited))
+      (assert= (:region (get-in m2 [:tutor :pending 99])) 0))))
+
+(describe "shipped examples are indented the way the editor indents"
+  ;; A lesson that ships code TAB would reformat teaches the wrong shape and looks
+  ;; broken next to the indenter. Every box line must already sit at the column
+  ;; `tutor-indent` (brood-mode's indenter, floored at the box margin) would give it.
+  (test "every box line of every lesson matches tutor-indent, under both profiles"
+    (dolist (prof (list :emacs :vim))
+      (dotimes (i (count tutor-lessons))
+        (let (text (tutor-lesson-text i prof))
+          (doseq (r (tutor-regions text))
+            (let (lines (string-split (substring text (:start r) (:end r)) "\n"))
+              (dotimes (n (count lines))
+                (when (> n 0)
+                  (let (bol (+ (:start r)
+                              (fold (fn (acc j) (+ acc 1 (string-length (nth lines j))))
+                                0 (range n)))
+                        line (nth lines n)
+                        have (- (string-length line) (string-length (triml line))))
+                    ;; a blank line inside a box has nothing to indent
+                    (when (not= (trim line) "")
+                      (assert= have (tutor/tutor-indent text bol)))))))))))))
+
+;; ---- the checker's warnings, where the mistake IS --------------------------------
+;; A runtime error can only surface where the code RAN: `(defn f (x) (* 2 x "d"))` stays
+;; silent until something calls f. The advisory checker knows at the definition, so the
+;; tutorial asks it and shows the answer on the defining line.
+
+(describe "type warnings"
+  (defn broken-fn-model ()
+    (let (m (tutor/tutor--show (ed-init (make-buffer "")) (lesson-idx "Functions"))
+          r (first (tut-regions m)))
+      (ed-tutor-launch
+        (ed-edit m (fn (b)
+                     (insert (delete-region (assoc (goto-char b (:start r)) :mark (:end r)))
+                       "  (defn dbl (x) (* 2 x \"d\"))"))))))
+
+  (test "the warning lands on the DEFN's line, not on the call that crashes"
+    (let (m (broken-fn-model)
+          notes (tut-notes m)
+          defn-line (:line (get notes 0)))
+      (is (includes? (:warn (get notes 0)) "⚠"))
+      (is (includes? (:warn (get notes 0)) "expects number"))
+      ;; …and the runtime failure is still reported, on its own (later) line
+      (let (fails (keep (fn (kv) (when (and (= (:kind (second kv)) :fail)
+                                         (> (:line (second kv)) defn-line))
+                                   (:text (second kv))))
+                    notes))
+        (is (not (empty? fails))))))
+
+  (test "a warning rides ALONGSIDE a result on the same line, as a field"
+    ;; a field, not appended text — see the idempotence test below
+    (let (note (get (tut-notes (broken-fn-model)) 0))
+      (is (includes? (:text note) "=> dbl"))          ; the result survives untouched
+      (is (includes? (:warn note) "⚠"))               ; the warning rides along
+      ;; and the renderers show ⚠ for such a note
+      (is (:italic (view/ed--eol-note-face :running false)))))
+
+  (test "REGRESSION: re-checking never duplicates the warning"
+    ;; appending the warning to the note's text was not idempotent — every debounce beat
+    ;; added another identical ⚠ to the line (three, four, … on screen)
+    (let (once (broken-fn-model)
+          twice (ed-tutor-launch once)
+          thrice (ed-tutor-launch twice)
+          warn (:warn (get (tut-notes thrice) 0)))
+      (is (not (nil? warn)))
+      ;; exactly one ⚠ in it, however many times the checker ran
+      (assert= 1 (count (filter (fn (c) (= c "⚠")) (string->list warn))))
+      ;; …and the composed line the view paints has exactly one too
+      (let (b (tut-buf thrice)
+            ops (view/ed--eol-note-ops b 0 400 0 0 200 4 1 0)
+            painted (apply str (keep (fn (op) (when (= (first op) :text) (nth op 3))) ops)))
+        (assert= 1 (count (filter (fn (c) (= c "⚠")) (string->list painted)))))))
+
+  (test "the gutter marks it ⚠ in the warning colour"
+    (let (m (broken-fn-model)
+          b (tut-buf m)
+          line (:line (get (tut-notes m) 0)))
+      (assert= ["⚠" modes/gutter-face-warn] (modes/gutter-mark-for b line))))
+
+  (test "clean code gets no warnings at all"
+    (let (m (ed-tutor-launch (tut-model)))
+      (is (empty? (keep (fn (kv) (when (= (:kind (second kv)) :warn) kv)) (tut-notes m))))))
+
+  (test "warnings are recomputed, not accumulated (fixing the code clears them)"
+    (let (m (broken-fn-model)
+          r (first (tut-regions m))
+          fixed (ed-tutor-launch
+                  (ed-edit m (fn (b)
+                               (insert (delete-region (assoc (goto-char b (:start r)) :mark (:end r)))
+                                 "  (defn dbl (x) (* 2 x))"))))) 
+      (is (empty? (keep (fn (kv) (when (= (:kind (second kv)) :warn) kv)) (tut-notes fixed)))))))
+
+(describe "type warnings — session context"
+  (test "REGRESSION: a box using an EARLIER box's definition is not 'unbound'"
+    ;; the checker runs over the boxes joined in order — the same session the sandbox
+    ;; builds — because checking each box alone reported `unbound symbol: double` on
+    ;; box 2 of the Functions lesson, which is correct code
+    (let (m (ed-tutor-launch (tutor/tutor--show (ed-init (make-buffer "")) (lesson-idx "Functions"))))
+      (is (empty? (keep (fn (kv) (:warn (second kv))) (tut-notes m))))
+      (is (empty? (keep (fn (kv) (when (= (:kind (second kv)) :warn) kv)) (tut-notes m))))))
+
+  (test "…but a typo in code that never RUNS is caught only by the checker"
+    ;; this is the checker's unique value: the defn succeeds, so no runtime error can
+    ;; exist yet, and without the advisory the mistake would stay invisible until called
+    (let (m (tutor/tutor--show (ed-init (make-buffer "")) (lesson-idx "Functions"))
+          r (first (tut-regions m))
+          typo (ed-tutor-launch
+                 (ed-edit m (fn (b)
+                              (insert (delete-region (assoc (goto-char b (:start r)) :mark (:end r)))
+                                "  (defn dbl (x) (doubel x))"))))
+          note (get (tut-notes typo) 0))
+      (is (includes? (:text note) "=> dbl"))                    ; the defn itself worked
+      (is (includes? (:warn note) "unbound symbol: doubel")))))
+
+(describe "an advisory only speaks when it adds something"
+  (defn box1-as (m src)
+    (let (r (first (tut-regions m)))
+      (ed-tutor-launch
+        (ed-edit m (fn (b)
+                     (insert (delete-region (assoc (goto-char b (:start r)) :mark (:end r)))
+                       src))))))
+
+  (test "REGRESSION: no ⚠ beside a runtime error that already says the same thing"
+    ;; `✗ unbound symbol: asfd` next to `⚠ unbound symbol: asfd` was pure noise
+    (let (m (box1-as (tut-model) "  (str \"my keys: \" \"emacs\" asfd)")
+          note (get (tut-notes m) 0))
+      (is (includes? (:text note) "✗"))
+      (is (includes? (:text note) "unbound symbol: asfd"))
+      (assert= (:warn note) nil)                       ; the advisory stays quiet
+      ;; and the painted line carries the error once, with no ⚠ anywhere
+      (let (painted (apply str (keep (fn (op) (when (= (first op) :text) (nth op 3)))
+                                (view/ed--eol-note-ops (tut-buf m) 0 400 0 0 200 4 1 0))))
+        (is (includes? painted "unbound symbol: asfd"))
+        (is (not (includes? painted "⚠"))))))
+
+  (test "…but it DOES speak on a line that succeeded (the latent bug)"
+    (let (m (tutor/tutor--show (ed-init (make-buffer "")) (lesson-idx "Functions"))
+          broken (box1-as m "  (defn dbl (x) (* 2 x \"d\"))")
+          note (get (tut-notes broken) 0))
+      (is (includes? (:text note) "=> dbl"))           ; the defn itself worked
+      (is (includes? (:warn note) "⚠"))))              ; …and the advisory explains why the call won't
+
+  (test "…and on a line that merely gave the WRONG ANSWER (it may explain it)"
+    ;; an unmet :expect is not a runtime error, so the advisory is still welcome there
+    (let (m (box1-as (tut-model) "  (+ 40 undefined-thing)")
+          note (get (tut-notes m) 0))
+      ;; that one IS a runtime error, so no ⚠ — assert the classification instead
+      (is (:error? note))))
+
+  (test "a timeout is classified as an error too (no advisory piling on)"
+    (let (note (tutor/tutor--verdict {} {:ok false :timeout true}))
+      (is (:error? note))
+      (is (includes? (:text note) "timed out")))
+    ;; an expectation miss is NOT an error
+    (let (note (tutor/tutor--verdict {:expect {:value "42"}} {:ok true :value "17"}))
+      (assert= (:error? note) nil))))
+
+(describe "the runtime outranks the checker"
+  (test "a checker warning that merely re-words the runtime's is dropped"
+    ;; same fault, different glyph — and the checker's longer wording still counts
+    (let (note {:line 4 :text "✗ unbound symbol: asfd"}
+          same {:line 4 :text "⚠ unbound symbol: asfd"}
+          longer {:line 4 :text "⚠ unbound symbol: asfd (did you mean asdf?)"})
+      (is (tutor/tutor--warning-echoes? note same))
+      (is (tutor/tutor--warning-echoes? note longer))))
+
+  (test "…but one that says something NEW survives, even on a line that has a note"
+    (let (note {:line 4 :text "=> dbl"}
+          w {:line 4 :text "⚠ *: argument 3 expects number, got \"d\""})
+      (is (not (tutor/tutor--warning-echoes? note w)))
+      (let (merged (tutor/tutor--merge-warning {[:res 4] note} w))
+        (is (includes? (:warn (get merged [:res 4])) "expects number")))))
+
+  (test "an echo is dropped even when the note is NOT classified as an error"
+    ;; the rule is \"the runtime already said it\", not \"the runtime crashed\"
+    (let (note {:line 4 :text "⋯ unbound symbol: zzz"}     ; no :error? flag
+          merged (tutor/tutor--merge-warning {[:res 4] note} {:line 4 :text "⚠ unbound symbol: zzz"}))
+      (assert= (:warn (get merged [:res 4])) nil)
+      (assert= 1 (count merged))))                          ; and no standalone one either
+
+  (test "a warning on a line with no note at all still stands alone"
+    (let (merged (tutor/tutor--merge-warning {} {:line 9 :text "⚠ unused binding: x"}))
+      (assert= 1 (count merged))
+      (is (includes? (:text (get merged [:warn 9])) "unused binding"))))
+
+  (test "an empty message never counts as an echo"
+    (is (not (tutor/tutor--warning-echoes? {:text "✗"} {:text "⚠ real problem"})))
+    (is (not (tutor/tutor--warning-echoes? {:text nil} {:text "⚠ real problem"})))))
+
+(describe "a half-typed box says what the reader is waiting for"
+  (defn box-src (m src)
+    (let (r (first (tut-regions m)))
+      (ed-tutor-launch
+        (ed-edit m (fn (b)
+                     (insert (delete-region (assoc (goto-char b (:start r)) :mark (:end r)))
+                       src))))))
+  (defn note1 (m) (get (tut-notes m) 0))
+
+  (test "REGRESSION: deleting a quote replaces the old result, never keeps it looking current"
+    ;; `(str "my keys: " "emacs` used to keep a confident `=> "my keys: emacs"` beside
+    ;; text that can no longer produce it
+    (let (ok (box-src (tut-model) "  (str \"my keys: \" \"emacs\")")
+          broken (box-src ok "  (str \"my keys: \" \"emacs"))
+      (is (includes? (:text (note1 ok)) "=> \"my keys: emacs\""))
+      (assert= (:kind (note1 broken)) :incomplete)
+      (is (includes? (:text (note1 broken)) "unterminated string"))
+      (is (not (includes? (:text (note1 broken)) "my keys: emacs")))))   ; the stale value is gone
+
+  (test "the reader's reason is specific, per delimiter"
+    (let (m (tut-model))
+      (is (includes? (:text (note1 (box-src m "  (+ 1 2"))) "unclosed list"))
+      (is (includes? (:text (note1 (box-src m "  [1 2"))) "unclosed vector"))))
+
+  (test "an unbalanced close is a real error, not a pending state"
+    ;; no amount of further typing makes `(+ 1 2))` valid, so it earns the ✗
+    (let (note (note1 (box-src (tut-model) "  (+ 1 2))")))
+      (assert= (:kind note) :fail)
+      (is (includes? (:text note) "unexpected ')'"))))
+
+  (test "it renders in the pending voice — dim and italic, never a verdict colour"
+    (let (face (view/ed--eol-note-face :incomplete false))
+      (assert= face (view/ed--eol-note-face :running false))       ; same as work in flight
+      (is (:italic face))
+      (assert= (:fg face) *overlay0*)))
+
+  (test "…and its gutter glyph is ⋯ in the dim face, not ✓/✗"
+    (let ([glyph face] (modes/mark--note-glyph {:kind :incomplete :text "⋯ unclosed list"} false))
+      (assert= glyph "⋯")
+      (assert= face modes/gutter-face-test-stale)))
+
+  (test "a blank box still says nothing at all"
+    ;; nothing typed yet is not a state worth narrating
+    (assert= (tutor/tutor--parse-state "   \n  ") :blank)))

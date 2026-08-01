@@ -86,7 +86,9 @@
     (let (m (ed-update (gui-m "a\nb\nc\nd") :ctrl-n 80 24))
       (assert= (buffer-current-line (cur m)) 1)  ; the down itself moved once
       (assert= (:held-key m) :ctrl-n)
-      (assert= (get-in m [:timers :key-repeat]) {:after *repeat-delay-ms*})))  ; initial delay before repeat
+      ;; :idle? — the delay counts from the LAST real input, so rollover typing
+      ;; (press b while a is down) can't erode the delay budget and machine-gun
+      (assert= (get-in m [:timers :key-repeat]) {:after *repeat-delay-ms* :idle? true})))
   (test "a key-repeat timer fire re-issues the key at the faster repeat rate"
     (let (m1 (ed-update (gui-m "a\nb\nc\nd\ne") :ctrl-n 80 24)  ; line 1
           m2 (ed-update m1 [:timer :key-repeat] 80 24)  ; line 2
@@ -94,7 +96,7 @@
       ; line 3
       (assert= (buffer-current-line (cur m2)) 2)
       (assert= (buffer-current-line (cur m3)) 3)
-      (assert= (get-in m3 [:timers :key-repeat]) {:every *repeat-rate-ms*})))  ; now at the faster rate
+      (assert= (get-in m3 [:timers :key-repeat]) {:every *repeat-rate-ms* :idle? true})))
   (test "key-up stops the repeat: held-key cleared, key-repeat timer removed, fires inert"
     (let (m1 (ed-update (gui-m "a\nb\nc") :ctrl-n 80 24)
           m2 (ed-update m1 [:key-up :ctrl-n] 80 24)
@@ -113,7 +115,7 @@
       (assert= (buffer-text (cur (ed-update m [:timer :key-repeat] 80 24))) "xx")))
   (test "repeat is the default — C-o, C-k, and other editing keys repeat unenumerated"
     (assert= (get (ed-update (gui-m "x") :ctrl-o 80 24) :held-key) :ctrl-o)
-    (assert= (get-in (ed-update (gui-m "x") :ctrl-o 80 24) [:timers :key-repeat]) {:after *repeat-delay-ms*})
+    (assert= (get-in (ed-update (gui-m "x") :ctrl-o 80 24) [:timers :key-repeat]) {:after *repeat-delay-ms* :idle? true})
     (assert= (get (ed-update (gui-m "abc") :ctrl-k 80 24) :held-key) :ctrl-k))
   (test "the cancel keys don't repeat (*no-repeat-keys*)"
     (is (not (ed-repeat-key? :escape)))
@@ -368,3 +370,75 @@
       (is (includes? (:echo bound) "localhost:8123"))
       ;; a stop that raced ahead of the bind leaves no :server — the event is dropped
       (is (nil? (get (ed-update (m-of "x") (web/web-port-event 8123) 80 24) :server))))))
+
+;; ---- undo limited to the region (Emacs undo-in-region) ---------------------------
+
+(describe "C-/ with a region undoes only those lines"
+  (defn ur-model ()
+    ;; two edits on two different lines, most recent on line 1
+    (let (m (ed-init (make-buffer "one\ntwo\nthree"))
+          m1 (ed-edit m (fn (b) (insert (goto-char b 3) "!")))
+          m2 (ed-edit m1 (fn (b) (insert (goto-char b 8) "?"))))
+      m2))
+
+  (test "selecting a line undoes that line's change and leaves the others"
+    (let (m (ur-model)
+          ;; select line 0 (its edit is the OLDER one — history is searched for it)
+          sel (ed-set-buf m (assoc (goto-char (cur m) 0) :mark 4))
+          out (cmd-undo sel nil))
+      (assert= (buffer-text (cur out)) "one\ntwo?\nthree")))
+
+  (test "with no region it is an ordinary undo"
+    (let (m (ur-model)
+          out (cmd-undo m nil))
+      (assert= (buffer-text (cur out)) "one!\ntwo\nthree")))
+
+  (test "a region with nothing to undo says so rather than changing the text"
+    (let (m (ed-init (make-buffer "untouched\ntext"))
+          sel (ed-set-buf m (assoc (goto-char (cur m) 0) :mark 5))
+          out (cmd-undo sel nil))
+      (assert= (buffer-text (cur out)) "untouched\ntext")
+      (is (includes? (:echo out) "no change in the region"))))
+
+  (test "the region survives, so C-/ again peels the next change off the same lines"
+    (let (m (ed-init (make-buffer "x\ny"))
+          m1 (ed-edit m (fn (b) (insert (goto-char b 1) "1")))
+          m2 (ed-edit m1 (fn (b) (insert (goto-char b 2) "2")))
+          sel (ed-set-buf m2 (assoc (goto-char (cur m2) 0) :mark 3))
+          once (cmd-undo sel nil))
+      (assert= (buffer-text (cur once)) "x1\ny")
+      (is (not (nil? (buffer-mark (cur once)))))
+      (assert= (buffer-text (cur (cmd-undo once nil))) "x\ny"))))
+
+(describe "M-^ joins the line UP (Emacs delete-indentation)"
+  (defn on (text n)
+    (let (m (ed-init (make-buffer text "t.blsp")))
+      (ed-apply m (fn (b) (goto-char b n)))))
+  (defn text-of (m) (buffer-text (ed-current-buf m)))
+
+  (test "REGRESSION: it pulls this line up, not the next line down"
+    ;; it used to delete the newline at END of line — Vim's J — so the line under
+    ;; point never moved and M-^ appeared to do nothing to it
+    (let (m (cmd-join-line (on "(foo)\n    (bar)\n(baz)" 10) (keyword "alt-^")))
+      (assert= (text-of m) "(foo) (bar)\n(baz)")))
+
+  (test "the seam rule holds on Brood source: no space before a closing delimiter"
+    (let (m (cmd-join-line (on "(let (x 1)\n  )" 12) (keyword "alt-^")))
+      (assert= (text-of m) "(let (x 1))")))
+
+  (test "the first line has nothing above it — a no-op, not an error"
+    (let (m (cmd-join-line (on "(foo)\n(bar)" 2) (keyword "alt-^")))
+      (assert= (text-of m) "(foo)\n(bar)")))
+
+  (test "with a region it joins every line in it, bottom-up"
+    ;; walking downward would use line numbers the earlier joins already invalidated
+    (let (b0 (make-buffer "a\n  b\n  c\n  d\ne" 0)
+          m (ed-init b0)
+          marked (ed-apply m (fn (b) (assoc (goto-char b 0) :mark 12)))   ; through "d"
+          joined (cmd-join-line marked (keyword "alt-^")))
+      (assert= (text-of joined) "a b c d\ne")))
+
+  (test "M-SPC / M-\\ still collapse the gap around point"
+    (let (m (on "a   \t  b" 4))
+      (assert= (text-of (cmd-just-one-space m :alt-space)) "a b")
+      (assert= (text-of (ed-collapse-ws m "")) "ab"))))

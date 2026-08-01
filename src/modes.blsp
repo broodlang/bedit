@@ -84,6 +84,7 @@ save drops the cached annotation)."
 (def gutter-face-test-pass {:fg *green*})
 (def gutter-face-test-fail {:fg *red* :bold true})
 (def gutter-face-test-stale {:fg *overlay0*})
+(def gutter-face-warn {:fg *yellow*})  ; an advisory type warning (⚠)
 (def gutter-face-describe-mixed {:fg *yellow* :bold true})  ; some passed, some failed
 (def gutter-face-describe-partial {:fg *blue*})  ; only some of the block's tests ran
 
@@ -99,32 +100,81 @@ dims all three."
       (and (> total 0) (< ran total)) ["◔" (if stale modes/gutter-face-test-stale modes/gutter-face-describe-partial)]
       else ["✓" (if stale modes/gutter-face-test-stale modes/gutter-face-test-pass)])))
 
-(defn gutter-mark-for (buf line)
-  "The `[glyph face]` margin mark for `line`, or nil, in precedence: a breakpoint ●,
-a per-test verdict ✓/✗/· (pass/fail/skip), then a `(describe …)` rollup (✓/◐/◔ —
-`describe-rollup-mark`). A verdict DIMS whenever the buffer's content differs from
-the run's (`:test-marks-rope` — an edit dims it, undoing back restores it) and
-blanks entirely when lines shifted (the positional-currency discipline)."
-  (let (n (editor/buffer/buffer-line-count buf)
-        breaks (:debug-break-lines buf)
-        tests (:test-marks buf)
-        describes (:describe-marks buf)
-        current? (= n (:test-marks-count buf))
-        stale (not= (editor/buffer/buffer-rope buf) (:test-marks-rope buf)))
+(defn mark--line-keyed (buf key line)
+  ;; The value a line-keyed annotation holds for `line`, plus whether it predates the
+  ;; current text — `nil` when the annotation is missing or no longer positionally
+  ;; current (lines shifted, so it would point at the wrong ones). Every gutter
+  ;; source below is this same question; `std/editor/buffer`'s `annotation` owns the
+  ;; currency/staleness pairing so none of them re-derives it.
+  (let (a (editor/buffer/annotation buf key))
+    (when (and a (:current? a) (contains? (:value a) line))
+      {:at (get (:value a) line) :stale? (:stale? a)})))
+
+(defn mark--eol-note (buf line)
+  ;; The eol-note anchored on `line` (notes are keyed by owner, with `:line` inside —
+  ;; a handful per buffer, so a scan is right). See `results/eol-notes`.
+  (let (a (editor/buffer/annotation buf :eol-notes))
+    (when (and a (:current? a))
+      (let (hit (find (fn (kv) (= (:line (second kv)) line)) (:value a)))
+        (when hit {:at (second hit) :stale? (:stale? a)})))))
+
+(defn mark--verdict-glyph (verdict stale)
+  ;; a test verdict: pass / fail / skipped, dimmed when it predates the text
+  (cond
+    (= verdict :skipped) ["·" modes/gutter-face-test-stale]
+    stale [(if verdict "✓" "✗") modes/gutter-face-test-stale]
+    verdict ["✓" modes/gutter-face-test-pass]
+    else ["✗" modes/gutter-face-test-fail]))
+
+(defn mark--note-glyph (note stale)
+  ;; an eol note: a result ·, a pass ✓, a failure ✗, work in flight ⋯. The ⋯ takes the
+  ;; dim face deliberately — grey reads as "pending", and it must NOT take the
+  ;; pass/fail colours, which would look like a verdict that has already landed.
+  (let (kind (if (:warn note) :warn (:kind note))
+        glyph (cond (= kind :pass) "✓" (= kind :fail) "✗"
+                (or (= kind :running) (= kind :incomplete)) "⋯"
+                (= kind :warn) "⚠" else "·"))
     (cond
-      (and breaks (= n (:debug-break-lines-count buf)) (get breaks line))
-      ["●" modes/gutter-face-breakpoint]
-      (and tests current? (contains? tests line))
-      (let (verdict (get tests line)
-            glyph (cond (= verdict :skipped) "·" verdict "✓" else "✗"))
-        (cond
-          stale [glyph modes/gutter-face-test-stale]
-          (= verdict :skipped) ["·" modes/gutter-face-test-stale]
-          verdict ["✓" modes/gutter-face-test-pass]
-          else ["✗" modes/gutter-face-test-fail]))
-      (and describes current? (contains? describes line))
-      (describe-rollup-mark (get describes line) stale)
-      else nil)))
+      ;; a warning is about the code as WRITTEN, so an edit doesn't make it stale in the
+      ;; way a result is — it's recomputed on every launch
+      (= kind :warn) [glyph modes/gutter-face-warn]
+      (or (= kind :running) (= kind :incomplete)) [glyph modes/gutter-face-test-stale]
+      stale [glyph modes/gutter-face-test-stale]
+      (= kind :pass) [glyph modes/gutter-face-test-pass]
+      (= kind :fail) [glyph modes/gutter-face-test-fail]
+      else [glyph modes/gutter-face-test-stale])))
+
+(def gutter-mark-sources
+  ;; The margin's sources in PRECEDENCE order — each `[reader glyph-fn]`, where the
+  ;; reader answers `{:at value :stale? bool}` for a line. Adding a source (an inline
+  ;; eval result, an LSP hint) is one row here, not another branch that re-implements
+  ;; the staleness dance.
+  [[(fn (buf line) (mark--line-keyed buf :debug-break-lines line))
+    (fn (_ _) ["●" modes/gutter-face-breakpoint])]
+   [(fn (buf line) (mark--line-keyed buf :test-marks line))
+    (fn (verdict stale) (mark--verdict-glyph verdict stale))]
+   [(fn (buf line) (mark--line-keyed buf :describe-marks line))
+    (fn (tally stale) (describe-rollup-mark tally stale))]
+   [(fn (buf line) (mark--eol-note buf line))
+    (fn (note stale) (mark--note-glyph note stale))]])
+
+(defn gutter-mark-for (buf line)
+  "The `[glyph face]` margin mark for `line`, or nil: the first source in
+`gutter-mark-sources` that has something to say — a breakpoint ●, a per-test verdict
+✓/✗/·, a `(describe …)` rollup ✓/◐/◔, or an end-of-line note's ·/✓/✗/⋯.
+
+Every source is a buffer ANNOTATION (`std/editor/buffer`), so all of them share one
+discipline instead of four copies of it: a mark blanks entirely once lines have
+shifted (it would point at the wrong line) and DIMS while the text differs from what
+produced it (an edit dims a verdict; undoing back restores it)."
+  ;; `keep` then `first`: each source's reader runs at most ONCE per line (a `find`
+  ;; followed by re-reading the winner ran it twice — two annotation lookups and two
+  ;; scans on every marked line, every frame the gutter cache misses).
+  (first (keep (fn (source)
+                 (let ([reader glyph] source
+                       found (reader buf line))
+                   (when found (glyph (:at found) (:stale? found)))))
+           gutter-mark-sources)))
 
 (defn gutter-annotate (buf line cell)
   "Overlay the line's margin mark (if any) on a gutter `cell` — the mark replaces the
@@ -146,8 +196,8 @@ space, in the dim line-number face. A **file buffer** prepends a coloured change
 the trailing gap column. Keyed on file-backing to match `line-number-width`, so the cell
 and the reserved width agree.
 
-The bar is drawn only while the cached `:git-line-status` is **positionally current** — its
-`:git-status-lines` (the line count when it was computed) still matches the buffer. The moment
+The bar is drawn only while the cached `:git-line-status` annotation is **positionally
+current** (`annotation-value` — the line count still matches what it was computed for). The moment
 a line is inserted/deleted the cached line→status map is shifted, so every bar below the edit
 would land on the wrong line; we blank the bars until the idle recompute lands a fresh map
 (rather than draw them too high/low). A within-line edit keeps the line count, so its bars stay."
@@ -157,8 +207,8 @@ would land on the wrong line; we blank the bars until the idle recompute lands a
       ;; spaces (pad-right to the full width) — the gutter→text gap.
       [(pad-right (pad-left (str (inc line)) (- gw modes/line-number-right-margin)) gw)
        modes/gutter-face-line-number]
-      (let (current? (= (editor/buffer/buffer-line-count buf) (:git-status-lines buf))
-            status (when current? (get-in buf [:git-line-status line])))
+      (let (bars (editor/buffer/annotation-value buf :git-line-status)
+            status (when bars (get bars line)))
         ;; a file buffer's bar takes column 0; the number chunk fills the remaining `gw-1`,
         ;; again with `line-number-right-margin` trailing spaces before the text.
         (list (gitdiff/bar-chunk status)
@@ -174,6 +224,34 @@ would land on the wrong line; we blank the bars until the idle recompute lands a
    :gutter-width 'modes/line-number-width
    :gutter-cell 'modes/line-number-cell})
 (register-type-layers :fundamental (list 'modes/text-mode-layer))
+
+;; welcome-mode: the startup scratch (`main/*welcome*`). An ordinary EDITABLE text
+;; buffer whose mode adds exactly one affordance: the tutorial line is a clickable
+;; link — `:line-loc` truthy on that line gives it the pointer cursor + hover
+;; underline (the shared link affordance in `view`), `:on-click` opens the tutorial,
+;; and a line face paints it link-blue. Type over it and it's just a scratch.
+
+(def *welcome-link-marker* "interactive Brood tutorial")
+
+(defn welcome-line-loc (buf line0)
+  "Truthy on the welcome buffer's tutorial-link line — the link affordance hook
+(this 'location' is consumed by `commands/cmd-welcome-tutorial`, never visited
+as a file)."
+  (when (includes? (editor/buffer/buffer-line-at buf line0) modes/*welcome-link-marker*)
+    {:welcome :tutorial}))
+
+(defn welcome-fontify (src)
+  (fontify-line-faces src
+    (fn (l) (when (includes? l modes/*welcome-link-marker*) {:fg *blue*}))))
+
+(def welcome-mode-layer
+  {:name 'welcome
+   :keymap {}
+   :fontify 'modes/welcome-fontify
+   :line-loc 'modes/welcome-line-loc
+   :on-click 'commands/cmd-welcome-tutorial})
+
+(register-type-layers :welcome (list 'modes/welcome-mode-layer 'modes/text-mode-layer))
 
 ;; bshell-mode: the project shell + Brood REPL (`C-x p e`, see src/bshell.blsp), stacked
 ;; on text-mode. RET runs the current input line; Tab completes (filenames for a command,
@@ -201,7 +279,11 @@ would land on the wrong line; we blank the bars until the idle recompute lands a
    ;; Brood services scoped to the input form: syntax colours, bracket matching, eldoc hints
    :fontify 'bshell/bshell-fontify
    :bracket-match 'bshell/bshell-bracket-match
-   :eldoc 'bshell/bshell-eldoc})
+   :eldoc 'bshell/bshell-eldoc
+   ;; after every key, keep point out of the read-only prompt (layers §7)
+   :post-key 'bshell/bshell-post-key
+   ;; killing the buffer stops the shell worker + its child (layers :on-close)
+   :hooks {:on-close '(bshell/bshell-on-close)}})
 (register-type-layers :bshell (list 'modes/bshell-mode-layer 'modes/text-mode-layer))
 
 (defn modes--register-with-layers (layer-ref type layers)

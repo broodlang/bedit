@@ -1,0 +1,152 @@
+;; The eval sandbox client (`src/sandbox.blsp`) — the worker's state machine as pure
+;; folds (line assembly, ready gating + queueing, inflight settlement, the watchdog
+;; predicate), plus ONE isolated live round-trip through a real `nest run` child
+;; (spawn → ready → eval → reply → session persistence → reset → shutdown). The live
+;; test uses receive-with-timeout as its barrier — every step is an awaited event,
+;; never a sleep.
+
+(defmodule sandbox-test
+  (:use test)
+  (:use-internals sandbox))
+
+(require 'eval-server)
+
+;; A worker state with no live child: :proc is a token — pure paths never proc-send.
+(defn st0 () {:proc :fake-proc :buf "" :ready false :queue () :inflight {} :gen 1
+              :spawned-at 0 :strikes 0})
+
+(defn reply-line (m) (str (eval-server/evsrv-encode-reply m) "\n"))
+
+;; ---- line assembly + protocol folding (pure: no editor process, empty queue) --
+
+(describe "sandbox--feed (stdout line assembly)"
+  (test "a partial line waits in :buf; completing it folds it"
+    (let (s1 (sandbox/sandbox--feed (st0) "{:rea")
+          s2 (sandbox/sandbox--feed s1 "dy true}\n"))
+      (assert= (:buf s1) "{:rea")
+      (assert= (:ready s1) false)
+      (assert= (:ready s2) true)
+      (assert= (:buf s2) "")))
+
+  (test "several lines in one chunk all fold; the trailing partial carries"
+    (let (s (sandbox/sandbox--feed (assoc (st0) :ready true :inflight {1 99 2 99})
+              (str (reply-line {:id 1 :ok true :value "3"})
+                (reply-line {:id 2 :ok true :value "4"})
+                "{:id 3")))
+      (assert= (:inflight s) {})
+      (assert= (:buf s) "{:id 3")))
+
+  (test "stray output between protocol lines is dropped, not fatal"
+    (let (s (sandbox/sandbox--feed (assoc (st0) :ready true :inflight {7 99})
+              (str "some late print from a spawned process\n"
+                (reply-line {:id 7 :ok true :value "1"}))))
+      (assert= (:inflight s) {}))))
+
+(describe "sandbox--handle-line"
+  (test "the ready banner flips :ready"
+    (assert= (:ready (sandbox/sandbox--handle-line (st0) "{:ready true}")) true))
+  (test "a reply settles exactly its own inflight id"
+    (let (s (sandbox/sandbox--handle-line (assoc (st0) :inflight {4 99 5 99})
+              (eval-server/evsrv-encode-reply {:id 4 :ok false :error "boom"})))
+      (assert= (:inflight s) {5 99})))
+  (test "garbage leaves the state untouched"
+    (let (s (assoc (st0) :inflight {1 99}))
+      (assert= (sandbox/sandbox--handle-line s "not protocol") s))))
+
+;; ---- ready gating: evals queue until the banner --------------------------------
+
+(describe "sandbox--step (ready gating + lifecycle)"
+  (test "an eval before ready queues (newest consed on; nothing sent)"
+    (let (s (sandbox/sandbox--step (sandbox/sandbox--step (st0) [:eval 1 "(+ 1 1)" 2000 nil])
+              [:eval 2 "(+ 2 2)" 2000 ["f"]]))
+      (assert= (count (:queue s)) 2)
+      ;; oldest-first flush order is (reverse queue)
+      (assert= (map first (reverse (:queue s))) (list 1 2))
+      (assert= (:inflight s) {})))
+
+  (test "a chunk from a superseded child handle is ignored"
+    (let (s (sandbox/sandbox--step (st0) [:proc :other-proc "{:ready true}\n"]))
+      (assert= (:ready s) false)))
+
+  (test "stderr is not protocol"
+    (assert= (sandbox/sandbox--step (st0) [:proc-err :fake-proc "warning: x"]) (st0)))
+
+  (test "an unknown message is a no-op"
+    (assert= (sandbox/sandbox--step (st0) [:wat]) (st0))))
+
+;; ---- the watchdog predicate -----------------------------------------------------
+
+(describe "sandbox--deadline (queue-position aware)"
+  (test "an empty queue: now + timeout + grace"
+    (assert= (sandbox/sandbox--deadline {} 2000 1000)
+      (+ 1000 2000 sandbox/*sandbox-grace-ms*)))
+  (test "queued behind slower requests: counts from the LATEST inflight deadline"
+    ;; the server is serial — request 2 can't start until request 1 could have
+    ;; finished, so its watchdog clock must not start at send time
+    (assert= (sandbox/sandbox--deadline {1 9000} 2000 1000)
+      (+ 9000 2000 sandbox/*sandbox-grace-ms*)))
+  (test "nil timeout uses the shared default"
+    (assert= (sandbox/sandbox--deadline {} nil 0)
+      (+ sandbox/*sandbox-default-timeout-ms* sandbox/*sandbox-grace-ms*))))
+
+(describe "sandbox--boot-overdue? (a child that never says ready)"
+  (test "overdue once the boot window passes without a ready banner"
+    (is (sandbox/sandbox--boot-overdue? (st0))))          ; spawned-at 0 — long ago
+  (test "never overdue once ready"
+    (is (not (sandbox/sandbox--boot-overdue? (assoc (st0) :ready true)))))
+  (test "not overdue while the window is open"
+    (is (not (sandbox/sandbox--boot-overdue? (assoc (st0) :spawned-at (now)))))))
+
+(describe "sandbox--wedged?"
+  (test "false while every inflight deadline is in the future"
+    (is (not (sandbox/sandbox--wedged? (assoc (st0) :inflight {1 (+ (now) 60000)})))))
+  (test "true once any inflight request outlives its deadline"
+    (is (sandbox/sandbox--wedged? (assoc (st0) :inflight {1 (- (now) 1)}))))
+  (test "false with nothing in flight"
+    (is (not (sandbox/sandbox--wedged? (st0))))))
+
+;; ---- one live round-trip through a real child ----------------------------------
+;; Isolated: registers :editor (the events' destination) as this test process.
+;; Every await is a receive with a hard timeout — the ready banner is the barrier
+;; for spawn, each reply the barrier for its eval.
+
+(defn sbt-await-ready ()
+  (receive
+    ((record sandbox/sandbox-ready-event {}) :ready)
+    (after 20000 :timed-out)))
+
+(defn sbt-await-reply (id)
+  (receive
+    ((record sandbox/sandbox-reply-event {:reply r})
+      :when (= (get r :id) id) r)
+    (after 20000 nil)))
+
+(describe "sandbox live round-trip"
+  :isolated
+
+  (test "spawn → ready → eval → reply → session persists → shutdown"
+    (let (_ (register :editor (self))
+          _ (sandbox-start))
+      (assert= (sbt-await-ready) :ready)
+      ;; a plain eval round-trips value + output
+      (sandbox-eval 1 "(do (println \"out\") (+ 40 2))" 5000)
+      (let (r (sbt-await-reply 1))
+        (assert= (get r :ok) true)
+        (assert= (get r :value) "42")
+        (assert= (get r :output) "out\n"))
+      ;; session state persists: a def from one request serves the next
+      (sandbox-eval 2 "(defn sbt-live-double (x) (* 2 x))" 5000)
+      (sbt-await-reply 2)
+      (sandbox-eval 3 "(sbt-live-double 21)" 5000)
+      (assert= (get (sbt-await-reply 3) :value) "42")
+      ;; a traced request carries the call/return cascade back in :spy
+      (sandbox-eval 5 "(sbt-live-double 4)" 5000 ["sbt-live-double"])
+      (let (r (sbt-await-reply 5))
+        (assert= (get r :value) "8")
+        (is (>= (count (get r :spy)) 2)))
+      ;; a reset respawns: fresh image, so the def is gone and ready re-announces
+      (sandbox-reset)
+      (assert= (sbt-await-ready) :ready)
+      (sandbox-eval 4 "(bound? 'sbt-live-double)" 5000)
+      (assert= (get (sbt-await-reply 4) :value) "false")
+      (sandbox-shutdown))))

@@ -1,0 +1,277 @@
+(defmodule sandbox
+  "The persistent eval sandbox: one long-lived NAMED process (`:sandbox`) that owns
+a `proc-spawn`ed child runtime running std's `eval-server` (`(require
+'eval-server)` + `(eval-server-run)`, ADR-198) and speaks its pr-str-line protocol
+over stdin/stdout. The editor gets REPL-grade evaluation of playground text —
+value, captured output, errors, per-request timeout — in a *separate OS process*,
+so nothing the user types can reach the live editor image (the in-image eval path
+is mutation-unsafe by design — one shared global table; see eval-command).
+
+lsp.blsp's connection shape, simplified: requests are fire-and-forget sends to the
+worker (`sandbox-eval`); replies come back to the `ui-run` mailbox as event
+records — `sandbox-ready-event` / `sandbox-reply-event` / `sandbox-down-event` —
+whose `UiEvent` folds live with their consumer (`tutor`), keeping this module
+consumer-blind. Policy:
+
+  - requests sent before the child's `{:ready true}` banner QUEUE in the worker
+    and flush on ready (the ~startup pause happens once, while the user reads);
+  - a reply is matched out of `:inflight` by id; stray child output (a process the
+    evaluated code spawned printing late) decodes to nil and is dropped;
+  - a request whose reply never arrives (a wedged child — the server's own
+    green-process kill missed, e.g. a native loop) trips the WATCHDOG: the child
+    is killed and respawned, every inflight id answered `{:timeout true}`;
+  - the child dying on its own respawns after a short pause, so an externally
+    killed sandbox heals itself;
+  - RESET (session state back to a fresh image) *is* respawn — `sandbox-reset`.
+
+Events are stamped with a generation (bumped on every spawn/reset) so a
+superseded child's stragglers are droppable by the folds, the testrun/apprun
+discipline."
+  )  ; no imports — proc-spawn / proc-send / string ops are prelude; the codec is required below
+
+(require 'eval-server)  ; the shared wire codec (evsrv-encode-request / evsrv-decode-reply)
+
+;; ---- the event records (folds live with the consumer: tutor) -----------------
+
+(defrecord sandbox-ready-event (gen))  ; the child printed {:ready true} — evals flow
+(defrecord sandbox-reply-event (reply gen))  ; one decoded reply map {:id :ok :value :output :error :timeout :ms}
+(defrecord sandbox-down-event (code gen))  ; the child exited (a respawn follows)
+
+;; ---- the child ----------------------------------------------------------------
+
+(def *sandbox-script-path* "/tmp/myedit-eval-server.blsp")
+
+;; The request timeout applied when the caller passes nil (mirrors the server's own
+;; default, so both ends agree on how long an eval may run).
+(def *sandbox-default-timeout-ms* 5000)
+
+;; How long past a request's expected completion the watchdog waits before
+;; declaring the child wedged. Generous: the server's in-child kill answers the
+;; common case (~4ms); this backstop exists for evals no green kill can stop.
+(def *sandbox-grace-ms* 1500)
+
+;; The mailbox-poll cadence while the watchdog has something to watch (requests in
+;; flight, or a child still booting).
+(def *sandbox-poll-ms* 250)
+
+;; Pause before respawning a child that died on its own — bounds the loop if the
+;; child keeps exiting (each death costs at least this).
+(def *sandbox-respawn-pause-ms* 500)
+
+;; A child death within this of its spawn counts as a STRIKE (something is wrong
+;; with the child itself, not the request load); so does a boot that never prints
+;; the ready banner within *sandbox-boot-timeout-ms*. Three consecutive strikes
+;; and the worker gives up (a final `:gave-up` event) instead of respawn-looping —
+;; a broken image must not spam the editor every half second forever.
+(def *sandbox-fast-death-ms* 3000)
+(def *sandbox-boot-timeout-ms* 20000)
+(def *sandbox-max-strikes* 3)
+
+(defn sandbox--script-source ()
+  (join "\n" (map pr-str (list '(require 'eval-server) '(eval-server/eval-server-run)))))
+
+(defn sandbox--spawn-child ()
+  ;; cwd /tmp: the sandbox is deliberately projectless — a bare std image, no
+  ;; project sources, so it starts fast and the session begins empty. nil when the
+  ;; child cannot even be spawned (`nest` not on PATH, unwritable script path) —
+  ;; the callers turn that into a `:spawn-failed` event rather than a worker crash.
+  (try
+    (do
+      (spit *sandbox-script-path* (sandbox--script-source))
+      (proc-spawn "nest" ["run" *sandbox-script-path*] {:cwd "/tmp"}))
+    (catch _ nil)))
+
+(defn sandbox--editor () (whereis :editor))
+
+(defn sandbox--emit (ev)
+  ;; The editor process may be gone (shutdown race) — dropping the event is right.
+  (let (ed (sandbox--editor))
+    (when ed (send ed ev))))
+
+;; ---- the worker ---------------------------------------------------------------
+;; State is one map threaded through the tail-recursive loop:
+;;   :proc        the child handle
+;;   :buf         the stdout partial (line assembly, procstream's discipline)
+;;   :ready       seen {:ready true} yet?
+;;   :queue       requests received before ready, oldest first (flushed on ready)
+;;   :inflight    {id -> deadline-epoch-ms} — the watchdog's view
+;;   :gen         the child generation (bumped every spawn), stamped on every event
+;;   :spawned-at  when this child was spawned (fast-death / boot-timeout clock)
+;;   :strikes     consecutive child failures (reset by a ready banner)
+
+(defn sandbox--deadline (inflight timeout-ms t)
+  "The watchdog deadline for a request sent at time `t` while `inflight` (id →
+deadline) is outstanding. Accounts for QUEUE POSITION: the server answers strictly
+one request at a time, so this request can't even start until every earlier
+inflight deadline could have passed — without this, one legitimately-slow box
+pushed the next box past its deadline and the watchdog killed a HEALTHY child."
+  (let (base (fold (fn (acc kv) (max acc (second kv))) t inflight))
+    (+ base (or timeout-ms *sandbox-default-timeout-ms*) *sandbox-grace-ms*)))
+
+(defn sandbox--send-request (state id src timeout-ms trace)
+  (proc-send (:proc state)
+    (str (eval-server/evsrv-encode-request id src timeout-ms trace) "\n"))
+  (update state :inflight assoc id
+    (sandbox--deadline (:inflight state) timeout-ms (now))))
+
+(defn sandbox--flush-queue (state)
+  ;; Oldest first: the queue was consed, so fold over its reverse.
+  (fold (fn (st req) (let ([id src timeout-ms trace] req)
+                       (sandbox--send-request st id src timeout-ms trace)))
+    (assoc state :queue ())
+    (reverse (:queue state))))
+
+(defn sandbox--handle-line (state line)
+  "Fold one complete stdout line: the ready banner flips `:ready` (flushing the
+queue, resetting the strike count) and announces itself; an id-carrying reply
+settles its inflight entry and forwards; anything else is a stray print — dropped."
+  (let (reply (eval-server/evsrv-decode-reply line))
+    (cond
+      (nil? reply) state
+      (get reply :ready) (do
+                           (sandbox--emit (sandbox-ready-event (:gen state)))
+                           (sandbox--flush-queue (assoc state :ready true :strikes 0)))
+      (int? (get reply :id)) (do
+                               (sandbox--emit (sandbox-reply-event reply (:gen state)))
+                               (update state :inflight dissoc (get reply :id)))
+      else state)))
+
+(defn sandbox--feed (state data)
+  "Assemble stdout chunks into lines (the trailing partial carries over) and fold
+each complete line through `sandbox--handle-line`."
+  (let (parts (string-split (str (:buf state) data) "\n")
+        complete (take (dec (count parts)) parts))
+    (assoc (fold sandbox--handle-line state complete) :buf (last parts))))
+
+(defn sandbox--fail-inflight (state why)
+  "Answer every inflight id with a failure reply (`why` merged in) — the respawn
+paths' obligation: no request may vanish without an answer."
+  (doseq (kv (:inflight state))
+    (let ([id _] kv)
+      (sandbox--emit (sandbox-reply-event (merge {:id id :ok false} why) (:gen state)))))
+  (assoc state :inflight {}))
+
+(defn sandbox--respawn (state)
+  "A fresh child + generation; inflight requests are answered `{:timeout true}`
+first (they died with the old session). `:sandbox-stopped` (after a
+`:spawn-failed` event) when a new child can't even be spawned."
+  (let (st (sandbox--fail-inflight state {:timeout true}))
+    (try (proc-close (:proc st)) (catch _ nil))
+    (let (child (sandbox--spawn-child))
+      (if (nil? child)
+        (do (sandbox--emit (sandbox-down-event :spawn-failed (:gen st)))
+          :sandbox-stopped)
+        {:proc child :buf "" :ready false :queue (:queue st) :inflight {}
+         :gen (inc (:gen st)) :spawned-at (now) :strikes (or (:strikes st) 0)}))))
+
+(defn sandbox--strike (state)
+  "One consecutive child failure (a fast death, a boot that never readied): respawn
+— unless this is strike `*sandbox-max-strikes*`, in which case give up loudly
+(one final `:gave-up` event) instead of respawn-looping forever."
+  (let (strikes (inc (or (:strikes state) 0)))
+    (if (>= strikes *sandbox-max-strikes*)
+      (do
+        (sandbox--emit (sandbox-down-event :gave-up (:gen state)))
+        (let (st (sandbox--fail-inflight state {:timeout true}))
+          (try (proc-close (:proc st)) (catch _ nil))
+          :sandbox-stopped))
+      (let (st (sandbox--respawn state))
+        (if (= st :sandbox-stopped) st (assoc st :strikes strikes))))))
+
+(defn sandbox--wedged? (state)
+  "Whether any inflight request has outlived its deadline — the child stopped
+answering entirely (the server's own per-request kill should have replied
+`{:timeout true}` long before this trips)."
+  (let (t (now))
+    (not (empty? (filter (fn (kv) (let ([_ deadline] kv) (> t deadline))) (:inflight state))))))
+
+(defn sandbox--boot-overdue? (state)
+  ;; a spawned child that never printed its ready banner
+  (and (not (:ready state))
+    (> (now) (+ (or (:spawned-at state) 0) *sandbox-boot-timeout-ms*))))
+
+(defn sandbox--check (state)
+  ;; the watchdog beat: a wedged child or an overdue boot is a strike
+  (if (or (sandbox--wedged? state) (sandbox--boot-overdue? state))
+    (sandbox--strike state)
+    state))
+
+(defn sandbox--step (state msg)
+  "Fold one mailbox message into the worker state; `:sandbox-stopped` ends the loop."
+  (match msg
+    ([:eval id src timeout-ms trace]
+      (if (:ready state)
+        (sandbox--send-request state id src timeout-ms trace)
+        (update state :queue (fn (q) (cons [id src timeout-ms trace] q)))))
+    ([:proc p data] (if (= p (:proc state)) (sandbox--feed state data) state))
+    ([:proc-err _ _] state)  ; child stderr is not protocol — ignore
+    ([:proc-closed p code]
+      (if (= p (:proc state))
+        (do
+          (sandbox--emit (sandbox-down-event code (:gen state)))
+          ;; a death soon after spawn = the child itself is broken — strike (and
+          ;; possibly give up); a late death (killed externally) just respawns
+          (if (< (- (now) (or (:spawned-at state) 0)) *sandbox-fast-death-ms*)
+            (sandbox--strike state)
+            (do (sleep *sandbox-respawn-pause-ms*) (sandbox--respawn state))))
+        state))
+    ([:reset] (let (st (sandbox--respawn state))   ; user-initiated: strikes forgiven
+                (if (= st :sandbox-stopped) st (assoc st :strikes 0))))
+    ([:shutdown] (do
+                   (try (proc-close (:proc state)) (catch _ nil))
+                   :sandbox-stopped))
+    (_ state)))
+
+(defn sandbox--loop (state)
+  (cond
+    (= state :sandbox-stopped) :sandbox-stopped
+    ;; nothing to watch: park until a message arrives
+    (and (:ready state) (empty? (:inflight state)))
+    (sandbox--loop (sandbox--step state (receive (msg msg))))
+    ;; watchdog duty (requests in flight, or a child still booting): poll
+    else
+    (receive
+      (msg (sandbox--loop (sandbox--step state msg)))
+      (after *sandbox-poll-ms*
+        (sandbox--loop (sandbox--check state))))))
+
+(defn sandbox-worker ()
+  "The `:sandbox` process body: spawn the child and serve until `[:shutdown]` (or
+a `:spawn-failed` / `:gave-up` stop — see the events)."
+  (let (child (sandbox--spawn-child))
+    (if (nil? child)
+      (do (sandbox--emit (sandbox-down-event :spawn-failed 1)) :sandbox-stopped)
+      (sandbox--loop {:proc child :buf "" :ready false :queue () :inflight {}
+                      :gen 1 :spawned-at (now) :strikes 0}))))
+
+;; ---- the client API (what tutor calls) ----------------------------------------
+
+(defn sandbox-running? ()
+  "Whether the `:sandbox` worker process is alive."
+  (not (nil? (whereis :sandbox))))
+
+(defn sandbox-start ()
+  "Ensure the `:sandbox` worker is up (named spawn is idempotent) and return its pid.
+The child runtime starts spawning immediately — call this when the tutorial opens,
+so its startup hides behind the user reading."
+  (spawn :sandbox (sandbox-worker)))
+
+(defn sandbox-eval (id src timeout-ms &optional trace)
+  "Fire-and-forget: evaluate `src` in the sandbox session, boundary-tracing the
+`trace` fn names (a vector of strings, or nil) — the reply's `:spy` carries the
+collected entries. The reply arrives on the editor mailbox as a
+`sandbox-reply-event` carrying `:id id`. Queued (not lost) if the child is still
+booting; a no-op when the worker isn't running."
+  (let (p (whereis :sandbox))
+    (when p (send p [:eval id src timeout-ms trace]))))
+
+(defn sandbox-reset ()
+  "Restart the sandbox session: respawn the child (fresh image, empty session),
+answering any inflight requests `{:timeout true}`. A no-op when not running."
+  (let (p (whereis :sandbox))
+    (when p (send p [:reset]))))
+
+(defn sandbox-shutdown ()
+  "Kill the child and stop the worker. A no-op when not running."
+  (let (p (whereis :sandbox))
+    (when p (send p [:shutdown]))))

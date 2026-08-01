@@ -35,6 +35,7 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
   (:use results)  ; the results-buffer abstraction — line-loc vocabulary + ed-append-follow
   (:use model))  ; current-buffer accessors, the kill ring, message
 
+(require 'modes)     ; *welcome-link-marker* — the welcome scratch's clickable tutorial line
 (require 'theme)     ; face-dired-* — the dired listing colours (qualified refs)
 (require 'datetime)  ; epoch-ms->dt / dt-format — the dired mtime column
 (require 'config)    ; init-config / apply-to-model — M-x reload-config
@@ -287,14 +288,29 @@ line, or from every line of the active region (one undo step, keeping the region
               last
               (fn (bb ln) (ed-dedent-line-at bb ln ed-tab-width)))))))))
 
+(defn ed-vim-command-mode? (m)
+  "True while a modal profile holds the keyboard in a COMMAND state — vim `:normal`
+or `:visual`, where a plain key means a command and **nothing types**. The guard a
+mode-local EDITING binding needs: a buffer's mode layer outranks the model's
+profile (that's what makes modes work), so a mode that binds an editing key —
+brood-mode's RET-inserts-and-indents, the tutorial's — would otherwise fire it in
+normal mode and type behind the user's back. Emacs has no modal state, so this is
+false there and the binding behaves exactly as before."
+  (member? (:edit-state m) [:normal :visual]))
+
 (defcommand cmd-newline-and-indent
   (m key)
   "Enter in a structured mode: insert a newline, then indent the new line to its
-mode's column (Emacs `newline-and-indent`)."
-  (ed-edit m
-    (fn (b)
-      (let (nb (insert b "\n"))
-        (ed-reindent-line nb (ed-indent-target nb))))))
+mode's column (Emacs `newline-and-indent`). Under a modal profile's command state
+RET is a **motion** (down a line, as in vim) rather than an edit — see
+`ed-vim-command-mode?`: this command is bound by MODE layers (brood-mode, the
+tutorial), which outrank the vim profile, so the check has to live here."
+  (if (ed-vim-command-mode? m)
+    (cmd-next-line m key)
+    (ed-edit m
+      (fn (b)
+        (let (nb (insert b "\n"))
+          (ed-reindent-line nb (ed-indent-target nb)))))))
 
 (defcommand cmd-indent-or-complete
   (m key)
@@ -583,8 +599,25 @@ enclosing list's close delimiter, so it can't break the parens. Reuses the kill 
         (insert (beginning-of-line b) (if (ends-with? lt "\n") lt (str lt "\n")))))))
 (defcommand cmd-join-line
   (m key)
-  "Join the next line onto this one — delete the newline at end of line (M-^)."
-  (ed-edit m (fn (b) (delete-char (end-of-line b)))))
+  "Join this line to the one ABOVE, collapsing its indentation to a single space —
+Emacs `delete-indentation` (M-^). With a region active, join every line in it, which
+is how you pull a wrapped paragraph back onto one line in one stroke (Emacs 29).
+
+This used to delete the newline at END of line, joining the NEXT line up into this one
+— Vim's `J`, the opposite direction — so the line under point never moved. The seam
+rule (one space, but none next to a delimiter) lives in `editor/buffer/join-line`."
+  (let (b (ed-current-buf m) region-bounds (buffer-region-bounds b))
+    (if (nil? region-bounds)
+      (ed-edit m join-line)
+      ;; bottom-up: joining shifts everything below the seam, so walking downward would
+      ;; invalidate the line numbers we still have to visit
+      (let ([first-line last-line] (region-line-range b))
+        (ed-edit m
+          (fn (bb)
+            ;; `ed-goto-line-col` is 0-based, matching `region-line-range`; the 1-based
+            ;; `ed-goto-line` would silently join one line short of the region's end
+            (fold (fn (acc line) (join-line (ed-goto-line-col acc line 0)))
+              bb (reverse (range (inc first-line) (inc last-line))))))))))
 
 ;; case
 (defcommand cmd-upcase-word (m key) (ed-xform-word m upper))
@@ -615,22 +648,11 @@ when there's no region (the region case commands)."
 
 ;; ---- whitespace around point (M-SPC / M-\) ----------------------------------
 
-(defn ed--ws-left (txt i)
-  (if (and (> i 0) (ed--ws-char? (char-at txt (dec i)))) (ed--ws-left txt (dec i)) i))
-(defn ed--ws-right (txt i n)
-  (if (and (< i n) (ed--ws-char? (char-at txt i))) (ed--ws-right txt (inc i) n) i))
-
 (defn ed-collapse-ws (m keep)
   "Replace the run of spaces/tabs surrounding point with `keep` (`\" \"` for
-just-one-space, `\"\"` for delete-horizontal-space)."
-  (ed-edit m
-    (fn (b)
-      (let (txt (buffer-text b)
-            p (buffer-point b)
-            n (string-length txt)
-            lo (ed--ws-left txt p)
-            hi (ed--ws-right txt p n))
-        (replace-region b lo hi keep)))))
+just-one-space M-SPC, `\"\"` for delete-horizontal-space M-\\) — `editor/buffer`'s
+`collapse-whitespace`, which `join-line` squeezes its seam with too."
+  (ed-edit m (fn (b) (collapse-whitespace b keep))))
 
 (defcommand cmd-just-one-space
   (m key)
@@ -1555,8 +1577,22 @@ when the run has nothing left."
 (defcommand cmd-undo
   (m key)
   "Undo one change (C-/ , C-x u). Emacs-style tree: after undoing, run any other command
-to break the chain and undo again — that undoes your undos (redo). No state is ever lost."
-  (ed--undo-step m 'commands/cmd-undo "No further undo" "undo"))
+to break the chain and undo again — that undoes your undos (redo). No state is ever lost.
+
+**With a region active this undoes only the selected lines** (Emacs
+`undo-in-region`, `editor/buffer/undo-in-region`): the most recent change that touched
+them is reverted and everything outside is left exactly as it is, with the region kept
+so a repeat peels the next change off the same lines. Cheap here because undo is
+snapshot-based — the change set is a line diff of the previous text, so the hunks
+outside your selection are simply not applied."
+  (let (b (ed-current-buf m))
+    (if (nil? (buffer-region-bounds b))
+      (ed--undo-step m 'commands/cmd-undo "No further undo" "undo")
+      (let (undone (editor/buffer/undo-in-region b))
+        (if (= (buffer-text undone) (buffer-text b))
+          (message m "no change in the region to undo")
+          (message (ed-set-buf m (assoc undone :modified true))
+            "undid the region"))))))
 
 (defcommand cmd-redo
   (m key)
@@ -1887,12 +1923,16 @@ unchanged. (Routes through `ed-map-panes` over all leaf payloads.)"
 no editable buffer, opens a fresh `*scratch*`. Panes showing the killed buffer are
 re-pointed; indices above it shift down. A hosted slot is unhosted first — its
 process stopped when locally owned, presence withdrawn when shared — and the
-surviving hosted links are remapped with the pool (`hosted/hosted-drop-slot`)."
+surviving hosted links are remapped with the pool (`hosted/hosted-drop-slot`).
+The buffer's mode layers get their `:on-close` (via std's `close-context`) — the
+async-cleanup seam where a mode kills a worker it owns (the tutorial's eval
+sandbox; a natural home for bshell's shell process too)."
   (let (killed-idx (ed-current-index m)
         buf (ed-current-buf m))
     (if (= (buffer-name buf) "*Messages*")
       (message m "cannot kill *Messages*")
-      (let (m0 (if (get-in m [:hosted killed-idx :shared?])
+      (let (_ (try (editor/layers/close-context buf) (catch _ nil))  ; hooks are effects; the buffer is going away
+            m0 (if (get-in m [:hosted killed-idx :shared?])
                  (collab/collab-unshare m killed-idx)   ; presence withdraw + unsubscribe
                  m)
             m0 (hosted/hosted-drop-slot m0 killed-idx)  ; stop-if-local + index remap
@@ -1908,6 +1948,20 @@ surviving hosted links are remapped with the pool (`hosted/hosted-drop-slot`)."
           ;; none left → append a fresh *scratch* and point the killed pane at it.
           (let (bufs (into removed [(ed-stamp (make-buffer ""))]))
             (message (ed--remap (assoc m0 :buffers bufs) killed-idx (count removed)) label)))))))
+
+(defcommand cmd-welcome-tutorial
+  (m key)
+  "The welcome scratch's `:on-click`: a click that landed on the tutorial-link
+line opens the interactive tutorial (`C-h t`'s command); a click anywhere else in
+the buffer is just a click. Tutor is deferred-loaded (~a second after startup),
+so a faster click gets told to try again rather than an unbound error."
+  (let (b (ed-current-buf m)
+        line (buffer-line-at b (buffer-current-line b)))
+    (if (not (includes? line modes/*welcome-link-marker*))
+      m
+      (if (bound? 'tutor/cmd-tutorial)
+        ((eval 'tutor/cmd-tutorial) m key)
+        (message m "the tutorial is still loading — one second, then click again")))))
 
 (defn ed-open-buffer (m buf)
   "Add `buf` to the pool (mode-stamped, and carrying a `:dir`) and show it in the selected
@@ -2639,7 +2693,7 @@ an already-finished task is a harmless no-op (its reply is dropped because the h
 cleared). This is the editor's guarantee that no background work can wedge it: slow work
 runs off the loop (never on the per-key path), and this key kills it.
 
-A cancelled diff-hl annotation also stamps the current rope onto `:git-status-rope`, so the
+A cancelled diff-hl annotation is re-stamped against the current text, so the
 idle beat treats the gutter as current and doesn't immediately relaunch the diff we just
 killed; it re-arms on the next edit. Diagnostics, by contrast, recompute once typing settles."
   (let (eval-p (:eval-proc m)
@@ -2648,14 +2702,16 @@ killed; it re-arms on the next edit. Diagnostics, by contrast, recompute once ty
         eldoc-p (:eldoc-proc m)
         procs (remove nil? (list eval-p diag-p gd-p eldoc-p))
         b (ed-current-buf m)
-        ;; a cancelled diff-hl recompute: stamp :git-status-rope = the current rope so the
-        ;; idle beat treats the gutter as current and won't relaunch the diff we just killed
-        ;; (keep any existing bars; show none if there were none). It re-arms on the next edit.
+        ;; a cancelled diff-hl recompute: re-stamp the bars annotation against the CURRENT
+        ;; text so the idle beat treats the gutter as current and won't relaunch the diff we
+        ;; just killed (keeping any existing bars; none if there were none). It re-arms on
+        ;; the next edit, because that is what makes the annotation stale again.
         b1 (if gd-p
-             (assoc b
-               :git-status-rope (buffer-rope b)
-               :git-status-lines (buffer-line-count b)
-               :git-line-status (or (:git-line-status b) {}))
+             ;; `:value`, NOT `annotation-value`: the current-only accessor returns nil
+             ;; exactly when a line was inserted (which is why a diff was in flight), so
+             ;; it would DISCARD the bars this branch exists to keep.
+             (editor/buffer/annotate b :git-line-status
+               (or (:value (editor/buffer/annotation b :git-line-status)) {}))
              b)
         m1 (dissoc (ed-set-buf m (clear-mark b1))
              :pending :prefix-arg :eval-proc :diag-proc :diag-checking :gitdiff-proc :gitdiff-checking

@@ -24,6 +24,8 @@ old full-screen one (mode line at `rows-2`, echo at `rows-1`)."
   (:use ui-kit)  ; the widget kit (ui-panel / ui-list) — the context menu is one list
   (:use editor/display))  ; clear / text / cursor / frame / zone-at render ops
 
+(require 'results)  ; eol-notes / eol-note-at — the shared end-of-line annotation
+
 (defn ed-fit (s w)
   "Clip string `s` to `w` columns (long lines don't wrap — v1 has no h-scroll)."
   (if (> (string-length s) w) (substring s 0 w) s))
@@ -279,13 +281,24 @@ selected pane's mode line so the warning count is always visible."
     (if (nil? root) "" (str "  [" (project-name root) "]"))))
 
 (defn ed--edit-state-label (m)
-  "`  <N>`/`<I>`/`<V>` for the Vim modal `:edit-state` on the selected pane's mode line,
-or `\"\"` under the Emacs profile (which has no modal state)."
+  "The typing-mode name for the modal `:edit-state` — `NORMAL` / `INSERT` /
+`VISUAL` — spelled out on the selected pane's mode line, or `\"\"` under the Emacs
+profile (which has no modal state). Named rather than abbreviated (`<N>`): which
+mode you're in decides what every key does, so it's the one thing on the bar that
+should never need decoding."
   (cond
-    (= (:edit-state m) :insert) "  <I>"
-    (= (:edit-state m) :visual) "  <V>"
-    (= (:edit-state m) :normal) "  <N>"
+    (= (:edit-state m) :insert) "INSERT"
+    (= (:edit-state m) :visual) "VISUAL"
+    (= (:edit-state m) :normal) "NORMAL"
     :else ""))
+
+(defn ed--edit-state-face (m)
+  "The mode chip's colour: insert green (you are typing — the state where keys go
+into the buffer), visual mauve (a region is live), normal the plain bar colour."
+  (cond
+    (= (:edit-state m) :insert) {:fg *green* :bold true}
+    (= (:edit-state m) :visual) {:fg *mauve* :bold true}
+    :else {:fg *subtext* :bold true}))
 
 (defn ed-scroll-pct (top vrows linecount)
   "Emacs-style scroll-position label for the mode line: `All` when the whole buffer
@@ -342,7 +355,14 @@ segment is clickable/hoverable exactly where it's drawn."
         ;; leading separator), so they need no `:sep`; empty ones are dropped.
         extras (filter (fn (s) (not (= "" (:text s))))
                  (list (seg :status (if (= "" (:status m)) "" (str "  —  " (:status m))))
-                       (seg :edit-state (ed--edit-state-label m))
+                       ;; the typing-mode chip (vim): NORMAL / INSERT / VISUAL, coloured
+                       ;; by state — insert is green so "I am typing into the buffer" is
+                       ;; readable at a glance, not decoded from a letter
+                       (seg :edit-state (ed--edit-state-label m)
+                         {:sep "  —  " :face (ed--edit-state-face m)
+                          :tooltip (fn (mm) (list (str "typing mode: " (ed--edit-state-label mm))
+                                              "i / a / o enter INSERT · ESC returns to NORMAL"
+                                              "v enters VISUAL · C-x v v leaves vim for emacs keys"))})
                        (seg :project (ed--project-label m))
                        (seg :presence (ed--presence-label m pane))
                        (seg :diag (ed--diag-label m))
@@ -649,6 +669,57 @@ unless the buffer's mode offers `:line-loc` (ordinary buffers cost one lookup)."
                   (cursor-zone col (+ y (* (- line0 top) s)) cw s :pointer)))
           (range top (inc last-line)))))))
 
+;; ---- end-of-line notes: derived text shown AT a line -------------------------
+;; A buffer may carry `:eol-notes` (see `results/eol-notes`) — derived text anchored
+;; to lines, e.g. the tutorial's per-box verdicts. THREE renderers share that one
+;; annotation: the margin glyph (modes/gutter-mark-for), the echo row when point is
+;; on the line (ed-eol-note-on-line), and here — eros-style ghost text two cells
+;; past the line's end: `=> 42` muted, `✓ 42` green, `✗ …` red, `⋯` pending, all
+;; dimmed once the text moves and blanked once lines shift (std `annotate` owns that
+;; currency). Pure ops over existing `text` — no new display primitive (the
+;; keep-the-surface-small rule).
+
+(defn ed--eol-note-face (kind stale)
+  (cond
+    ;; no-answer-yet reads as pending (dim, italic), never as a stale verdict — whether
+    ;; the sandbox is still working (:running) or the form isn't finished (:incomplete)
+    (or (= kind :running) (= kind :incomplete)) {:fg *overlay0* :italic true}
+    (= kind :warn) {:fg *yellow*}
+    stale {:fg *overlay0*}
+    (= kind :pass) {:fg *green*}
+    (= kind :fail) {:fg *red*}
+    else {:fg *subtext*}))
+
+(defn ed--eol-note-ops (buf top text-h x y w gw s hscroll)
+  "Ghost-text ops for the pane's visible end-of-line notes — `results/eol-notes`,
+one annotation lookup on a buffer that has none. A note is owner-keyed with its
+anchor line inside (`:line`), so it can never be stranded at a line the text moved
+out from under. Columns follow the pane's `hscroll` like the body text; clipped to
+the pane's text width, and a line too full to fit at least a few cells drops its
+note rather than overpaint. Whoever annotates gets this rendering for free: the
+tutorial's verdicts today, inline eval results / inlay hints / blame next."
+  (let (notes (results/eol-notes buf))
+    (if (or (nil? notes) (empty? notes))
+      '()
+      (let (stale (results/eol-notes-stale? buf)
+            tw (max 1 (- (max 1 (quot w s)) gw)))
+        (keep (fn (kv)
+                (let (note (second kv)
+                      line (:line note))
+                  (when (and line (>= line top) (< line (+ top text-h)))
+                    (let (col (- (+ (display-width (ed-line-text buf line)) 2) hscroll)
+                          avail (- tw col 1))
+                      (when (and (>= col 0) (> avail 3))
+                        (text (+ y (* (- line top) s)) (+ x (* (+ gw col) s))
+                          ;; a result may carry an advisory `:warn` for the same line —
+                          ;; composed here so re-checking can never duplicate it
+                          (ui-clip (if (:warn note)
+                                     (str (:text note) "   " (:warn note))
+                                     (:text note))
+                            avail)
+                          (ed--eol-note-face (if (:warn note) :warn (:kind note)) stale)))))))
+          notes)))))
+
 (defn ed-pane-ops (m pane)
   "All render ops for one pane: a full-width hl-line band behind the text, an optional
 left line-number gutter, its visible buffer lines inside the rect above its mode line, a
@@ -723,6 +794,9 @@ the ops are emitted flat (no region wrapper) for test-compatibility and zero ove
                          (ed-pane-gutter-cells m pane buf top
                            (if (= s 1) render-h (max 1 (quot render-h s))) gw)
                          top render-h x y w gw s hl-ranges spans overrides hscroll (:gui m))
+                       ;; end-of-line notes: ghost text past a line's end (`=> 42` /
+                       ;; ✓ / ✗ / ⋯) — one annotation lookup on ordinary buffers
+                       (ed--eol-note-ops buf top render-h x y w gw s hscroll)
                        ;; other participants' carets + name tags (collab presence) — drawn
                        ;; over the text, under our own cursor
                        (ed--remote-cursor-ops m pane buf top x y w gw text-h s hscroll)
@@ -865,11 +939,22 @@ prompt without one. Shown after the input so you see what completion will offer.
               (or (:diagnostics m) '())))
     (when hit (str "warning: " (:message hit)))))
 
+(defn ed-eol-note-on-line (buf)
+  "The end-of-line note on `buf`'s current line, in full — the echo-row seat of the
+feedback (the gutter shows the glyph, the ghost text may be clipped; here the whole
+text fits). Silent once the note is stale: an edited line's old result shouldn't
+keep talking."
+  (when (not (results/eol-notes-stale? buf))
+    (let (note (results/eol-note-at buf (buffer-current-line buf)))
+      (when note
+        (if (:warn note) (str (:text note) "   " (:warn note)) (:text note))))))
+
 (defn ed-echo-or-eldoc (m)
   "The echo-row text when no minibuffer is open, by precedence: the latest explicit
-`message`; else a **diagnostic on the current line**; else the model's cached `:eldoc`
-hint (the current buffer mode's signature for point, e.g. `(map f coll)`, refreshed by
-`model/ed-post-step` once per event); else `\"\"`."
+`message`; else a **diagnostic on the current line**; else the tutorial note on the
+current line (the full verdict/hint for the box at point); else the model's cached
+`:eldoc` hint (the current buffer mode's signature for point, e.g. `(map f coll)`,
+refreshed by `model/ed-post-step` once per event); else `\"\"`."
   (let (echo (:echo m))
     (if (not (= echo ""))
       echo
@@ -877,7 +962,7 @@ hint (the current buffer mode's signature for point, e.g. `(map f coll)`, refres
             diag (ed-diagnostic-on-line m buf))
         ;; the eldoc hint is cached on the model by `ed-post-step` (computed once per
         ;; event, not re-derived here every frame) — just paint it.
-        (or diag (:eldoc m) "")))))
+        (or diag (ed-eol-note-on-line buf) (:eldoc m) "")))))
 
 (defn ed-echo-line (m cols rows)
   "The bottom row (`rows-1`): the active minibuffer prompt + input if one is open,
@@ -990,8 +1075,12 @@ width of the current line from char column `hscroll` to point (0 when point is l
   {:label (:label it) :key (:key it) :enabled (:enabled it) :sep (:sep it)})
 
 (def ed-menu-style
-  ;; a popup card: raised surface, a hairline, one cell of horizontal padding
-  {:fg :on-surface :bg :surface :border :hairline :pad [0 1 0 1] :radius 0.5})
+  ;; A popup card: raised surface, a hairline, one cell of padding on EVERY edge.
+  ;; The vertical pad matters as much as the horizontal one here: the card is rounded
+  ;; (`:radius`) and the selected row is a full-width pill, so with no top/bottom pad
+  ;; the highlight ran into the rounded corner and the hairline — the first and last
+  ;; items looked clipped. One row of breathing space above and below fixes it.
+  {:fg :on-surface :bg :surface :border :hairline :pad [1 1 1 1] :radius 0.5})
 
 (defn ed-menu-widget (m cols rows)
   "The context menu as a widget: a `ui-list` of the items in a `ui-panel`, sized and
@@ -1003,7 +1092,11 @@ keeps the menu open). `{:ops [] :zones [] :area nil}` when no menu is open."
       {:ops [] :zones [] :area nil}
       (let (items (:items menu)
             meas (ui-list-measure items ed--menu-rowfn (:sel menu))
-            area (ui-clamp [(:col menu) (:row menu) (+ (:w meas) 2) (:h meas)] cols rows)
+            ;; the card's outer size = the rows plus the style's padding on each edge
+            ;; (`ui-panel` renders the body into the PADDED inner rect, so the caller
+            ;; owns the outer size — a vertical pad the area didn't account for would
+            ;; simply clip the last row)
+            area (ui-clamp [(:col menu) (:row menu) (+ (:w meas) 2) (+ (:h meas) 2)] cols rows)
             ctx (ui-ctx (:gui m))
             res (ui-panel area ctx ed-menu-style
                   (ui-list {:items items :selected (:sel menu) :row ed--menu-rowfn
