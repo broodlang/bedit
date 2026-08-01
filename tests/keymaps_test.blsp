@@ -142,8 +142,10 @@
     (let (vis (press (vim-of "abcdef") (list "v")))
       (assert= (:edit-state vis) :visual)
       (is (not (nil? (buffer-mark (cur vis)))))  ; mark set at the anchor
-      (let (deleted (press vis (list "l" "l" "d")))  ; extend over "ab", delete
-        (assert= (buffer-text (cur deleted)) "cdef")
+      ;; Vim's charwise selection is INCLUSIVE of the character under the cursor, so
+      ;; v-l-l covers a, b AND c. This asserted "cdef" while the region ran one short.
+      (let (deleted (press vis (list "l" "l" "d")))
+        (assert= (buffer-text (cur deleted)) "def")
         (assert= (:edit-state deleted) :normal))))
 
   (test "y copies the selection and returns to normal without changing the text"
@@ -294,3 +296,97 @@
     (assert= (ed-substitute-command-keys (profile-keymap :emacs) "plain text") "plain text")
     (is (includes? (ed-substitute-command-keys (profile-keymap :emacs) "oops \\[unclosed")
           "\\[unclosed"))))
+
+;; ---- vim conformance: the places this diverged from real vim --------------------
+;; Written after a report that "vim-mode seems very broken". Each of these was
+;; measured against what vim actually does, not against what the code did.
+
+(describe "vim motions land where vim lands"
+  (defn at (text point) (ed-apply (vim-of text) (fn (b) (goto-char b point))))
+  (defn point-after (text point ks) (buffer-point (cur (press (at text point) ks))))
+  (def TXT "hello world\nsecond line\nthird")
+
+  (test "REGRESSION: G goes to the LAST LINE, not past the last character"
+    ;; end-of-buffer left the cursor after the final line, so G then any horizontal
+    ;; motion behaved as though the file had one more line than it has
+    (assert= (point-after TXT 0 (list "G")) 24)
+    (assert= (buffer-current-line (cur (press (at TXT 0) (list "G")))) 2))
+
+  (test "gg goes to the first line"
+    (assert= (point-after TXT 20 (list "g" "g")) 0))
+
+  (test "counts multiply a motion"
+    (assert= (point-after TXT 0 (list "l")) 1)
+    (assert= (point-after TXT 0 (list "3" "l")) 3)
+    (assert= (point-after TXT 0 (list "2" "w")) 12))
+
+  (test "0 and $ are the line's ends"
+    (assert= (point-after TXT 5 (list "0")) 0)
+    (assert= (point-after TXT 0 (list "$")) 11))
+
+  (test "j and k move by line"
+    (assert= (point-after TXT 0 (list "j")) 12)
+    (assert= (point-after TXT 12 (list "k")) 0)))
+
+(describe "vim visual mode is inclusive, like vim"
+  (test "REGRESSION: v with no motion still covers one character"
+    ;; the region ran from mark to point exclusive, so `v d` deleted NOTHING
+    (let (deleted (press (vim-of "abcdef") (list "v" "d")))
+      (assert= (buffer-text (cur deleted)) "bcdef")))
+
+  (test "v l l d takes three characters, not two"
+    (assert= (buffer-text (cur (press (vim-of "abcdef") (list "v" "l" "l" "d")))) "def"))
+
+  (test "…and y leaves the text alone while returning to normal"
+    (let (yanked (press (vim-of "abcdef") (list "v" "l" "y")))
+      (assert= (buffer-text (cur yanked)) "abcdef")
+      (assert= (:edit-state yanked) :normal))))
+
+(describe "vim edits and modes"
+  (def TXT2 "hello world\nsecond line\nthird")
+  (test "the mode transitions land in the right state"
+    (assert= (:edit-state (press (vim-of "abc") (list "i"))) :insert)
+    (assert= (:edit-state (press (vim-of "abc") (list "i" :escape))) :normal)
+    (assert= (:edit-state (press (vim-of "abc") (list "v"))) :visual)
+    (assert= (:edit-state (press (vim-of "abc") (list "v" :escape))) :normal))
+
+  (test "insert-mode keys reach the buffer; normal-mode letters do not"
+    (assert= (buffer-text (cur (press (vim-of "abc") (list "i" "X")))) "Xabc")
+    ;; `z` is unbound in normal mode: a dead key, never self-insert
+    (assert= (buffer-text (cur (press (vim-of "abc") (list "z")))) "abc"))
+
+  (test "x, dd, dw and counts edit the way vim does"
+    (assert= (buffer-text (cur (press (vim-of TXT2) (list "x")))) "ello world\nsecond line\nthird")
+    (assert= (buffer-text (cur (press (vim-of TXT2) (list "3" "x")))) "lo world\nsecond line\nthird")
+    (assert= (buffer-text (cur (press (vim-of TXT2) (list "d" "d")))) "second line\nthird")
+    (assert= (buffer-text (cur (press (vim-of TXT2) (list "3" "d" "d")))) "")
+    (assert= (buffer-text (cur (press (vim-of TXT2) (list "d" "w")))) "world\nsecond line\nthird"))
+
+  (test "yy then p duplicates the line, and u undoes an edit"
+    (assert= (buffer-text (cur (press (vim-of TXT2) (list "y" "y" "p"))))
+      "hello world\nhello world\nsecond line\nthird")
+    (assert= (buffer-text (cur (press (vim-of TXT2) (list "x" "u")))) TXT2))
+
+  (test ". repeats the last change"
+    (assert= (buffer-text (cur (press (vim-of TXT2) (list "x" ".")))) "llo world\nsecond line\nthird")))
+
+(describe "REGRESSION: nothing types in a vim COMMAND state"
+  ;; The keymap fallback self-inserted any printable key, so every key vim does not
+  ;; bind typed itself into the buffer in NORMAL mode — z q s t r m f and most of the
+  ;; keyboard. `ed-vim-command-mode?` existed for exactly this rule and the fallback,
+  ;; where the majority of keys land, never consulted it.
+  (test "unbound letters are dead keys in normal mode"
+    (dolist (k (list "z" "q" "s" "t" "r" "m" "f" "n" "Z" "Q"))
+      (assert= (buffer-text (cur (press (vim-of "abc") (list k)))) "abc")))
+
+  (test "…and in visual mode"
+    (dolist (k (list "z" "q" "s"))
+      (assert= (buffer-text (cur (press (vim-of "abc") (list "v" k)))) "abc")))
+
+  (test "but insert mode still types everything, including those keys"
+    (dolist (k (list "z" "q" "s"))
+      (assert= (buffer-text (cur (press (vim-of "abc") (list "i" k)))) (str k "abc"))))
+
+  (test "and the emacs profile is untouched — plain keys type there"
+    (let (m (ed-init (make-buffer "abc" "t.txt")))
+      (assert= (buffer-text (cur (press m (list "z")))) "zabc"))))
