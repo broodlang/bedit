@@ -40,6 +40,17 @@ nest check               # advisory type/lint check
 > GUI feature and clobbers the installed binary — verify the GUI only via the
 > installed `nest` (or `cargo build --features brood/gui` in `../brood`).
 
+To install it as a desktop app — a standalone `bedit` binary plus the desktop
+entry and icon, so it launches from the GNOME dash with its own name and icon
+rather than as an unidentified window:
+
+```bash
+make install          # -> ~/.local/bin/bedit + the .desktop entry + the icon
+```
+
+See [`assets/README.md`](assets/README.md) for how the three names (the window's
+app id, the entry, the icon) hook up.
+
 ## What works today
 
 Emacs-style movement and editing, a kill ring, multiple buffers and a
