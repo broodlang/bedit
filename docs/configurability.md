@@ -36,7 +36,7 @@ user with `C-x C-e` can already re-skin and rebind a running editor.
 
 ## The gap: the config *surface* is a closed 3-key DSL
 
-`config.blsp` reads `~/.config/brood-edit/init.blsp` as **data** (not eval'd —
+`config.blsp` reads `~/.config/bedit/init.blsp` as **data** (not eval'd —
 ADR-065, and correct), but understands exactly three keys: `:fullscreen`, `:hl-line`,
 `:cursor`. There is **no general abstraction** for variables, user keybindings, hooks,
 or theme selection. The tell: adding the `:hl-line` setting touched **four**

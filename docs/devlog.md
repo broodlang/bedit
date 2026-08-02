@@ -1,4 +1,4 @@
-# Dev log — brood-edit
+# Dev log — bedit
 
 A skimmable record of work, **newest first**. One entry per feature: what shipped, *why*,
 the key files, the tests, and the commit. Use it to recover the *why* without reading every
@@ -129,7 +129,7 @@ commits (`git log --since=2026-06-16 --until=2026-07-10`) have the detail:
     + `key-parse`/`key-describe` in `std/editor/keymap`; the editor rewrites `config.blsp`
     as a fold + adds the user-facing forms.
   - **`docs/packages.md`** — *an editor package is a Brood nest*; the user's
-    `~/.config/brood-edit/` is itself a nest whose `:dependencies` are the installed
+    `~/.config/bedit/` is itself a nest whose `:dependencies` are the installed
     packages, and **Brood's existing package manager** (ADR-037) is the package system. A
     package registers through the same functions core uses. Live, restart-free install via
     the runtime-mutable `*load-path*` + late binding. The one real language gap is ADR-070

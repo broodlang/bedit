@@ -1,4 +1,4 @@
-# myedit roadmap
+# bedit roadmap
 
 A small, Emacs-style GUI text editor written in Brood, on the standard editor
 framework (`editor/buffer`, `editor/keymap`, `editor/layers`, `sexp`, `regex`,
@@ -11,7 +11,7 @@ design-of-record in the brood repo: `docs/layers.md`).
 Legend: ✅ done · 🟡 in progress · ⬜ not started
 
 **Strategic direction — competing with Neovim/Emacs/VSCode:** the honest standing
-vs the big three and the three tracks that would make someone *choose* myedit over
+vs the big three and the three tracks that would make someone *choose* bedit over
 them are in **`docs/competitive-tracks.md`**. The flagship (Track 1 — remote &
 multiplayer editing) is now **largely built** — see §E below and the as-built ledger
 in **`docs/remote-multiplayer-plan.md`**; the user-facing runbook is
@@ -244,7 +244,7 @@ silently stopped matching); exit signals never reached a natively-nested `receiv
 ## G. Packages — an extension ecosystem (deferred — design note)
 
 - ⬜ **Load editor packages, almost like Emacs** — *an editor package is a Brood nest*;
-  the user's `~/.config/brood-edit/` is itself a nest whose `:dependencies` are the
+  the user's `~/.config/bedit/` is itself a nest whose `:dependencies` are the
   installed packages, and **Brood's existing package manager** (ADR-037: `:dependencies`,
   `project.lock.blsp`, `_deps/`, `nest add/fetch`) is the package system. A package hooks
   in by calling the same registration functions core uses (`register-type-layers`,

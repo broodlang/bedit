@@ -36,7 +36,7 @@ functions at load time — `defcommand`, `register-type-layers` / `register-file
 
 Put those two facts together and the design falls out:
 
-> **An editor package is a Brood nest. The user's `~/.config/brood-edit/` directory
+> **An editor package is a Brood nest. The user's `~/.config/bedit/` directory
 > *is itself a nest*; installed packages are its `:dependencies`; the existing `nest`
 > package manager is the package system. A package hooks into the editor by calling the
 > same registration functions core uses.**
@@ -46,9 +46,9 @@ The brood repo already anticipated this (`docs/decisions.md`, ADR-037 motivation
 the absence of a package story stops a real ecosystem from forming."* The package
 manager **is** the intended plugin substrate.
 
-## Concept mapping (Emacs → myedit)
+## Concept mapping (Emacs → bedit)
 
-| Emacs | myedit |
+| Emacs | bedit |
 |---|---|
 | `.el` file with `(provide 'foo)` | a `defmodule` in a Brood nest |
 | `load-path` | `*load-path*` (already runtime-mutable) |
@@ -69,7 +69,7 @@ API to learn*. A whole syntax-highlighter package:
 
 ```clojure
 (defmodule pkg-zig
-  "Zig syntax highlighting + structural nav for brood-edit."
+  "Zig syntax highlighting + structural nav for bedit."
   (:use editor/layers) (:use editor/treesit))
 
 (defn zig-fontify (text) (treesit/fontify text :zig pkg-zig/zig-face-of))
@@ -110,7 +110,7 @@ Its `project.blsp` declares `:name "pkg-zig"` and any deps; that's the entire pa
 **Part 2 — the editor.** Built on Part 1 and on the config registries from
 [`configurability.md`](configurability.md):
 
-1. **Config dir as a nest + startup loader.** Treat `~/.config/brood-edit/` as a nest: a
+1. **Config dir as a nest + startup loader.** Treat `~/.config/bedit/` as a nest: a
    `project.blsp` whose `:dependencies` are the user's packages, plus `init.blsp` (still
    declarative data, ADR-065 intact). At startup `main` calls `load-nest` on it →
    packages' modules load and register live → then `init.blsp` is applied. Bundled modes

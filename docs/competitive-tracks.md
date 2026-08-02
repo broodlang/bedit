@@ -1,6 +1,6 @@
 # Competing with Neovim, Emacs & VSCode — the three tracks
 
-**Status:** strategy note. Where myedit stands against the big three, and the
+**Status:** strategy note. Where bedit stands against the big three, and the
 three tracks that would make someone *choose* it over them rather than settle for
 a smaller Emacs. **Track 1 (remote & multiplayer) is now largely BUILT** — daemon
 attach, one shared mode with per-participant carets/presence, follow/mirror,
@@ -11,7 +11,7 @@ Remaining on that track: the v2 CRDT and per-participant undo. This doc is the m
 
 ## Where we actually stand
 
-myedit is well past "toy." The feature-parity checklist most young editors are
+bedit is well past "toy." The feature-parity checklist most young editors are
 missing is largely *checked* (see `ROADMAP.md` for the full list): undo with
 Emacs-style boundaries/amalgamation, keyboard macros, LSP wired all the way
 through (goto-def, references, hover, rename — not just completion), tree-sitter
@@ -27,7 +27,7 @@ stop chasing and start winning?"**
 You will never out-feature the big three by matching them one capability at a
 time. VSCode has thousands of extensions and a paid team on the debugger; Emacs
 has org-mode and 30 years of packages; Neovim has the tree-sitter/Lua plugin
-explosion. Chase parity and myedit is always *N* features behind, forever.
+explosion. Chase parity and bedit is always *N* features behind, forever.
 
 The reason this project exists (the prime directive) is that it's written in
 **Brood — a language built to host a self-editing, remotely-hostable editor**. So
@@ -58,7 +58,7 @@ because their models are single-process and local. Brood's is not.
 ## Track 2 — Self-editing, live *(the other Brood-native superpower)*
 
 Emacs's actual killer feature isn't org-mode — it's redefining any command while
-it runs. myedit already has the hard part: **late-bound command symbols and
+it runs. bedit already has the hard part: **late-bound command symbols and
 hot-swappable keymaps** (a key dispatches to a *symbol* resolved at call time, so
 a `C-x C-e` on a `defcommand` hot-swaps the binding under your fingers, no
 restart). Turning that into a first-class experience — `describe-key` /
@@ -89,7 +89,7 @@ these off opportunistically; they're how you avoid embarrassment, not how you wi
 ## Recommendation
 
 Don't spread across all three. **Pick a flagship and go deep** — that's what makes
-someone choose myedit over the big three. The order that plays to Brood's strengths
+someone choose bedit over the big three. The order that plays to Brood's strengths
 and to what's already built:
 
 1. **Track 1 (remote & multiplayer)** — the flagship. On-thesis, the substrate is

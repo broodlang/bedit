@@ -16,11 +16,11 @@ import shutil
 from drive import PROJECT, Report, Session, TOOLS
 
 HOME = os.path.join(PROJECT, "target", "drive-progress-home")   # gitignored build dir
-PROGRESS = os.path.join(HOME, "brood-edit", "tutor-progress.blsp")
+PROGRESS = os.path.join(HOME, "bedit", "tutor-progress.blsp")
 
 r = Report()
 shutil.rmtree(HOME, ignore_errors=True)
-os.makedirs(os.path.join(HOME, "brood-edit"), exist_ok=True)
+os.makedirs(os.path.join(HOME, "bedit"), exist_ok=True)
 env = {"XDG_CONFIG_HOME": HOME}
 
 # ---- session 1: solve the first exercise -------------------------------------------

@@ -1,11 +1,11 @@
-# CLAUDE.md — working in the myedit repo
+# CLAUDE.md — working in the bedit repo
 
 Guidance for Claude Code (and humans) working in this project. For the machine
 setup (Ubuntu, apt, Rust via rustup, etc.) see the global `~/.claude/CLAUDE.md`.
 
 ## What this project is
 
-**myedit is an Emacs clone, written in [Brood](../brood).** Brood is a small,
+**bedit is an Emacs clone, written in [Brood](../brood).** Brood is a small,
 immutable Lisp built specifically to be the language a modern, self-editing,
 remotely-hostable editor is written in. This repo is that editor — the thing
 Brood exists to make possible.
@@ -31,12 +31,12 @@ area, eval-in-buffer, eventually a self-editing keymap you can redefine live.
 abstraction Brood doesn't yet have, the correct move is **to go add it to the
 Brood language** (in `../brood` — a kernel primitive or a `std/` module), then
 build the editor feature on that clean primitive. **Do not** hack the missing
-capability into myedit as a one-off workaround.
+capability into bedit as a one-off workaround.
 
 This is not a detour from building the editor — it *is* building the editor. A
 self-editing Emacs clone is only possible if its abstractions live in a language
 expressive enough to host them. Every gap the editor exposes is a gap in Brood
-worth fixing properly. **Be actively on the lookout for these** — treat "myedit
+worth fixing properly. **Be actively on the lookout for these** — treat "bedit
 wants X and can't express it cleanly" as a signal to improve Brood, and say so.
 
 **Worked example (the live one).** Eval-in-buffer (`C-x C-e`: eval the form
@@ -44,10 +44,10 @@ before point, show its output in the `*Messages*` buffer) needs to *capture*
 what the evaluated code prints. Brood has no output capture today — `print`/
 `println` write straight to stdout (`crates/lisp/src/introspect.rs` flags the
 missing `*out*` dynvar + `with-out-str` facility explicitly). The wrong fix is
-to intercept output inside myedit. The right fix is to **add `*out*` +
+to intercept output inside bedit. The right fix is to **add `*out*` +
 `with-out-str` to Brood** — a general capability (REPL capture, test output
 assertions, the MCP `EvalResult.stdout` field all want it) — and then have
-myedit's eval command simply `(with-out-str …)`.
+bedit's eval command simply `(with-out-str …)`.
 
 When you do change Brood, follow that repo's conventions (`../brood/CLAUDE.md`):
 prefer Brood over Rust, keep the core small, add a builtin only when it genuinely
@@ -64,7 +64,7 @@ Every plan for this project **must have two explicit parts, in this order**:
    the language before building on it. If a plan has nothing here, say so
    explicitly — "no language gap; builds on existing primitives" — so it's clear
    the question was asked, not skipped.
-2. **What we will do.** The concrete editor work in myedit, built on the
+2. **What we will do.** The concrete editor work in bedit, built on the
    primitives from part 1 (and existing ones): the files, the order, the tests.
 
 Keep the two separate so the language improvement never gets buried inside the
@@ -75,7 +75,7 @@ feature work — surfacing it is half the point of this project.
 ```
 src/main.blsp               entry point — window / daemon startup (--serve/--attach), runs the ui-run loop
 src/model.blsp              the ui-run model: buffer pool, kill ring, minibuffer, *Messages*, scrolling
-src/config.blsp             ~/.config/brood-edit/init.blsp — the declarative user config (data, not eval'd)
+src/config.blsp             ~/.config/bedit/init.blsp — the declarative user config (data, not eval'd)
 src/theme.blsp              every colour the editor paints (Catppuccin Mocha), referenced by role
 src/panes.blsp              pane-layout geometry + mouse-event folding (model -> model)
 src/view.blsp               pure view: model -> render frame (editor/display ops)
@@ -129,7 +129,7 @@ tools/drive*.py            live pty drivers: run the real editor, assert on what
                            the wiring the model tests can't see (`make drive`, tools/README.md)
 assets/                     the desktop identity: the icon (SVG) + the .desktop entry the
                             window's `:app-id` is matched against (`make install` places both)
-project.blsp                the nest manifest (:name "myedit")
+project.blsp                the nest manifest (:name "bedit")
 ```
 
 ## Commands

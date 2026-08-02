@@ -1,4 +1,4 @@
-# brood-edit (myedit) — build & install the standalone `bedit` editor binary.
+# bedit (bedit) — build & install the standalone `bedit` editor binary.
 #
 # `nest release` bundles the project (manifest + every src/**) onto the
 # GUI-enabled `brood` runtime embedded in the installed `nest`, producing one
@@ -11,7 +11,7 @@
 # Usage:
 #     make install                 # -> ~/.local/bin/bedit + desktop entry & icon
 #     make install PREFIX=/usr/local
-#     make install NAME=myedit     # install under a different command name
+#     make install NAME=bedit     # install under a different command name
 #     make build                   # a local ./bedit, without installing
 #     make install-desktop         # just the desktop entry + icon
 #     make uninstall
@@ -26,7 +26,7 @@ NAME   ?= bedit
 # declares — src/main.blsp's `:app-id` — and the desktop entry MUST be named after
 # it, since that name is the only thing tying the running window to its icon. It is
 # therefore independent of NAME (the command), which may be renamed freely.
-APPID   ?= brood-edit
+APPID   ?= bedit
 DATADIR ?= $(PREFIX)/share
 APPSDIR ?= $(DATADIR)/applications
 ICONDIR ?= $(DATADIR)/icons/hicolor/scalable/apps
@@ -51,7 +51,7 @@ install-bin:
 	@echo "installed $(NAME) -> $(DESTDIR)$(BINDIR)/$(NAME)"
 
 # The desktop entry + icon: what makes the window show up in the dash / alt-tab as
-# brood-edit with its own icon instead of an unidentified window with the generic
+# bedit with its own icon instead of an unidentified window with the generic
 # fallback one. `Exec=` is rewritten to the *installed path* — a desktop launch does
 # not inherit a login shell's PATH (a GNOME session's is often missing ~/.local/bin),
 # so the bare command in the committed file would launch nothing. DESTDIR is a

@@ -1,10 +1,10 @@
-# myedit
+# bedit
 
 An Emacs clone, written in [Brood](../brood). Brood is a small, immutable Lisp
 built to be the language a modern, self-editing, remotely-hostable editor is
 written in — and this repo is that editor.
 
-myedit is **pure Brood glue over the editor toolkit that ships in Brood's
+bedit is **pure Brood glue over the editor toolkit that ships in Brood's
 `std/`** — nothing custom in any kernel. Every layer is a `std/` module:
 
 | Layer | Toolkit module   | Role |
@@ -22,7 +22,7 @@ command redefined live (via `C-x C-e`) hot-swaps on the next keystroke.
 
 ## Running it
 
-myedit consumes the **installed** `nest` (`~/.local/bin/nest`), which must be
+bedit consumes the **installed** `nest` (`~/.local/bin/nest`), which must be
 built with the GUI backend. Building that lives in the Brood repo:
 
 ```bash
@@ -80,7 +80,7 @@ next.
 ```
 src/main.blsp               entry point — window / daemon startup (--serve/--attach), runs the ui-run loop
 src/model.blsp              the ui-run model: buffer pool, kill ring, minibuffer, *Messages*, scrolling
-src/config.blsp             ~/.config/brood-edit/init.blsp — the declarative user config (data, not eval'd)
+src/config.blsp             ~/.config/bedit/init.blsp — the declarative user config (data, not eval'd)
 src/theme.blsp              every colour the editor paints (Catppuccin Mocha), referenced by role
 src/panes.blsp              pane-layout geometry + mouse-event folding (model -> model)
 src/view.blsp               pure view: model -> render frame (editor/display ops)
@@ -106,14 +106,14 @@ src/web.blsp                live HTTP mirror of the selected buffer (C-x w)
 src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclient model
 src/collab.blsp             shared-buffer collaboration: presence carets, delta merges, follow/mirror
 tests/*_test.blsp           pure model/view tests, one suite per area (no window needed)
-project.blsp                the nest manifest (:name "myedit")
+project.blsp                the nest manifest (:name "bedit")
 ```
 
 ## Contributing
 
 The prime directive: when the editor needs a core abstraction Brood doesn't yet
 have, **add it to the Brood language** (in `../brood`) and build the feature on
-that clean primitive — don't hack the missing capability into myedit as a
+that clean primitive — don't hack the missing capability into bedit as a
 one-off. A self-editing Emacs clone is only possible if its abstractions live in
 a language expressive enough to host them. See [`CLAUDE.md`](CLAUDE.md) for the
 full working guide (conventions, how to write a plan, the prime directive in
