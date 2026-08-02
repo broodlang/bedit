@@ -39,6 +39,44 @@
   (find (fn (i) (= (:title (nth tutor-lessons i)) title)) (range (count tutor-lessons))))
 (defn nav-count () (count (tutor/tutor--group-indices [:navigation nil])))
 
+;; Move point into box `i` and let the tutor's own `:post-key` hook run — the real path
+;; a motion takes (M-n, an arrow), which is what makes the *Workings* pane follow.
+(defn tut-goto-box (m i)
+  (let (r (nth (tut-regions m) i)
+        moved (ed-edit m (fn (b) (goto-char b (+ (:start r) 2)))))
+    (tutor/tutor-post-key m moved "M-n")))
+
+;; The *Workings* text, or nil when the pane is closed.
+(defn tut-workings (m)
+  (let (wi (ed-buffer-index-by-name m "*Workings*"))
+    (when wi (buffer-text (ed-buf-at m wi)))))
+
+;; Put a cascade in the pane for box `i`, the way a sandbox reply does. Every pane test
+;; goes through here rather than through a real trace: the headless evaluator deliberately
+;; instruments NOTHING (tracing rebinds globals, and the globals here are shared by every
+;; test process in the run), so a cascade in a test is a synthetic reply by construction.
+;; What the reader actually sees is covered end to end by the pty drive.
+(defn tut-cascade-reply (fname)
+  {:ok true :value "6"
+   :spy (list {:kind "call" :fn fname :args "(3)"} {:kind "return" :fn fname :value "6"})})
+
+;; the same shape with no cascade — a box that ran and traced nothing
+(defn tut-quiet-reply () {:ok true :value "6" :spy ()})
+
+(defn tut-with-cascade (m i fname)
+  (tutor-workings/show m i (tutor/tutor--box-at-point m) (tut-cascade-reply fname)))
+
+;; a lesson rendered with point parked in box 0 (what `tutor--show` does)
+(defn tut-page (title) (tutor/tutor--show (ed-init (make-buffer "")) (lesson-idx title)))
+
+;; The index of the first box whose source mentions `needle` — tests say WHICH box they
+;; mean by what is in it, so a reordered lesson doesn't silently test the wrong box.
+(defn tut-box-with (m needle)
+  (let (text (tut-text m)
+        rs (tut-regions m))
+    (find (fn (i) (includes? (substring text (:start (nth rs i)) (:end (nth rs i))) needle))
+      (range (count rs)))))
+
 ;; ---- the box parser -----------------------------------------------------------
 
 (describe "tutor-regions (the one reader of the box syntax)"
@@ -399,23 +437,146 @@
           m2 (key-into m :alt-p))
       (assert= (buffer-point (tut-buf m2)) (+ (:start (last rs)) 2)))))
 
-(describe "the workings pane (traced boxes)"
-  (test "a traced sync eval opens *Workings* aside with the call cascade"
-    ;; lesson 7 (Functions) traces `double`/`triple`; render it and launch headless
-    (let (m (ed-tutor-launch (tutor/tutor--show (ed-init (make-buffer "")) (lesson-idx "Functions")))
-          wi (ed-buffer-index-by-name m "*Workings*"))
-      (is (not (nil? wi)))
-      (let (wtext (buffer-text (ed-buf-at m wi)))
-        (is (includes? wtext "The workings"))
-        (is (includes? wtext "triple 14"))
-        (is (includes? wtext "= ")))))
+(describe "the workings pane (it follows the selected box)"
+  ;; A synthetic reply, so these tests are about the PANE and not about the tracer: which
+  ;; functions get instrumented is the sandbox's business, and in this shared test image
+  ;; it depends on what earlier tests defined (the headless path evals in-image). The live
+  ;; cascade is checked end-to-end by the pty drive instead.
+  (test "a reply with a cascade for the box you are in opens *Workings* aside"
+    (let (m (tut-with-cascade (tut-page "Functions") 0 "fac")
+          wtext (tut-workings m))
+      (is (not (nil? wtext)))
+      (is (includes? wtext "The workings"))
+      (is (includes? wtext "fac 3"))
+      (is (includes? wtext "= 6"))))
 
-  (test "an untraced lesson opens no workings pane"
+  (test "a reply for a box you are NOT in updates its cache silently, pane untouched"
+    ;; a background re-eval must not yank the view off the box you are reading
+    (let (m (tut-with-cascade (tut-page "Functions") 1 "fac"))
+      (assert= (tut-workings m) nil)                                   ; no pane appeared
+      (is (not (nil? (tutor-workings/cascade m 1))))            ; but it is cached
+      ;; …and moving into that box shows it, without any re-evaluation
+      (is (includes? (tut-workings (tut-goto-box m 1)) "fac 3"))))
+
+  (test "a reply with no cascade does not open the pane, but is remembered as ran"
+    (let (m (let (m (tut-page "Functions")) (tutor-workings/show m 0 (tutor/tutor--box-at-point m) (tut-quiet-reply))))
+      (assert= (tut-workings m) nil)
+      (assert= (get-in m [:tutor :workings 0]) :none)
+      ;; once the pane IS open, it says so for that box rather than showing another's
+      (let (open-pane (tutor/cmd-tutorial-workings m nil))
+        (is (includes? (tut-workings open-pane) "nothing traceable")))))
+
+  (test "a LAUNCH opens the pane for a lesson that has workings, showing the box at point"
+    ;; the launch-side entry point (`ed-tutor-launch` ends in a refresh): a page where some
+    ;; box has a cascade is worth the split even when the box you are in has none. The
+    ;; second launch changes nothing, so `tutor--forget-workings` keeps the cache — which is
+    ;; how a seeded cascade survives into the launch under test.
+    (let (page (tut-page "Functions")
+          settled (ed-tutor-launch page)                        ; boxes evaluated, no pane
+          _ (assert= (tut-workings settled) nil)
+          seeded (assoc-in settled [:tutor :workings 1] "The workings — every traced call:\n\nfac 3\n= 6")
+          relaunched (ed-tutor-launch seeded))                  ; nothing changed → cache kept
+      (is (not (nil? (tut-workings relaunched))))
+      (is (includes? (tut-workings relaunched) "The workings"))
+      ;; and it shows the box at POINT (box 0), not the box that has the cascade
+      (assert= (tut-workings relaunched) (tutor-workings/body relaunched 0))))
+
+  (test "the pane shows the box the cursor is in — whichever box that is"
+    ;; the invariant, asserted against the model's own record
+    (let (m (tut-with-cascade (tut-page "Functions")
+              0 "fac")
+          boxes (count (tut-regions m)))
+      (assert= (map (fn (i)
+                      (let (after (tut-goto-box m i))
+                        (= (tut-workings after) (tutor-workings/body after i))))
+                 (range boxes))
+        (map (fn (_) true) (range boxes)))))
+
+  (test "…and it names the box, so a cascade is never mistaken for another box's"
+    ;; a box with no cascade of its own must say whose pane this is
+    (let (m (tut-with-cascade (tut-page "Functions")
+              0 "fac")
+          bodies (map (fn (i) (tutor-workings/body m i)) (range (count (tut-regions m))))
+          ;; every body is either a cascade (headed by the shared title) or names its box
+          ok (map (fn (i) (let (b (nth bodies i))
+                            (or (includes? b "every traced call")
+                              (includes? b (str "box " (inc i))))))
+               (range (count bodies))))
+      (assert= ok (map (fn (_) true) bodies))))
+
+  (test "moving to another box re-renders the pane WITHOUT re-evaluating anything"
+    ;; the cache is what makes following the cursor free: no sandbox round trip, so the
+    ;; pane keeps up with a motion
+    (let (m (tut-with-cascade (tut-page "Functions")
+              0 "fac")
+          before (get-in m [:tutor :next-id])
+          moved (tut-goto-box m 1))
+      (assert= (get-in moved [:tutor :next-id]) before)   ; nothing was sent
+      (is (not (nil? (tut-workings moved))))))
+
+  ;; `tutor--workings-body` is the whole vocabulary of the pane, so it is worth pinning
+  ;; directly — three cache states, three different things to say. No sandbox involved.
+  (test "the body says which of the three states a box is in"
+    (let (m (assoc-in (ed-init (make-buffer "")) [:tutor :workings]
+              {0 "The workings — every traced call and return:\n\nfac 3\n= 6"
+               1 :none}))
+      (is (includes? (tutor-workings/body m 0) "fac 3"))      ; has a cascade
+      (is (includes? (tutor-workings/body m 1) "box 2"))      ; ran, traced nothing
+      (is (includes? (tutor-workings/body m 1) "nothing traceable"))
+      (is (includes? (tutor-workings/body m 7) "box 8"))      ; never ran
+      (is (includes? (tutor-workings/body m 7) "has not run yet"))
+      ;; and in prose, where there is no box at all
+      (is (includes? (tutor-workings/body m nil) "put the cursor in"))))
+
+  (test "a lesson where nothing traces opens no pane at all"
+    ;; having something to show is what earns a split — a page of prose and motion
+    ;; practice must not halve itself
     (let (m (ed-tutor-launch (tut-model)))
       (assert= (ed-buffer-index-by-name m "*Workings*") nil)))
 
+  (test "a box traces what it defines and what it calls, so every box has workings"
+    ;; the lesson no longer has to name anything: the box's own source says what is
+    ;; interesting in it — the function it defines, and the ones it calls (the case that
+    ;; matters, where the function came from a box further up)
+    (let (names (tutor/tutor--trace-names {} "(defn double (x) (* x 2))\n(double 21)\n"))
+      (is (includes? names "double"))                  ; defined here
+      (refute (includes? names "defn"))))              ; syntax, not a function
+
+  (test "a box that only DEFINES is still traced — the call may come later"
+    ;; the definition is offered on its own account, not because the box also calls it:
+    ;; the next box's `(helper 2)` runs in the same session, and the trace is already on
+    (let (names (tutor/tutor--trace-names {} "(defn helper (x) (inc x))\n"))
+      (is (includes? names "helper"))))
+
+  (test "a call of a function defined in an EARLIER box is traced"
+    (let (names (tutor/tutor--trace-names {} "(triple 14)\n"))
+      (is (includes? names "triple"))))
+
+  (test "special forms are dropped, and the lesson's own :trace still rides along"
+    (let (names (tutor/tutor--trace-names {:trace ["from-lesson"]} "(if true (fac 3) nil)\n"))
+      (is (includes? names "from-lesson"))
+      (is (includes? names "fac"))
+      (refute (includes? names "if"))))
+
+  (test "a name is offered once, however often the box mentions it"
+    ;; the sandbox installs each trace once; a duplicate would be noise in the request
+    (let (names (tutor/tutor--trace-names {:trace ["fac"]} "(fac (fac 2))\n"))
+      (assert= (count (filter (fn (s) (= s "fac")) names)) 1)))
+
+  (test "the walk is structural: quoted data and let bindings offer names too"
+    ;; documented, not accidental — over-naming is free (the tracer skips what it cannot
+    ;; wrap) and resolving what is really a call would mean knowing the sandbox's globals
+    (is (includes? (tutor/tutor--trace-names {} "'(secret-fn 1)") "secret-fn"))
+    (is (includes? (tutor/tutor--trace-names {} "(let (helper 1) helper)") "helper"))
+    ;; …and a form with no heads at all offers nothing
+    (assert= (tutor/tutor--trace-names {} "[a b]") []))
+
+  (test "a box that does not parse yet offers nothing, and does not raise"
+    ;; mid-typing: `(fac ` has no verdict either, so there is nothing to trace
+    (assert= (tutor/tutor--trace-names {} "(fac ") []))
+
   (test "the workings lines nest calls and returns"
-    (assert= (tutor/tutor--workings-lines
+    (assert= (tutor-workings/lines
                (list {:kind "call" :fn "fac" :args "(2)"}
                  {:kind "call" :fn "fac" :args "(1)"}
                  {:kind "return" :fn "fac" :value "1"}
@@ -798,7 +959,7 @@
   (test "editing an EARLIER box re-evaluates the later ones too (they may depend on it)"
     ;; a two-box lesson where box 2 calls what box 1 defines: change the definition
     ;; and the dependent box's result must follow
-    (let (m (ed-tutor-launch (tutor/tutor--show (ed-init (make-buffer "")) (lesson-idx "Functions")))  ; Functions
+    (let (m (ed-tutor-launch (tut-page "Functions"))  ; Functions
           call-note (fn (mm) (:text (get (tut-notes mm) 1)))
           before (call-note m)
           m2 (ed-tutor-launch (set-box m 0 "  (defn double (x) (* 10 x))")))
@@ -943,7 +1104,7 @@
 
 (describe "type warnings"
   (defn broken-fn-model ()
-    (let (m (tutor/tutor--show (ed-init (make-buffer "")) (lesson-idx "Functions"))
+    (let (m (tut-page "Functions")
           r (first (tut-regions m)))
       (ed-tutor-launch
         (ed-edit m (fn (b)
@@ -1011,14 +1172,14 @@
     ;; the checker runs over the boxes joined in order — the same session the sandbox
     ;; builds — because checking each box alone reported `unbound symbol: double` on
     ;; box 2 of the Functions lesson, which is correct code
-    (let (m (ed-tutor-launch (tutor/tutor--show (ed-init (make-buffer "")) (lesson-idx "Functions"))))
+    (let (m (ed-tutor-launch (tut-page "Functions")))
       (is (empty? (keep (fn (kv) (:warn (second kv))) (tut-notes m))))
       (is (empty? (keep (fn (kv) (when (= (:kind (second kv)) :warn) kv)) (tut-notes m))))))
 
   (test "…but a typo in code that never RUNS is caught only by the checker"
     ;; this is the checker's unique value: the defn succeeds, so no runtime error can
     ;; exist yet, and without the advisory the mistake would stay invisible until called
-    (let (m (tutor/tutor--show (ed-init (make-buffer "")) (lesson-idx "Functions"))
+    (let (m (tut-page "Functions")
           r (first (tut-regions m))
           typo (ed-tutor-launch
                  (ed-edit m (fn (b)
@@ -1050,7 +1211,7 @@
         (is (not (includes? painted "⚠"))))))
 
   (test "…but it DOES speak on a line that succeeded (the latent bug)"
-    (let (m (tutor/tutor--show (ed-init (make-buffer "")) (lesson-idx "Functions"))
+    (let (m (tut-page "Functions")
           broken (box1-as m "  (defn dbl (x) (* 2 x \"d\"))")
           note (get (tut-notes broken) 0))
       (is (includes? (:text note) "=> dbl"))           ; the defn itself worked
@@ -1211,11 +1372,27 @@
                   (tutor/tutor-fontify text)))
       (assert= spans '()))))
 
-(describe "every exercise ships UNSOLVED"
-  ;; An exercise whose template already satisfies its own :expect greets the reader
-  ;; with a ✓ they did not earn, and the lesson teaches nothing. Checked in session
-  ;; order, because a box may depend on definitions from the boxes above it.
-  (test "no exercise template already passes its own check"
+(describe "every exercise ships UNSOLVED — and its shipped answer solves it"
+  :isolated
+  ;; An exercise whose template already satisfies its own :expect greets the reader with a
+  ;; ✓ they did not earn, and the lesson teaches nothing. Its `:answer` must do the
+  ;; opposite: an answer that does not solve the exercise leaves the reader unable to tell
+  ;; whether they misunderstood or the lesson is wrong.
+  ;;
+  ;; `:isolated`, and that is load-bearing rather than tidiness. These checks EVALUATE
+  ;; lesson code in this image, and some of that cannot be undone: lesson "One name, many
+  ;; shapes" asks the reader to `impl` an ability for their own record, and an ability impl
+  ;; lives in an image-global registry with no way to unregister it. So once the ANSWER has
+  ;; run, that lesson's template — `(area (Rect 6 7))`, deliberately shipped with no impl —
+  ;; starts passing on the leaked impl. That is why this suite was green in file order and
+  ;; failed on the SECOND iteration of `--repeat-until-failure` at every seed: the flake
+  ;; was real, and it was in the tests, not the tutorial. The isolated phase runs each unit
+  ;; against the clean post-load baseline and rolls back what it defines, which is exactly
+  ;; the "fresh session" a reader gets — and what this property is about.
+  ;;
+  ;; Both halves check in session order, because a box may depend on the boxes above it.
+  (test "no template passes on its own, and every answer does"
+    ;; every template, first — before any answer has been evaluated in this image
     (dotimes (i (count tutor-lessons))
       (let (m (ed-tutor-launch (tutor/tutor--show (ed-init (make-buffer "")) i))
             notes (or (results/eol-notes (tut-buf m)) {})
@@ -1226,7 +1403,24 @@
             ;; `:already-passes?` marks the deliberate read-and-see boxes — an
             ;; expectation that is already met because the POINT is to read why
             (when (and (:expect pg) (not (:already-passes? pg)))
-              (is (not= (:kind note) :pass)))))))))
+              (is (not= (:kind note) :pass)))))))
+    ;; …then every shipped answer, in the same order
+    (dotimes (i (count tutor-lessons))
+      (let (m (tutor/tutor--show (ed-init (make-buffer "")) i)
+            regions (tut-regions m)
+            pgs (tutor/tutor--playgrounds m))
+        (dotimes (r (count pgs))
+          (let (pg (nth pgs r {}))
+            (when (:answer pg)
+              (let (region (nth regions r nil)
+                    solved (ed-tutor-launch
+                             (ed-edit m (fn (b)
+                                          (insert (delete-region
+                                                    (assoc (goto-char b (:start region))
+                                                      :mark (:end region)))
+                                            (tutor/tutor--margined (:answer pg))))))
+                    note (get (or (results/eol-notes (tut-buf solved)) {}) r))
+                (assert= (:kind note) :pass)))))))))
 
 (describe "TAB never completes inside a prose box"
   (defn tab-at (lesson needle offset)
@@ -1409,7 +1603,31 @@
   (test "the footer names the hierarchy keys it actually has"
     (let (text (tutor-lesson-text (lesson-idx "Values") :emacs))
       (is (includes? text "C-c C-u up"))
-      (is (includes? text "C-c C-l back")))))
+      (is (includes? text "C-c C-l back"))))
+
+  (test "REGRESSION: every key the prose can name is a key that actually works"
+    ;; `tutor--own-key-specs` is only the *vocabulary* — the render asks the keymap
+    ;; where each command is bound. So a command listed there but never bound renders as
+    ;; a blank hole in the prose AND cannot be typed: exactly what happened when
+    ;; C-c C-w was added to the specs and not to `tutor-keymap`. One test for the class.
+    (let (unbound (filter
+                    (fn (kv) (empty? (editor/keymap/keymap-where-is
+                                       tutor/tutor-keymap (first (second kv)))))
+                    tutor/tutor--own-key-specs))
+      (assert= (into [] (map first unbound)) [])))
+
+  (test "the workings key names the command it runs"
+    ;; the concrete case of the rule above — and what the lesson's `{{workings}}` hole
+    ;; renders from
+    (assert= (editor/keymap/keymap-where-is tutor/tutor-keymap 'tutor/cmd-tutorial-workings)
+      '([:ctrl-c :ctrl-w])))
+
+  (test "…and the lesson that teaches the pane prints that key, not a hole"
+    ;; the end of the chain: prose names the COMMAND, the render asks the keymap, and the
+    ;; reader sees a key they can press
+    (let (text (tutor-lesson-text (lesson-idx "Watching it run") :emacs))
+      (is (includes? text "C-c C-w"))
+      (refute (includes? text "{{")))))
 
 (describe "every box runs in the REAL sandbox, not just in-image"
   ;; The headless test path evaluates boxes in THIS process, where every editor module
@@ -1476,7 +1694,7 @@
       (is (nil? (tutor/tutor--warning-line spans 999)))))
 
   (test "a placed warning still lands, so the guard did not silence everything"
-    (let (m (ed-tutor-launch (tutor/tutor--show (ed-init (make-buffer "")) (lesson-idx "Functions")))
+    (let (m (ed-tutor-launch (tut-page "Functions"))
           r (first (tut-regions m))
           broken (ed-tutor-launch
                    (ed-edit m (fn (b)
@@ -1486,31 +1704,105 @@
       (is (includes? (:warn note) "⚠")))))
 
 (describe "the *Workings* pane belongs to one box"
-  (test "REGRESSION: editing an untraced box stops showing the traced box's cascade"
+  (test "REGRESSION: working in one box never leaves another box's cascade on screen"
     ;; the pane is a view of ONE box's execution; it went on showing box 1's call tree
     ;; while you worked in box 2, with nothing to say the trace was not yours
-    ;; "Watching it run": box 1 is traced, box 2 (the exercise) is not — the shape the
-    ;; report came from
-    (let (m (ed-tutor-launch (tutor/tutor--show (ed-init (make-buffer "")) (lesson-idx "Watching it run")))
-          r2 (second (tut-regions m))
-          edited (ed-tutor-launch
-                   (ed-edit m (fn (b)
-                                (insert (delete-region
-                                          (assoc (goto-char b (:start r2)) :mark (:end r2)))
-                                  "  (+ 1 1)"))))
-          wi (ed-buffer-index-by-name edited "*Workings*")
-          wtext (when wi (buffer-text (ed-buf-at edited wi))))
-      (is (not (nil? wtext)))
-      (is (includes? wtext "not traced"))
-      (is (not (includes? wtext "sum-doubles [1 2 3]")))))
+    (let (m (tut-with-cascade (tut-page "Watching it run")
+              0 "sum-doubles")
+          wtext (tut-workings (tut-goto-box m 1)))
+      (is (not (nil? wtext)))                         ; the pane is open, showing box 2
+      (is (includes? wtext "box 2"))
+      (is (not (includes? wtext "sum-doubles")))))    ; …not box 1's cascade
 
-  (test "a launch that re-evaluates the traced box keeps its cascade"
-    ;; showing >= from means that box was just re-run, so the pane is current
-    (let (m (ed-tutor-launch (tutor/tutor--show (ed-init (make-buffer "")) (lesson-idx "Watching it run")))
-          wi (ed-buffer-index-by-name m "*Workings*"))
-      (is (includes? (buffer-text (ed-buf-at m wi)) "sum-doubles")))))
+  (test "the box you edited keeps its own cascade after the re-run"
+    ;; re-evaluating a box replaces its workings rather than dropping them: the pane is
+    ;; current for the box you are working in, which is the whole point of watching it
+    (let (m (tut-with-cascade (tut-page "Watching it run")
+              0 "sum-doubles")
+          after (tut-goto-box m 0))
+      (assert= (tut-workings after) (tutor-workings/body after 0))
+      (is (includes? (tut-workings after) "sum-doubles"))))
+
+  (test "closing the pane is respected — a motion does not force it back"
+    ;; …but C-c C-w does. A closed pane that reopened itself on the next keystroke would
+    ;; be unclosable
+    (let (m (tut-with-cascade (tut-page "Watching it run")
+              0 "sum-doubles")
+          killed (let (k (cmd-kill-buffer (ed-select m (ed-buffer-index-by-name m "*Workings*")) nil))
+                   (ed-select k (ed-buffer-index-by-name k "*Tutorial*")))
+          moved (tut-goto-box killed 1))                       ; a box with no cascade
+      (assert= (tut-workings moved) nil)
+      ;; and back on the box that HAS one, a motion still does not reopen it…
+      (assert= (tut-workings (tut-goto-box killed 0)) nil)
+      ;; …only the command does
+      (is (not (nil? (tut-workings (tutor/cmd-tutorial-workings (tut-goto-box killed 0) nil)))))))
+
+  (test "REGRESSION: a reply after closing the pane does not drag it back either"
+    ;; the pane opens on a reply for the box you are in — but not once you have closed it,
+    ;; or C-x 0 would be undone by the next thing you type
+    (let (m (tut-with-cascade (tut-page "Watching it run")
+              0 "sum-doubles")
+          killed (let (k (cmd-kill-buffer (ed-select m (ed-buffer-index-by-name m "*Workings*")) nil))
+                   (ed-select k (ed-buffer-index-by-name k "*Tutorial*")))
+          ;; a fresh reply for the box at point — exactly what opened it the first time
+          replied (tut-with-cascade (tut-goto-box killed 0) 0 "sum-doubles"))
+      (assert= (tut-workings replied) nil)
+      ;; the cascade is still cached, so C-c C-w brings back the current thing
+      (is (not (nil? (tutor-workings/cascade replied 0))))))
+
+  (test "killing the tutorial takes its *Workings* pane with it"
+    ;; the pane is a view of the tutorial's boxes and says nothing without them, so leaving
+    ;; it behind left a corpse on screen. The tutor's `:on-close` hook NAMES it
+    ;; (`layers/request-close`) and `cmd-kill-buffer` performs the close — a hook is handed
+    ;; only its own buffer, and it is the editor that knows the buffer pool.
+    (let (m (tut-with-cascade (tut-page "Watching it run")
+              0 "sum-doubles")
+          _ (is (not (nil? (ed-buffer-index-by-name m "*Workings*"))))     ; both are open
+          killed (cmd-kill-buffer (ed-select m (ed-buffer-index-by-name m "*Tutorial*")) nil))
+      (assert= (ed-buffer-index-by-name killed "*Tutorial*") nil)
+      (assert= (ed-buffer-index-by-name killed "*Workings*") nil)
+      ;; …and the pool is still usable: something editable is selected
+      (is (not (nil? (ed-current-buf killed))))
+      ;; REGRESSION: the echo names what you killed. Each companion kill echoes its own
+      ;; name as it goes, and the last one used to win — so killing *Tutorial* reported
+      ;; "killed *Workings*", a buffer the reader never mentioned.
+      (is (includes? (:echo killed) "killed *Tutorial*"))
+      (is (includes? (:echo killed) "*Workings*"))))         ; …and says what went with it
+
+  (test "killing the *Workings* pane leaves the tutorial alone"
+    ;; the relationship is one-way: the pane owns nothing
+    (let (m (tut-with-cascade (tut-page "Watching it run")
+              0 "sum-doubles")
+          killed (cmd-kill-buffer (ed-select m (ed-buffer-index-by-name m "*Workings*")) nil))
+      (assert= (ed-buffer-index-by-name killed "*Workings*") nil)
+      (is (not (nil? (ed-buffer-index-by-name killed "*Tutorial*"))))))
+
+  (test "REGRESSION: a new lesson never shows the previous lesson's cascade"
+    ;; the cache is keyed by box index WITHIN the page, so box 1 of the lesson you left is
+    ;; not box 1 of this one. It used to survive the page change, and a motion landed on it
+    ;; before the new page's own replies did.
+    (let (m (tut-with-cascade (tut-page "Watching it run")
+              0 "sum-doubles")
+          ;; rendering another page must drop the cache, BEFORE any launch refills it
+          next-page (tutor/tutor--show m (lesson-idx "Moving by structure")))
+      (assert= (get-in next-page [:tutor :workings]) {})
+      (assert= (get-in next-page [:tutor :workings-region]) nil)
+      ;; The pane itself is an ordinary buffer and survives the page change — that is
+      ;; fine, and better than flickering shut. What must not survive is its CONTENT: a
+      ;; motion on the new page shows the new box's state, not the old box's call tree.
+      (let (wtext (tut-workings (tut-goto-box next-page 0)))
+        (is (includes? wtext "has not run yet"))
+        (is (not (includes? wtext "sum-doubles")))))))
 
 (describe "progress survives the session"
+  :isolated
+  ;; `:isolated` because one test here REGISTERS `:editor` (to prove the persistence gate no
+  ;; longer cares about it). That name is process-global and ten editor modules read it as
+  ;; "there is a live editor" — including the tutorial's own eval-path choice — so while it is
+  ;; registered, a tutor test running in PARALLEL would take the live/async path and find no
+  ;; verdicts. The registry releases the name when the registrant dies, so the window is
+  ;; exactly the overlap; the isolated phase removes the overlap. Four other suites that
+  ;; register `:editor` already follow this rule.
   (test "the file lives beside init.blsp and is data, not code"
     (is (includes? (tutor/tutor--progress-file) "brood-edit"))
     (is (ends-with? (tutor/tutor--progress-file) "tutor-progress.blsp")))
@@ -1525,14 +1817,76 @@
       (assert= back (into #{} solved))
       (delete-file path)))
 
-  (test "REGRESSION: headless runs neither read nor write the user's config"
-    ;; the first cut of this read AND wrote ~/.config/brood-edit/tutor-progress.blsp
-    ;; from the test suite, so runs contaminated each other and the developer's own
-    ;; record of what they had solved
-    (assert= (tutor/tutor--load-progress) #{})
-    (let (m (tutor/tutor--save-progress {:tutor {:passed #{[1 1]}}}))
-      (assert= (get-in m [:tutor :passed]) #{[1 1]})       ; returns the model untouched
-      (is (not (file-exists? (tutor/tutor--progress-file))))))
+  ;; These drive the REAL read/write against a temp path. The previous version asserted
+  ;; `(not (file-exists? (tutor--progress-file)))` — a claim about the developer's own home
+  ;; directory, which is false the moment they use the tutorial, and which sent a whole
+  ;; debugging session chasing a "mystery write" that was just their own saved progress.
+  (test "REGRESSION: a test model neither reads nor writes progress"
+    (let (path (temp-path "tutor-progress-guard-")
+          m (ed-init (make-buffer ""))
+          saved (tutor/tutor--save-progress (assoc-in m [:tutor :passed] #{[1 1]}) path))
+      (refute (tutor/tutor--persist? m))
+      (assert= (get-in saved [:tutor :passed]) #{[1 1]})     ; returns the model untouched
+      (is (not (file-exists? path)))                         ; …and wrote nothing
+      (assert= (tutor/tutor--load-progress m path) #{})))    ; …and reads nothing
+
+  (test "REGRESSION: a REGISTERED :editor does not make a test model persist"
+    ;; the gate used to be `(whereis :editor)` — process-global, and a full `nest test`
+    ;; run is ONE image: the first suite to register `:editor` for its own reasons left it
+    ;; registered, and from then on every tutor test that solved an answer rewrote the
+    ;; developer's real progress file with the suite's solves. The gate is a MODEL flag
+    ;; now (`:recent-files`, as recentf/bookmarks use), which a test model cannot have.
+    (let (path (temp-path "tutor-progress-registered-")
+          _ (register :editor (self))
+          m (ed-init (make-buffer "")))
+      (refute (tutor/tutor--persist? m))
+      (tutor/tutor--save-progress (assoc-in m [:tutor :passed] #{[1 1]}) path)
+      (is (not (file-exists? path)))))
+
+  (test "an existing map-format file still reads — no migration on the shared layer"
+    ;; the format did not change when the write moved onto `projects/persist-write!`, so a
+    ;; reader's existing progress keeps working. Worth pinning: losing it silently would be
+    ;; indistinguishable from "you never solved anything".
+    (let (path (temp-path "tutor-progress-legacy-")
+          _ (spit path (str ";; brood-edit — tutorial progress. Data, not code: safe to delete.\n"
+                         "{:passed [[6 1] [2 1]]}\n"))
+          m (assoc (ed-init (make-buffer "")) :recent-files true))
+      (assert= (tutor/tutor--load-progress m path) #{[6 1] [2 1]})
+      (delete-file path)))
+
+  (test "the write is ATOMIC, and keeps the header a person reads"
+    ;; a plain `spit` can leave a truncated file if the editor dies mid-write; the next read
+    ;; would take that as "nothing solved" and then overwrite it
+    (let (path (temp-path "tutor-progress-atomic-")
+          m (assoc (ed-init (make-buffer "")) :recent-files true)
+          _ (tutor/tutor--save-progress (assoc-in m [:tutor :passed] #{[1 1]}) path)
+          text (slurp path))
+      (is (includes? text ";; brood-edit"))              ; says what it is, and that it is safe to delete
+      (is (not (file-exists? (str path ".tmp"))))        ; the temp file was renamed away
+      (assert= (tutor/tutor--load-progress m path) #{[1 1]})
+      (delete-file path)))
+
+  (test "a TRUNCATED progress file reads as nothing solved instead of throwing"
+    ;; progress is a nicety: a half-written file must never stop the tutorial opening
+    (let (path (temp-path "tutor-progress-corrupt-")
+          _ (spit path "{:passed [[1 ")
+          m (assoc (ed-init (make-buffer "")) :recent-files true))
+      (assert= (tutor/tutor--load-progress m path) #{})
+      (delete-file path)))
+
+  (test "the live editor's model DOES persist, and round-trips"
+    ;; the other half: the gate must not be so tight that nothing ever saves — this is the
+    ;; between-sessions promise, in one assertion
+    (let (path (temp-path "tutor-progress-live-")
+          m (assoc (ed-init (make-buffer "")) :recent-files true)   ; the flag `main` sets
+          _ (tutor/tutor--save-progress (assoc-in m [:tutor :passed] #{[3 1] [0 1]}) path))
+      (is (tutor/tutor--persist? m))
+      (is (file-exists? path))
+      (assert= (tutor/tutor--load-progress m path) #{[3 1] [0 1]})
+      ;; a FRESH model (a new session) reads the same set back
+      (assert= (tutor/tutor--load-progress (assoc (ed-init (make-buffer "")) :recent-files true) path)
+        #{[3 1] [0 1]})
+      (delete-file path)))
 
   (test "opening the tutorial keeps progress already made this session"
     ;; reopening mid-session must not forget the exercise you solved five minutes ago
@@ -1540,27 +1894,10 @@
           opened (tutor/cmd-tutorial m nil))
       (is (includes? (get-in opened [:tutor :passed]) [2 0])))))
 
-(describe "C-c C-a writes a worked answer that actually works"
-  (test "every shipped :answer satisfies its own :expect"
-    ;; an answer that does not solve the exercise is worse than no answer: the reader
-    ;; has no way left to tell whether they misunderstood or the lesson is wrong
-    (dotimes (i (count tutor-lessons))
-      (let (m (tutor/tutor--show (ed-init (make-buffer "")) i)
-            regions (tut-regions m)
-            pgs (tutor/tutor--playgrounds m))
-        (dotimes (r (count pgs))
-          (let (pg (nth pgs r {}))
-            (when (:answer pg)
-              (let (region (nth regions r nil)
-                    solved (ed-tutor-launch
-                             (ed-edit m (fn (b)
-                                          (insert (delete-region
-                                                    (assoc (goto-char b (:start region))
-                                                      :mark (:end region)))
-                                            (tutor/tutor--margined (:answer pg))))))
-                    note (get (or (results/eol-notes (tut-buf solved)) {}) r))
-                (assert= (:kind note) :pass))))))))
-
+(describe "C-c C-a writes a worked answer"
+  ;; the COMMAND's behaviour. That every shipped `:answer` actually satisfies its
+  ;; expectation is checked with the templates, in one order-independent test — see
+  ;; "every exercise ships UNSOLVED — and its shipped answer solves it".
   (test "the command replaces the box, so the answer evaluates like your own attempt"
     (let (m (tutor/tutor--show (ed-init (make-buffer "")) (lesson-idx "Your own shapes"))
           r (second (tut-regions m))

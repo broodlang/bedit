@@ -31,6 +31,8 @@ away. Headless (tests, no `:editor` process) the eval falls back to std's
   (:use sandbox))  ; the eval sandbox client + its event records
 
 
+(require 'tutor-workings)  ; the *Workings* pane: its cache, its body text, its open/close
+(require 'projects)  ; persist-read-value / persist-write! — the editor's own state files
 (require 'sexp)  ; top-level-forms — note anchoring
 (require 'eval-server)  ; eval-capturing — the headless/sync fallback
 (require 'modes)  ; fontify-line-faces (report-buffer line roles) + the brood indenter
@@ -101,7 +103,10 @@ away. Headless (tests, no `:editor` process) the eval falls back to std's
    :up ['tutor/cmd-tutorial-up "C-c C-u"]
    :last-page ['tutor/cmd-tutorial-last "C-c C-l"]
    :contents ['tutor/cmd-tutorial-contents "C-c C-t"]
-   :answer-key ['tutor/cmd-tutorial-show-answer "C-c C-a"]})
+   :answer-key ['tutor/cmd-tutorial-show-answer "C-c C-a"]
+   ;; the workings pane follows the cursor on its own; this is how you get it back
+   ;; after closing it (and how to open it on a box that has not run yet)
+   :workings ['tutor/cmd-tutorial-workings "C-c C-w"]})
 
 (defn tutor--prose (profile)
   ;; the editorially-different half: shapes, not keys
@@ -364,7 +369,16 @@ newline-and-indent, and the guard offered to send you to a box the page does not
         m2 (tutor--bufset m1 {:tutor-skeleton (tutor-skeleton text)
                               :tutor-contents? contents?
                               :tutor-profile (:profile m :emacs)}))
-    (update m2 :tutor merge tutor-fields)))
+    ;; The workings cache is keyed by box index WITHIN THE PAGE, so it cannot outlive the
+    ;; page: box 2 of the lesson you just left is not box 2 of this one. Cleared here, in
+    ;; the one place every render passes through — the next idle launch would clear it
+    ;; too, but a keystroke lands first (M-n straight after C-c C-n), and showing the
+    ;; previous lesson's call tree for this box is the exact confusion the pane exists to
+    ;; avoid. The pane's visibility goes with it (`tutor-workings/*unshown*`, defined with
+    ;; the rest of the pane's state below), so it is free to open once on the new page and a
+    ;; pane the reader closed there stays closed.
+    (update m2 :tutor merge
+      (merge (assoc tutor-workings/*unshown* :workings {}) tutor-fields))))
 
 (defn tutor--show-contents (m &optional (banner ""))
   "Render the contents hub into *Tutorial* (`banner` is an optional one-line note,
@@ -411,6 +425,14 @@ compares against (`formbuf/skeleton`)."
 (defn tutor--region-at (regions pos)
   "The box whose content span contains `pos` (boundaries inclusive), or nil."
   (editor/formbuf/region-at regions pos))
+
+(defn tutor--box-at-point (m)
+  "The index of the box the cursor is in, or nil (prose, or another buffer). The tutorial owns
+the box parser, so it answers this and hands the index to `tutor-workings` — that is the
+boundary that keeps the pane module from needing anything back."
+  (let (b (ed-current-buf m))
+    (when (tutor-buffer? b)
+      (editor/formbuf/region-index (tutor-regions (buffer-text b)) (buffer-point b)))))
 
 (defn tutor--line-of (text pos)
   ;; 0-based line of char offset `pos` (clamped) — newlines before it.
@@ -581,74 +603,53 @@ titles, code templates and hints all speak the user's keys."
   (tutor--rendered-playgrounds (nth tutor-lessons (get-in m [:tutor :lesson] 0))
     (tutor--keyset (:profile m :emacs))))
 
-;; ---- the workings pane: a traced box's call/return cascade ---------------------
-;; A reply whose request carried `:trace` comes back with `:spy` entries; they
-;; render as an indented call tree in *Workings*, shown ASIDE (`ed-show-named-aside`
-;; splits/reuses another pane, never replacing the tutorial's own) and refreshed on
-;; every re-eval — the "show me how it actually ran" channel.
+;; ---- which names a box traces ---------------------------------------------------
+;; The pane shows the workings of the box you are IN, so every box has to be traced,
+;; not just the ones a lesson thought to name. The list is derived from the box's own
+;; source: what it DEFINES (`(defn double …)`) and what it CALLS (`(double 21)` — the
+;; interesting case, where the function came from a box further up). A lesson's own
+;; `:trace` still rides along, for a name the source never mentions.
+;;
+;; Over-naming is free and deliberate: the sandbox installs each trace inside a `try`
+;; and skips whatever it cannot wrap (`eval-server--try-traces`) — a builtin, a macro,
+;; a reserved prelude name (ADR-166), a name that isn't defined yet. So the rule is
+;; "offer everything plausible and let the tracer choose", not "predict what is
+;; traceable" — the editor would only ever be guessing at the sandbox's global table.
 
-(def *tutor-workings-name* "*Workings*")
+(defn tutor--call-heads (form)
+  "Every symbol used as a call head anywhere in `form`, outermost first.
 
-(defn tutor--strip-parens (s)
-  ;; "(5)" -> "5" — an args list reads better without its wrapping parens
-  (if (and (string? s) (starts-with? s "(") (ends-with? s ")"))
-    (substring s 1 (dec (string-length s)))
-    (or s "")))
+Structurally, not semantically: a `let`'s binding list and a QUOTED form contribute their
+heads too (`'(secret-fn 1)` offers `secret-fn`), because this walks shape and does not
+evaluate. Harmless by design — the tracer skips a name it cannot wrap, and a name that IS
+a live function is one the box mentions, so tracing it tells the reader something true.
+Not worth a resolver here: only the sandbox knows its own global table."
+  (if (not (pair? form))
+    '()
+    (let (head (first form)
+          inner (fold (fn (acc f) (append acc (tutor--call-heads f))) '() (rest form)))
+      (if (symbol? head) (cons head inner) inner))))
 
-(defn tutor--workings-lines (entries)
-  "Spy entries → indented lines: a `call` opens a level (`fac 3`), its `return`
-closes it (`= 6`); anything else renders flat."
-  (let (r (fold (fn (acc e)
-                  (let ([depth lines] acc
-                        kind (:kind e))
-                    (cond
-                      (= kind "call")
-                      [(inc depth)
-                       (cons (str (string-repeat "  " depth) (:fn e) " "
-                               (tutor--strip-parens (:args e)))
-                         lines)]
-                      (= kind "return")
-                      (let (d (max 0 (dec depth)))
-                        [d (cons (str (string-repeat "  " d) "= " (:value e)) lines)])
-                      else [depth (cons (str (:form e) " => " (:value e)) lines)])))
-            [0 '()]
-            entries))
-    (reverse (second r))))
+(defn tutor--defined-names (form)
+  "The name a top-level definition binds — `(defn f …)` / `(def f …)` → `f`, else nil.
+A box's own function is the one thing it is guaranteed to be worth tracing."
+  (when (and (pair? form)
+          (member? (first form) ['def 'defn 'defmacro 'defdyn])
+          (symbol? (second form)))
+    (second form)))
 
-(defn tutor--workings-text (reply)
-  (join "\n"
-    (append (list (str "The workings — every traced call and return, innermost nested:") "")
-      (tutor--workings-lines (or (:spy reply) ())))))
-
-(defn tutor--show-workings (m region-idx reply)
-  "Put a traced reply's call cascade in *Workings*, remembering WHICH box it belongs
-to. Shown aside, so the tutorial's own pane is never replaced."
-  (if (empty? (or (:spy reply) ()))
-    m
-    (assoc-in (ed-show-named-aside m tutor/*tutor-workings-name*
-                (tutor--workings-text reply) :tutor-workings)
-      [:tutor :workings-region] region-idx)))
-
-(defn tutor--clear-stale-workings (m from)
-  "Blank *Workings* when the box you just edited is not the one the pane is showing
-and produced no trace of its own.
-
-The pane is a view of ONE box's execution. Editing an untraced box used to leave the
-previous box's cascade on screen, so you sat in box 2 reading a call tree from box 1
-with nothing to say it was not yours. A trace of code you are not looking at is worse
-than an empty pane. Untouched when the pane already belongs to the box you are in."
-  ;; `showing < from` is exactly the stale case: boxes from `from` down were just
-  ;; re-evaluated, so a pane belonging to any of them is current, while one belonging
-  ;; to a box ABOVE the edit was left over from an earlier round.
-  (let (showing (get-in m [:tutor :workings-region]))
-    (if (or (nil? from) (nil? showing) (>= showing from)
-          (nil? (ed-buffer-index-by-name m tutor/*tutor-workings-name*)))
-      m
-      (assoc-in (ed-show-named-aside m tutor/*tutor-workings-name*
-                  (str "The workings — box " (inc from) " is not traced, so there is"
-                    "\nnothing to show for the edit you just made.")
-                  :tutor-workings)
-        [:tutor :workings-region] from))))
+(defn tutor--trace-names (pg src)
+  "The fn-name strings to boundary-trace for one box: what `src` defines, what it
+calls, and the lesson's explicit `:trace` — deduped, special forms dropped (they are
+syntax, never functions). `src` that doesn't parse contributes nothing; the box is
+mid-typing and has no verdict yet either."
+  (let (forms (try (read-all src) (catch _ '()))
+        defined (filter (fn (s) (not (nil? s))) (map tutor--defined-names forms))
+        called (fold (fn (acc f) (append acc (tutor--call-heads f))) '() forms)
+        specials (special-forms)
+        names (filter (fn (s) (not (member? s specials)))
+                (map name (append defined called))))
+    (into [] (distinct (append (into [] (or (:trace pg) [])) names)))))
 
 (defn tutor--progress-file ()
   "Where solved exercises are remembered between sessions:
@@ -659,37 +660,55 @@ they worked through, small, and worth surviving a reinstall. It is DATA — a pr
 map — never eval'd, exactly as `init.blsp` is read rather than executed."
   (path-join (config/config-dir) "tutor-progress.blsp"))
 
-(defn tutor--load-progress ()
+(defn tutor--persist? (m)
+  "Whether this model may touch the reader's progress file on disk: the `:recent-files`
+flag, which only `main` sets — the same gate recentf, bookmarks and the project cache use.
+
+NOT `tutor--live?` (a `:editor` process exists). That is a PROCESS-global fact, and a
+full `nest test` run is one image: the first suite that registers `:editor` for its own
+reasons (sandbox, gitdiff, web-logging tests all do) leaves it registered, and from then
+on every tutor test that evaluates a passing answer wrote into
+`~/.config/brood-edit/tutor-progress.blsp` — silently rewriting the developer's real
+record with whatever the suite had just solved. A MODEL flag cannot leak that way: a test
+model comes from `ed-init` and simply doesn't have it."
+  (:recent-files m))
+
+(defn tutor--load-progress (m &optional (file (tutor--progress-file)))
   "The saved `:passed` set, or an empty one. Any failure — no file, unreadable,
 corrupt — is an empty set: progress is a nicety and must never stop the tutorial
 opening.
 
-Headless (no `:editor` process — tests, batch) it reads nothing, the same rule the
-sandbox follows. A test must not inherit a developer's real progress, and the first
-version of this did exactly that: the suite read and WROTE
-~/.config/brood-edit/tutor-progress.blsp, so runs contaminated each other and the
-user's own record."
-  (if (not (tutor--live?))
+Reads nothing unless `m` is the live editor's model (`tutor--persist?`): a test must
+never inherit a developer's real progress, and the first version of this did exactly
+that. `file` is a parameter for the same reason `config`'s read/ensure take one — so a
+test drives the real code against a temp path instead of asserting things about the
+developer's home directory (an assertion that is false the moment they use the tutorial)."
+  (if (not (tutor--persist? m))
     #{}
-    (or (try
-        (let (text (slurp (tutor--progress-file))
-              data (first (read-all text)))
-          (when (map? data) (into #{} (or (:passed data) []))))
-          (catch _ nil))
-      #{})))
+    ;; `projects/persist-read-value` is the editor's one reader for its own state files:
+    ;; never throws, `default` on anything unreadable, and the counterpart of the ATOMIC
+    ;; write below. Rolling its own `slurp` + `read-all` here was the same code minus the
+    ;; care.
+    (let (data (projects/persist-read-value file {}))
+      (if (map? data) (into #{} (or (:passed data) [])) #{}))))
 
-(defn tutor--save-progress (m)
+(defn tutor--save-progress (m &optional (file (tutor--progress-file)))
   "Write the session's solved set out, best-effort. Returns `m` untouched — saving is a
 side effect of making progress, never something that can fail the command that caused
-it, so a read-only home directory costs you persistence and nothing else."
+it, so a read-only home directory costs you persistence and nothing else.
+
+Writes only for the live editor's model (`tutor--persist?`) — see there for why the
+gate is a model flag and not the `:editor` process. `file` is a parameter so a test can
+drive the real write against a temp path (the `config` idiom)."
   (do
-    (try
-      (when (tutor--live?)
-        (make-dir (config/config-dir))
-        (spit (tutor--progress-file)
-          (str ";; brood-edit — tutorial progress. Data, not code: safe to delete.\n"
-            (pr-str {:passed (into [] (or (get-in m [:tutor :passed]) #{}))}) "\n")))
-      (catch _ nil))
+    (when (tutor--persist? m)
+      ;; ATOMIC, via the shared layer (`projects/persist-write!`): a plain `spit` can leave a
+      ;; truncated file if the editor dies mid-write, and the next read would take that as
+      ;; "nothing solved" and then overwrite it. Progress is small and cheap to write; losing
+      ;; it to a crash is not cheap for the reader who earned it.
+      (projects/persist-write! file
+        {:passed (into [] (or (get-in m [:tutor :passed]) #{}))}
+        "brood-edit — tutorial progress. Data, not code: safe to delete."))
     m))
 
 (defn tutor--remember-pass (m region-idx pg note)
@@ -706,9 +725,8 @@ it, so a read-only home directory costs you persistence and nothing else."
   ;; a completed evaluation lands three places: the box's note, the session's
   ;; passed-set (contents progress), and — when traced — the workings pane
   (let (note (tutor--verdict pg reply))
-    (tutor--show-workings
-      (tutor--remember-pass (tutor--set-note m region-idx note) region-idx pg note)
-      region-idx reply)))
+    (let (m1 (tutor--remember-pass (tutor--set-note m region-idx note) region-idx pg note))
+      (tutor-workings/show m1 region-idx (tutor--box-at-point m1) reply))))
 
 (defn tutor--region-srcs (text regions)
   "`{region-idx -> source}` for `regions` — what each box currently holds."
@@ -887,8 +905,14 @@ Reading order is dependency order here, which is what a tutorial should teach."
             srcs (tutor--region-srcs text regions)
             from (tutor--first-changed srcs old-srcs (count regions))
             start-id (get-in m [:tutor :next-id] 1)
-            m0 (tutor--bufset-buf (tutor--bufset m {:tutor-eval-rope rope})
-                 (fn (bb) (editor/buffer/annotate bb :eol-notes {})))
+            ;; Drop the cached workings of every box being re-sent BEFORE anything is
+            ;; evaluated: their old cascades describe code that no longer exists, and a
+            ;; headless (synchronous) launch applies its verdicts inside the fold below —
+            ;; forgetting afterwards would erase the very entries it just produced.
+            m0 (tutor-workings/forget
+                 (tutor--bufset-buf (tutor--bufset m {:tutor-eval-rope rope})
+                   (fn (bb) (editor/buffer/annotate bb :eol-notes {})))
+                 from)
             ;; nothing in any box changed (an edit the guard reverted, whitespace the
             ;; parser ignores): re-anchor every note and send nothing
             result (if (nil? from)
@@ -942,15 +966,29 @@ Reading order is dependency order here, which is what a tutorial should teach."
                              (:ok
                                (if live
                                  (do
-                                   (sandbox-eval next-id src tutor/*tutor-eval-timeout-ms* (:trace pg))
+                                   (sandbox-eval next-id src tutor/*tutor-eval-timeout-ms*
+                                     (tutor--trace-names pg src))
                                    ;; show it as in flight straight away: with a
                                    ;; `receive` in the box a reply can be hundreds of
                                    ;; ms away, and a stale verdict sitting there
                                    ;; looking current is the wrong thing to show
                                    [(tutor--set-note m1 i {:kind :running :text "⋯ evaluating…"})
                                     (inc next-id) (assoc pending next-id {:region i :rope rope})])
+                                 ;; HEADLESS (tests, batch): the eval runs IN THIS IMAGE, and
+                                 ;; it installs NO traces — not the derived list, not even
+                                 ;; the lesson's own `:trace`. Instrumentation rebinds
+                                 ;; globals, and here the globals are the running editor's,
+                                 ;; shared by every test process in the run: a `trace-fn`
+                                 ;; here shows up as `[reload] arity changed` churn, and two
+                                 ;; tests evaluating the same lesson concurrently are the
+                                 ;; "concurrent writers" case wholesale global rebinding is
+                                 ;; documented not to survive (ADR-017). Tracing belongs to
+                                 ;; the sandbox, a throwaway image built for it. So the
+                                 ;; headless path yields verdicts (values, ✓/✗) but no
+                                 ;; cascade — the pane's own behaviour is tested from
+                                 ;; synthetic replies, and end to end by the pty drive.
                                  [(tutor--apply-verdict m1 i pg
-                                    (eval-server/eval-capturing src (:trace pg)))
+                                    (eval-server/eval-capturing src nil))
                                   next-id pending])))))
                        ;; Seed with the in-flight entries of the boxes we are NOT
                        ;; re-sending (those above the edit): their replies are still
@@ -968,10 +1006,23 @@ Reading order is dependency order here, which is what a tutorial should teach."
                                 old-srcs
                                 (fold (fn (acc i) (assoc acc i (get srcs i)))
                                   old-srcs (range from (count regions))))}))
-        (tutor--clear-stale-workings
-          (tutor--with-warnings
-            (update m3 :tutor merge {:next-id next-id :pending pending}))
-          from)))))
+        ;; Re-render the pane for the box at point (the stale cascades of the re-sent
+        ;; boxes are already gone — see `m0`), so it says `⋯ has not run yet` until the
+        ;; reply lands rather than showing the version you just edited away.
+        ;;
+        ;; A lesson where ANY box has workings gets the pane opened, even when the box
+        ;; you happen to be in has none: on a lesson built around watching code run, the
+        ;; pane has to be there to be noticed. It still shows the box at point — the
+        ;; reader moves and it follows — rather than whichever box traced last.
+        ;;
+        ;; Only ONCE per page, though: `:workings-region` unset means the pane has not
+        ;; been shown on this page yet (`tutor--install-page` clears it), so a pane the
+        ;; reader closed is not dragged back by the next thing they type. C-c C-w is the
+        ;; way back after that, which is the point of having the command.
+        (let (m4 (tutor--with-warnings
+                   (update m3 :tutor merge {:next-id next-id :pending pending})))
+          (tutor-workings/refresh m4 (tutor--box-at-point m4)
+            (and (nil? (get-in m4 [:tutor :workings-region])) (tutor-workings/on-page? m4))))))))
 
 (defn tutor-apply-reply (m reply)
   "Fold one sandbox reply into the model: unknown id or a rope that moved since
@@ -1050,11 +1101,18 @@ re-renders for the new keys instead of being compared against the old skeleton."
     (cond
       (not (tutor-buffer? b)) m
       (not= (:tutor-profile b) (:profile m :emacs)) (tutor--rerender-for-profile m)
-      else (editor/formbuf/guard-veto m-before m
-             (fn (mm) (buffer-text (ed-current-buf mm)))
-             (fn (mm) (:tutor-skeleton (ed-current-buf mm)))
-             (fn (mm) (message mm "read-only prose — edit inside a ╭─ box (M-n jumps to one)"))
-             tutor/tutor-regions))))
+      else (tutor--follow-workings
+             (editor/formbuf/guard-veto m-before m
+               (fn (mm) (buffer-text (ed-current-buf mm)))
+               (fn (mm) (:tutor-skeleton (ed-current-buf mm)))
+               (fn (mm) (message mm "read-only prose — edit inside a ╭─ box (M-n jumps to one)"))
+               tutor/tutor-regions)))))
+
+(defn tutor--follow-workings (m)
+  "The `:post-key` half of the pane: answer which box the cursor is in and let
+`tutor-workings/follow` decide what the pane should do about it. One region lookup on the
+hot path; the pane only touches the buffer when the box actually changed."
+  (tutor-workings/follow m (tutor--box-at-point m)))
 
 ;; ---- rendering a lesson into the pool -------------------------------------------
 
@@ -1150,7 +1208,7 @@ pick). The eval sandbox starts spawning here, so its boot hides behind reading."
       ;; you did last time. Merged with whatever this session already holds rather
       ;; than replacing it: reopening the tutorial mid-session must not forget the
       ;; exercise you solved five minutes ago.
-      (let (saved (tutor--load-progress)
+      (let (saved (tutor--load-progress m)
             ;; assoc-in, not update: on the very first open there is no `:tutor` map
             ;; yet, and `update` on a missing key hands `assoc` a nil
             m1 (assoc-in m [:tutor :passed]
@@ -1335,6 +1393,27 @@ mid-exercise: the edit lands in the very text their answer is checked against."
       (= (:kind region) :text) (ed-edit m (fn (bb) (ed-reindent-line bb (tutor-indent (buffer-text bb) (buffer-point (beginning-of-line bb))))))
       else (cmd-indent-or-complete m key))))
 
+(defcommand cmd-tutorial-workings (m key)
+  "Bring back the *Workings* pane for the box at point (C-c C-w).
+
+The pane is an ordinary buffer in an ordinary pane, so `C-x 0` closes it like any
+other — and then nothing else reopens it, because a closed pane is a choice the
+following keystroke must not undo. This is the way back. It is also how to open it
+the first time on a box you have not typed in yet: the pane says what it is waiting
+for instead of appearing only once a reply has landed."
+  (if (not (tutor-buffer? (ed-current-buf m)))
+    (message m "the workings pane belongs to the tutorial (C-h t opens it)")
+    ;; Clearing the latch is the whole job of this command: asking for the pane back is
+    ;; the one thing that outranks having closed it. `:workings-region` goes too, or the
+    ;; "was shown on this page and is gone now" inference in `tutor-workings/refresh`
+    ;; would re-latch on the spot and the command could never win.
+    (message (let (m1 (update m :tutor merge tutor-workings/*unshown*))
+               (tutor-workings/refresh m1 (tutor--box-at-point m1) true))
+      (let (i (tutor--box-at-point m))
+        (if (nil? i)
+          "the workings follow the box your cursor is in — M-n jumps to one"
+          (str "the workings of box " (inc i)))))))
+
 (defcommand cmd-tutorial-show-answer (m key)
   "Write the idiomatic solution into the box at point (C-c C-a), for the exercises
 where knowing the answer is not the same as knowing how it is usually written.
@@ -1387,9 +1466,15 @@ anew, not reset (reset on a dead worker was a silent no-op)."
 
 (defn tutor-on-close (buf)
   "The tutor layer's `:on-close` hook (fired by `commands/cmd-kill-buffer` via
-`close-context`): the tutorial buffer is going away — shut the sandbox worker and
-its child runtime down with it. Reopening the tutorial spawns a fresh pair."
-  (do (sandbox-shutdown) buf))
+`close-context`): the tutorial buffer is going away — shut the sandbox worker and its child
+runtime down with it, and ask for the *Workings* pane to go too. Reopening the tutorial
+spawns a fresh pair.
+
+The pane is a view of the tutorial's boxes and says nothing without them, so leaving it
+behind was leaving a corpse on screen. `request-close` NAMES it rather than closing it: a
+hook is handed only its own buffer, and it is the app that knows the buffer pool."
+  (do (sandbox-shutdown)
+    (editor/layers/request-close buf tutor-workings/*buffer-name*)))
 
 ;; ---- indent: the brood indenter, floored at the box margin ------------------------
 
@@ -1482,6 +1567,7 @@ exercises passed of those with an expectation, and the sandbox state (● ready 
     (keymap-bind [:alt-p] 'tutor/cmd-tutorial-prev-playground)  ; M-p — previous box
     (keymap-bind [:back-tab] 'tutor/cmd-tutorial-prev-playground)  ; S-TAB — previous box too
     (keymap-bind [:ctrl-c :ctrl-t] 'tutor/cmd-tutorial-contents)  ; the section hub
+    (keymap-bind [:ctrl-c :ctrl-w] 'tutor/cmd-tutorial-workings)  ; the workings pane, back
     ;; structural motion scoped to the box (the prose around it isn't Brood)
     (keymap-bind [:ctrl-meta-f] 'tutor/cmd-tutorial-forward-sexp)
     (keymap-bind [:ctrl-meta-b] 'tutor/cmd-tutorial-backward-sexp)
@@ -1512,7 +1598,8 @@ message is the honest answer."
    ;; + click), the same affordance the results buffers get
    :line-loc 'tutor/tutor-contents-section-at
    :on-click 'tutor/cmd-tutorial-enter-section
-   :hooks {:on-close '(tutor/tutor-on-close)}  ; kill the buffer → kill the sandbox
+   ;; kill the buffer → kill the sandbox, and take the *Workings* pane with it
+   :hooks {:on-close '(tutor/tutor-on-close)}
    :commands '("tutorial-next" "tutorial-prev" "tutorial-up" "tutorial-last"
                 "tutorial-show-answer"
                 "tutorial-contents"
