@@ -8,6 +8,13 @@ box source → derived trace names → sandbox → spy entries → cache → pan
 
 `term-tutor.blsp` opens straight at the lesson that teaches the pane; walking the contents
 page by keystroke is not what this checks.
+
+**Assert on what only a real reply can paint.** This driver used to search for
+"sum-doubles" and "*Workings*" — both of which are on the page anyway, as box source and as
+the lesson's own prose. It therefore passed green for as long as the harness forgot to start
+the sandbox at all (`sandbox-eval` is a documented no-op with no worker), reporting a chain
+that never ran. The checks below are the pane's own vocabulary: a `= <value>` return line and
+the verdict note on the box, neither of which exists without a reply.
 """
 from drive import Report, Session
 
@@ -15,14 +22,16 @@ r = Report()
 ed = Session("term-tutor.blsp", rows=44, cols=150).start()
 
 r.check(ed.wait_for("Watching it run", 40), "opened at the lesson that teaches the pane")
-r.check(ed.wait_for("*Workings*", 40), "the pane opened on its own")
-r.check(ed.wait_for("sum-doubles", 40), "…showing the traced call")
-r.check(ed.wait_for("double-", 20), "…including the inner call")
+r.check(ed.wait_for("=> 12", 60), "the box evaluated in the sandbox (the verdict note)")
+r.check(ed.wait_for("The workings — every traced call", 40), "the pane opened on its own")
+r.check(ed.wait_for("sum-doubles [1 2 3]", 20), "…showing the traced call with its args")
+r.check(ed.wait_for("double- 1", 20), "…including the inner call, nested under it")
+r.check(ed.wait_for("= 12", 20), "…and its RETURN — a line only a real cascade produces")
 
 # it FOLLOWS the cursor: M-n to the exercise box, which traces its own `twice-it`
 ed.mark()
 ed.send("\x1bn", pause=1.5)
-r.check(ed.wait_for("twice-it", 25), "moving box re-rendered the pane for the box at point")
+r.check(ed.wait_for("twice-it 20", 25), "moving box re-rendered the pane for the box at point")
 
 # closing it is respected; C-c C-w brings it back
 ed.mark()

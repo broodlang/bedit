@@ -10,6 +10,44 @@ Language-level changes live in the Brood repo's `docs/devlog.md` + `docs/decisio
 
 ---
 
+## 2026-08-02
+
+### the tail-call lesson stops contradicting itself; every display truncates — Brood ADR-207
+- **Why:** the tutorial's "Recursion is the loop" box counts a million tail calls down to prove
+  O(1) stack — and it *overflowed*: `recursion too deep: exceeded the VM's 1048576-frame
+  non-tail-call limit`. The tutorial boundary-traces every box (the *Workings* pane follows the
+  cursor), and a trace wrapper emits its `:return` AFTER the call, so each level of a traced
+  self-call is a real frame. The number had already been walked back to 250 000 with an
+  apologetic comment; the instrumentation was contradicting the lesson it illustrated.
+- **Brood (prime directive), not worked around here — ADR-207:** a `*spy-sink*` may answer
+  `:spy-stop` ("I have all I want"), and `debug/trace-fn` then restores the original and
+  delegates in TAIL position — so past its budget a traced loop is a plain tail loop.
+  `eval-server`'s sink answers it at `*spy-entry-cap*`. Separately, `pr-str-bounded` gained
+  `*print-string-length*` (a *leaf* bound — collections and nesting were bounded, a 10 MB string
+  was not) and every display protocol now prints through it. Measured through the sandbox's own
+  path: 250k traced calls 641 ms → 73 ms, 1M 2493 ms → 227 ms (was over the 2 s box budget), 4M
+  from overflow → 844 ms.
+- **What (here):** the box is a million again, and its comment records why that is now honest;
+  the lesson body teaches the budget note as the point ("watching costs something"). The
+  *Workings* header says *"the first 200 traced calls"* when the cascade filled the budget,
+  instead of claiming "every traced call and return" — it also footers that the code carried on.
+  Display paths bounded: the *Spy* tap's JSON fields, the `*Debug*` locals preview, the trace
+  lines, eval-in-scope, and `C-x C-e`'s `=> …` (Emacs bounds this too —
+  `eval-expression-print-length`).
+- **Files:** `src/tutor-lessons.blsp`, `src/tutor-workings.blsp` (`budget-spent?`),
+  `src/debugger.blsp`, `src/eval-command.blsp`. **Tests:** +3 in `tests/tutor_test.blsp`
+  (a short cascade vs one that filled the budget); suite green (1205).
+- **A false green fixed, and the driver that would have caught it:** `tools/term-tutor.blsp`
+  never called `sandbox-start` (that is `cmd-tutorial`'s job, and the harness opens the tutorial
+  by calling `tutor--show`), so `sandbox-eval` was a documented **no-op** — every box sat at
+  "⋯ evaluating…". `drive_workings.py` passed anyway, because "sum-doubles" and "*Workings*" are
+  on the page as box source and prose. It now asserts on the pane's own vocabulary (`= 12`, a
+  return line only a real cascade produces) and on the verdict note. New
+  **`tools/drive_tailcalls.py`**: a million traced tail calls answer `=> :liftoff` in the real
+  editor — unreachable from model tests, which deliberately instrument nothing.
+  `term-tutor.blsp` takes the lesson from `BEDIT_DRIVE_LESSON`, so a new check is a new driver,
+  not a second copy of the harness.
+
 ## 2026-07-11 (later)
 
 ### The actor-model endgame (§E.2) — every buffer a process — `b6937fa`…
