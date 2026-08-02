@@ -60,7 +60,7 @@ Put those two facts together and the design falls out:
 | `~/.emacs.d/elpa/` | the config nest's `_deps/` + `project.lock.blsp` |
 | `package-refresh-contents` | nothing to refresh — hive is queried live |
 | `package-install` | add the dep + resolve + `require`, **in the running image** |
-| `Package-Requires: ((emacs "29.1"))` | `:extends {bedit ">= 0.1"}` (the marker *and* the version check) |
+| `Package-Requires: ((emacs "29.1"))` | `:enhances {bedit ">= 0.1"}` (the marker *and* the version check) |
 | `defcustom` / `define-key` / `add-hook` / `auto-mode-alist` | the settings / `bind-key` / `add-hook` / `register-file-type` registries ([`configurability.md`](configurability.md)) |
 | `use-package` | a declarative `(package …)` form in `init.blsp` — **data, not code** |
 | autoloads | the `M-x` registry + late-bound command symbols |
@@ -74,7 +74,7 @@ editor yet.
 hive is *Brood's* registry, not bedit's: it holds web apps, a Postgres store, an S3
 client. An editor package has to be identifiable, for two different reasons:
 
-- **Discovery.** `M-x package-list` must show the packages that extend *this editor*, not
+- **Discovery.** `M-x package-list` must show the packages written for *this editor*, not
   every package published for the language. Emacs never had this, and MELPA's flat
   namespace is exactly why `list-packages` opens on thousands of unrelated rows.
 - **Safety.** An editor package calls editor registration functions and is loaded *into
@@ -92,9 +92,10 @@ client. An editor package has to be identifiable, for two different reasons:
 That rules out an app-named manifest key (`:bedit-version`), an app-specific `kind`
 enum, and any `if name == "bedit"` anywhere in the tooling.
 
-### The mechanism: one generic key, `:extends`
+### The mechanism: one generic key, `:enhances`
 
-A package declares **which hosts it extends, and which versions of them it needs**:
+A package declares **which application it adds functionality to, and which versions of it
+that requires**:
 
 ```clojure
 ;; a published editor package's project.blsp
@@ -103,47 +104,58 @@ A package declares **which hosts it extends, and which versions of them it needs
   :version "0.1.0"
   :description "Zig syntax highlighting + structural nav for bedit."
   :repository "https://github.com/…/bedit-zig"
-  :extends {bedit ">= 0.1"}          ; ← the whole marker
+  :enhances {bedit ">= 0.1"}          ; ← the whole marker
   :dependencies [])
 ```
 
 ```clojure
 ;; …and the same mechanism, no new code, for other ecosystems
-:extends {hatch ">= 1.0"}            ; a web-framework plugin
-:extends {nest ">= 0.4"}             ; a `nest` subcommand / format plugin
-:extends {bedit ">= 0.1", magit ">= 0.4"}   ; extends the editor *and* another package
+:enhances {hatch ">= 1.0"}            ; a web-framework plugin
+:enhances {nest ">= 0.4"}             ; a `nest` subcommand / format plugin
+:enhances {bedit ">= 0.1", waggle ">= 0.2"}   ; useful inside either application
 ;; absent entirely = an ordinary library (every package published so far)
 ```
 
-**Host names are data.** `brood`/`nest`/`hive` parse the map, carry it, store it and
-filter on it; they never enumerate the keys. `bedit` is a string a package author typed,
+The name is **Debian's `Enhances:`** field, which means exactly this — *"this package adds
+functionality to that one"* — and comes from packaging, the domain this actually belongs
+to. Two names were tried and rejected first: **`:extends`** carries OO inheritance
+baggage, and a package does not subclass an editor; **`:host` / `:hosts`** collides with
+what "host" already means across this project — a *machine* (`bedit --attach ed@HOST:PORT`,
+"the host's own window"). `:enhances` reads as a plain sentence with no gloss needed:
+*bedit-zig enhances bedit >= 0.1*.
+
+**The names in it are data.** `brood`/`nest`/`hive` parse the map, carry it, store it and
+filter on it; they never enumerate its keys. `bedit` is a symbol a package author typed,
 exactly like `hatch` or anything else. The vocabulary is open by construction, not by a
 promise to extend a list later.
 
-**Discovery** becomes `GET /api/v1/packages?q=&extends=bedit` — generic on both sides;
-`nest search --extends hatch` works the same day it works for the editor.
+**Discovery** becomes `GET /api/v1/packages?q=&enhances=bedit` — generic on both sides;
+`nest search --enhances hatch` works the same day it works for the editor.
 
-**Compatibility** is checked by the *host*, at load time, against its own version — not
-by the resolver. bedit reads its own entry out of the package's manifest and declines a
-package that needs a newer editor, with a message. Deliberately: ADR-037's resolver takes
-**exact versions and has no semver solver**, and this must not smuggle one in. A
-*predicate* ("does 0.1.0 satisfy `>= 0.1`?") is not a solver — it decides nothing about
-which version to fetch, and it belongs in `std` because **hive already hand-rolled it**
-(`version-compare` / `version-core` in `src/registry.blsp`) and bedit would be the third
-to write it.
+**Compatibility** is checked by the *enhanced application*, at load time, against its own
+version — not by the resolver. bedit reads its own entry out of the package's manifest and
+declines a package that needs a newer editor, with a message. Deliberately: ADR-037's
+resolver takes **exact versions and has no semver solver**, and this must not smuggle one
+in. A *predicate* ("does 0.1.0 satisfy `>= 0.1`?") is not a solver — it decides nothing
+about which version to fetch — and it belongs in `std` because **hive already hand-rolled
+it** (`version-compare` / `version-core` in `src/registry.blsp`) and bedit would be the
+third to write it.
 
 ### Why not the alternatives
 
 | Alternative | Why not |
 |---|---|
+| **`:extends {bedit …}`** | Reads as OO inheritance (`class Foo extends Bar`), which is the wrong mental model: a package is *loaded beside* an application and calls its registries, it does not specialise a type. |
+| **`:host` / `:hosts`** | "Host" already means a *machine* in this project — `--attach ed@HOST:PORT`, the daemon's host window. Reusing it for "application I plug into" makes two unrelated things one word. |
 | A `bedit-*` **name convention** | Can't be queried (the editor would pull the whole index and filter client-side), can't be enforced (a package that forgets the prefix is invisible), and carries no version compatibility. Still a good *naming* habit — just not the mechanism. |
-| A **`:kind` enum** (`:bedit`, `:hatch-plugin`, …) | One concept too many: "what I extend" already implies "what kind I am". And an enum invites a blessed list in the toolchain, which is the thing being avoided. |
-| A **dependency on `bedit`** | The host is already in the image. It would drag the whole editor into `_deps/` for a 40-line mode, and needs a version *range*, which the resolver deliberately doesn't do. |
-| A free-form **`:meta {…}`** map | Maximally open, but every host invents its own key, so the registry can't index anything consistently and discovery dies. One named field with author-supplied values is the right altitude. |
+| A **`:kind` enum** (`:bedit`, `:hatch-plugin`, …) | One concept too many: what a package enhances already implies what kind it is. And an enum invites a blessed list in the toolchain, which is the thing being avoided. |
+| A **dependency on `bedit`** | The application is already in the image. It would drag the whole editor into `_deps/` for a 40-line mode, and needs a version *range*, which the resolver deliberately doesn't do. |
+| A free-form **`:meta {…}`** map | Maximally open, but every application invents its own key, so the registry can't index anything consistently and discovery dies. One named field with author-supplied values is the right altitude. |
 
-Emacs, notably, marks packages the same way: `Package-Requires: ((emacs "29.1"))` — the
-host is just another entry in a requirements list, not a category. `:extends` is that
-idea, kept separate from `:dependencies` because the host is *present*, not *fetched*.
+Emacs marks packages the same way, notably: `Package-Requires: ((emacs "29.1"))` puts the
+application in a requirements list rather than in a category field. `:enhances` is that
+idea, kept separate from `:dependencies` because what it names is *present*, not
+*fetched*.
 
 ## 2. What a package author writes (the payoff)
 
@@ -171,25 +183,25 @@ API to learn*. A whole syntax-highlighter package:
 
 ### Part 1 — Brood / `std` / hive (the language + registry gaps)
 
-1. **`:extends` end to end (small, three layers — and generic at every one).**
-   - *Brood* — `project-apply` parses `:extends` into `*project-extends*` (a
+1. **`:enhances` end to end (small, three layers — and generic at every one).**
+   - *Brood* — `project-apply` parses `:enhances` into `*project-enhances*` (a
      name → constraint map, beside the existing `*project-dependencies*`);
-     `registry--publish-payload` includes it; `nest search` grows `--extends <host>`.
-     No host name appears anywhere in the implementation.
+     `registry--publish-payload` includes it; `nest search` grows `--enhances <app>`.
+     No application name appears anywhere in the implementation.
    - *hive* — store it the way `dependencies` already is (a JSON **text** column on the
-     release, since the param encoder is scalar-only), plus a denormalized host list on
+     release, since the param encoder is scalar-only), plus a denormalized application list on
      `packages` for listing filters — the same denormalization `description` /
      `latest_version` already get from the newest release. Then
-     `GET /api/v1/packages?q=&extends=<host>`, and a web-UI facet whose values come from
+     `GET /api/v1/packages?q=&enhances=<app>`, and a web-UI facet whose values come from
      the data rather than a list in the code.
    - *`std`, promoted not invented* — `version-satisfies?`, over the `version-compare` /
      `version-core` pair that **already exists in hive** (`src/registry.blsp`) because
-     `std` lacks it. Two consumers today (hive deciding which release is latest, a host
+     `std` lacks it. Two consumers today (hive deciding which release is latest, an application
      deciding whether a package is compatible with it), and any application hosting
      plugins is the third. **Explicitly not a resolver change:** the predicate answers a
      yes/no question about two versions and never chooses one, so ADR-037's
      exact-version, no-solver invariant stands untouched.
-   - Both sides are additive: a package published without `:extends` is an ordinary
+   - Both sides are additive: a package published without `:enhances` is an ordinary
      library, and today's hive already ignores unknown metadata fields (its publish
      handler reads named keys off the envelope), so a new client is safe against the
      registry as deployed.
@@ -246,7 +258,7 @@ Built on Part 1 and on the config registries from
    Single-key actions in Emacs's `list-packages` vocabulary: `i` mark install, `d` mark
    delete, `u` unmark, `U` mark all upgrades, `x` execute the marks, `RET` describe
    (`C-h P` from anywhere), `g` refresh, `/` filter, `q` quit. The rows are one hive query
-   (`?extends=bedit` — the editor names itself; the registry doesn't) joined against the
+   (`?enhances=bedit` — the editor names itself; the registry doesn't) joined against the
    config nest's manifest + lock, so "installed", "upgrade" and "available" fall out of
    one request and one file read.
 3. **`M-x package-install`, live.** Completion over hive's search results through **plume**
@@ -268,7 +280,7 @@ Built on Part 1 and on the config registries from
    to get. `package-upgrade` re-resolves one dep; `package-delete` drops it from the
    manifest and `_deps/` (effective next start, per Part 1.4).
 6. **Trust, stated plainly.** A package is arbitrary Brood code in the editor's image;
-   `:extends` is author-declared metadata, **not a sandbox**. The policy: explicit installs only
+   `:enhances` is author-declared metadata, **not a sandbox**. The policy: explicit installs only
    (nothing auto-installs), immutable releases pinned by checksum in the lock, and `C-h P`
    shows what a package registers before you install it. The real answer is the one this
    editor is already built on — **a package could run in its own process**, the way every
@@ -310,7 +322,7 @@ Built on Part 1 and on the config registries from
 
 ## A staged path
 
-1. **Stage 1 — the marker and a live install (no language change).** `:extends` end to end
+1. **Stage 1 — the marker and a live install (no language change).** `:enhances` end to end
    (Part 1.1) + `load-nest` (1.2) + config-dir-as-nest startup (2.1) + `M-x
    package-install` / `package-list`, async (2.2–2.4), restricted to curated packages.
    That already gives a live, restart-free, Emacs-like flow over machinery that exists
@@ -334,7 +346,7 @@ glue over a registry, a resolver and a lockfile that already work, and it proves
 "config dir is a nest, packages load live" model end to end.
 
 The headline: we point the package manager and registry Brood already has at the editor;
-a package says what it extends (`:extends {bedit ">= 0.1"}`) in a field whose vocabulary
+a package says what it enhances (`:enhances {bedit ">= 0.1"}`) in a field whose vocabulary
 is the author's, so the toolchain gains *plugin ecosystems* as a concept and never learns
 this editor's name; the user's config dir is a nest; and packages register through the
 same late-bound registries the core uses — so "core" and "package" are the same
