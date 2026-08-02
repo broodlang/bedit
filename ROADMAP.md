@@ -253,11 +253,13 @@ silently stopped matching); exit signals never reached a natively-nested `receiv
   `bind-key`, `defsetting`, …) — the registries *are* the plugin API. Live, restart-free
   install via the mutable `*load-path*` + late binding.
   Gaps — Brood/hive, and **generic by requirement**: nothing in `brood`/`nest`/`hive` may
-  know bedit exists, so the marker is `:extends {bedit ">= 0.1"}` — a manifest map of
-  *host → version constraint* whose keys are author data, carried manifest → `nest publish`
-  → hive → a `?extends=<host>` search filter, with `version-satisfies?` promoted into `std`
-  from the copy hive already hand-rolled (a predicate, not a resolver change — ADR-037's
-  exact-version invariant stands) and the constraint checked by the **host** at load time.
+  know bedit exists, so the marker is `:enhances {bedit ">= 0.1"}` (Debian's `Enhances:`
+  — *not* `:extends`, which reads as OO inheritance, and *not* `:host`, which already means
+  a machine here) — a manifest map of *application → version constraint* whose keys are
+  author data, carried manifest → `nest publish` → hive → a `?enhances=<app>` search filter,
+  with `version-satisfies?` promoted into `std` from the copy hive already hand-rolled (a
+  predicate, not a resolver change — ADR-037's exact-version invariant stands) and the
+  constraint checked by **the enhanced application** at load time.
   A Hatch plugin or a `nest` plugin then works with no new code. Also: a runtime
   **`load-nest`**; package-rooted
   namespaces (ADR-070 — the one real language investment, gating *third-party* packages;
