@@ -15,7 +15,8 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
   (:use editor/buffer)  ; the buffer ops the commands drive (incl. undo/redo, word motion)
   (:use eval-command)  ; last-sexp-source + eval-source — the async C-x C-e family
   (:use sexp)  ; structural s-expression navigation (brood-mode commands)
-  (:use editor/treesit)  ; tree-sitter structural motions (ruby/elixir-mode), ROADMAP §C
+  ;; NB: tree-sitter's structural motions (ruby/elixir-mode, ROADMAP §C) are deliberately
+  ;; NOT `:use`d — see the `require` below.
   (:use interactive)  ; defcommand — define + register an interactive command (M-x)
   (:use editor/pane)  ; the pane-tree ops behind the split/other/delete commands
   (:use panes)  ; ed-toggle-line-numbers — the line-number gutter toggle (C-x l)
@@ -35,6 +36,13 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
   (:use results)  ; the results-buffer abstraction — line-loc vocabulary + ed-append-follow
   (:use model))  ; current-buffer accessors, the kill ring, message
 
+;; Tree-sitter's structural motions (ruby/elixir-mode) are REQUIRED, not `:use`d. They
+;; share several names with `sexp` — `point-defun-start`, `point-down`, … — and two `:use`s
+;; of one name is a load error (E0099), so importing both put the whole editor one std
+;; addition away from not loading at all. Every call here is qualified anyway
+;; (`sexp/…` over Brood source; `editor/treesit/…` for a foreign language, whose signatures
+;; take a `lang`), and a qualified call only needs the module loaded.
+(require 'editor/treesit)
 (require 'modes)     ; *welcome-link-marker* — the welcome scratch's clickable tutorial line
 (require 'theme)     ; face-dired-* — the dired listing colours (qualified refs)
 (require 'datetime)  ; epoch-ms->dt / dt-format — the dired mtime column
@@ -656,12 +664,67 @@ just-one-space M-SPC, `\"\"` for delete-horizontal-space M-\\) — `editor/buffe
 
 (defcommand cmd-just-one-space
   (m key)
-  "Collapse the whitespace around point to a single space (M-SPC)."
+  "Collapse the whitespace around point to a single space (Emacs `just-one-space`;
+M-SPC runs `cmd-cycle-spacing`, whose first press is exactly this)."
   (ed-collapse-ws m " "))
+
+;; `cycle-spacing` — what M-SPC does in a modern Emacs (29 took the key from
+;; `just-one-space`). One key, pressed repeatedly, walks the three answers you might
+;; want for the gap you are standing in: ONE space, then NONE, then *what was there* —
+;; so an over-eager squeeze is undone by pressing the same key again rather than by
+;; remembering an undo. The cycle restarts wherever the previous command wasn't this one,
+;; which is what makes it feel like a per-gap toggle instead of a global mode.
+;;
+;; The restore step is why this needs state: the original run and where point stood in it
+;; are gone from the buffer after the first press. Both ride the model (`:cycle-spacing`),
+;; keyed by the position the run starts at, so a stale stash can never apply to a
+;; different gap.
+
+(def ed--cycle-spacing-phases [:one-space :none :restore])
+
+(defn ed--cycle-spacing-next (st lo)
+  "The phase for this press: the one after `st`'s, or the first when there is no live
+stash for the run at `lo` (a different gap, or a different command in between)."
+  (if (or (nil? st) (not= (:lo st) lo))
+    :one-space
+    (let (i (index-of ed--cycle-spacing-phases (:phase st)))
+      ;; past the end it starts over, so holding the key keeps cycling
+      (nth ed--cycle-spacing-phases (rem (inc (or i 0)) (count ed--cycle-spacing-phases))))))
+
+(defcommand cmd-cycle-spacing
+  (m key)
+  "Cycle the whitespace around point (M-SPC): one space, then none, then what was
+there before you started — Emacs 29's `cycle-spacing`, which replaced `just-one-space`
+on this key. Pressing any other command in between starts the cycle fresh.
+
+The restore step puts the run back exactly, point included, so M-SPC is safe to lean
+on: nothing you cycle through is lost."
+  (let (b (ed-current-buf m)
+        [lo hi] (editor/buffer/whitespace-run-at b)
+        st (when (= (:last-command m) 'commands/cmd-cycle-spacing) (:cycle-spacing m))
+        phase (ed--cycle-spacing-next st lo)
+        ;; the run as it stood when the cycle began — captured on the first press,
+        ;; carried unchanged after that (the buffer no longer holds it)
+        orig (if (= phase :one-space)
+               {:text (substring (buffer-text b) lo hi) :offset (- (buffer-point b) lo)}
+               (:orig st))
+        stash {:phase phase :lo lo :orig orig})
+    (assoc
+      (if (= phase :restore)
+        ;; back to the original text AND the original point inside it
+        (ed-edit m (fn (bb)
+                     (let ([l h] (editor/buffer/whitespace-run-at bb)
+                           restored (replace-region bb l h (:text orig)))
+                       (goto-char restored (+ l (:offset orig))))))
+        (ed-collapse-ws m (if (= phase :one-space) " " "")))
+      :cycle-spacing stash)))
 (defcommand cmd-delete-horizontal-space
   (m key)
   "Delete all whitespace around point (M-\\)."
   (ed-collapse-ws m ""))
+
+;; (cycle-spacing's stash lives on the model as `:cycle-spacing`; nothing else reads it,
+;; and `:last-command` is what decides whether it is still live.)
 
 ;; ---- fill-paragraph (M-q) ---------------------------------------------------
 ;; The line-breaking itself is `text/fill` (std/text) — a general `string -> string`
@@ -1917,6 +1980,59 @@ unchanged. (Routes through `ed-map-panes` over all leaf payloads.)"
       (let (b (:buffer w))
         (assoc w :buffer (cond (< b killed) b (> b killed) (dec b) else target))))))
 
+(defn ed--kill-at (m killed-idx follow-companions?)
+  "Kill pool buffer `killed-idx`: fire its mode layers' `:on-close`, unhost/unshare it,
+remove it, and re-point the panes that showed it (appending a fresh `*scratch*` if the pool
+would be left with nothing editable). The body of `cmd-kill-buffer`, factored out so the
+companion sweep below can reuse the whole path rather than half of it.
+
+With `follow-companions?` the buffers the closing mode NAMED (`layers/request-close`) are
+killed too — a mode's own second window, like the tutorial's *Workings* pane, which means
+nothing once the tutorial is gone. Their own `:on-close` fires (they may own workers), but
+their requests are NOT followed: one level, so a pair of modes naming each other cannot
+loop."
+  (let (buf (nth (:buffers m) killed-idx)
+        ;; The close hooks are effects (a mode kills the worker it spawned), but the closed
+        ;; context is also DATA — the companion names it left on itself. A hook cannot close
+        ;; them itself: it only ever sees its own buffer, and layers has no idea the app
+        ;; keeps a pool. So it names them and we act, here, where the pool is.
+        closed (try (editor/layers/close-context buf) (catch _ nil))
+        companions (if follow-companions?
+                     (try (editor/layers/close-requests closed) (catch _ (list)))
+                     (list))
+        m0 (if (get-in m [:hosted killed-idx :shared?])
+             (collab/collab-unshare m killed-idx)   ; presence withdraw + unsubscribe
+             m)
+        m0 (hosted/hosted-drop-slot m0 killed-idx)  ; stop-if-local + index remap
+        removed (remove-nth (:buffers m0) killed-idx)
+        label (str "killed " (buffer-name buf))
+        m1 (if (ed-has-editable? removed)
+             ;; another editable buffer remains: the killed pane shows the buffer
+             ;; that shifted into its slot (clamped to the last index).
+             (message (ed--remap (assoc m0 :buffers removed)
+                        killed-idx
+                        (min killed-idx (dec (count removed))))
+               label)
+             ;; none left → append a fresh *scratch* and point the killed pane at it.
+             (let (bufs (into removed [(ed-stamp (make-buffer ""))]))
+               (message (ed--remap (assoc m0 :buffers bufs) killed-idx (count removed)) label))))
+    ;; Then the companions, by NAME — indices have just shifted, so each is looked up
+    ;; afresh; one that is already gone (or never existed) is simply skipped.
+    ;;
+    ;; The echo is re-stated at the end, naming what the reader actually killed. Each
+    ;; companion kill echoes its own name as it goes, and the last one won: killing
+    ;; *Tutorial* reported "killed *Workings*", which is not the buffer anyone asked about.
+    (let ([m2 also] (fold (fn (acc nm)
+                            (let ([mm killed] acc
+                                  i (ed-buffer-index-by-name mm nm))
+                              (if (or (nil? i) (= nm "*Messages*"))
+                                acc
+                                [(ed--kill-at mm i false) (append killed (list nm))])))
+                     [m1 (list)] companions))
+      (if (empty? also)
+        m2
+        (message m2 (str label " (with " (join ", " also) ")"))))))
+
 (defcommand cmd-kill-buffer
   (m key)
   "Kill the current buffer (C-x k). Refuses to kill `*Messages*`; if it would leave
@@ -1926,28 +2042,12 @@ process stopped when locally owned, presence withdrawn when shared — and the
 surviving hosted links are remapped with the pool (`hosted/hosted-drop-slot`).
 The buffer's mode layers get their `:on-close` (via std's `close-context`) — the
 async-cleanup seam where a mode kills a worker it owns (the tutorial's eval
-sandbox; a natural home for bshell's shell process too)."
-  (let (killed-idx (ed-current-index m)
-        buf (ed-current-buf m))
+sandbox; a natural home for bshell's shell process too) — and any companion buffers
+that mode asked to take with it (`layers/request-close`) are killed as well."
+  (let (buf (ed-current-buf m))
     (if (= (buffer-name buf) "*Messages*")
       (message m "cannot kill *Messages*")
-      (let (_ (try (editor/layers/close-context buf) (catch _ nil))  ; hooks are effects; the buffer is going away
-            m0 (if (get-in m [:hosted killed-idx :shared?])
-                 (collab/collab-unshare m killed-idx)   ; presence withdraw + unsubscribe
-                 m)
-            m0 (hosted/hosted-drop-slot m0 killed-idx)  ; stop-if-local + index remap
-            removed (remove-nth (:buffers m0) killed-idx)
-            label (str "killed " (buffer-name buf)))
-        (if (ed-has-editable? removed)
-          ;; another editable buffer remains: the killed pane shows the buffer
-          ;; that shifted into its slot (clamped to the last index).
-          (message (ed--remap (assoc m0 :buffers removed)
-                     killed-idx
-                     (min killed-idx (dec (count removed))))
-            label)
-          ;; none left → append a fresh *scratch* and point the killed pane at it.
-          (let (bufs (into removed [(ed-stamp (make-buffer ""))]))
-            (message (ed--remap (assoc m0 :buffers bufs) killed-idx (count removed)) label)))))))
+      (ed--kill-at m (ed-current-index m) true))))
 
 (defcommand cmd-welcome-tutorial
   (m key)
@@ -2291,7 +2391,12 @@ root-relative; Tab narrows, Enter opens the first match). The shared core of `C-
 lists the files of the project it switched to, not wherever the current buffer sits."
   (if (nil? root)
     (message m "not in a project (no project.blsp found)")
-    (let (_ (remember-project! root)  ; discovered → record it for C-x p p
+    ;; Recording the project writes the on-disk cache, so it is gated on `:recent-files` —
+    ;; the live-editor flag `main` sets, exactly as recentf, bookmarks and the tutorial's
+    ;; progress are. Ungated, ANY model reached this: a pure model test would rewrite the
+    ;; developer's real `~/.config/brood-edit/state/projects.blsp` with its /tmp fixtures,
+    ;; which is why `panes_projects_test` used to save and restore that file by hand.
+    (let (_ (when (:recent-files m) (remember-project! root))
           files (project-files root))
       (assoc m
         :minibuffer
@@ -2343,7 +2448,12 @@ Projects are discovered by using `C-x p f` / opening one; reports when none are 
                           ;; make it current (and bump it to front of the cache), then find a file
                           ;; in *that* project — pass the chosen root explicitly, since the current
                           ;; buffer still sits in the old project (ed-project-root resolves live).
-                          (ed-find-file-in-project (assoc mm :project-root (remember-project! root)) root)
+                          ;; same gate as above; `remember-project!` returns the root it
+                          ;; recorded, so the ungated path stays value-identical
+                          (ed-find-file-in-project
+                            (assoc mm :project-root
+                              (if (:recent-files mm) (remember-project! root) root))
+                            root)
                           (message mm (str "no such project: " root))))
          :complete-fn (fn (t) (ed-complete-name t projs))
          :rank-source projs

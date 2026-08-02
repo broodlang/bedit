@@ -8,6 +8,7 @@
   (:use model)  ; ed-init / message / ed-buf-at / ui-event-fold (UiEvent)
   (:use editor/buffer)
   (:use debugger)
+  (:use-internals debugger)  ; the editor's own breakpoint wrapper (`--` names)
   (:use debug))  ; start/step the std side where a real park is wanted
 
 (defn dbt-model () (ed-init (make-buffer "x")))
@@ -119,6 +120,49 @@
       (debug/untrace-fn 'dbt-target)
       (%set-trace-context nil)
       (def *spy-sink* nil)
+      (send c [:stop]))))
+
+(describe "debugger — the editor's OWN breakpoint wrapper (not std's break-fn)"
+  :isolated
+  ;; `debugger--install-breakpoint` rebinds the function to a wrapper that parks every
+  ;; caller EXCEPT the editor process. The parking call is `debug/break`, a MACRO — it was
+  ;; `apply`ed, which raises at runtime, so a breakpoint hit by any worker threw instead
+  ;; of parking. `nest check` had been reporting it ("apply: argument 1 expects fn |
+  ;; native, got macro") the whole time.
+  (test "REGRESSION: a non-editor caller parks (and does not raise) at the breakpoint"
+    (let (me (self)
+          c (debugger-collector-start me))
+      (%set-trace-context {:debugger c :span nil})
+      (def *spy-sink* (debug/debugger-sink))
+      (eval '(defn dbt-bp-target (n) (+ n 1)))
+      (debugger/debugger--install-breakpoint 'dbt-bp-target)
+      (spawn (send me [:result (dbt-bp-target 41)]))
+      (let (e (dbt-next-event 2000))
+        (is (record? e))                                   ; it parked, rather than raising
+        (let (snap (debug-break-event-snapshot e))
+          (assert= "dbt-bp-target" (:label snap))
+          (assert= (list 41) (:args (:vals snap))))
+        (send (debug-break-event-pid e) [:resume]))
+      (assert= 42 (receive ([:result r] r) (after 2000 :timeout)))   ; and delegated
+      (debugger/debugger--uninstall-breakpoint 'dbt-bp-target)
+      (%set-trace-context nil)
+      (def *spy-sink* nil)
+      (send c [:stop])))
+
+  (test "the editor's own process is never parked by its own breakpoint"
+    ;; the reason this wrapper exists instead of std's `break-fn`: parking the ui-run loop
+    ;; would freeze the only sender of [:resume]
+    (let (me (self)
+          c (debugger-collector-start me))
+      (register :editor (self))
+      (%set-trace-context {:debugger c :span nil})
+      (eval '(defn dbt-bp-self (n) (* n 2)))
+      (debugger/debugger--install-breakpoint 'dbt-bp-self)
+      ;; through `eval`, like the target above: the defn is installed at runtime, so a
+      ;; direct call would be an unbound name to the checker
+      (assert= 20 (eval '(dbt-bp-self 10)))                ; straight through, no park
+      (debugger/debugger--uninstall-breakpoint 'dbt-bp-self)
+      (%set-trace-context nil)
       (send c [:stop]))))
 
 (describe "debugger — margin breakpoints (pure)"
