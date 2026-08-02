@@ -243,17 +243,25 @@ silently stopped matching); exit signals never reached a natively-nested `receiv
 
 ## G. Packages — an extension ecosystem (deferred — design note)
 
-- ⬜ **Load editor packages, almost like Emacs** — *an editor package is a Brood nest*;
-  the user's `~/.config/bedit/` is itself a nest whose `:dependencies` are the
-  installed packages, and **Brood's existing package manager** (ADR-037: `:dependencies`,
-  `project.lock.blsp`, `_deps/`, `nest add/fetch`) is the package system. A package hooks
-  in by calling the same registration functions core uses (`register-type-layers`,
+- ⬜ **Load editor packages, almost like Emacs** — *an editor package is a Brood nest,
+  published to **hive*** (Brood's registry, which `nest` already speaks: `:version` deps,
+  `nest search`/`publish`, sha256-pinned immutable tarballs into `_deps/`). The user's
+  `~/.config/bedit/` is itself a nest whose `:dependencies` are the installed packages;
+  ADR-037's resolver + `project.lock.blsp` are the installer, and a lockfile in the config
+  dir means a **reproducible editor config** (what Emacs needed straight.el for). A package
+  hooks in by calling the same registration functions core uses (`register-type-layers`,
   `bind-key`, `defsetting`, …) — the registries *are* the plugin API. Live, restart-free
-  install via the mutable `*load-path*` + late binding. Brood-side gaps: package-rooted
-  namespaces + `:exports` (ADR-070 — the one real language investment, gating third-party
-  packages) and a runtime `load-nest`. Editor-side: config-dir-as-nest startup loader,
-  `M-x package-install`, `autoload`, a `use-package`-style `(package …)` form. Decided
-  direction, **not building yet** — full design + staged path: **`docs/packages.md`**.
+  install via the mutable `*load-path*` + late binding.
+  Gaps — Brood/hive: a **`:kind :bedit` marker** carried manifest → `nest publish` → a hive
+  column → a `?kind=` search filter (so the editor lists editor packages, and knows a
+  package is meant for it before loading it); a runtime **`load-nest`**; package-rooted
+  namespaces (ADR-070 — the one real language investment, gating *third-party* packages;
+  its prelude/heap groundwork landed 2026-08-02). Editor-side: config-dir-as-nest startup
+  loader, a `*Packages*` buffer (`M-x package-list`, dired-style single keys, `C-h P`),
+  `M-x package-install` through plume, all of it off the loop on `procstream`, `autoload`,
+  and a `use-package`-style `(package …)` form — **data, never eval'd**, so user code lives
+  in a local `:path` package. Decided direction, **not building yet** — full design +
+  staged path: **`docs/packages.md`**.
 
 ## A.2 Emacs-parity round 2 (done)
 
