@@ -6,7 +6,7 @@ polished and one an afterthought.
 
 This follows the repo's two-part rule (CLAUDE.md): **Part 1** is what we add to *Brood*
 (`../brood/std/editor`) — the prime directive — and **Part 2** is the editor work built on
-it. The kit lives in Brood; brood-edit becomes thin usage.
+it. The kit lives in Brood; bedit becomes thin usage.
 
 ---
 
@@ -157,7 +157,7 @@ zone in the same step — the hit-test IS the zone list."
 Component set on top: `ui-panel`, `ui-list`, `ui-menu` (panel+list preset), `ui-field`
 (line editor), `ui-tooltip`, `ui-table`, `ui-segments` (status bar).
 
-## 6. Part 2 — brood-edit: migration
+## 6. Part 2 — bedit: migration
 
 The context menu — which I just rebuilt by hand — becomes one `ui-list` in a `ui-panel`.
 **`ed-menu-ops` geometry and `ed-menu-hit` both disappear**; the zones are the hit-test:

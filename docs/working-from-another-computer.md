@@ -1,31 +1,31 @@
 # Working from another computer
 
-A runbook for picking up myedit on a second machine, and for the serve/attach
-(daemon/emacsclient) modes. myedit lives in **two** repos and the editor depends on
+A runbook for picking up bedit on a second machine, and for the serve/attach
+(daemon/emacsclient) modes. bedit lives in **two** repos and the editor depends on
 the language's `std/`, so you set up both.
 
 | Repo | Remote | What it is |
 |---|---|---|
 | `brood` | `git@github.com:broodlang/brood.git` | the Brood language + `std/` (buffer, serve, ui, …) and the `nest`/`bedit` build |
-| `brood-edit` | `git@github.com:broodlang/brood-edit.git` | the editor itself (pure Brood over `std/`) |
+| `bedit` | `git@github.com:broodlang/bedit.git` | the editor itself (pure Brood over `std/`) |
 
-Both are pushed to `main`. `brood-edit` builds against the **installed** `nest`, whose
+Both are pushed to `main`. `bedit` builds against the **installed** `nest`, whose
 `std/` is baked in at build time — so after pulling `brood` you must reinstall `nest`
 for the editor to see std changes (markers, buffer subscribe/push, `attach-display-local`).
 
 ## First-time setup on a fresh machine
 
 ```bash
-# 1. clone both, side by side (brood-edit expects ../brood)
+# 1. clone both, side by side (bedit expects ../brood)
 git clone git@github.com:broodlang/brood.git
-git clone git@github.com:broodlang/brood-edit.git
+git clone git@github.com:broodlang/bedit.git
 
 # 2. build + install a GUI-enabled nest (heavy deps, one-time)
 cd brood
 ./configure --with-gui && make install      # installs nest / brood / brood-lsp to ~/.local/bin
 
 # 3. build + install the standalone editor binary
-cd ../brood-edit
+cd ../bedit
 make install                                  # `nest release` → ~/.local/bin/bedit
 ```
 
@@ -35,10 +35,10 @@ Make sure `~/.local/bin` is on your `PATH`.
 
 ```bash
 cd brood       && git pull && ./configure --with-gui && make install   # if std changed
-cd ../brood-edit && git pull && make install                            # rebuild bedit
+cd ../bedit && git pull && make install                            # rebuild bedit
 ```
 
-If only `brood-edit` changed (no std change), you can skip the `brood` reinstall.
+If only `bedit` changed (no std change), you can skip the `brood` reinstall.
 
 ## Running the editor
 
@@ -86,8 +86,8 @@ bedit --attach ed --as alice
 - **`share-mirror` (`C-x F`)** — like share-follow, but your window also reproduces their
   viewport (scroll), so you see exactly what they see — the classic one-view pairing.
 - **`M-x share-session` / `M-x share-session-stop`** — start/stop hosting from a NORMAL
-  running editor (no --serve needed): it becomes the daemon `bedit --attach myedit` reaches.
-- **Names**: `--as NAME` → `:share-name "you"` in `~/.config/brood-edit/init.blsp` → your
+  running editor (no --serve needed): it becomes the daemon `bedit --attach bedit` reaches.
+- **Names**: `--as NAME` → `:share-name "you"` in `~/.config/bedit/init.blsp` → your
   OS username; `share-session` prompts if none is set. Name tags show quietly — only for a
   few seconds after that caret moves; the coloured bar stays.
 - `M-x collab-status` echoes who's here and what you're following.
@@ -140,7 +140,7 @@ serialize with no CRDT while every cursor stays independent (see
 
 ```bash
 cd brood       && cargo run -q -p nest -- test tests/buffer_test.blsp   # markers + subscribe/push
-cd ../brood-edit && nest test                                            # whole editor (~771 tests)
+cd ../bedit && nest test                                            # whole editor (~771 tests)
 ```
 
 All green ⇒ the language foundation and the editor are in sync on this machine.
