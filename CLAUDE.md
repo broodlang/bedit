@@ -112,6 +112,9 @@ src/sandbox.blsp            the persistent eval sandbox: one `nest run` child on
                             eval-server (ADR-198), pr-str-line protocol, watchdog + respawn
 src/tutor.blsp              the interactive Brood tutorial (C-h t): playground boxes that
                             eval-on-type in the sandbox — ✓/✗ gutter, ghost results, prose guard
+src/tutor-workings.blsp     the tutorial's *Workings* pane: the per-box cascade cache, its body
+                            text, and its open/follow/close (knows a pane + a box INDEX; the
+                            tutorial owns the box parser and passes the index — acyclic)
 src/tutor-lessons.blsp      the tutorial's CONTENT only — the lessons vector (grow the course here)
 src/compile.blsp            M-x compile: run a build in the project root, C-x ` next-error
 src/projects.blsp           project root + file walk (find-file-in-project)
@@ -122,6 +125,10 @@ src/web.blsp                live HTTP mirror of the selected buffer (C-x w)
 src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclient model over node links
 src/collab.blsp             shared-buffer collaboration: presence carets, delta merges, follow/mirror
 tests/*_test.blsp           pure model/view tests, one suite per area (no window needed)
+tools/drive*.py            live pty drivers: run the real editor, assert on what it paints —
+                           the wiring the model tests can't see (`make drive`, tools/README.md)
+assets/                     the desktop identity: the icon (SVG) + the .desktop entry the
+                            window's `:app-id` is matched against (`make install` places both)
 project.blsp                the nest manifest (:name "myedit")
 ```
 
@@ -143,6 +150,7 @@ nest test --failed       # just what failed last run — the edit/rerun loop
 nest test --cover        # function-level coverage: what the suite never calls
 nest test --repeat-until-failure 5 --seed 0   # shake out a flaky/order-dependent test
 nest check               # advisory type/lint check
+make drive               # live pty drivers: the real editor, driven (tools/README.md)
 ```
 
 **Verify the GUI only via the installed `nest`** (or a `cargo build --features
