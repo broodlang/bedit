@@ -252,9 +252,14 @@ silently stopped matching); exit signals never reached a natively-nested `receiv
   hooks in by calling the same registration functions core uses (`register-type-layers`,
   `bind-key`, `defsetting`, …) — the registries *are* the plugin API. Live, restart-free
   install via the mutable `*load-path*` + late binding.
-  Gaps — Brood/hive: a **`:kind :bedit` marker** carried manifest → `nest publish` → a hive
-  column → a `?kind=` search filter (so the editor lists editor packages, and knows a
-  package is meant for it before loading it); a runtime **`load-nest`**; package-rooted
+  Gaps — Brood/hive, and **generic by requirement**: nothing in `brood`/`nest`/`hive` may
+  know bedit exists, so the marker is `:extends {bedit ">= 0.1"}` — a manifest map of
+  *host → version constraint* whose keys are author data, carried manifest → `nest publish`
+  → hive → a `?extends=<host>` search filter, with `version-satisfies?` promoted into `std`
+  from the copy hive already hand-rolled (a predicate, not a resolver change — ADR-037's
+  exact-version invariant stands) and the constraint checked by the **host** at load time.
+  A Hatch plugin or a `nest` plugin then works with no new code. Also: a runtime
+  **`load-nest`**; package-rooted
   namespaces (ADR-070 — the one real language investment, gating *third-party* packages;
   its prelude/heap groundwork landed 2026-08-02). Editor-side: config-dir-as-nest startup
   loader, a `*Packages*` buffer (`M-x package-list`, dired-style single keys, `C-h P`),
