@@ -112,16 +112,54 @@ list, default none) floats its entries to the top on empty input via the shared
       (sexp-fn b key)
       (goto-char b (ts-point (buffer-text b) lang (:point b))))))
 
+(defn ed--structural-move (key ts-point sexp-fn)
+  "The mode-polymorphic structural move as one `buffer -> buffer` op — `ts-point` for a
+tree-sitter mode, `sexp-fn` for Brood. Naming the buffer op (rather than inlining the `fn`)
+is what lets the motions, the structural KILLS (`ed-kill-span` wants a `buffer -> buffer`)
+and `mark-sexp` all share a single definition of \"one sexp forward\"."
+  (fn (b) (ed--structural b key ts-point sexp-fn)))
+
 (defcommand cmd-forward-sexp (m key)
-  (ed-apply m (fn (b) (ed--structural b key editor/treesit/point-forward sexp/forward))))
+  "Forward over the next s-expression (C-M-f)."
+  (ed-apply m (ed--structural-move key editor/treesit/point-forward sexp/forward)))
 (defcommand cmd-backward-sexp (m key)
-  (ed-apply m (fn (b) (ed--structural b key editor/treesit/point-backward sexp/backward))))
+  "Back over the previous s-expression (C-M-b)."
+  (ed-apply m (ed--structural-move key editor/treesit/point-backward sexp/backward)))
+(defcommand cmd-forward-list (m key)
+  "Forward over the next LIST, stepping past atom siblings rather than stopping at them
+(C-M-n) — the \"jump the whole next block\" motion."
+  (ed-apply m (ed--structural-move key editor/treesit/point-list-forward sexp/list-forward)))
+(defcommand cmd-backward-list (m key)
+  "Back over the previous LIST, stepping past atom siblings (C-M-p)."
+  (ed-apply m (ed--structural-move key editor/treesit/point-list-backward sexp/list-backward)))
+(defcommand cmd-backward-up-list (m key)
+  "Out of the enclosing list backward, to before its opening delimiter (C-M-u)."
+  (ed-apply m (ed--structural-move key editor/treesit/point-up sexp/up)))
 (defcommand cmd-up-list (m key)
-  (ed-apply m (fn (b) (ed--structural b key editor/treesit/point-up sexp/up))))
+  "Out of the enclosing list forward, to past its closing delimiter (Emacs `up-list`) —
+the mirror of `backward-up-list`, and the quick way out of a form you've finished."
+  (ed-apply m (ed--structural-move key editor/treesit/point-up-forward sexp/up-forward)))
 (defcommand cmd-down-list (m key)
-  (ed-apply m (fn (b) (ed--structural b key editor/treesit/point-down sexp/down))))
+  "Down into the next list, just past its opening delimiter (C-M-d)."
+  (ed-apply m (ed--structural-move key editor/treesit/point-down sexp/down)))
 (defcommand cmd-beginning-of-defun (m key)
-  (ed-apply m (fn (b) (ed--structural b key editor/treesit/point-defun-start sexp/beginning-of-defun))))
+  "To the start of the enclosing definition (C-M-a)."
+  (ed-apply m (ed--structural-move key editor/treesit/point-defun-start sexp/beginning-of-defun)))
+(defcommand cmd-end-of-defun (m key)
+  "To the end of the enclosing definition (C-M-e) — the close of the very form
+`beginning-of-defun` finds, so the pair brackets one defun."
+  (ed-apply m (ed--structural-move key editor/treesit/point-defun-end sexp/end-of-defun)))
+
+;; The structural kills: `ed-kill-span` over the same motions, so a killed sexp is
+;; whatever `C-M-f`/`C-M-b` would have moved over — the whole form however many lines it
+;; spans. Distinct from brood-mode's `C-k` (`cmd-sexp-kill`), which is paredit's
+;; line-bounded kill: that one refuses to break the parens, these take a balanced form.
+(defcommand cmd-kill-sexp (m key)
+  "Kill the s-expression after point (C-M-k)."
+  (ed-kill-span m (ed--structural-move key editor/treesit/point-forward sexp/forward)))
+(defcommand cmd-backward-kill-sexp (m key)
+  "Kill the s-expression before point (C-M-DEL)."
+  (ed-kill-span m (ed--structural-move key editor/treesit/point-backward sexp/backward)))
 
 ;; ---- structural editing (brood-mode: paredit slurp/barf/raise/splice/wrap) ---
 ;; Each runs a `std/sexp` structural *edit* over the current buffer — a whole-buffer
@@ -150,16 +188,21 @@ list, default none) floats its entries to the top on empty input via the shared
 (defcommand cmd-wrap-round (m key)
   "Wrap the form at point in a fresh (…), point landing just inside (paredit M-()."
   (ed-apply m (fn (b) (sexp/wrap-round b key))))
+(defcommand cmd-transpose-sexps (m key)
+  "Interchange the s-expressions either side of point, point landing past both (C-M-t).
+Point inside a form counts as being before it, so the chord mid-symbol swaps that symbol
+with its predecessor — as it does in Emacs."
+  (ed-apply m (fn (b) (sexp/transpose b key))))
 
-(defn ed--mark-sexp (m self point-nav)
-  "Mark the next/previous s-expression from point (per `point-nav` —
-`sexp/point-forward` or `sexp/point-backward`, `(text point) -> point`), leaving
-point and activating the region. When the previous command was `self`, extend from
-the existing mark instead of starting at point (the repeat-extends mechanism)."
+(defn ed--mark-by (m self move)
+  "Mark the span from point to where `move` (a `buffer -> buffer` point move) lands,
+leaving point where it is and activating the region so it highlights. When the previous
+command was `self`, extend from the existing mark instead of from point — the
+repeat-extends mechanism: each press grows the region by one more unit."
   (let (b (ed-current-buf m)
         extending (and (= (:last-command m) self) (buffer-mark b))
         from (if extending (buffer-mark b) (buffer-point b))
-        target (point-nav (buffer-text b) from))
+        target (buffer-point (move (goto-char b from))))
     (ed-set-buf m (assoc b :mark target))))
 
 (defcommand cmd-mark-sexp
@@ -168,15 +211,20 @@ the existing mark instead of starting at point (the repeat-extends mechanism)."
 region so it highlights (Emacs `mark-sexp`, C-M-SPC). Pressed repeatedly it extends the
 region by one more sexp each time (the mark advances; point stays put). With a negative
 argument (`M-- C-M-SPC` / `C-- C-M-SPC`) it marks the *previous* sexp instead, via the
-registered inverse (`cmd-mark-sexp-backward`)."
-  (ed--mark-sexp m 'commands/cmd-mark-sexp sexp/point-forward))
+registered inverse (`cmd-mark-sexp-backward`). Marks by the same motion `C-M-f` uses, so
+in a tree-sitter mode it marks a tree-sitter node."
+  (ed--mark-by m
+    'commands/cmd-mark-sexp
+    (ed--structural-move key editor/treesit/point-forward sexp/forward)))
 
 ;; The inverse `cmd-mark-sexp` flips to under a negative argument: marks the PREVIOUS
 ;; sexp (the mark moves back from point), extending backward on repeat. A plain `defn`
 ;; (not a `defcommand`) — it isn't a standalone Emacs command, just the negative-arg
 ;; target the dispatcher resolves via `command-inverse`.
 (defn cmd-mark-sexp-backward (m key)
-  (ed--mark-sexp m 'commands/cmd-mark-sexp-backward sexp/point-backward))
+  (ed--mark-by m
+    'commands/cmd-mark-sexp-backward
+    (ed--structural-move key editor/treesit/point-backward sexp/backward)))
 
 ;; ---- indentation (TAB / RET; sexp-aware via the mode's :indent service) -----
 ;; The mechanism is language-neutral: `ed-indent-target` asks the buffer's mode for
@@ -259,14 +307,16 @@ acting on the same block."
         end (if (< (inc last) n) (rope-line->char rope (inc last)) (buffer-length buf)))
     (assoc buf :point end :mark start)))
 
-(defn ed--map-region-lines (buf first last f)
+(defn ed--fold-region-lines (buf first last f)
   "Apply `(f buf ln)` down lines `first..last`, coalescing every line's edit into ONE
-undo step (amalgamate after the first), then re-select the block."
-  (ed--reselect-lines (fold (fn (b ln) (f (if (= ln first) b (amalgamate-undo b)) ln))
-                        buf
-                        (range first (inc last)))
-    first
-    last))
+undo step (amalgamate after the first). Leaves point/mark wherever `f` left them — the
+caller decides (TAB re-selects the block; `indent-sexp` restores point)."
+  (fold (fn (b ln) (f (if (= ln first) b (amalgamate-undo b)) ln)) buf (range first (inc last))))
+
+(defn ed--map-region-lines (buf first last f)
+  "`ed--fold-region-lines`, then re-select lines `first..last` so repeated TAB / Shift-TAB
+keep acting on the same block."
+  (ed--reselect-lines (ed--fold-region-lines buf first last f) first last))
 
 (defn ed-reindent-line-at (buf ln)
   "Reindent line `ln` to its mode column (positions point at the line first so the shared
@@ -295,6 +345,27 @@ line, or from every line of the active region (one undo step, keeping the region
               first
               last
               (fn (bb ln) (ed-dedent-line-at bb ln ed-tab-width)))))))))
+
+(defcommand cmd-indent-sexp
+  (m key)
+  "Reindent every line of the s-expression after point (C-M-q) as one undo step — the
+whole-form counterpart of TAB's single line. Point returns to the indentation of the
+form's first line (Emacs holds point with a marker; landing on the reindented text is the
+useful equivalent). A no-op when no form follows point."
+  (let (buf (ed-current-buf m)
+        rope (buffer-rope buf)
+        point (buffer-point buf)
+        end (buffer-point ((ed--structural-move key editor/treesit/point-forward sexp/forward)
+                            buf))
+        first (rope-char->line rope point))
+    (if (<= end point)
+      m
+      (let (last (rope-char->line rope (dec end)))
+        (ed-edit m
+          (fn (b)
+            (let (nb (ed--fold-region-lines b first last ed-reindent-line-at))
+              (back-to-indentation
+                (goto-char nb (rope-line->char (buffer-rope nb) first))))))))))
 
 (defn ed-vim-command-mode? (m)
   "True while a modal profile holds the keyboard in a COMMAND state — vim `:normal`
@@ -416,10 +487,21 @@ margin; point moves, the view does not."
         line (min last (max top target)))
     (assoc (ed-set-buf m (forward-line buf (- line (buffer-current-line buf)))) :mwl-cycle pos)))
 
-;; ---- paragraph motion (M-{ / M-}) -------------------------------------------
+;; ---- paragraph / sentence / indentation motion (M-{ M-} · M-a M-e · M-m) -----
+;; All three are `std/editor/buffer` primitives — the text-level motions live next to
+;; `forward-word` in the toolkit, so these commands are one `ed-apply` each.
 
 (defcommand cmd-forward-paragraph (m key) (ed-apply m forward-paragraph))
 (defcommand cmd-backward-paragraph (m key) (ed-apply m backward-paragraph))
+(defcommand cmd-forward-sentence (m key)
+  "To the end of the sentence (M-e); the paragraph's end when none follows."
+  (ed-apply m forward-sentence))
+(defcommand cmd-backward-sentence (m key)
+  "To the start of the sentence (M-a); the paragraph's start when none precedes."
+  (ed-apply m backward-sentence))
+(defcommand cmd-back-to-indentation (m key)
+  "To the first non-whitespace character of the line, skipping its indent (M-m)."
+  (ed-apply m back-to-indentation))
 
 ;; ---- editing ----------------------------------------------------------------
 
@@ -544,6 +626,14 @@ enclosing list's close delimiter, so it can't break the parens. Reuses the kill 
   (m key)
   "Kill the word before point (M-DEL)."
   (ed-kill-span m backward-word))
+(defcommand cmd-kill-sentence
+  (m key)
+  "Kill from point to the end of the sentence (M-k)."
+  (ed-kill-span m forward-sentence))
+(defcommand cmd-backward-kill-sentence
+  (m key)
+  "Kill from point back to the start of the sentence (C-x DEL)."
+  (ed-kill-span m backward-sentence))
 (defcommand cmd-kill-whole-line
   (m key)
   "Kill the whole current line, newline included."
@@ -1516,6 +1606,19 @@ imenu/xref jumps, which land on a symbol's start position."
                         (message mm (str "not a line number: " t))
                         (ed-apply mm (fn (b) (ed-goto-line b n))))))}))
 
+(defcommand cmd-goto-char
+  (m key)
+  "Prompt for a character offset and jump to it (M-g c). Clamped to the buffer."
+  (assoc m
+    :minibuffer
+    {:edit (ed-mb-edit "Goto char: " "")
+     :on-complete (fn (mm t)
+                    (let (n (ed--parse-int t))
+                      (if (nil? n)
+                        (message mm (str "not a character offset: " t))
+                        (ed-apply mm
+                          (fn (b) (goto-char b (max 0 (min n (buffer-length b)))))))))}))
+
 (defn ed--recentf-prompt (m files)
   "The recentf minibuffer spec over `files` (full paths, most-recent first): a Vertico
 list, fuzzy-narrowed, that opens the chosen file. A no-op-with-message when empty."
@@ -1695,8 +1798,15 @@ typed after it build `-N` (e.g. `M-- 3 C-f` moves back three chars)."
 (register-inverse 'commands/cmd-forward-word 'commands/cmd-backward-word)
 (register-inverse 'commands/cmd-next-line 'commands/cmd-previous-line)
 (register-inverse 'commands/cmd-forward-sexp 'commands/cmd-backward-sexp)
+(register-inverse 'commands/cmd-forward-list 'commands/cmd-backward-list)
+(register-inverse 'commands/cmd-up-list 'commands/cmd-backward-up-list)
+(register-inverse 'commands/cmd-end-of-defun 'commands/cmd-beginning-of-defun)
+(register-inverse 'commands/cmd-kill-sexp 'commands/cmd-backward-kill-sexp)
 (register-inverse 'commands/cmd-mark-sexp 'commands/cmd-mark-sexp-backward)
+(register-inverse 'commands/cmd-mark-word 'commands/cmd-mark-word-backward)
 (register-inverse 'commands/cmd-forward-paragraph 'commands/cmd-backward-paragraph)
+(register-inverse 'commands/cmd-forward-sentence 'commands/cmd-backward-sentence)
+(register-inverse 'commands/cmd-kill-sentence 'commands/cmd-backward-kill-sentence)
 (register-inverse 'commands/cmd-delete-char 'commands/cmd-delete-backward)
 (register-inverse 'commands/cmd-kill-word 'commands/cmd-backward-kill-word)
 (register-inverse 'commands/cmd-scroll-up 'commands/cmd-scroll-down)
@@ -1730,6 +1840,18 @@ A no-op (with a note) when no mark is set."
     (if (nil? mk)
       (message m "no mark set")
       (ed-set-buf m (assoc b :point mk :mark (buffer-point b))))))
+
+(defcommand cmd-mark-word
+  (m key)
+  "Set the mark at the end of the next word, leaving point (Emacs `mark-word`, M-@).
+Repeated, it extends the region by another word; under a negative argument it marks the
+*previous* word instead (the registered inverse). Same repeat-extends machinery as
+`mark-sexp` — see `ed--mark-by`."
+  (ed--mark-by m 'commands/cmd-mark-word forward-word))
+
+;; `mark-word`'s negative-argument direction — a plain `defn`, like `cmd-mark-sexp-backward`.
+(defn cmd-mark-word-backward (m key)
+  (ed--mark-by m 'commands/cmd-mark-word-backward backward-word))
 
 (defcommand cmd-mark-paragraph
   (m key)

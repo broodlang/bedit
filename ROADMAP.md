@@ -51,6 +51,21 @@ in **`docs/remote-multiplayer-plan.md`**; the user-facing runbook is
   runaway one.
 - ✅ **Structural navigation (brood-mode)** — `C-M-f/b/u/d/a` over the parse-source
   CST (`sexp`).
+- ✅ **The rest of Emacs' sexp/list family** — `C-M-n`/`C-M-p` `forward-list` /
+  `backward-list` (step over the atom siblings, stop only at whole lists), `C-M-e`
+  `end-of-defun`, `up-list` (the forward mirror of `C-M-u`'s `backward-up-list`;
+  M-x-only, as in Emacs), the structural kills `C-M-k` / `C-M-DEL`, `C-M-t`
+  `transpose-sexps` and `C-M-q` `indent-sexp`. The motions/kills/reindent sit on the
+  shared `prog-mode-layer`, so a tree-sitter mode inherits them; the pure primitives
+  are in `std/tool/sexp.blsp` (`point-list-forward` / `point-list-backward` /
+  `point-up-forward` / `point-defun-end` / `point-transpose`) and mirrored in
+  `std/editor/treesit.blsp` — the prime-directive home, next to the five they join.
+  `mark-sexp` now marks by the same motion `C-M-f` uses, so it is mode-polymorphic too.
+- ✅ **The non-structural Emacs motions** — `M-m` `back-to-indentation`, sentence
+  motion `M-a`/`M-e` with `M-k` / `C-x DEL` to kill one, `M-@` `mark-word`, `M-g c`
+  `goto-char`, and `M-g n`/`M-g p` `next-error`/`previous-error` (`C-x \`` still works).
+  `back-to-indentation` / `forward-sentence` / `backward-sentence` are new
+  `std/editor/buffer.blsp` primitives, next to `forward-word`/`forward-paragraph`.
 - ✅ **Syntax highlighting (brood-mode)** — live lexical colouring via the
   `:fontify` mode service over `editor/highlight`; spans lexed once per frame, region
   `:reverse` merged into the lexer face.
@@ -120,6 +135,10 @@ in **`docs/remote-multiplayer-plan.md`**; the user-facing runbook is
   `C-M-s` splice (`M-s` is the search prefix), and `C-k` rebinds to the sexp-aware kill
   (won't break parens). All M-x-reachable (`slurp-forward`, …). Shifted-Ctrl chord
   encodings are best-guesses to confirm on a live GUI — see "Loose ends".
+- ✅ **`C-M-t` transpose-sexps** — `sexp/point-transpose`, the same pure-edit shape.
+  On `brood-keymap` (a CST edit, like the paredit family) rather than the shared prog
+  layer. Point inside a form counts as being before it, so the chord mid-symbol swaps
+  that symbol with its predecessor, matching Emacs.
 
 ## C. Multi-language via tree-sitter (the big architectural piece)
 
