@@ -17,37 +17,34 @@ coloured like `*Spy*`, and an exit footer; error locations are jumpable with RET
 The editor side is testrun/compile's shape: a `:apprun` process (via `procstream`)
 owns the proc handle, line-buffers stdout, and forwards `UiEvent` records the loop
 folds; the statusbar chip shows live telemetry."
-  (:use model)  ; UiEvent + message / ed-append-named / ed-buf-at
-  (:use interactive)  ; defcommand
-  (:use commands)  ; ed-show-named-aside / ed-find-file / ed-apply / ed-goto-line
-  (:use results)  ; ed-append-follow / loc-at-line — the results-buffer abstraction
-  (:use editor/keymap)  ; keymap-bind — the *Run* keys
-  (:use editor/layers)  ; register-type-layers — the :run-log buffer type
-  (:use json))  ; json-parse — decode the taps' event lines
-
-(require 'debugger)  ; debugger-spy-tap-form — the shared spy tap the script splices in
-(require 'procstream)  ; the shared streaming-subprocess worker (:apprun rides it)
-(require 'modes)  ; fontify-line-faces + the results faces
-
+  (:use model) ; UiEvent + message / ed-append-named / ed-buf-at
+  (:use interactive) ; defcommand
+  (:use commands) ; ed-show-named-aside / ed-find-file / ed-apply / ed-goto-line
+  (:use results) ; ed-append-follow / loc-at-line — the results-buffer abstraction
+  (:use editor/keymap) ; keymap-bind — the *Run* keys
+  (:use editor/layers) ; register-type-layers — the :run-log buffer type
+  (:use json)) ; json-parse — decode the taps' event lines
+(require 'debugger) ; debugger-spy-tap-form — the shared spy tap the script splices in
+(require 'procstream) ; the shared streaming-subprocess worker (:apprun rides it)
+(require 'modes) ; fontify-line-faces + the results faces
 (def *run-buffer* "*Run*")
 ;; unguessable, per editor process — see sandbox.blsp on why a fixed /tmp name is
 ;; both a collision between two editors and a symlink hazard
 (def *apprun-script-path* (temp-path "bedit-apprun-"))
-(def *apprun-stats-ms* 2000)  ; the heartbeat period (fast enough to feel live)
-
+(def *apprun-stats-ms* 2000) ; the heartbeat period (fast enough to feel live)
 ;; ---- the async events (UiEvent records — see model.blsp) --------------------
 
-(defrecord apprun-output-event (text gen))  ; one line of the app's own stdout/stderr
-(defrecord apprun-spy-event (entry gen))  ; a spy/trace-fn entry: {:kind :form :value :fn :args :depth}
-(defrecord apprun-stats-event (stats gen))  ; the heartbeat: {:procs :memory :uptime-ms}
-(defrecord apprun-done-event (code gen))  ; the app exited
-
+(defrecord apprun-output-event (text gen)) ; one line of the app's own stdout/stderr
+(defrecord apprun-spy-event (entry gen)) ; a spy/trace-fn entry: {:kind :form :value :fn :args :depth}
+(defrecord apprun-stats-event (stats gen)) ; the heartbeat: {:procs :memory :uptime-ms}
+(defrecord apprun-done-event (code gen)) ; the app exited
 ;; ---- the generated wrapper script ----------------------------------------------
 ;; Quoted forms, pr-str'd (the testrun pattern). The taps go in BEFORE run-project
 ;; boots the app, as root `def`s — ambient, so every process the app spawns streams
 ;; through them.
 
-(defn apprun--run-forms (run-breaks)
+(defn- apprun-run-forms
+  (run-breaks)
   "The forms that RUN the project. With no run breakpoints it's just
 `project/run-project`. With them, it replicates run-project's flow but installs a
 trace on each breakpointed symbol AFTER the entry module is required (so the project
@@ -61,56 +58,61 @@ traces survive. Each traced call then streams into *Run* via the spy tap."
     ;; to unloaded module" warning flood — unlike force-loading every source file. Then
     ;; run-project: its `require` is idempotent (these modules are already loaded), so it
     ;; doesn't reload and wipe the traces. Each traced call streams into *Run*.
-    (append
-      (list '(require 'debug)
-        '(project/load-config)
-        '(let (root (project/project-find-root (cwd)))
-           (when root (project/project-setup root))))
+    (append (list '(require 'debug)
+              '(project/load-config)
+              '(let (root (project/project-find-root (cwd)))
+                 (when root (project/project-setup root))))
       (map (fn (sym)
              (let (parts (string-split (str sym) "/")
                    module (symbol (join "/" (take (dec (count parts)) parts))))
-               `(do (try (require (quote ~module)) (catch error nil))
+               `(do
+                  (try (require (quote ~module)) (catch error nil))
                   (when (bound? (quote ~sym)) (debug/trace-fn (quote ~sym))))))
         run-breaks)
       (list '(project/run-project '())))))
 
-(defn apprun--script-forms (run-breaks)
+(defn- apprun-script-forms
+  (run-breaks)
   (append
-    (list
-      '(require 'project)
+    (list '(require 'project)
       '(require 'json)
       ;; every spy/trace-fn entry, anywhere in the app -> one JSON line — the shared
       ;; debugger tap
       debugger/debugger-spy-tap-form
       ;; the stats heartbeat: a tiny sibling process, hibernating between beats
-      (list 'def 'apprun--stats-ms *apprun-stats-ms*)
-      '(defn apprun--emit-stats (started)
+      (list 'def 'apprun-stats-ms *apprun-stats-ms*)
+      '(defn- apprun-emit-stats
+         (started)
          (let (infos (keep process-info (list-processes)))
-           (println (json/json-encode
-                      {:event "stats"
-                       :procs (count infos)
-                       ;; reductions (work done) is the reliable live signal; :memory
-                       ;; only updates at a process's last receive, so it reads 0 for a
-                       ;; process that hasn't received yet
-                       :reductions (fold (fn (acc p) (+ acc (or (get p :reductions) 0))) 0 infos)
-                       :memory (fold (fn (acc p) (+ acc (or (get p :memory) 0))) 0 infos)
-                       :uptime-ms (- (now) started)}))))
-      '(defn apprun--beat (started)
+           (println
+             (json/json-encode
+               {:event "stats"
+                :procs (count infos)
+                ;; reductions (work done) is the reliable live signal; :memory
+                ;; only updates at a process's last receive, so it reads 0 for a
+                ;; process that hasn't received yet
+                :reductions (fold (fn (acc p) (+ acc (or (get p :reductions) 0))) 0 infos)
+                :memory (fold (fn (acc p) (+ acc (or (get p :memory) 0))) 0 infos)
+                :uptime-ms (- (now) started)}))))
+      '(defn- apprun-beat
+         (started)
          (do
-           (apprun--emit-stats started)          ; emit at once, then every interval —
-           (receive (after apprun--stats-ms nil)) ; so telemetry shows immediately, even
-           (apprun--beat started)))               ; for an app that exits before 5s
-      '(spawn (apprun--beat (now))))
-    (apprun--run-forms run-breaks)))
+           (apprun-emit-stats started) ; emit at once, then every interval —
+           (receive (after apprun-stats-ms nil)) ; so telemetry shows immediately, even
+           (apprun-beat started))) ; for an app that exits before 5s
+      '(spawn (apprun-beat (now))))
+    (apprun-run-forms run-breaks)))
 
-(defn apprun--script-source (run-breaks)
-  (join "\n" (map pr-str (apprun--script-forms run-breaks))))
+(defn- apprun-script-source
+  (run-breaks)
+  (join "\n" (map pr-str (apprun-script-forms run-breaks))))
 
 ;; ---- the runner process ----------------------------------------------------------
 
-(defn apprun--editor () (whereis :editor))
+(defn- apprun-editor () (whereis :editor))
 
-(defn apprun--decode-line (line)
+(defn- apprun-decode-line
+  (line)
   "Classify one stdout line — `[:spy m]` / `[:stats m]` / `[:output s]` / `[:drop]` —
 salvaging a JSON line another process's unflushed `print` may have prefixed (the
 testrun--decode-line shape; the shared decoder is a fold-up candidate)."
@@ -122,78 +124,100 @@ testrun--decode-line shape; the shared decoder is a fold-up candidate)."
       (= (trim line) "") [:drop]
       else [:output line])))
 
-(defn apprun--dispatch-line (line gen)
-  (let (kv (apprun--decode-line line))
+(defn- apprun-dispatch-line
+  (line gen)
+  (let (kv (apprun-decode-line line))
     (case (first kv)
-      :spy (send (apprun--editor) (apprun-spy-event (second kv) gen))
-      :stats (send (apprun--editor) (apprun-stats-event (second kv) gen))
-      :output (send (apprun--editor) (apprun-output-event (second kv) gen))
+      :spy (send (apprun-editor) (apprun-spy-event (second kv) gen))
+      :stats (send (apprun-editor) (apprun-stats-event (second kv) gen))
+      :output (send (apprun-editor) (apprun-output-event (second kv) gen))
       nil)))
 
-(defn apprun--handlers ()
+(defn- apprun-handlers
+  ()
   "The `procstream` handlers (each takes the run token): stdout decodes into
 spy/stats/output events, stderr forwards as plain output, the exit becomes done."
-  {:on-line apprun--dispatch-line
-   :on-err-line (fn (line gen) (send (apprun--editor) (apprun-output-event line gen)))
-   :on-done (fn (code gen) (send (apprun--editor) (apprun-done-event code gen)))})
+  {:on-line apprun-dispatch-line
+   :on-err-line (fn (line gen) (send (apprun-editor) (apprun-output-event line gen)))
+   :on-done (fn (code gen) (send (apprun-editor) (apprun-done-event code gen)))})
 
 ;; ---- rendering + folds -------------------------------------------------------------
 
-(defn apprun-bytes-human (n) (ed-bytes-human n))  ; the shared formatter (model)
-
-(defn apprun-reds-human (n) (ed-reds-human n))  ; the shared formatter (model)
-
+(defn apprun-bytes-human (n) (ed-bytes-human n)) ; the shared formatter (model)
+(defn apprun-reds-human (n) (ed-reds-human n)) ; the shared formatter (model)
 (defn apprun-stats-line (s)
   "The one-line stats rendering (the chip tooltip's first line)."
-  (str (get s :procs) " procs · " (apprun-bytes-human (or (get s :memory) 0))
-    " · up " (quot (or (get s :uptime-ms) 0) 1000) "s"))
+  (str (get s :procs)
+    " procs · "
+    (apprun-bytes-human (or (get s :memory) 0))
+    " · up "
+    (quot (or (get s :uptime-ms) 0) 1000)
+    "s"))
 
-(defn apprun--current? (m gen)
+(defn- apprun-current?
+  (m gen)
   "Whether `gen` is the running app's generation — a superseded run's straggler is
 dropped."
   (= gen (get-in m [:apprun :gen])))
 
-(impl UiEvent apprun-output-event
+(impl UiEvent
+  apprun-output-event
   (ui-event-fold [e m textrows cols rows]
-    (if (apprun--current? m (apprun-output-event-gen e))
+    (if (apprun-current? m (apprun-output-event-gen e))
       (ed-append-follow m *run-buffer* (str (apprun-output-event-text e) "\n") cols rows)
       m)))
 
-(impl UiEvent apprun-spy-event
+(impl UiEvent
+  apprun-spy-event
   (ui-event-fold [e m textrows cols rows]
-    (if (apprun--current? m (apprun-spy-event-gen e))
-      (ed-append-follow m *run-buffer*
-        (str "~ " (let (sp (apprun-spy-event-entry e))
-                    (debugger/debugger-spy-body (get sp :kind) (get sp :form) (get sp :value)
-                      (get sp :fn) (get sp :args)))
+    (if (apprun-current? m (apprun-spy-event-gen e))
+      (ed-append-follow m
+        *run-buffer*
+        (str "~ "
+          (let (sp (apprun-spy-event-entry e))
+            (debugger/debugger-spy-body (get sp :kind)
+              (get sp :form)
+              (get sp :value)
+              (get sp :fn)
+              (get sp :args)))
           "\n")
-        cols rows)
+        cols
+        rows)
       m)))
 
-(impl UiEvent apprun-stats-event
+(impl UiEvent
+  apprun-stats-event
   ;; model-only: the statusbar chip renders the stats live and its hover carries the
   ;; detail (current + peak) — *Run* stays the app's OWN output, never the taps'.
   ;; Peaks make a leak/spawn-storm visible even if you look after it settled.
   (ui-event-fold [e m textrows cols rows]
-    (if (not (apprun--current? m (apprun-stats-event-gen e)))
+    (if (not (apprun-current? m (apprun-stats-event-gen e)))
       m
       (let (s (apprun-stats-event-stats e)
             peak (get-in m [:apprun :peak] {}))
-        (update m :apprun assoc
-          :stats s
-          :peak {:procs (max (or (get s :procs) 0) (or (get peak :procs) 0))
-                 :memory (max (or (get s :memory) 0) (or (get peak :memory) 0))
-                 :reductions (max (or (get s :reductions) 0) (or (get peak :reductions) 0))})))))
+        (update m
+          :apprun
+          assoc
+          :stats
+          s
+          :peak
+          {:procs (max (or (get s :procs) 0) (or (get peak :procs) 0))
+           :memory (max (or (get s :memory) 0) (or (get peak :memory) 0))
+           :reductions (max (or (get s :reductions) 0) (or (get peak :reductions) 0))})))))
 
-(impl UiEvent apprun-done-event
+(impl UiEvent
+  apprun-done-event
   ;; drop :apprun so the statusbar chip disappears with the app. A stale-gen done
   ;; (an old run exiting just as a new one starts) must NOT clear the new run's chip.
   (ui-event-fold [e m textrows cols rows]
-    (if (not (apprun--current? m (apprun-done-event-gen e)))
+    (if (not (apprun-current? m (apprun-done-event-gen e)))
       m
       (let (code (apprun-done-event-code e))
-        (message (ed-append-follow (dissoc m :apprun) *run-buffer*
-                   (str "\n[app exited " (if (nil? code) "killed" code) "]\n") cols rows)
+        (message (ed-append-follow (dissoc m :apprun)
+                   *run-buffer*
+                   (str "\n[app exited " (if (nil? code) "killed" code) "]\n")
+                   cols
+                   rows)
           (str "app exited " (if (nil? code) "(killed)" code)))))))
 
 ;; ---- the commands -------------------------------------------------------------------
@@ -204,15 +228,18 @@ dropped."
 the debug taps installed — app output, coloured spy/trace traffic and a stats
 heartbeat stream into *Run*."
   (let (run-breaks (or (:run-breaks m) '()))
-    (spit *apprun-script-path* (apprun--script-source run-breaks))
+    (spit *apprun-script-path* (apprun-script-source run-breaks))
     (let (root (or (:project-root m) (cwd))
-          proc (spawn :apprun (procstream/procstream-loop (apprun--handlers)))
+          proc (spawn :apprun (procstream/procstream-loop (apprun-handlers)))
           gen (inc (or (get-in m [:apprun :gen]) 0)))
       (send proc [:run "nest" ["run" *apprun-script-path*] root gen])
-      (ed-show-named-aside
-        (message (assoc m :apprun {:root root :gen gen})
-          (str "running project in " root "…"
-            (if (empty? run-breaks) "" (str " (" (count run-breaks) " breakpoint(s) traced)"))))
+      (ed-show-named-aside (message (assoc m :apprun {:root root :gen gen})
+                             (str "running project in "
+                               root
+                               "…"
+                               (if (empty? run-breaks)
+                                 ""
+                                 (str " (" (count run-breaks) " breakpoint(s) traced)"))))
         *run-buffer*
         (str "-*- run: " root " -*-\n\n")
         :run-log))))
@@ -229,7 +256,8 @@ the worker's mere existence — the worker idles alive between runs. `[:shutdown
 fires the done event, so the chip clears and *Run* gets its footer."
   (if (nil? (:apprun m))
     (message m "nothing is running")
-    (do (send (whereis :apprun) [:shutdown])
+    (do
+      (send (whereis :apprun) [:shutdown])
       m)))
 
 ;; ---- the :run-log buffer type ---------------------------------------------------
@@ -243,7 +271,8 @@ fires the done event, so the chip clears and *Run* gets its footer."
 (def run-face-error {:fg *red* :bold true})
 (def run-face-header {:fg *subtext* :bold true})
 
-(defn apprun--line-face (line)
+(defn- apprun-line-face
+  (line)
   (cond
     (starts-with? line "~ ") run-face-spy
     (starts-with? line "-*-") run-face-header
@@ -254,7 +283,7 @@ fires the done event, so the chip clears and *Run* gets its footer."
 (defn run-log-fontify (src)
   "The *Run* `:fontify`: teal spy traffic, red error locations (role colour per
 line). Clickability is the pointer/hover the view draws from `:line-loc`."
-  (modes/fontify-line-faces src apprun--line-face))
+  (modes/fontify-line-faces src apprun-line-face))
 
 (def run-log-mode-layer
   {:name 'run-log
@@ -263,5 +292,5 @@ line). Clickability is the pointer/hover the view draws from `:line-loc`."
    :commands '("run-stop")})
 
 (register-type-layers :run-log
-  (list 'apprun/run-log-mode-layer 'results/location-jump-layer
-    'modes/special-mode-layer 'modes/text-mode-layer))
+  (list 'apprun/run-log-mode-layer
+    'results/location-jump-layer 'modes/special-mode-layer 'modes/text-mode-layer))
