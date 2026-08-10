@@ -18,6 +18,7 @@ python3 tools/drive_mspc.py # or one at a time (from anywhere)
 | `drive_workings.py` | The whole tutorial chain: box source → derived trace names → a real sandbox child → spy entries → cache → the *Workings* pane, following the cursor. Plus that killing the tutorial takes the pane with it. |
 | `drive_progress.py` | Progress survives a session — two editor processes, one throwaway `XDG_CONFIG_HOME`, a solve in the first and the count still there in the second. |
 | `drive_tailcalls.py` | A million TRACED tail calls answer `=> :liftoff`. The lesson teaching O(1) stack is boundary-traced, and a trace wrapper used to cost a frame per level (Brood ADR-207). Model tests can't see it: the headless evaluator instruments nothing, which is exactly the instrumentation that broke. |
+| `drive_tutor_readonly.py` | The REAL editor refuses a backspace at a box's edge and says so, while the box stays writable — the tutorial's prose/borders are read-only at the edit primitive (`:read-only-spans`, ADR-219), not a `:post-key` guard a held key could outrun. |
 
 **Three bugs these caught that 1200 model tests could not.** A new tutorial key was added to the
 help-text vocabulary but never `keymap-bind`-ed, so it rendered as a blank hole in the prose

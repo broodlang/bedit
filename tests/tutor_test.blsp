@@ -1,6 +1,6 @@
 ;; The interactive Brood tutorial (`src/tutor.blsp`) — pure model tests: the box
 ;; parser and skeleton, the lesson render + re-stash across navigation, the
-;; :post-key prose guard through real `ed-update` dispatch, the parse gate
+;; read-only prose (protected spans) through real `ed-update` dispatch, the parse gate
 ;; (E0002 = mid-typing = silence), the eval triple's headless sync fallback
 ;; (verdicts land as notes without a sandbox), stale-reply dropping, and the
 ;; playground commands (TAB / reset). No window, no subprocess — the sandboxed
@@ -107,7 +107,7 @@
   (test "an unclosed box yields no region"
     (assert= (tutor-regions "╭─ a ──\n(+ 1 2)") ())))
 
-(describe "tutor-skeleton (what the prose guard compares)"
+(describe "tutor-skeleton (the prose-integrity query)"
   (test "box content never reaches the skeleton"
     (let (a "p\n╭─ t ──\n(+ 1 2)\n╰──\nq"
           b "p\n╭─ t ──\n(completely different)\n╰──\nq")
@@ -125,7 +125,9 @@
           b (tut-buf m))
       (assert= (buffer-name b) "*Tutorial*")
       (is (includes? (tut-text m) (str "Brood Tutorial · Navigation — 1/" (nav-count))))
-      (is (not (nil? (:tutor-skeleton b)))) ; the guard's stash
+      ;; the prose/borders are frozen at the edit primitive: the complement of the boxes
+      ;; is stamped as the buffer's read-only spans (ADR-219)
+      (is (not (empty? (read-only-spans b))))
       ;; point parks in the first box, past its margin
       (assert= (buffer-point b) (+ (:start (first (tut-regions m))) 2))))
 
@@ -139,8 +141,9 @@
     (let (m (tut-model-at-open)
           m2 (tutor/cmd-tutorial-next m nil))
       (is (includes? (tut-text m2) (str "Navigation — 2/" (nav-count))))
-      ;; the fresh render re-stashed a matching skeleton — the guard passes
-      (assert= (:tutor-skeleton (tut-buf m2)) (tutor-skeleton (tut-text m2)))
+      ;; the fresh render re-stamped the read-only spans to match the new page's boxes
+      (assert= (read-only-spans (tut-buf m2))
+        (editor/formbuf/protected-spans (tut-text m2) (tutor-regions (tut-text m2))))
       (is (includes? (tut-text (tutor/cmd-tutorial-prev m2 nil))
             (str "Navigation — 1/" (nav-count))))))
 
@@ -153,9 +156,9 @@
           ;; no unrendered {{hole}} survives a render
           (is (not (includes? text "{{"))))))))
 
-;; ---- the :post-key prose guard (through real dispatch) ---------------------------
+;; ---- read-only prose: protected spans through real dispatch ----------------------
 
-(describe "the prose guard"
+(describe "editing inside vs outside a box"
   (test "typing INSIDE a box is an ordinary edit"
     (let (m (tut-model)
           m2 (key-into m "1"))
@@ -173,7 +176,59 @@
           r (first (tut-regions m0))
           m (ed-apply m0 (fn (b) (goto-char b (:start r))))
           m2 (key-into m :backspace))
-      (assert= (tut-text m2) (tut-text m)))))
+      (assert= (tut-text m2) (tut-text m))))
+
+  ;; The original bug: holding backspace to clear a box sailed past the box start and ate
+  ;; the ╭ border and the prose, because the HELD-key repeat path (`[:timer :key-repeat]` →
+  ;; `ed-repeat-key-step`) never ran the reactive `:post-key` guard. Protection now lives at
+  ;; the edit primitive (the box regions' complement is read-only — ADR-219), so `delete`
+  ;; itself refuses the border char on every path; the repeat is no different from a tap.
+  (test "REGRESSION: a HELD backspace repeat can't eat the box border"
+    (let (m0 (tut-model)
+          r (first (tut-regions m0))
+          held (assoc (ed-apply m0 (fn (b) (goto-char b (:start r)))) :held-key :backspace)
+          fired (ed-update held [:timer :key-repeat] 80 24))
+      (assert= (tut-text fired) (tut-text held))))
+
+  (test "REGRESSION: sustained held backspace against the border never damages the skeleton"
+    (let (m0 (tut-model)
+          r (first (tut-regions m0))
+          held (assoc (ed-apply m0 (fn (b) (goto-char b (:start r)))) :held-key :backspace)
+          ;; five repeat beats, as if the key stayed down at the boundary
+          fired (fold (fn (m _) (ed-update m [:timer :key-repeat] 80 24)) held (range 5)))
+      (assert= (tutor-skeleton (tut-text fired)) (tutor-skeleton (tut-text held)))))
+
+  ;; The FULL held-key lifecycle through real dispatch — a frontend that reports releases
+  ;; (`:gui-keys`) so repeat engages. Covers everything the model can: a real press ARMS the
+  ;; repeat (`ed-arm-repeat`/`ed-repeatable?`), the timer FIRES it, key-up STOPS it — with the
+  ;; box border intact throughout. The one link a process test can't reach is the native
+  ;; window poll `gui-held-key` (`ed-still-held?`), which needs a real window; here it falls
+  ;; back to true, so the release path (`:key-up`) is what stops the loop, exactly as it does
+  ;; on a real frontend when a key-up arrives.
+  (test "held-key repeat lifecycle at a box edge: arm → fire → stop, guarded throughout"
+    (let (m0 (assoc (tut-model) :gui-keys true)
+          r (first (tut-regions m0))
+          skel (tutor-skeleton (tut-text m0))
+          ;; point at the box's first char; a REAL backspace press — refused (border), but it
+          ;; arms hold-repeat because this frontend can later stop it
+          pressed (ed-update (ed-apply m0 (fn (b) (goto-char b (:start r)))) :backspace 80 24))
+      (assert= (:held-key pressed) :backspace) ; armed
+      (assert= (tutor-skeleton (tut-text pressed)) skel) ; border untouched (refused)
+      (let (repeated (fold (fn (m _) (ed-update m [:timer :key-repeat] 80 24)) pressed (range 6)))
+        (assert= (tutor-skeleton (tut-text repeated)) skel) ; still intact after the repeats
+        (let (released (ed-update repeated [:key-up :backspace] 80 24))
+          (is (nil? (:held-key released))))))) ; the release stops the repeat
+
+  (test "the same held key INSIDE the box still edits (repeat is not blanket-suppressed)"
+    ;; arm backspace in the middle of box content and confirm the timer deletes a char — the
+    ;; guard refuses only at the protected edge, not everywhere
+    (let (m0 (assoc (ed-tutor-launch (tut-model)) :gui-keys true)
+          r (first (tut-regions m0))
+          ;; put point a few chars into the box (past the margin + one code char)
+          inside (ed-update (ed-apply m0 (fn (b) (goto-char b (+ (:start r) 4)))) :backspace 80 24)
+          before-len (string-length (tut-text inside))
+          repeated (ed-update inside [:timer :key-repeat] 80 24))
+      (is (< (string-length (tut-text repeated)) before-len)))))
 
 ;; ---- the parse gate ---------------------------------------------------------------
 
@@ -319,10 +374,12 @@
                                          (when (= (:kind (second kv)) :fail) (:line (second kv))))
                                    (tut-notes m)))))
       (assert= (modes/gutter-mark-for b fail-line) ["✗" modes/gutter-face-test-fail])
-      ;; an edit dims the mark (rope stamp), an inserted line blanks it (count)
+      ;; an edit dims the mark (rope stamp), an inserted line blanks it (count). Both edits
+      ;; land in box 1 (where point is parked) — the prose is read-only now, so the shift
+      ;; has to come from inside a box, which also proves an in-box newline still flows.
       (let (dimmed (tut-buf (ed-edit m (fn (bb) (insert bb "1")))))
         (assert= (modes/gutter-mark-for dimmed fail-line) ["✗" modes/gutter-face-test-stale]))
-      (let (shifted (tut-buf (ed-edit m (fn (bb) (insert (goto-char bb 0) "\n")))))
+      (let (shifted (tut-buf (ed-edit m (fn (bb) (insert bb "\n")))))
         (assert= (modes/gutter-mark-for shifted fail-line) nil))))
 
   (test "ghost text ops paint the note past the line's end"
@@ -363,22 +420,22 @@
 
 ;; ---- review-fix regressions + the new keys -----------------------------------------
 
-(describe "guard resilience (the veto must never brick the buffer)"
-  (test "pre-existing prose damage doesn't veto later keys — navigation still works"
-    ;; damage the prose OUTSIDE dispatch (what a hypothetical bypass would leave);
-    ;; the guard must see the damage predates the key and let the key through
-    (let (m (tut-model)
-          damaged (ed-edit (ed-apply m (fn (b) (goto-char b 0))) (fn (b) (insert b "XX")))
-          moved (key-into damaged :right))
-      ;; the arrow key was NOT undone: point moved off 0
-      (is (> (buffer-point (tut-buf moved)) 0))
-      ;; and the damage (not the key) is still there — nothing silently reverted
-      (is (includes? (tut-text moved) "XX"))))
-
-  (test "a keystroke that causes fresh damage is still vetoed"
+(describe "prose protection lives at the edit primitive (ADR-219)"
+  (test "typing in the prose is refused; text untouched, movement never blocked"
     (let (m (ed-apply (tut-model) (fn (b) (goto-char b 0)))
-          m2 (key-into m "x"))
-      (assert= (tut-text m2) (tut-text m)))))
+          typed (key-into m "x"))
+      (assert= (tut-text typed) (tut-text m)) ; the insert was refused at the mutator
+      (is (> (buffer-point (tut-buf (key-into typed :right))) 0)))) ; the arrow still moves
+
+  (test "refusal is per-edit — no state to brick; a box edit still lands after prose keys"
+    ;; the reactive guard once had a was-intact-before rule to avoid bricking; the primitive
+    ;; needs none — each edit is refused (or allowed) on its own, the buffer never gets stuck
+    (let (m (ed-apply (tut-model) (fn (b) (goto-char b 0)))
+          hammered (key-into (key-into (key-into m "x") :backspace) "y")
+          r (first (tut-regions hammered))
+          edited (key-into (ed-apply hammered (fn (b) (goto-char b (+ (:start r) 2)))) "Z"))
+      (assert= (tutor-skeleton (tut-text hammered)) (tutor-skeleton (tut-text m))) ; prose intact
+      (is (includes? (tut-text edited) "Z"))))) ; and the box edits normally
 
 (describe "box navigation and TAB"
   (test "M-n hops to the next box; M-p and S-TAB hop back"
@@ -672,8 +729,9 @@
           m2 (key-into switched :down))
       (is (includes? (tut-text m2) ": vim-mode")) ; vim's prompt key, rendered live
       (is (includes? (tut-text m2) "(my-marker)")) ; the box edit survived
-      ;; the re-render re-stashed: the guard passes and the skeleton matches
-      (assert= (:tutor-skeleton (tut-buf m2)) (tutor-skeleton (tut-text m2)))))
+      ;; the re-render re-stamped the read-only spans to match the reflowed page
+      (assert= (read-only-spans (tut-buf m2))
+        (editor/formbuf/protected-spans (tut-text m2) (tutor-regions (tut-text m2))))))
 
   (test "verdict hints render for the active profile"
     ;; lesson 4 (Editing)'s exercise hint is a template; under vim it should
