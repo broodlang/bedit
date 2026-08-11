@@ -1,0 +1,319 @@
+(defmodule packages
+  "bedit's package manager: install / update / remove hive packages that `:enhances bedit`, at
+RUNTIME with no restart, plus the *Packages* browser (`M-x package-list`). Packages install
+into a USER directory — `~/.config/bedit/packages/` (the Emacs `elpa` model) — NOT the
+project's build `_deps`, so a plugin is something a user adds live, never a build dependency.
+
+The heavy lifting is std's: `package/registry-install` (download + sha-VERIFY + extract),
+`package/registry-enhancers` (list installable bedit plugins — the runtime `--enhances`),
+`package/registry-latest-version` (update checks), and `project/enhancers-in` (which INSTALLED
+packages enhance bedit). This module is bedit's POLICY: the user dir + load-path, applying and
+unapplying a contribution (themes today), and the UI. A plugin that lacks its entry or throws
+is skipped — one bad package never blocks the editor."
+  (:use interactive)   ; defcommand — the M-x commands
+  (:use themes)        ; register-theme! / unregister-theme! — apply/unapply a theme contribution
+  (:use config)        ; config-dir — the user package dir lives under it
+  (:use model)         ; message — echo results
+  (:use commands)      ; ed-show-named / ed-name-prompt / ed-goto-line / ed-apply
+  (:use editor/buffer)) ; buffer-current-line — the *Packages* row at point
+;; What a plugin's `:enhances {bedit …}` constraint is checked against — kept in lockstep with
+;; project.blsp's :version. A plugin needing a newer bedit than this is not applied.
+(def *bedit-version* "0.2.0")
+(def *bedit-name* "bedit")
+
+;; ---- the user package directory (~/.config/bedit/packages) ------------------
+
+(defn user-package-dir ()
+  "Where installed plugins live: `~/.config/bedit/packages/` (honouring $XDG_CONFIG_HOME)."
+  (path-join (config/config-dir) "packages"))
+
+(defn- pkg-dir (name) (path-join (user-package-dir) name))
+(defn- pkg-manifest (name) (path-join (pkg-dir name) "project.blsp"))
+
+(defn- plist-get (plist key)
+  "The value after `key` in a plist, or nil — a local copy (no dependency on the project tool)."
+  (cond
+    (or (nil? plist) (nil? (rest plist))) nil
+    (= (first plist) key) (first (rest plist))
+    :else (plist-get (rest (rest plist)) key)))
+
+(defn- manifest-value (name key)
+  "A value from an installed package's `(project …)` manifest, or nil."
+  (try
+    (let (form (read-string (slurp (pkg-manifest name))))
+      (if (and (list? form) (= (first form) 'project))
+        (plist-get (rest form) key)
+        nil))
+    (catch e nil)))
+
+(defn installed? (name)
+  "Whether package `name` is installed in the user package dir."
+  (file-exists? (pkg-manifest name)))
+
+(defn installed-version (name)
+  "The installed version string of `name`, or nil."
+  (manifest-value name :version))
+
+(defn installed-packages ()
+  "The names of packages installed in the user package dir (a dir with a project.blsp)."
+  (if (not (file-exists? (user-package-dir)))
+    []
+    (vec (filter installed? (list-dir (user-package-dir))))))
+
+;; ---- apply / unapply a contribution (themes today) -------------------------
+
+(defn- add-to-load-path! (name)
+  "Put package `name`'s src/ on `*load-path*` so `(require 'name)` finds it (idempotent)."
+  (add-load-path! (path-join (pkg-dir name) "src")))
+
+(defn- plugin-entry (name)
+  "Require package `name` (its src must be on the load-path) and return its `(bedit-plugin)`
+contribution map, or nil if it lacks the entry or throws."
+  (try
+    (do
+      (require (symbol name))
+      (let (entry (eval (symbol (str name "/bedit-plugin"))))
+        (if (fn? entry) (entry) nil)))
+    (catch e nil)))
+
+(defn apply-plugin! (name)
+  "Load package `name`'s contribution into the LIVE editor: put it on the load-path, require it,
+register its themes. Returns true if its entry loaded. Realtime — the theme appears in
+`M-x theme-select` immediately."
+  (add-to-load-path! name)
+  (let (contribution (plugin-entry name))
+    (if (nil? contribution)
+      false
+      (do
+        (doseq (theme (or (:themes contribution) [])) (register-theme! theme))
+        true))))
+
+(defn unapply-plugin! (name)
+  "Remove package `name`'s contribution from the live editor: unregister the themes it added, so
+they leave `M-x theme-select`. The module stays in memory until restart (Brood has no
+`unrequire`), but its contribution is gone."
+  (let (contribution (plugin-entry name))
+    (doseq (theme (or (:themes contribution) [])) (unregister-theme! (:name theme)))))
+
+;; ---- startup: discover + load what's installed -----------------------------
+
+(defn load-installed! ()
+  "At startup: put every installed package on the load-path, then apply each that `:enhances
+bedit`. Returns the vector of names applied. Safe with no packages dir (⇒ [])."
+  (doseq (name (installed-packages)) (add-to-load-path! name))
+  (require 'project)
+  (vec (keep (fn (name) (when (apply-plugin! name) name))
+         (project/enhancers-in (user-package-dir) *bedit-name* *bedit-version*))))
+
+;; ---- install / remove / update (runtime, from the hive) --------------------
+
+(defn install! (name)
+  "Install (or reinstall) package `name` from the hive into the user dir and apply it live.
+Returns `{:name :version …}`. Errors propagate (unknown package, download failure, checksum
+mismatch — the sha256 pin `nest add` gives)."
+  (require 'package)
+  (let (result (package/registry-install name (user-package-dir)))
+    (apply-plugin! name)
+    result))
+
+(defn remove! (name)
+  "Unapply package `name` and delete it from the user dir. Returns true if it was installed."
+  (if (not (installed? name))
+    false
+    (do
+      (unapply-plugin! name)
+      (delete-dir (pkg-dir name))
+      true)))
+
+(defn update! (name)
+  "Reinstall `name` if the hive has a newer version than installed. Returns the new version
+string when updated, nil when already current."
+  (require 'package)
+  (require 'version)
+  (let (installed (installed-version name)
+        latest (package/registry-latest-version name))
+    (if (and latest (or (nil? installed) (version/version-newer? latest installed)))
+      (do (install! name) latest)
+      nil)))
+
+(defn available ()
+  "The bedit packages published to the hive — `[{:name :latest_version :description :kind} …]`,
+or [] on a network failure."
+  (require 'package)
+  (or (package/registry-enhancers *bedit-name*) []))
+
+;; ---- the *Packages* browser (M-x package-list) -----------------------------
+;; Rows are 0-indexed to the buffer line (the git-status/dired discipline), nil for the header
+;; lines, so `package-row-at` reads the row under point.
+
+(defn- version-newer? (a b)
+  (require 'version)
+  (version/version-newer? a b))
+
+(defn- row-status (installed latest)
+  (cond
+    (nil? installed) :available
+    (and latest (version-newer? latest installed)) :update
+    :else :installed))
+
+(defn package-rows ()
+  "The merged package list for the browser: every hive bedit package annotated with install
+status, plus any installed package not on the hive (a local/dev one). Each row is
+`{:name :installed :latest :status :description}`."
+  (let (avail (available)
+        avail-names (map :name avail)
+        from-hive (map (fn (p)
+                         (let (name (:name p)
+                               installed (installed-version name)
+                               latest (:latest_version p))
+                           {:name name
+                            :installed installed
+                            :latest latest
+                            :description (or (:description p) "")
+                            :status (row-status installed latest)}))
+                    avail)
+        orphans (keep (fn (name)
+                        (when (not (member? name avail-names))
+                          {:name name
+                           :installed (installed-version name)
+                           :latest nil
+                           :description "(installed — not on the registry)"
+                           :status :installed}))
+                  (installed-packages)))
+    (append from-hive orphans)))
+
+(defn- spaces (n) (if (<= n 0) "" (str " " (spaces (- n 1)))))
+(defn- pad (s width)
+  (let (text (str (or s "-")))
+    (if (>= (count text) width) text (str text (spaces (- width (count text)))))))
+
+(defn- status-label (status)
+  (cond (= status :update) "update" (= status :installed) "installed" :else "available"))
+
+(defn- render-package-row (row)
+  (str "  " (pad (status-label (:status row)) 11)
+    (pad (:name row) 30)
+    (pad (:installed row) 11)
+    (pad (:latest row) 10)
+    (:description row)))
+
+(def *packages-header*
+  (list "  bedit packages — i install · d remove · u update · g refresh · q quit"
+    ""
+    (str "  " (pad "Status" 11) (pad "Package" 30) (pad "Installed" 11) (pad "Latest" 10) "Description")))
+
+(defn- render-packages (rows)
+  "The *Packages* buffer text, and the line→row vector aligned to it (nil for header lines)."
+  (let (header-lines *packages-header*
+        body (map render-package-row rows)
+        ;; rows aligned to buffer lines: one nil per header line, then one row per body line
+        line-rows (append (map (fn (_) nil) header-lines) rows))
+    {:text (join "\n" (append header-lines body))
+     :rows line-rows}))
+
+(defn package-row-at (m)
+  "The package row under point in *Packages*, or nil on a header line."
+  (let (rows (:package-rows m)
+        i (buffer-current-line (ed-current-buf m)))
+    (if (and rows (>= i 0) (< i (count rows))) (nth rows i) nil)))
+
+(defn show-packages (m)
+  "Build/refresh *Packages* from the hive and show it, recording `:package-rows`. Point lands on
+the first package."
+  (let (rows (package-rows)
+        rendered (render-packages rows)
+        m1 (ed-show-named (assoc m :package-rows (:rows rendered)) "*Packages*" (:text rendered) :packages))
+    (ed-apply m1 (fn (b) (ed-goto-line b (count *packages-header*))))))
+
+;; ---- commands --------------------------------------------------------------
+
+(defcommand cmd-package-list
+  (m key)
+  "Browse bedit packages from the hive (`M-x package-list`) — install/remove/update live."
+  (message (show-packages m) "packages: i install · d remove · u update · g refresh · q quit"))
+
+(defcommand cmd-package-refresh
+  (m key)
+  "Re-fetch the package list from the hive and redraw *Packages* (g)."
+  (show-packages m))
+
+(defcommand cmd-package-quit
+  (m key)
+  "Bury the *Packages* buffer (q)."
+  (commands/cmd-kill-buffer m key))
+
+(defcommand cmd-package-install
+  (m key)
+  "Install the package on the current *Packages* line (i), live — its theme appears in
+theme-select at once. Outside the browser, prompts for a package name."
+  (let (row (package-row-at m))
+    (if (nil? row)
+      (cmd-package-install-prompt m key)
+      (let (name (:name row))
+        (if (installed? name)
+          (message m (str name " is already installed — u to update"))
+          (try
+            (let (result (install! name))
+              (show-packages (message m (str "installed " name " " (:version result) " — now in M-x theme-select"))))
+            (catch e (message m (str "install failed: " name)))))))))
+
+(defcommand cmd-package-install-prompt
+  (m key)
+  "Prompt for a bedit package to install (M-x package-install), completing over the hive."
+  (assoc m
+    :minibuffer (ed-name-prompt "Install package: "
+                  (map :name (available))
+                  (fn (mm name)
+                    (try
+                      (let (result (install! name))
+                        (message mm (str "installed " name " " (:version result))))
+                      (catch e (message mm (str "install failed: " name))))))))
+
+(defcommand cmd-package-remove
+  (m key)
+  "Remove the package on the current *Packages* line (d), live — its theme leaves theme-select.
+Outside the browser, prompts."
+  (let (row (package-row-at m))
+    (if (nil? row)
+      (cmd-package-remove-prompt m key)
+      (let (name (:name row))
+        (if (not (installed? name))
+          (message m (str name " is not installed"))
+          (do (remove! name) (show-packages (message m (str "removed " name)))))))))
+
+(defcommand cmd-package-remove-prompt
+  (m key)
+  "Prompt for an installed package to remove (M-x package-remove)."
+  (assoc m
+    :minibuffer (ed-name-prompt "Remove package: "
+                  (installed-packages)
+                  (fn (mm name) (do (remove! name) (message mm (str "removed " name)))))))
+
+(defcommand cmd-package-update
+  (m key)
+  "Update the package on the current *Packages* line (u) to the hive's newest version, live.
+Outside the browser, prompts."
+  (let (row (package-row-at m))
+    (if (nil? row)
+      (cmd-package-update-prompt m key)
+      (let (name (:name row))
+        (if (not (installed? name))
+          (message m (str name " is not installed"))
+          (let (new-version (try (update! name) (catch e :error)))
+            (cond
+              (= new-version :error) (message m (str "update failed: " name))
+              (nil? new-version) (message m (str name " is already up to date"))
+              :else (show-packages (message m (str "updated " name " → " new-version))))))))))
+
+(defcommand cmd-package-update-prompt
+  (m key)
+  "Prompt for an installed package to update (M-x package-update)."
+  (assoc m
+    :minibuffer (ed-name-prompt "Update package: "
+                  (installed-packages)
+                  (fn (mm name)
+                    (let (new-version (try (update! name) (catch e :error)))
+                      (cond
+                        (= new-version :error) (message mm (str "update failed: " name))
+                        (nil? new-version) (message mm (str name " is already up to date"))
+                        :else (message mm (str "updated " name " → " new-version))))))))
