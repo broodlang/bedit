@@ -242,7 +242,7 @@ silently stopped matching); exit signals never reached a natively-nested `receiv
   latest-projection cache, version-reconciled by `link-fold`.
 - **Upstream this track won:** concurrent-safe `require` (a top-of-file `provide`
   let a racing require observe a half-loaded module — found by this track's suite
-  churn), `[:io-write]` as a ring-recorded splice delta, `buffer-edit-reply`
+  churn), `[:io/write]` as a ring-recorded splice delta, `buffer-edit-reply`
   (read-then-decide edits), `std/editor/buffer-client` + `text-apply-splice`,
   native `%str-splice-diff`.
 
@@ -276,7 +276,7 @@ silently stopped matching); exit signals never reached a natively-nested `receiv
   — *not* `:extends`, which reads as OO inheritance, and *not* `:host`, which already means
   a machine here) — a manifest map of *application → version constraint* whose keys are
   author data, carried manifest → `nest publish` → hive → a `?enhances=<app>` search filter,
-  with `version-satisfies?` promoted into `std` from the copy hive already hand-rolled (a
+  with `version/satisfies?` promoted into `std` from the copy hive already hand-rolled (a
   predicate, not a resolver change — ADR-037's exact-version invariant stands) and the
   constraint checked by **the enhanced application** at load time.
   A Hatch plugin or a `nest` plugin then works with no new code. Also: a runtime

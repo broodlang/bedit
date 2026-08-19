@@ -121,7 +121,7 @@ everything.
 Split state by **who anchors to text positions**:
 
 - **Buffer process** — the rope, **markers/overlays** (positions that survive edits),
-  undo. It is already an `io` sink (`[:io-write s]` appends — see `std/buffer`'s
+  undo. It is already an `io` sink (`[:io/write s]` appends — see `std/buffer`'s
   `buffer--serve`). Owns everything anchored to text.
 - **Pane / view** — `point` and scroll. (Today point lives *on the buffer*, so two
   panes on one buffer share a cursor — not even real Emacs behaviour. Moving point to

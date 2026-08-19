@@ -90,7 +90,7 @@ client. An editor package has to be identifiable, for two different reasons:
 > affordance without a line of code changing anywhere.
 
 That rules out an app-named manifest key (`:bedit-version`), an app-specific `kind`
-enum, and any `if name == "bedit"` anywhere in the tooling.
+seq, and any `if name == "bedit"` anywhere in the tooling.
 
 ### The mechanism: one generic key, `:enhances`
 
@@ -138,7 +138,7 @@ declines a package that needs a newer editor, with a message. Deliberately: ADR-
 resolver takes **exact versions and has no semver solver**, and this must not smuggle one
 in. A *predicate* ("does 0.1.0 satisfy `>= 0.1`?") is not a solver — it decides nothing
 about which version to fetch — and it belongs in `std` because **hive already hand-rolled
-it** (`version-compare` / `version-core` in `src/registry.blsp`) and bedit would be the
+it** (`version/compare` / `version/core` in `src/registry.blsp`) and bedit would be the
 third to write it.
 
 ### Why not the alternatives
@@ -148,7 +148,7 @@ third to write it.
 | **`:extends {bedit …}`** | Reads as OO inheritance (`class Foo extends Bar`), which is the wrong mental model: a package is *loaded beside* an application and calls its registries, it does not specialise a type. |
 | **`:host` / `:hosts`** | "Host" already means a *machine* in this project — `--attach ed@HOST:PORT`, the daemon's host window. Reusing it for "application I plug into" makes two unrelated things one word. |
 | A `bedit-*` **name convention** | Can't be queried (the editor would pull the whole index and filter client-side), can't be enforced (a package that forgets the prefix is invisible), and carries no version compatibility. Still a good *naming* habit — just not the mechanism. |
-| A **`:kind` enum** (`:bedit`, `:hatch-plugin`, …) | One concept too many: what a package enhances already implies what kind it is. And an enum invites a blessed list in the toolchain, which is the thing being avoided. |
+| A **`:kind` seq** (`:bedit`, `:hatch-plugin`, …) | One concept too many: what a package enhances already implies what kind it is. And an seq invites a blessed list in the toolchain, which is the thing being avoided. |
 | A **dependency on `bedit`** | The application is already in the image. It would drag the whole editor into `_deps/` for a 40-line mode, and needs a version *range*, which the resolver deliberately doesn't do. |
 | A free-form **`:meta {…}`** map | Maximally open, but every application invents its own key, so the registry can't index anything consistently and discovery dies. One named field with author-supplied values is the right altitude. |
 
@@ -194,8 +194,8 @@ API to learn*. A whole syntax-highlighter package:
      `latest_version` already get from the newest release. Then
      `GET /api/v1/packages?q=&enhances=<app>`, and a web-UI facet whose values come from
      the data rather than a list in the code.
-   - *`std`, promoted not invented* — `version-satisfies?`, over the `version-compare` /
-     `version-core` pair that **already exists in hive** (`src/registry.blsp`) because
+   - *`std`, promoted not invented* — `version/satisfies?`, over the `version/compare` /
+     `version/core` pair that **already exists in hive** (`src/registry.blsp`) because
      `std` lacks it. Two consumers today (hive deciding which release is latest, an application
      deciding whether a package is compatible with it), and any application hosting
      plugins is the third. **Explicitly not a resolver change:** the predicate answers a
