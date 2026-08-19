@@ -82,7 +82,7 @@ Language-level changes live in the Brood repo's `docs/devlog.md` + `docs/decisio
   module — surfaced as a 1-in-5 suite flake, fixed with `*features-loading*` +
   waiter takeover); **`editor/buffer-client`** (ADR-134 — the protocol's client
   half: `link-init/-propagate/-fold`, `text-splice`, `view-parts`,
-  `text-apply-splice`); `[:io-write]` as a ring-recorded splice delta;
+  `text-apply-splice`); `[:io/write]` as a ring-recorded splice delta;
   `buffer-edit-reply`/`-value` (read-then-decide edits); native `%str-splice-diff`
   (the per-keystroke diff: 40 ms → 0.4 ms on a 300-line hosted buffer).
 - **Tests:** `tests/hosted_test.blsp` (new — host/converge/echo/fault/flip/kill),
