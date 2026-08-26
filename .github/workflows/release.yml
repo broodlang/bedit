@@ -1,17 +1,19 @@
 name: Release
 
-# Build the standalone `bedit` binary for each supported platform and attach the
-# tarballs to a GitHub Release. Triggered by pushing a version tag (`v1.2.3`), or
-# manually via workflow_dispatch with a tag name.
+# Build bedit as a single self-contained executable for Linux and macOS, and attach
+# the tarballs to a GitHub Release.
 #
-# bedit is a Brood app: `nest release` bundles its source onto the GUI-enabled `brood`
-# runtime embedded in a `nest` built with `--with-gui`. So each job first builds and
-# installs a GUI-enabled nest from the brood repo, then runs bedit's `make build`
-# (which is `nest release -o bedit`). The binary is native to the runner's arch, so —
-# like brood's own release — each target is built on a matching runner.
+# bedit is a Brood app, not a Rust crate, so a "binary" here is `nest release`
+# (ADR-038): the project's manifest and every `src/**/*.blsp` appended to a copy of
+# the brood runtime. The result runs on any compatible machine with no interpreter,
+# no project directory and no sources beside it — one file.
 #
-# NOTE: the x86_64-apple-darwin (Intel) job uses the macos-13 runner, whose
-# availability on GitHub-hosted runners is limited; if it stalls, re-run the job.
+# Which means the runtime it is appended to has to be built FIRST, and with the GUI
+# backend on (`./configure --with-gui`): bedit opens a window, and the default brood
+# build has no window backend at all. That is why this workflow installs X11/Wayland/
+# xkbcommon/GL headers on Linux — the runtime links against them, not bedit.
+#
+# Triggered by a version tag (`v0.2.1`), or manually with a tag name.
 
 on:
   push:
@@ -19,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build and release (e.g. v0.1.0)"
+        description: "Tag to build and release (e.g. v0.2.1)"
         required: true
 
 concurrency:
@@ -28,8 +30,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # The brood release the GUI nest is built from (kept in step with the toolchain).
-  BROOD_TAG: v0.3.0
 
 jobs:
   build:
@@ -39,65 +39,86 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
           - os: macos-14
             target: aarch64-apple-darwin
-          - os: macos-13
-            target: x86_64-apple-darwin
+          # x86_64-apple-darwin is deliberately absent. `nest release` appends to a
+          # runtime for the TARGET and cross-compiling is out of scope (ADR-038) — it
+          # would mean cross-building brood on the arm64 runner and passing it via
+          # `--runtime`. Doable, but it is a second untested path for a shrinking
+          # platform; add it when someone actually needs an Intel Mac build.
     steps:
-      - name: Checkout bedit
-        uses: actions/checkout@v4
-        with:
-          path: bedit
+      - uses: actions/checkout@v4
 
-      - name: Checkout brood (for the GUI-enabled nest)
-        uses: actions/checkout@v4
-        with:
-          repository: broodlang/brood
-          ref: ${{ env.BROOD_TAG }}
-          path: brood
-
-      - name: Install system dependencies (macOS)
-        run: brew install cmake
+      # The GUI backend's system libraries. Linux only: macOS gets its window server
+      # from the SDK, so nothing to install there.
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config git \
+            libasound2-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: brood
-          key: bedit-release-${{ matrix.target }}
-
-      # A GUI-enabled nest (its embedded brood runtime carries the native window
-      # backend), installed into ~/.local/bin so `nest release` bundles a GUI binary.
-      - name: Build + install GUI-enabled nest
-        working-directory: brood
+      # Pinned to brood `main`, matching what CI checks against — a release built
+      # against an older runtime than the one CI proves green would be a different
+      # program from the one that was tested.
+      - name: Build the brood toolchain with the GUI backend
         run: |
-          ./configure --with-gui
+          git clone --depth 1 https://github.com/broodlang/brood.git /tmp/brood
+          cd /tmp/brood
+          ./configure --prefix="$HOME/.local" --with-gui
           make install
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # bedit's `make build` is `nest release -o bedit` — a self-contained binary.
-      - name: Build bedit
-        working-directory: bedit
-        run: make build
+      - name: Bundle bedit
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          nest release -o "bedit-${{ matrix.target }}"
+          chmod +x "bedit-${{ matrix.target }}"
+
+      # A smoke check that the bundle is actually runnable, so a broken artifact is
+      # caught here rather than by whoever downloads it. `--version` needs no window,
+      # which matters on a headless runner.
+      - name: Smoke-check the bundle
+        run: |
+          ./bedit-${{ matrix.target }} --version || \
+            BROOD_GUI_HEADLESS=1 ./bedit-${{ matrix.target }} --version
 
       - name: Package
-        id: package
-        shell: bash
-        working-directory: bedit
+        run: tar -czf "bedit-${{ matrix.target }}.tar.gz" "bedit-${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bedit-${{ matrix.target }}
+          path: bedit-${{ matrix.target }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ github.event.inputs.tag || github.ref_name }}"
-          name="bedit-${tag}-${{ matrix.target }}"
-          mkdir -p "dist/${name}"
-          cp bedit "dist/${name}/"
-          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
-          ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-
-      - name: Upload to release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.package.outputs.tag }}
-          files: |
-            bedit/dist/*.tar.gz
-            bedit/dist/*.sha256
-          fail_on_unmatched_files: true
+          gh release create "$tag" dist/*.tar.gz \
+            --repo "${{ github.repository }}" \
+            --title "$tag" \
+            --generate-notes \
+            || gh release upload "$tag" dist/*.tar.gz --repo "${{ github.repository }}" --clobber
