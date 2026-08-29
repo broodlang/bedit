@@ -140,15 +140,90 @@ from `:post-key`, so it may not parse."
                      (and node (>= point (:start node)) (<= point (:end node)))))
            (range (count forms)))))
 
-(defn first-changed (srcs old-srcs total)
-  "The index of the first form whose source differs from last time, or nil when none does.
-
-Everything from here down is re-sent; everything above keeps its result. That is the
-dependency direction — a form cannot depend on text below it — and it is what stops a
-one-character edit re-running the whole buffer, which for a playground full of loops and
-spawns is the difference between a live surface and a stuttering one."
+(defn changed-forms (srcs old-srcs total)
+  "The indices whose source differs from last time — a form someone edited, one that has just
+appeared, one whose text a deletion shifted into this slot. `()` when nothing moved."
   (let (n (math/max total (count old-srcs)))
-    (first (filter (fn (i) (not= (get srcs i) (get old-srcs i))) (range n)))))
+    (filter (fn (i) (not= (get srcs i) (get old-srcs i))) (range n))))
+
+(defn deps-of (text)
+  "Per top-level form of `text`, `{:defines (…) :references (…)}` — `reflect/source-deps`,
+with `()` when the kernel is too old to have it. Degrading rather than raising is deliberate:
+without deps the launch falls back to re-sending the whole tail, which is what it always did."
+  (try (reflect/source-deps text) (catch _ '())))
+
+(defn- reaches?
+  (references defines)
+  ;; Does any of `references` name one of `defines`? A qualified reference matches its own
+  ;; bare name too: inside a `(defmodule bar)` buffer a `(defn foo …)` defines `foo` and is
+  ;; called as `bar/foo`, and deps are reported as WRITTEN. Matching the last segment
+  ;; over-matches (a local `foo` and an unrelated `other/foo` from a required module), which
+  ;; re-runs a form that did not need it — the safe direction.
+  (any? (fn (r)
+          (any? (fn (d) (or (= r d) (string/ends-with? r (str "/" d)))) defines))
+    references))
+
+(defn- namespace-form?
+  (src)
+  ;; Does this form change what names MEAN below it? `defmodule` re-roots every later
+  ;; definition and reference into another namespace; `require`/`use` change what a bare name
+  ;; resolves to. Neither is an edge dependency analysis can see — the affected forms name
+  ;; nothing that changed — so a re-run of one of these takes the whole tail with it.
+  (let (head (try
+               (let (f (reflect/read-first src)) (when (pair? f) (first f)))
+               (catch _ nil)))
+    (includes? (list 'defmodule 'require 'require-one 'use 'in-ns) head)))
+
+(defn stale-forms (srcs old-srcs deps old-deps total)
+  "Which forms a launch must re-send: every one whose own source changed, plus every LATER
+form that reaches one of them — directly, or through another form that is being re-run.
+
+The rule this replaced was \"everything from the first change down\", which is correct and
+expensive: editing the second of twenty forms re-evaluated nineteen, on every settle of the
+keyboard. Correct because definitions flow downward and a later form may have been built on
+the one you just changed — but most edits are to a CALL, and nothing below a call can see it.
+So the question is not \"is this form below the edit?\" but \"does this form use anything the
+edit could have changed?\", which `reflect/source-deps` answers.
+
+Both the OLD and the new `:defines` of a re-run form count, or renaming `foo` to `bar` would
+leave the forms that called `foo` sitting on a stale answer instead of the error they now
+deserve.
+
+Downward only, matching the model the buffer already documents: a form cannot depend on text
+below it. Two things this cannot see, and both are handled by widening rather than by
+guessing: a form that changes what names mean below it ([[namespace-form?]]) takes the whole
+tail, and a `deps` that does not line up with `forms` one-for-one falls back to the old
+suffix rule."
+  (let (changed (changed-forms srcs old-srcs total)
+        defines-at (fn (i)
+                     (append (get (nth deps i {}) :defines '())
+                       (get (nth old-deps i {}) :defines '())))
+        r (fold (fn (acc i)
+                  (let ([provided stale tail?] acc
+                        mine? (or tail?
+                                (includes? changed i)
+                                (reaches? (get (nth deps i {}) :references '()) provided)))
+                    (if mine?
+                      [(append provided (defines-at i))
+                        (cons i stale)
+                        (or tail? (namespace-form? (get srcs i "")))]
+                      acc)))
+            ['() '() false]
+            (range total)))
+    (reverse (second r))))
+
+(defn launch-plan (srcs old-srcs deps old-deps total)
+  "The indices a launch re-sends: [[stale-forms]] when the dependency data lines up with the
+forms one-for-one, else every form from the first change down.
+
+The fallback is not defensive padding. `reflect/source-deps` and `sexp/top-level-forms` parse
+the same text with the same notion of a top-level form, so they agree — but a buffer is
+mid-edit half the time, and if they ever disagreed the indices would be off by one and this
+would re-run the wrong forms, silently. Re-running too much is the failure worth having."
+  (if (= (count deps) total)
+    (stale-forms srcs old-srcs deps old-deps total)
+    (let (from (first (changed-forms srcs old-srcs total)))
+      (if (nil? from) '() (range from total)))))
 
 ;; ---- notes: a result at the end of its form --------------------------------------
 
@@ -186,7 +261,8 @@ arms the `:playground-eval` idle timer (`model/ed-sync-timers`)."
     (and (playground-buffer? b) (not= (buffer-rope b) (:playground-rope b)))))
 
 (defn ed-playground-launch (m)
-  "The debounce landed: re-evaluate every top-level form from the first changed one down.
+  "The debounce landed: re-evaluate the forms this edit could have changed the answer of —
+the ones whose own text moved, plus the ones that use what those define ([[launch-plan]]).
 
 A form that is mid-typing (reader E0002) says so in the pending voice and keeps nothing
 stale; one that is genuinely broken fails locally with no round trip; a blank one says
@@ -204,17 +280,23 @@ blank on its way to the same answer."
             forms (forms-of text)
             srcs (form-srcs-in text forms)
             old-srcs (or (:playground-srcs b) {})
+            deps (deps-of text)
+            old-deps (or (:playground-deps b) '())
             old-notes (or (results/eol-notes-any b) {})
             live (playground-live?)
-            from (first-changed srcs old-srcs (count forms))
+            stale (launch-plan srcs old-srcs deps old-deps (count forms))
             start-id (get-in m [:playground :next-id] 1)
             ;; Drop the cached cascades of everything being re-sent (they describe code that
-            ;; no longer exists) and clear the notes, before anything runs.
-            m0 (pg-update-buf (workings/forget *spy-spec* m from)
+            ;; no longer exists) and clear the notes, before anything runs. Only the re-sent
+            ;; ones: a form nobody re-ran keeps a report that is still true.
+            m0 (pg-update-buf (workings/forget *spy-spec* m (fn (i) (includes? stale i)))
                  (fn (bb)
-                   (pg-clear-notes (assoc bb :playground-rope rope :playground-srcs srcs))))
+                   (pg-clear-notes (assoc bb
+                                     :playground-rope rope
+                                     :playground-srcs srcs
+                                     :playground-deps deps))))
             note-at (fn (mm i note) (pg-set-note mm i note forms text))
-            result (if (nil? from)
+            result (if (empty? stale)
                      ;; nothing changed (whitespace the reader ignores, an edit undone):
                      ;; re-anchor every note where it now sits and send nothing. Form keys
                      ;; only: a hint (`results/hint-key`) is derived from its result note, so
@@ -231,9 +313,11 @@ blank on its way to the same answer."
                          (let ([m1 next-id pending] acc
                                src (get srcs i "")
                                old (get old-notes i)
-                               state (if (< i from) :carry (liveeval/parse-state src)))
+                               state (if (includes? stale i)
+                                       (liveeval/parse-state src)
+                                       :carry))
                            (match state
-                             ;; above the edit: unaffected, so keep the verdict as it is
+                             ;; nothing this edit could reach: keep the verdict as it is
                              (:carry (if old
                                        [(note-at m1 i (dissoc old :line)) next-id pending]
                                        acc))
@@ -284,7 +368,7 @@ Clearing `:playground-srcs` is the load-bearing half — leaving it behind would
 restart re-send nothing, and every form would look evaluated against a session that no longer
 holds any of its definitions."
   (pg-update-buf (update m :playground merge {:sandbox-gen gen :sandbox-ready true :pending {}})
-    (fn (bb) (assoc bb :playground-rope nil :playground-srcs {}))))
+    (fn (bb) (assoc bb :playground-rope nil :playground-srcs {} :playground-deps '()))))
 
 (defn playground-sandbox-reply (m reply gen)
   "Fold one sandbox reply into the model. A reply the playground never sent, one from a
@@ -309,7 +393,7 @@ cascade."
               ;; `workings/show` caches this form's cascade and opens the pane only if the
               ;; cascade is real AND belongs to the form the cursor is in — so a background
               ;; re-eval never yanks the pane off what you are reading.
-              (workings/show *spy-spec* m2 i (form-index-at text forms (:point b 0)) reply)))))))
+              (workings/show *spy-spec* m2 i (form-index-at text forms (:point b 0)) reply src)))))))
 
 (defn playground-sandbox-down (m code)
   "The child went away and somebody still wants a sandbox (letting it go for good is
@@ -328,16 +412,41 @@ cascade."
   "Is the *Playground Spy* pane currently on screen?"
   (not (nil? (ed-buffer-index-by-name m *spy-buffer-name*))))
 
+(defn doc-at-point (b)
+  "What the cursor in buffer `b` is pointing at, as pane lines — the brood-mode `:doc-at`
+service (`modes/brood-doc-at`): the symbol under point, else the head of the call it is
+inside, with that name's arglist, checker signature and docstring. `()` when neither names
+anything bound.
+
+Read through the mode rather than called directly, like every other language service here, so
+the pane documents whatever language the buffer is in rather than assuming Brood."
+  (let (f (ed-mode-service b :doc-at))
+    (or (when f (try (f (buffer-text b) (:point b 0)) (catch _ nil))) '())))
+
 (defn playground-post-key (m-before m key)
-  "The playground's `:post-key` hook: keep the spy pane following the cursor from form to
-form, with no re-evaluation. One parse, and it only touches the buffer when the form under
-point actually changed — this runs on every keystroke."
+  "The playground's `:post-key` hook, on every keystroke: keep the spy pane following the
+cursor from form to form and showing the docs of whatever it is on, with no re-evaluation.
+
+Ordered cheapest-first because of that. The doc lookup is a token scan and an image lookup;
+the form index needs a parse of the whole buffer, which at 40 forms costs ~345µs — so it is
+only taken when the pane has something to follow, and the pane is only re-rendered when the
+docs or the form actually changed. Everything else is two string compares."
   (let (b (ed-current-buf m))
     (if (not (playground-buffer? b))
       m
-      (let (text (buffer-text b)
+      (let (docs (doc-at-point b)
+            moved? (not= docs (workings/at-point-lines *spy-spec* m))
+            m1 (if moved? (workings/at-point *spy-spec* m docs) m)
+            text (buffer-text b)
             i (form-index-at text (forms-of text) (:point b 0)))
-        (if (nil? i) m (workings/follow *spy-spec* m i))))))
+        (cond
+          (nil? i) m1
+          ;; the form changed (or is showing for the first time): `follow` decides whether
+          ;; that is worth opening a closed pane for
+          (not= i (get-in m1 [:playground :workings-region])) (workings/follow *spy-spec* m1 i)
+          ;; same form, new docs: re-render what is already open, never open one for a hover
+          moved? (workings/refresh *spy-spec* m1 i false)
+          else m1)))))
 
 ;; ---- the modes: a Brood buffer that runs, and a read-only pane beside it -------------
 
@@ -360,6 +469,9 @@ point actually changed — this runs on every keystroke."
   (line)
   (cond
     (string/starts-with? line "What ran") {:fg *subtext*}
+    ;; the untraced note is an aside about the tracer, not about your code — dimmest, italic,
+    ;; so the eye passes over it on the way back to the value
+    (string/starts-with? line liveeval/*untraced-note*) {:fg *overlay0* :italic true}
     (string/starts-with? (string/triml line) "= ") {:fg *teal*}
     else nil))
 
