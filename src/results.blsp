@@ -195,17 +195,34 @@ final empty line — so this and `buffer-line-count` agree."
   (let (p (math/min (math/max 0 pos) (string/length text)))
     (dec (count (string/split (string/substring text 0 p) "\n")))))
 
-(defn line-below (text pos)
-  "The 0-based line AFTER the one `pos` falls on — where an ANSWER goes, so it reads as the
-result of the code above rather than as a label trailing it — clamped to the last line that
-exists.
+(defn line-text (text line)
+  "The text of 0-based `line`, without its newline; `\"\"` for a line that isn't there."
+  (nth (string/split text "\n") line ""))
 
-The clamp is the load-bearing half. A region ending at the very end of a buffer with no
-trailing newline has no line below it, and an anchor past EOF is not merely invisible: a
-renderer asks the rope for that line and the whole frame dies (`%rope-line: line 4 out of
-bounds`). Clamped, the answer lands at the end of the region's own last line instead, which
-is where it would have sat without a blank line to fall onto."
-  (math/min (inc (line-of text pos)) (dec (line-count text))))
+(defn answer-line (text pos)
+  "Where a RESULT for code ending at offset `pos` goes: **the line below when that line is
+blank**, else the code's own line.
+
+Not simply \"the line below\", which is what it reads best as — `=> 6` under the form rather
+than trailing it — because that only holds when the line below is empty. Two other cases
+share one answer:
+
+  - **The next form starts immediately below.** An answer placed there lands where that
+    form's own derived text already sits, and two ghost texts at one line's end paint over
+    each other — `=> bar` and `=> 42` come out as illegible mush. (What made this a bug and
+    not a curiosity: a buffer with no blank lines between forms is the normal way to write.)
+  - **There is no line below at all** — code at the very end of a buffer with no trailing
+    newline. That anchor is past EOF, which does not merely hide the note: a renderer asks
+    the rope for the line and the frame dies (`%rope-line: line 4 out of bounds`).
+
+In both, the right place is the end of the code's own line, so this is one rule rather than
+a rule plus a clamp. [[set-note]] then folds a hint for that same line into the answer, since
+they would otherwise be the two texts overpainting."
+  (let (here (line-of text pos)
+        below (inc here))
+    (if (and (< below (line-count text)) (string/blank? (line-text text below)))
+      below
+      here)))
 
 (defn eol-notes (buf)
   "The buffer's end-of-line notes while they are positionally current, else nil."
@@ -222,19 +239,64 @@ paint at the wrong line."
   "Whether the notes predate the buffer's current text (an edit dims them)."
   (let (a (annotation buf :eol-notes)) (and a (:stale? a))))
 
-(defn eol-note-at (buf line)
-  "The note anchored on 0-based `line`, or nil — nil also when the notes are no
-longer positionally current. A buffer holds a handful, so this scans."
-  (let (notes (eol-notes buf))
-    (when notes
-      (let (hit (seq/find (fn (kv) (= (:line (second kv)) line)) notes))
-        (when hit (second hit))))))
-
 (defn hint-key (key)
   "The key owner `key`'s HINT is stored under. Derived rather than chosen by the caller so
 that [[set-note]] can always find and clear a hint that no longer applies — and keyed apart
 from the result because the two sit on different lines and are rebuilt together."
   [:hint key])
+
+(defn owner-of (key)
+  "Whose note `key` holds — itself, or the owner its hint was derived for. [[hint-key]]'s
+inverse, so a reader can order a hint with the thing it describes rather than beside it."
+  (if (and (vector? key) (= (first key) :hint)) (second key) key))
+
+(defn- by-owner
+  (entries)
+  ;; `[key note]` pairs in owner order — a hint sorting with the owner it describes, since
+  ;; `owner-of` is `hint-key`'s inverse. Every producer keys by an index into what it derived
+  ;; notes FROM (a form, a box, a region), so numeric order is source order, which is what
+  ;; makes two notes on one line read left to right the way the code does. A non-numeric
+  ;; owner sorts after those, by its printed form, so the order is total whatever a future
+  ;; producer keys by; the annotation is a map, and map order is not an order.
+  (let (owner (fn (kv) (owner-of (first kv)))
+        ints (filter (fn (kv) (int? (owner kv))) entries))
+    (append (sort-by owner ints)
+      (sort-by (fn (kv) (pr-str (owner kv)))
+        (filter (fn (kv) (not (int? (owner kv)))) entries)))))
+
+(defn notes-on-line (buf line)
+  "EVERY current note anchored on 0-based `line`, in reading order: the hint first (it
+describes the code right there), then the results in owner order. `()` when the notes are
+not positionally current.
+
+Plural because a line can carry more than one — two forms written on one line, or a form
+whose answer had nowhere below it to go — and every reader of this annotation has to survive
+that. A reader that takes only the first silently drops the rest; a renderer that draws them
+all at the same column paints them on top of each other. A buffer holds a handful of notes,
+so this scans."
+  (let (here (by-owner (filter (fn (kv) (= (:line (second kv)) line))
+                         (or (eol-notes buf) {})))
+        notes (map second here))
+    (append (filter (fn (n) (= (:kind n) :hint)) notes)
+      (filter (fn (n) (not= (:kind n) :hint)) notes))))
+
+(defn note-lines (buf)
+  "The distinct lines carrying a current note, ascending — what a renderer iterates so it
+visits each line once and can lay that line's notes out side by side."
+  (sort (seq/distinct (map (fn (kv) (:line (second kv))) (or (eol-notes buf) {})))))
+
+(defn note-text (note)
+  "One note's full text, its `:warn` advisory included — what a reader with room for the
+whole thing shows. Shared so the ghost text, the echo row and any later reader cannot
+disagree about what a note says."
+  (if (:warn note) (str (:text note) "   " (:warn note)) (:text note)))
+
+(defn eol-note-at (buf line)
+  "The line's notes as ONE string (`\": int  => 42\"`), or nil when it carries none — the
+echo-area form of [[notes-on-line]], for the row that reports what is on the cursor's line."
+  (let (notes (notes-on-line buf line))
+    (when (not (empty? notes))
+      (string/join "  " (map note-text notes)))))
 
 (defn set-note (buf key note at &optional (hint-at nil))
   "Store `note` under `key` anchored on 0-based line `at`, re-stamping the annotation against
@@ -242,10 +304,10 @@ the current text.
 
 When the note carries `:hint` and `hint-at` names a DIFFERENT line, that hint is stored there
 as its own note under [[hint-key]] — the answer below the code, the type at it, neither able
-to move the other. When the two lines coincide (a region with no line below it, so
-[[line-below]] clamped its answer back onto its own line) the hint rejoins the note's text
-instead: two ghost texts at one line's end overpaint each other. With no hint, any stale one
-for `key` is dropped.
+to move the other. When the two lines coincide (a region whose answer [[answer-line]] put at
+the end of its own line, having nowhere blank below) the hint rejoins the note's text
+instead, rather than becoming a second note at the same cell. With no hint, any stale one for
+`key` is dropped.
 
 The hint travels INSIDE the note rather than as a second argument so that a producer
 re-anchoring its notes after an edit re-derives both from one entry, and cannot leave a hint
