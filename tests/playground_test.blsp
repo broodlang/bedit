@@ -146,9 +146,61 @@
   (test "nothing traced is no lines"
     (assert= (liveeval/spy-lines []) '()))
 
-  (test "the body text carries a heading, and the caller chooses it"
-    (is (includes? (liveeval/spy-text {:spy [{:kind "call" :fn "f" :args "(1)"}]} "What ran")
-          "What ran"))))
+  (test "the cascade is one section of the report, indented under a line naming it"
+    (let (lines (liveeval/report-lines {:ok true
+                                        :value "1"
+                                        :spy [{:kind "call" :fn "f" :args "(1)"}]}))
+      (is (any? (fn (l) (includes? l "every traced call")) lines))
+      (is (includes? lines "  f 1")))))
+
+;; What the PANE says, as opposed to the one line beside the code. Everything here is a
+;; section that a note structurally cannot carry: output as it was written, a value with room
+;; to be read, the reason a trace is empty.
+(describe "liveeval/report-lines — a whole reply, for a pane"
+  (test "the value, with its derived type when the source is at hand"
+    (assert= (first (liveeval/report-lines {:ok true :value "3" :ms 0} "(+ 1 2)")) "=> 3   : int")
+    (assert= (first (liveeval/report-lines {:ok true :value "3" :ms 0})) "=> 3"))
+
+  ;; The half `printed-note` mangles: it trims the output and puts it on one line, so three
+  ;; printed lines arrive as one run-on and then get clipped by the pane width.
+  (test "printed output arrives verbatim, line by line"
+    (let (lines (liveeval/report-lines {:ok true :value "nil" :output "one\ntwo\nthree\n"}))
+      (is (includes? lines "printed:"))
+      (is (includes? lines "  one"))
+      (is (includes? lines "  two"))
+      (is (includes? lines "  three"))))
+
+  (test "nothing printed, no printed section"
+    (is (not (any? (fn (l) (includes? l "printed"))
+               (liveeval/report-lines {:ok true :value "1" :output ""})))))
+
+  ;; The pane stays quiet about the ordinary case: a fast evaluation that left nothing
+  ;; behind has no cost worth a line.
+  (test "cost is reported only when there is one"
+    (assert= (liveeval/cost-lines {:ok true :ms 5}) '())
+    (assert= (liveeval/cost-lines {:ok true :ms 400}) (list "400ms"))
+    (assert= (liveeval/cost-lines {:ok true :ms 5 :procs {:alive 2}})
+      (list "2 processes still running"))
+    (assert= (liveeval/cost-lines {:ok true :ms 400 :procs {:alive 1}})
+      (list "400ms · 1 process still running")))
+
+  (test "a raise reports the error where the value would be, and nothing else pretends"
+    (let (lines (liveeval/report-lines {:ok false :error "unbound symbol: nope"}))
+      (is (includes? (first lines) "unbound symbol: nope"))))
+
+  ;; "It traced nothing" and "nothing happened" are different facts, and the difference is
+  ;; worth ONE dim line at the bottom. It began as a paragraph explaining the tracing policy,
+  ;; which was right while it was the only thing the pane could say and a wall the moment
+  ;; there was a value, an output and a cost above it.
+  (test "an empty trace says so in one line, last"
+    (let (lines (liveeval/report-lines {:ok true :value "6" :spy ()}))
+      (assert= (first lines) "=> 6")
+      (assert= (last lines) liveeval/*untraced-note*)
+      (assert= (count (string/split liveeval/*untraced-note* "\n")) 1)))
+
+  ;; A raise is the story; "nothing of yours ran" beside it is true and unhelpful.
+  (test "a raise with no trace says nothing about the trace"
+    (assert= (count (liveeval/report-lines {:ok false :error "boom" :spy ()})) 1)))
 
 ;; ---- the playground's own pieces -------------------------------------------------------
 
@@ -251,23 +303,90 @@
     (assert= (results/line-count "a\nb\n") (buffer-line-count (make-buffer "a\nb\n")))
     (assert= (results/line-count "") (buffer-line-count (make-buffer "")))))
 
-(describe "first-changed — what a launch re-sends"
+(describe "changed-forms — whose text moved"
   (test "nothing changed, nothing to send"
-    (assert= (playground/first-changed {0 "(a)" 1 "(b)"} {0 "(a)" 1 "(b)"} 2) nil))
+    (assert= (playground/changed-forms {0 "(a)" 1 "(b)"} {0 "(a)" 1 "(b)"} 2) '()))
 
-  (test "the first differing form, and it is the FIRST one"
-    (assert= (playground/first-changed {0 "(a)" 1 "(c)"} {0 "(a)" 1 "(b)"} 2) 1))
-
-  ;; Everything below the edit re-runs because definitions flow downward; everything above
-  ;; keeps its result, since a form cannot depend on text beneath it.
-  (test "editing the top means everything below it re-runs"
-    (assert= (playground/first-changed {0 "(z)" 1 "(b)"} {0 "(a)" 1 "(b)"} 2) 0))
+  (test "the ones that differ, in order"
+    (assert= (playground/changed-forms {0 "(z)" 1 "(c)"} {0 "(a)" 1 "(b)"} 2) (list 0 1))
+    (assert= (playground/changed-forms {0 "(a)" 1 "(c)"} {0 "(a)" 1 "(b)"} 2) (list 1)))
 
   (test "a newly typed form is a change"
-    (assert= (playground/first-changed {0 "(a)" 1 "(b)"} {0 "(a)"} 2) 1))
+    (assert= (playground/changed-forms {0 "(a)" 1 "(b)"} {0 "(a)"} 2) (list 1)))
 
   (test "a DELETED form is a change too — the count shrinking must not hide it"
-    (assert= (playground/first-changed {0 "(a)"} {0 "(a)" 1 "(b)"} 1) 1)))
+    (assert= (playground/changed-forms {0 "(a)"} {0 "(a)" 1 "(b)"} 1) (list 1))))
+
+;; What a launch re-sends. The rule this replaced was "everything from the first change
+;; down", which is correct and expensive — editing the second of twenty forms re-evaluated
+;; nineteen, every time typing settled. Most edits are to a CALL, and nothing below a call
+;; can see it.
+(describe "the launch plan — only what the edit could reach"
+  ;; Drives the real path: `srcs`/`deps` derived from text the way a launch derives them, so
+  ;; a change to how forms or deps are computed is caught here rather than in a fixture.
+  (defn plan (before after)
+    (playground/launch-plan (playground/form-srcs after)
+      (playground/form-srcs before)
+      (playground/deps-of after)
+      (playground/deps-of before)
+      (count (playground/forms-of after))))
+
+  (test "nothing changed, nothing re-sent"
+    (assert= (plan "(+ 1 2)\n(+ 3 4)\n" "(+ 1 2)\n(+ 3 4)\n") '()))
+
+  ;; The point of the whole exercise.
+  (test "editing a form nothing uses re-sends that form alone"
+    (assert= (plan "(defn f (n) n)\n(+ 1 2)\n(+ 3 4)\n"
+               "(defn f (n) n)\n(+ 1 9)\n(+ 3 4)\n")
+      (list 1)))
+
+  (test "editing a definition re-sends its users, and only its users"
+    (assert= (plan "(defn f (n) n)\n(f 1)\n(+ 3 4)\n"
+               "(defn f (n) (inc n))\n(f 1)\n(+ 3 4)\n")
+      (list 0 1)))
+
+  ;; Transitively: g uses f, and h uses g, so editing f reaches h without naming it.
+  (test "a dependency of a dependency is re-sent too"
+    (assert= (plan "(defn f (n) n)\n(defn g (n) (f n))\n(g 1)\n(+ 5 6)\n"
+               "(defn f (n) (inc n))\n(defn g (n) (f n))\n(g 1)\n(+ 5 6)\n")
+      (list 0 1 2)))
+
+  ;; Renaming would otherwise leave `(f 1)` sitting on a stale `=> 1` instead of the unbound
+  ;; error it now deserves — which is why the OLD defines count as well as the new.
+  (test "renaming a definition still reaches what called it by the old name"
+    (is (includes? (plan "(defn f (n) n)\n(f 1)\n" "(defn ff (n) n)\n(f 1)\n") 1)))
+
+  ;; Not an edge dependency analysis can see: the forms below name nothing that changed,
+  ;; they just mean something different.
+  (test "a namespace form takes the whole tail with it"
+    (assert= (plan "(defmodule aa)\n(+ 1 2)\n(+ 3 4)\n"
+               "(defmodule bb)\n(+ 1 2)\n(+ 3 4)\n")
+      (list 0 1 2)))
+
+  ;; Downward only — the model the buffer already documents.
+  (test "a form above the edit is left alone even when it names the same thing"
+    (assert= (plan "(f 1)\n(defn f (n) n)\n" "(f 1)\n(defn f (n) (inc n))\n") (list 1)))
+
+  ;; A deleted form's index is past the end of the new buffer, so the walk never visits it —
+  ;; and its users would keep showing the answer the definition it lost used to give.
+  (test "deleting a definition still reaches what called it"
+    (assert= (plan "(defn f (n) n)\n(f 1)\n" "(f 1)\n") (list 0)))
+
+  ;; A deleted form's index is past the end of the new buffer, so the walk never visits it —
+  ;; and its callers would keep showing the answer the definition it lost used to give.
+  (test "deleting a definition still reaches what called it"
+    (assert= (plan "(defn f (n) n)\n(f 1)\n" "(f 1)\n") (list 0)))
+
+  ;; The safety valve: if the deps ever failed to line up with the forms one-for-one, the
+  ;; indices would be off and this would re-run the WRONG forms, silently. Re-running too
+  ;; much is the failure worth having.
+  (test "deps that do not line up fall back to the old suffix rule"
+    (assert= (playground/launch-plan {0 "(a)" 1 "(b)" 2 "(c)"}
+               {0 "(a)" 1 "(z)" 2 "(c)"}
+               '()
+               '()
+               3)
+      (list 1 2))))
 
 (describe "the command"
   (test "M-x brood-playground opens *Playground*"
@@ -359,13 +478,45 @@
   ;; ":none" and "no entry" must not look alike: one means the form ran and called nothing
   ;; traceable, the other means it never ran. A pane that conflated them would report a
   ;; working session as a broken one.
-  (test "a form that ran and traced nothing says THAT instead"
-    (let (m (assoc-in (m-of "") [:playground :workings 0] :none))
-      (is (includes? (workings/body playground/*spy-spec* m 0) "called nothing of yours"))))
+  (test "a form that ran and traced nothing still shows what it answered"
+    (let (m (assoc-in (m-of "")
+              [:playground :workings 0]
+              {:traced? false :body "=> 6\n\nnothing of yours ran"}))
+      (is (includes? (workings/body playground/*spy-spec* m 0) "=> 6"))
+      (is (includes? (workings/body playground/*spy-spec* m 0) "nothing of yours ran"))
+      ;; …but it is still not worth halving the page for on its own
+      (assert= (workings/cascade playground/*spy-spec* m 0) nil)))
 
-  (test "a cached cascade is the body"
-    (let (m (assoc-in (m-of "") [:playground :workings 0] "fac 3\n= 6"))
-      (assert= (workings/body playground/*spy-spec* m 0) "fac 3\n= 6")))
+  ;; What the cursor is POINTING at, above what the form DID — two answers to two questions
+  ;; on two different clocks (per keystroke, per reply) in one pane.
+  (test "the docs of the symbol at point sit above the report, behind a rule"
+    (let (m (workings/at-point playground/*spy-spec*
+              (assoc-in (m-of "") [:playground :workings 0] {:traced? true :body "=> 6"})
+              (list "(map f coll)" "" "A list of `(f x)` for each `x` in `coll`."))
+          text (workings/body playground/*spy-spec* m 0))
+      (is (string/starts-with? text "(map f coll)"))
+      (is (includes? text workings/*rule*))
+      ;; …and the report is still under it
+      (is (< (index-of text workings/*rule*) (index-of text "=> 6")))))
+
+  (test "nothing under the cursor, no rule and no gap"
+    (let (m (assoc-in (m-of "") [:playground :workings 0] {:traced? true :body "=> 6"}))
+      (is (not (includes? (workings/body playground/*spy-spec* m 0) workings/*rule*)))))
+
+  ;; The service, through the mode — a cursor anywhere in a call documents its head, so the
+  ;; pane is never a dead spot wherever you happen to have stopped.
+  (test "the doc block is the symbol at point, else the call around it"
+    (let (head (fn (p) (first (or (modes/brood-doc-at "(map f [1 2 3])" p) '(nil)))))
+      (assert= (head 2) "(map f coll)") ; on `map`
+      (assert= (head 6) "(map f coll)") ; on `f`, which is not bound — the call answers
+      (assert= (head 10) "(map f coll)"))) ; inside the vector — one level out
+  (test "a cached report is the body, under a heading naming the form"
+    (let (m (assoc-in (m-of "")
+              [:playground :workings 0]
+              {:traced? true :body "=> 6\n\n  fac 3\n  = 6"}))
+      (assert= (workings/body playground/*spy-spec* m 0)
+        "What ran — form 1:\n\n=> 6\n\n  fac 3\n  = 6")
+      (assert= (workings/cascade playground/*spy-spec* m 0) "=> 6\n\n  fac 3\n  = 6")))
 
   ;; Closing it is a choice; a later result must not undo it.
   (test "a dismissed pane stays dismissed, and M-x playground-spy is the way back"
@@ -431,3 +582,22 @@
 
   (test "an open playground keeps it alive"
     (is (sandbox-events/any-client-live? (pg-open "(+ 1 2)")))))
+
+(describe "the checker's warnings ride the line as ⚠ notes"
+  ;; `(< number)` typed `: bool` and answered `=> true` while the checker knew the argument
+  ;; could not be ordered — the warning sat in the gutter, easy to miss beside the live
+  ;; buffer's own marks. It is painted as a note on the line now, and ONLY for the rope the
+  ;; check was run on, so it can never drift onto a line the text moved out from under.
+  (test "a diagnostic on the checked rope is a ⚠ note beside the line's other notes"
+    (let (buf (results/set-note (make-buffer "(< number)\n") 0 {:kind :info :text "=> true"} 0)
+          m {:diagnostics (list {:line 1 :col 1 :message "<: argument 1 expects ordered, got list"})
+             :diag-rope (buffer-rope buf)}
+          ops (view/ed-eol-note-ops buf 0 24 0 0 400 4 1 0 (view/ed-diag-notes m buf))
+          texts (map (fn (op) (nth op 3)) ops))
+      (is (any? (fn (t) (= t "=> true")) texts))
+      (is (any? (fn (t) (string/starts-with? t "⚠ <: argument 1")) texts))))
+  (test "a diagnostic computed for another rope is not painted"
+    (let (buf (make-buffer "(< number)\n")
+          other (make-buffer "(< other)\n")
+          m {:diagnostics (list {:line 1 :col 1 :message "x"}) :diag-rope (buffer-rope other)})
+      (assert= (view/ed-diag-notes m buf) {}))))

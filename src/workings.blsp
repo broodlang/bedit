@@ -2,9 +2,12 @@
   "The **workings pane** — the \"show me how it actually ran\" channel, for any buffer that
 evaluates regions of itself.
 
-A sandbox reply for a traced region carries `:spy` entries; they render as an indented
-call/return tree in a pane beside the page, and the pane shows the workings of the region the
-cursor is IN, following it with no re-evaluation.
+A sandbox reply carries everything the evaluation did — the value it answered, what it
+printed, what it cost, and (for a traced region) `:spy` entries that render as an indented
+call/return tree. The pane shows all of it for the region the cursor is IN, following it with
+no re-evaluation. That is the division of labour with the one-line note beside the code: the
+note is what you read while typing, the pane is what you read when the note was not enough —
+a value too big for the margin, or three lines of output a note can only show as one.
 
 **Two clients, one pane discipline.** The tutorial (`tutor-workings`, `*Workings*` beside a
 lesson's boxes) and the playground (`*Playground Spy*` beside its top-level forms) want
@@ -28,11 +31,13 @@ its pane is called:
 
 `:key` is the model sub-map holding this pane's state — so two panes never collide:
 
-  `:workings`         region index → its rendered cascade (a string), or `:none` for \"it ran
-                      and traced nothing\". The distinction is load-bearing in both
-                      directions: it is the difference between \"region 3 called
-                      nothing of yours\" and \"region 3 has not run yet\", and only a real
-                      cascade is worth opening a closed pane for.
+  `:workings`         region index → `{:body <the whole reply, rendered> :traced? bool}`,
+                      absent for a region that has never run. Both halves are load-bearing
+                      and they are not the same question: `:body` is what the pane SHOWS —
+                      the value, what was printed, what it cost, how it got there — and
+                      every reply has one; `:traced?` is what earns a SPLIT, and only a real
+                      cascade does. Absence is the third state, \"region 3 has not run yet\",
+                      which must not read like either.
   `:workings-region`  which region the pane is showing (nil = not shown).
   `:workings-closed?` the reader dismissed it — latched.
 
@@ -58,44 +63,83 @@ sandbox, no window."
   ;; The model path to one of this pane's state slots — `[:playground :workings 3]`.
   (into [(:key spec)] rest))
 
+(defn report (spec m i)
+  "Region `i`'s cached report — `{:body <lines as text> :traced? bool}` — or nil when it has
+never run."
+  (let (v (get-in m (path spec :workings i))) (when (map? v) v)))
+
 (defn cascade (spec m i)
-  "Region `i`'s cached cascade text, or nil when it has none (never ran, or traced nothing) —
-also the test for whether the pane has something worth showing."
-  (let (v (get-in m (path spec :workings i)))
-    (when (string? v) v)))
+  "Region `i`'s cached report text, but only when it TRACED something — nil when it never ran
+and nil when it ran and called nothing of the reader's.
+
+Deliberately narrower than [[report]], because this is the open decision, not the content
+one: every reply has a body worth showing once the pane is up, and almost none of them are
+worth halving the page for on their own."
+  (let (v (report spec m i)) (when (:traced? v) (:body v))))
 
 (defn on-page? (spec m)
-  "Whether any region has a cascade — what makes the pane worth having open at all."
-  (any? string? (vals (or (get-in m (path spec :workings)) {}))))
+  "Whether any region traced something — what makes the pane worth having open at all."
+  (any? :traced? (vals (or (get-in m (path spec :workings)) {}))))
+
+(def *rule*
+  ;; The hairline between what the cursor is POINTING at and what the region DID — two
+  ;; answers to two different questions, on two different clocks, in one pane.
+  "────────")
+
+(defn at-point (spec m lines)
+  "Remember what the client says the cursor is pointing AT — a list of body lines (a symbol's
+documentation, say), or nil for nothing. [[body]] shows it above the region's report.
+
+Kept on the model beside `:workings-region` rather than threaded through `refresh`, because
+it changes on a different clock: a report is per REPLY and the pointing is per KEYSTROKE, and
+threading the second through the first's call chain would make every caller of `refresh`
+carry an argument only one of them can fill in. This module still never looks at a buffer —
+the client reads the cursor and hands over lines."
+  (assoc-in m (path spec :at-point) lines))
+
+(defn at-point-lines (spec m)
+  "What the client last said is under the cursor, or `()`."
+  (or (get-in m (path spec :at-point)) '()))
 
 (defn body (spec m i)
-  "What the pane should show for region `i` right now: its cached cascade, else why there
-isn't one. `i` nil means the cursor is not in a region at all."
-  (let (v (when i (get-in m (path spec :workings i)))
-        noun (:noun spec "region")
-        heading (:heading spec "The workings"))
-    (cond
-      (nil? i) (str heading " — put the cursor in a " noun " to see how its code ran.")
-      (string? v) v
-      (= v :none)
-        (str heading " — " noun " " (inc i) " called nothing of yours."
-          "\nThe trace follows the functions THIS session defined; the language's own"
-          "\n(`+`, `map`, `str`, …) run untraced, or every result would arrive under a"
-          "\npage of prelude internals. Define a function, call it, and it appears here.")
-      else
-        (str heading " — " noun " " (inc i) " has not run yet.\n"
-          "Type in it and the calls it makes appear here."))))
+  "What the pane should show for region `i` right now: what the cursor is pointing at
+([[at-point]]) above everything its reply said, under a heading naming the region — else why
+there is nothing. `i` nil means the cursor is not in a region at all.
 
-(defn forget (spec m from)
-  "Drop the cached workings of every region from `from` down — they were just re-sent, so
-their old cascades describe code that no longer exists. Keeps the regions above, whose
-replies still stand. `from` nil (nothing changed) keeps everything."
-  (if (nil? from)
-    m
-    (assoc-in m (path spec :workings)
-      (into {}
-        (filter (fn (kv) (< (first kv) from))
-          (or (get-in m (path spec :workings)) {}))))))
+The pointing goes ABOVE the report because it answers the question you asked by moving there;
+the report answers one you asked by typing, and is still underneath when you look back."
+  (let (v (when i (report spec m i))
+        noun (:noun spec "region")
+        heading (:heading spec "The workings")
+        at (at-point-lines spec m)
+        head (if (empty? at) "" (str (string/join "\n" at) "\n\n" *rule* "\n\n"))
+        tail (cond
+               (nil? i) (str heading " — put the cursor in a " noun " to see how its code ran.")
+               v (str heading " — " noun " " (inc i) ":\n\n" (:body v))
+               else
+                 (str heading
+                   " — "
+                   noun
+                   " "
+                   (inc i)
+                   " has not run yet.\n"
+                   "Type in it and the calls it makes appear here.")))
+    (str head tail)))
+
+(defn forget (spec m stale?)
+  "Drop the cached workings of every region `stale?` says is being re-sent — their old
+cascades describe code that no longer exists. Everything else keeps its report, because its
+reply still stands.
+
+A PREDICATE rather than a cut-off index, because the set being re-sent is not always a
+suffix: a client that re-evaluates only the forms an edit could reach (`playground`'s
+dependency closure) re-sends a scattered handful, and forgetting the whole tail there would
+blank the panes of regions nobody re-ran."
+  (assoc-in m
+    (path spec :workings)
+    (into {}
+      (filter (fn (kv) (not (stale? (first kv))))
+        (or (get-in m (path spec :workings)) {})))))
 
 (defn refresh (spec m i force)
   "Re-render the pane for region `i`. With `force` it is opened if it isn't there; without,
@@ -116,13 +160,17 @@ has never opened. [[reopen]] is the way back, and the only thing that clears the
         (path spec :workings-region)
         i))))
 
-(defn show (spec m region-idx at reply)
-  "Cache what region `region-idx` just did, then refresh the pane for region `at` (the one at
-point). Opens the pane only for a reply that has a cascade AND belongs to the region the
-reader is in — see the module docstring for why that is the rule."
+(defn show (spec m region-idx at reply &optional (src nil))
+  "Cache everything region `region-idx`'s reply said, then refresh the pane for region `at`
+(the one at point). Opens the pane only for a reply that TRACED something AND belongs to the
+region the reader is in — see the module docstring for why that is the rule.
+
+`src` (the region's source, when the client has it) buys the derived type beside the value;
+without it the report is the same minus that line."
   (let (spy (or (:spy reply) ())
-        cached (assoc-in m (path spec :workings region-idx)
-                 (if (empty? spy) :none (liveeval/spy-text reply (:heading spec "The workings")))))
+        cached (assoc-in m
+                 (path spec :workings region-idx)
+                 {:body (liveeval/report-text reply src) :traced? (not (empty? spy))}))
     (refresh spec cached at (and (not (empty? spy)) (= region-idx at)))))
 
 (defn follow (spec m i)
