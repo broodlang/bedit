@@ -109,9 +109,16 @@ so it is a Brood file first and a playground second."
 
 ;; ---- the forms, and which of them changed ---------------------------------------
 ;;
-;; Every entry point parses ONCE and threads the result. `sexp/top-level-forms` builds a CST
-;; of the whole buffer, and the two hot paths here (a launch over N forms, and `:post-key` on
-;; every keystroke) each used to call it per form — N+1 full parses for one keystroke.
+;; `sexp/top-level-forms` builds a CST of the whole buffer, and the hot paths here once
+;; called it per form — N+1 full parses for one keystroke. Now only the LAUNCH parses, and
+;; what it caches on the buffer is the currency everything else spends:
+;;
+;;   `:playground-srcs`   index -> source, for finding what changed
+;;   `:playground-spans`  index -> [start end], for finding which form a point is in
+;;   `:playground-deps`   index -> what it defines / uses, for finding what a change reaches
+;;
+;; All three describe `:playground-rope`, and are exact for exactly as long as the buffer
+;; still holds it — an O(1) comparison, and the one both later readers make.
 
 (defn forms-of (text)
   "The buffer's top-level forms as positioned nodes. Error-tolerant, so it answers over text
@@ -132,13 +139,17 @@ time's to find what changed."
   "`{index -> source}` for `text`, parsing it. The convenience form of [[form-srcs-in]]."
   (form-srcs-in text (forms-of text)))
 
-(defn form-index-at (text forms point)
-  "Which top-level form `point` falls in, or nil. Takes already-parsed `forms` — it is called
-from `:post-key`, so it may not parse."
+(defn form-spans-in (text forms)
+  "`[[start end] …]` for already-parsed `forms`, in order — the extents a launch caches so
+that finding which form the cursor is in later costs a scan rather than a parse."
+  (into [] (map (fn (node) [(:start node) (:end node)]) forms)))
+
+(defn form-index-in (spans point)
+  "Which form `point` falls in, given [[form-spans-in]] extents, or nil. The only place that
+answers \"which form is this?\" — a scan over extents, never a parse."
   (first (filter (fn (i)
-                   (let (node (nth forms i nil))
-                     (and node (>= point (:start node)) (<= point (:end node)))))
-           (range (count forms)))))
+                   (let ([lo hi] (nth spans i)) (and (>= point lo) (<= point hi))))
+           (range (count spans)))))
 
 (defn changed-forms (srcs old-srcs total)
   "The indices whose source differs from last time — a form someone edited, one that has just
@@ -228,22 +239,23 @@ would re-run the wrong forms, silently. Re-running too much is the failure worth
 ;; ---- notes: a result at the end of its form --------------------------------------
 
 (defn- pg-set-note
-  (m i note forms text)
+  (m i note spans text)
   ;; Stamp `note` for form `i` through the shared anchored-note channel: its answer on the
   ;; line below the form's last, its `:hint` (the derived type `liveeval/result-note` put
   ;; there) at the form's opening line. `results/set-note` owns everything else — the
   ;; owner-keying, the hint key, and the one-line collapse when a form at EOF has no line
-  ;; below it. `forms`/`text` are passed in because the callers already have them.
-  (let (node (nth forms i nil))
-    (if (nil? node)
+  ;; below it. `spans`/`text` are passed in because both callers already have them.
+  (let (span (nth spans i nil))
+    (if (nil? span)
       m
-      (pg-update-buf m
-        (fn (bb)
-          (results/set-note bb
-            i
-            note
-            (results/answer-line text (dec (:end node))) ; `:end` is exclusive
-            (results/line-of text (:start node))))))))
+      (let ([lo hi] span)
+        (pg-update-buf m
+          (fn (bb)
+            (results/set-note bb
+              i
+              note
+              (results/answer-line text (dec hi)) ; the extent's end is exclusive
+              (results/line-of text lo))))))))
 
 (defn- pg-clear-notes
   (bb)
@@ -279,6 +291,7 @@ blank on its way to the same answer."
             rope (buffer-rope b)
             forms (forms-of text)
             srcs (form-srcs-in text forms)
+            spans (form-spans-in text forms)
             old-srcs (or (:playground-srcs b) {})
             deps (deps-of text)
             old-deps (or (:playground-deps b) '())
@@ -294,8 +307,9 @@ blank on its way to the same answer."
                    (pg-clear-notes (assoc bb
                                      :playground-rope rope
                                      :playground-srcs srcs
+                                     :playground-spans spans
                                      :playground-deps deps))))
-            note-at (fn (mm i note) (pg-set-note mm i note forms text))
+            note-at (fn (mm i note) (pg-set-note mm i note spans text))
             result (if (empty? stale)
                      ;; nothing changed (whitespace the reader ignores, an edit undone):
                      ;; re-anchor every note where it now sits and send nothing. Form keys
@@ -368,7 +382,8 @@ Clearing `:playground-srcs` is the load-bearing half — leaving it behind would
 restart re-send nothing, and every form would look evaluated against a session that no longer
 holds any of its definitions."
   (pg-update-buf (update m :playground merge {:sandbox-gen gen :sandbox-ready true :pending {}})
-    (fn (bb) (assoc bb :playground-rope nil :playground-srcs {} :playground-deps '()))))
+    (fn (bb)
+      (assoc bb :playground-rope nil :playground-srcs {} :playground-spans [] :playground-deps '()))))
 
 (defn playground-sandbox-reply (m reply gen)
   "Fold one sandbox reply into the model. A reply the playground never sent, one from a
@@ -386,14 +401,18 @@ cascade."
               i (:region pend))
           (if (or (nil? b) (not= (buffer-rope b) (:rope pend)))
             m1
+            ;; The rope test above has already proved the buffer still holds the text the
+            ;; launch parsed, so its cached extents and sources are exact — a reply lands
+            ;; without parsing anything, where it used to re-parse the whole buffer once per
+            ;; form sent.
             (let (text (buffer-text b)
-                  forms (forms-of text)
-                  src (get (form-srcs-in text forms) i)
-                  m2 (pg-set-note m1 i (liveeval/result-note reply src) forms text))
+                  spans (or (:playground-spans b) [])
+                  src (get (or (:playground-srcs b) {}) i)
+                  m2 (pg-set-note m1 i (liveeval/result-note reply src) spans text))
               ;; `workings/show` caches this form's cascade and opens the pane only if the
               ;; cascade is real AND belongs to the form the cursor is in — so a background
               ;; re-eval never yanks the pane off what you are reading.
-              (workings/show *spy-spec* m2 i (form-index-at text forms (:point b 0)) reply src)))))))
+              (workings/show *spy-spec* m2 i (form-index-in spans (:point b 0)) reply src)))))))
 
 (defn playground-sandbox-down (m code)
   "The child went away and somebody still wants a sandbox (letting it go for good is
@@ -427,25 +446,34 @@ the pane documents whatever language the buffer is in rather than assuming Brood
   "The playground's `:post-key` hook, on every keystroke: keep the spy pane following the
 cursor from form to form and showing the docs of whatever it is on, with no re-evaluation.
 
-Ordered cheapest-first because of that. The doc lookup is a token scan and an image lookup;
-the form index needs a parse of the whole buffer, which at 40 forms costs ~345µs — so it is
-only taken when the pane has something to follow, and the pane is only re-rendered when the
-docs or the form actually changed. Everything else is two string compares."
+**Nothing here parses the buffer.** It used to: finding which form the cursor was in meant a
+full `sexp/top-level-forms`, 345µs on a 40-form buffer, on every keystroke, almost always to
+conclude that the form had not changed. The extents cached by the last launch
+([[form-spans-in]]) answer the same question with a scan — and they are EXACT precisely when
+the rope is still the text that launch parsed, which is an O(1) comparison the debounce
+already makes.
+
+While the rope has moved on, the extents describe text that no longer exists and the pane
+holds the form it was on. That is not an approximation to apologise for: typing inside a form
+does not change which form you are in, and the debounce re-parses ~150ms later and corrects
+the boundary case for free. Paying 345µs a keystroke to move the pane somewhere it is about
+to move anyway is the worse trade. The DOCS still track the cursor throughout — a token scan
+and an image lookup — which is the half you want while typing a call."
   (let (b (ed-current-buf m))
     (if (not (playground-buffer? b))
       m
       (let (docs (doc-at-point b)
             moved? (not= docs (workings/at-point-lines *spy-spec* m))
             m1 (if moved? (workings/at-point *spy-spec* m docs) m)
-            text (buffer-text b)
-            i (form-index-at text (forms-of text) (:point b 0)))
+            here (get-in m1 [:playground :workings-region])
+            i (when (= (buffer-rope b) (:playground-rope b))
+                (form-index-in (or (:playground-spans b) []) (:point b 0))))
         (cond
-          (nil? i) m1
           ;; the form changed (or is showing for the first time): `follow` decides whether
           ;; that is worth opening a closed pane for
-          (not= i (get-in m1 [:playground :workings-region])) (workings/follow *spy-spec* m1 i)
+          (and i (not= i here)) (workings/follow *spy-spec* m1 i)
           ;; same form, new docs: re-render what is already open, never open one for a hover
-          moved? (workings/refresh *spy-spec* m1 i false)
+          (and moved? (not (nil? (or i here)))) (workings/refresh *spy-spec* m1 (or i here) false)
           else m1)))))
 
 ;; ---- the modes: a Brood buffer that runs, and a read-only pane beside it -------------
@@ -524,7 +552,8 @@ reopen it behind you; asking for the playground again does, because that is you 
               text (when b (buffer-text b)))
           (if (nil? b)
             m1
-            (workings/reopen *spy-spec* m1 (form-index-at text (forms-of text) (:point b 0)))))
+            (workings/reopen *spy-spec* m1
+              (form-index-in (form-spans-in text (forms-of text)) (:point b 0)))))
         ;; `:playground` stacks a two-hook layer over the real brood-mode, so the buffer is a
         ;; Brood file first — highlighting, indent, eldoc and paredit all come for free.
         ;;
