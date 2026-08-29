@@ -1,0 +1,427 @@
+(defmodule playground
+  "The **Brood playground** (`M-x brood-playground`) — a scratch buffer that runs.
+
+The tutorial's machinery pointed at nothing in particular: `*Playground*` is one ordinary,
+fully editable Brood file where every top-level form evaluates as you settle typing, and each
+one's result appears as ghost text at its end —
+
+    (defn fac (n) (if (= n 0) 1 (* n (fac (dec n)))))
+                                            => #<fn fac>
+    (fac 5)                                 => 120  : int
+
+— with the *Playground Spy* pane beside it showing what actually ran to produce the form your
+cursor is in: every call and return, nested.
+
+**Free text, no boxes.** Unlike the tutorial there is no generated prose to protect and
+nothing is read-only; prose is `;` comments, because the buffer is Brood source and nothing
+else. That is the whole difference between the two features, and it is why they share
+`liveeval` (the notes vocabulary) and `workings` (the pane) rather than one being written in
+terms of the other.
+
+**Two things this needed from the language**, both added rather than worked around here:
+
+  - `:trace :all` (`eval-server`) — trace every global the SESSION defined, resolved in the
+    sandbox's own image. The tutorial had to guess a trace list by walking box source for
+    call heads, which structurally cannot see a helper the source doesn't name. In a
+    free-text buffer that indirection is the thing you opened the pane to watch.
+  - `reflect/expr-type` — the checker's type for an anonymous expression. `type-signature`
+    needs a global to ask about; what you just typed has no name.
+
+**Evaluation is per top-level form, from the first changed one down.** The forms share one
+sandbox session and definitions flow downward, so re-running only the form you touched would
+leave a dependent form below showing a result from the old definition — a stale value that
+looks current. Forms ABOVE the edit cannot depend on text below them and keep their results.
+
+**The notes map is REBUILT every launch**, never patched. Patching is how a result outlives
+the form it described: delete the last form and its `=> 6` stays behind, anchored to a line
+that now holds something else. Rebuilding makes that unrepresentable — a note exists only if
+this launch just put it there.
+
+**Nothing persists.** A fresh buffer every time the editor starts: the point is a surface
+with no stakes, and a playground that accumulates is a file you end up tidying. `C-x C-w` if
+a session turns out to be worth keeping."
+  (:use model) ; ed-buffer-index-by-name / message / ed-current-buf
+  (:use commands) ; ed-show-named / ed-select
+  (:use interactive) ; defcommand — M-x brood-playground
+  (:use editor/buffer) ; buffer-text / buffer-rope / annotate
+  (:use editor/layers) ; register-type-layers / request-close
+  (:use theme) ; *subtext* / *teal* — the spy pane's two faces
+  (:use sandbox)) ; sandbox-start / sandbox-eval / the session
+;; liveeval, workings, sandbox-events, results, sexp and modes are referenced qualified
+;; below — each `mod/name` auto-loads its module.
+
+(def *buffer-name* "*Playground*")
+(def *spy-buffer-name* "*Playground Spy*")
+(def *playground-timeout-ms* 5000)
+
+;; Where this pane's state lives and what it is called — see `workings`, which owns the
+;; behaviour. `:key` keeps it clear of the tutorial's pane in the same model.
+(def *spy-spec*
+  {:key :playground
+   :buffer playground/*spy-buffer-name*
+   :type :playground-spy
+   :noun "form"
+   :heading "What ran"})
+
+(def *welcome*
+  ;; Deliberately tiny. A playground that opens full of somebody else's examples is a file
+  ;; you clear before you can use it; two lines say what the surface does and get out of
+  ;; the way. It is ordinary editable text like everything else here — delete it.
+  (str ";; Brood playground — every top-level form runs as you stop typing.\n"
+    ";; Results appear at the end of each form; the pane on the right shows what ran.\n\n"
+    "(+ 1 2)\n"))
+
+;; ---- the buffer ----------------------------------------------------------------
+
+(defn playground-buffer? (b)
+  "Is buffer `b` the playground? Keyed on the buffer NAME, like every other report buffer
+here. Its TYPE is `:playground`, which stacks a two-hook layer over the real brood-mode —
+so it is a Brood file first and a playground second."
+  (and b (= (:name b) *buffer-name*)))
+
+(defn playground-live-buffer? (m)
+  "Is *Playground* on screen — i.e. does the playground still want a sandbox? One of the
+`sandbox-events` client hooks; it is what stops a dead child being let go while this is open."
+  (not (nil? (ed-buffer-index-by-name m *buffer-name*))))
+
+(defn- playground-live?
+  ()
+  ;; Is there a running editor to deliver a sandbox event to? A PROCESS-global fact, not a
+  ;; model one: without the `ui-run` loop a fire-and-forget request has nowhere to come back
+  ;; to, so the launcher evaluates in-image instead of stranding every form on `evaluating…`.
+  ;; It also gates spawning the sandbox at all — a headless open (a test, a `--headless`
+  ;; daemon) has no use for a child runtime and should not start one.
+  (not (nil? (proc/whereis :editor))))
+
+(defn- pg-index (m) (ed-buffer-index-by-name m *buffer-name*))
+
+(defn- pg-buf
+  (m)
+  (let (i (pg-index m)) (when i (nth (:buffers m) i))))
+
+(defn- pg-update-buf
+  (m f)
+  ;; Apply `f` to the playground buffer wherever it sits in the pool, leaving the rest of the
+  ;; model alone. Every note-stamping path goes through here so none of them has to care
+  ;; whether the playground is the selected buffer (it usually isn't when a reply lands).
+  (let (i (pg-index m))
+    (if (nil? i) m (assoc m :buffers (assoc (:buffers m) i (f (nth (:buffers m) i)))))))
+
+;; ---- the forms, and which of them changed ---------------------------------------
+;;
+;; Every entry point parses ONCE and threads the result. `sexp/top-level-forms` builds a CST
+;; of the whole buffer, and the two hot paths here (a launch over N forms, and `:post-key` on
+;; every keystroke) each used to call it per form — N+1 full parses for one keystroke.
+
+(defn forms-of (text)
+  "The buffer's top-level forms as positioned nodes. Error-tolerant, so it answers over text
+someone is mid-typing — whether a given form *evaluates* is `liveeval/parse-state`'s
+separate question."
+  (sexp/top-level-forms text))
+
+(defn form-srcs-in (text forms)
+  "`{index -> source}` for already-parsed `forms` — the shape a launch compares against last
+time's to find what changed."
+  (fold (fn (acc iv)
+          (let ([i node] iv)
+            (assoc acc i (string/substring text (:start node) (:end node)))))
+    {}
+    (seq/enumerate forms)))
+
+(defn form-srcs (text)
+  "`{index -> source}` for `text`, parsing it. The convenience form of [[form-srcs-in]]."
+  (form-srcs-in text (forms-of text)))
+
+(defn form-index-at (text forms point)
+  "Which top-level form `point` falls in, or nil. Takes already-parsed `forms` — it is called
+from `:post-key`, so it may not parse."
+  (first (filter (fn (i)
+                   (let (node (nth forms i nil))
+                     (and node (>= point (:start node)) (<= point (:end node)))))
+           (range (count forms)))))
+
+(defn first-changed (srcs old-srcs total)
+  "The index of the first form whose source differs from last time, or nil when none does.
+
+Everything from here down is re-sent; everything above keeps its result. That is the
+dependency direction — a form cannot depend on text below it — and it is what stops a
+one-character edit re-running the whole buffer, which for a playground full of loops and
+spawns is the difference between a live surface and a stuttering one."
+  (let (n (math/max total (count old-srcs)))
+    (first (filter (fn (i) (not= (get srcs i) (get old-srcs i))) (range n)))))
+
+;; ---- notes: a result at the end of its form --------------------------------------
+
+(defn- pg-set-note
+  (m i note forms text)
+  ;; Stamp `note` for form `i` through the shared anchored-note channel: its answer on the
+  ;; line below the form's last, its `:hint` (the derived type `liveeval/result-note` put
+  ;; there) at the form's opening line. `results/set-note` owns everything else — the
+  ;; owner-keying, the hint key, and the one-line collapse when a form at EOF has no line
+  ;; below it. `forms`/`text` are passed in because the callers already have them.
+  (let (node (nth forms i nil))
+    (if (nil? node)
+      m
+      (pg-update-buf m
+        (fn (bb)
+          (results/set-note bb
+            i
+            note
+            (results/line-below text (dec (:end node))) ; `:end` is exclusive
+            (results/line-of text (:start node))))))))
+
+(defn- pg-clear-notes
+  (bb)
+  ;; Drop every note. A launch rebuilds the map from nothing, so a note for a form that has
+  ;; been deleted cannot survive — the alternative (patching in place) leaves the result of a
+  ;; form that no longer exists sitting on whatever line took its place.
+  (annotate bb :eol-notes {}))
+
+;; ---- eval-on-type: the stale? / launch / apply triple ------------------------------
+
+(defn ed-playground-stale? (m)
+  "O(1): the selected buffer is the playground and its rope moved since the last launch —
+arms the `:playground-eval` idle timer (`model/ed-sync-timers`)."
+  (let (b (ed-current-buf m))
+    (and (playground-buffer? b) (not= (buffer-rope b) (:playground-rope b)))))
+
+(defn ed-playground-launch (m)
+  "The debounce landed: re-evaluate every top-level form from the first changed one down.
+
+A form that is mid-typing (reader E0002) says so in the pending voice and keeps nothing
+stale; one that is genuinely broken fails locally with no round trip; a blank one says
+nothing. Each sent form carries `:trace :all`, so the pane can show what it actually called
+rather than what its own text happened to name.
+
+Notes are rebuilt, not patched — see the module docstring. A form whose reply is still in
+flight wears `⋯ evaluating…` rather than nothing, so a rebuild never flashes the buffer
+blank on its way to the same answer."
+  (let (b (pg-buf m))
+    (if (nil? b)
+      m
+      (let (text (buffer-text b)
+            rope (buffer-rope b)
+            forms (forms-of text)
+            srcs (form-srcs-in text forms)
+            old-srcs (or (:playground-srcs b) {})
+            old-notes (or (results/eol-notes-any b) {})
+            live (playground-live?)
+            from (first-changed srcs old-srcs (count forms))
+            start-id (get-in m [:playground :next-id] 1)
+            ;; Drop the cached cascades of everything being re-sent (they describe code that
+            ;; no longer exists) and clear the notes, before anything runs.
+            m0 (pg-update-buf (workings/forget *spy-spec* m from)
+                 (fn (bb)
+                   (pg-clear-notes (assoc bb :playground-rope rope :playground-srcs srcs))))
+            note-at (fn (mm i note) (pg-set-note mm i note forms text))
+            result (if (nil? from)
+                     ;; nothing changed (whitespace the reader ignores, an edit undone):
+                     ;; re-anchor every note where it now sits and send nothing. Form keys
+                     ;; only: a hint (`results/hint-key`) is derived from its result note, so
+                     ;; re-stamping the results re-anchors the hints too — while re-stamping
+                     ;; a hint directly would index `forms` with its `[:hint i]` key.
+                     [(fold (fn (mm kv)
+                              (let ([i note] kv) (note-at mm i (dissoc note :line))))
+                        m0
+                        (filter (fn (kv) (int? (first kv))) old-notes))
+                       start-id
+                       {}]
+                     (fold
+                       (fn (acc i)
+                         (let ([m1 next-id pending] acc
+                               src (get srcs i "")
+                               old (get old-notes i)
+                               state (if (< i from) :carry (liveeval/parse-state src)))
+                           (match state
+                             ;; above the edit: unaffected, so keep the verdict as it is
+                             (:carry (if old
+                                       [(note-at m1 i (dissoc old :line)) next-id pending]
+                                       acc))
+                             (:blank acc)
+                             ;; Mid-form. Neither re-stamp the old verdict (a confident
+                             ;; `=> 6` beside a form that can no longer produce it) nor show
+                             ;; nothing (indistinguishable from "no feedback yet"): say what
+                             ;; it is waiting for, dim.
+                             ([:incomplete reason] [(note-at m1
+                                                      i
+                                                      {:kind :pending :text (str "… " reason)})
+                                                     next-id pending])
+                             ([:err msg] [(note-at m1
+                                            i
+                                            {:kind :fail :error? true :text (str "✗ " msg)})
+                                           next-id pending])
+                             ;; Live (an `:editor` process exists): fire the request at the
+                             ;; sandbox and let the reply land through `sandbox-events`.
+                             ;; Headless (tests, no loop to deliver an event to): evaluate
+                             ;; in-image, synchronously — the diag-fallback discipline the
+                             ;; tutorial follows. It yields values but no cascade: `:trace
+                             ;; :all` resolves against the SANDBOX's session, and the
+                             ;; editor's own image is not it.
+                             (:ok (if live
+                                    (do
+                                      (sandbox-eval next-id src *playground-timeout-ms* :all)
+                                      [(note-at m1 i {:kind :pending :text "⋯ evaluating…"})
+                                        (inc next-id)
+                                        (assoc pending next-id {:region i :rope rope})])
+                                    [(note-at m1
+                                       i
+                                       (liveeval/result-note (eval-server/eval-capturing src nil)
+                                         src))
+                                      next-id pending])))))
+                       [m0 start-id {}]
+                       (range (count forms))))
+            [m2 next-id pending] result)
+        (update m2
+          :playground merge
+          {:next-id next-id :pending (merge (get-in m2 [:playground :pending] {}) pending)})))))
+
+;; ---- the sandbox client hooks (registered in `sandbox-events/*clients*`) ------------
+
+(defn playground-sandbox-ready (m gen)
+  "The child announced itself (first boot, or a reset): remember its generation and clear the
+eval stash so the next idle beat replays the whole buffer against the fresh, empty session.
+Clearing `:playground-srcs` is the load-bearing half — leaving it behind would make the
+restart re-send nothing, and every form would look evaluated against a session that no longer
+holds any of its definitions."
+  (pg-update-buf (update m :playground merge {:sandbox-gen gen :sandbox-ready true :pending {}})
+    (fn (bb) (assoc bb :playground-rope nil :playground-srcs {}))))
+
+(defn playground-sandbox-reply (m reply gen)
+  "Fold one sandbox reply into the model. A reply the playground never sent, one from a
+superseded child, or one whose buffer has moved on since the send is dropped — the next idle
+beat re-evaluates. Otherwise the result lands as the form's note and its trace as the pane's
+cascade."
+  (let (id (get reply :id)
+        pend (get-in m [:playground :pending id]))
+    (cond
+      (nil? pend) m ; not ours (the tutorial's, or a straggler) — the fan-out's no-op
+      (not= gen (get-in m [:playground :sandbox-gen])) m
+      else
+        (let (m1 (update m :playground update :pending dissoc id)
+              b (pg-buf m1)
+              i (:region pend))
+          (if (or (nil? b) (not= (buffer-rope b) (:rope pend)))
+            m1
+            (let (text (buffer-text b)
+                  forms (forms-of text)
+                  src (get (form-srcs-in text forms) i)
+                  m2 (pg-set-note m1 i (liveeval/result-note reply src) forms text))
+              ;; `workings/show` caches this form's cascade and opens the pane only if the
+              ;; cascade is real AND belongs to the form the cursor is in — so a background
+              ;; re-eval never yanks the pane off what you are reading.
+              (workings/show *spy-spec* m2 i (form-index-at text forms (:point b 0)) reply)))))))
+
+(defn playground-sandbox-down (m code)
+  "The child went away and somebody still wants a sandbox (letting it go for good is
+`sandbox-events`' call — only it can see whether every client is gone)."
+  (let (m1 (update m :playground merge {:sandbox-ready false}))
+    (cond
+      (not (playground-live-buffer? m1)) m1 ; not ours to narrate
+      (= code :gave-up) (message m1 "playground sandbox keeps dying — *Messages* may say why")
+      (= code :spawn-failed)
+        (message m1 "could not start the playground sandbox (is `nest` on PATH?)")
+      else (message m1 "playground sandbox restarting…"))))
+
+;; ---- the pane follows the cursor -----------------------------------------------------
+
+(defn spy-on-screen? (m)
+  "Is the *Playground Spy* pane currently on screen?"
+  (not (nil? (ed-buffer-index-by-name m *spy-buffer-name*))))
+
+(defn playground-post-key (m-before m key)
+  "The playground's `:post-key` hook: keep the spy pane following the cursor from form to
+form, with no re-evaluation. One parse, and it only touches the buffer when the form under
+point actually changed — this runs on every keystroke."
+  (let (b (ed-current-buf m))
+    (if (not (playground-buffer? b))
+      m
+      (let (text (buffer-text b)
+            i (form-index-at text (forms-of text) (:point b 0)))
+        (if (nil? i) m (workings/follow *spy-spec* m i))))))
+
+;; ---- the modes: a Brood buffer that runs, and a read-only pane beside it -------------
+
+;; The playground layer adds exactly two things to brood-mode: the `:post-key` hook that
+;; keeps the pane following the cursor, and an `:on-close` that takes the pane with it. It
+;; STACKS over the real brood-mode rather than replacing it, so the buffer keeps every
+;; language service a `.blsp` file has — highlighting, indent, eldoc, completion, the
+;; structural motions. A playground where `(` didn't indent would be a worse place to try
+;; the language than the file you already had open.
+(def playground-mode-layer
+  {:name 'playground
+   :post-key 'playground/playground-post-key
+   :hooks {:on-close '(playground/playground-on-close)}})
+
+(register-type-layers :playground
+  (list 'playground/playground-mode-layer
+    'modes/brood-mode-layer 'modes/prog-mode-layer 'modes/text-mode-layer))
+
+(defn- spy-line-face
+  (line)
+  (cond
+    (string/starts-with? line "What ran") {:fg *subtext*}
+    (string/starts-with? (string/triml line) "= ") {:fg *teal*}
+    else nil))
+
+(defn spy-fontify (src)
+  "The spy pane's colouring: the heading dim, every `= value` return in the accent — so a
+cascade reads as calls going in and values coming back rather than as a wall of text."
+  (modes/fontify-line-faces src playground/spy-line-face))
+
+(def playground-spy-layer
+  {:name 'playground-spy :no-line-numbers true :fontify 'playground/spy-fontify})
+
+(register-type-layers :playground-spy
+  (list 'playground/playground-spy-layer 'modes/special-mode-layer 'modes/text-mode-layer))
+
+(defn playground-on-close (buf)
+  "The `:on-close` hook: killing *Playground* takes its pane with it — the pane is a view of
+the playground's forms and says nothing without them, so leaving it behind leaves a corpse on
+screen. `request-close` NAMES the pane rather than closing it: a hook is handed only its own
+buffer, and it is the app that knows the buffer pool.
+
+The sandbox is deliberately NOT stopped here. The tutorial may still be using it, and
+`sandbox-events` is the only place that can see whether every client is gone."
+  (editor/layers/request-close buf *spy-buffer-name*))
+
+;; ---- the commands ---------------------------------------------------------------------
+
+(defcommand cmd-brood-playground
+  (m key)
+  "Open the Brood playground (M-x brood-playground, C-c p p): a free-text `*Playground*`
+buffer whose top-level forms evaluate as you settle typing, results as ghost text, and a
+*Playground Spy* pane beside it showing what each form actually called.
+
+**One command, not two.** Running it again switches to the buffer you already have — and
+brings the pane back if you closed it, on the form the cursor is in. A separate
+`playground-spy` command was a second thing to know for what is really the same intent
+(\"show me the playground\"), and a second entry cluttering `M-x` for a reader who has no
+idea the pane can be dismissed. Closing the pane still latches, so a later result does not
+reopen it behind you; asking for the playground again does, because that is you asking."
+  (do
+    ;; The sandbox is a child runtime, and only a running editor can receive its replies —
+    ;; so a headless open (a test, a `--headless` daemon) starts nothing.
+    (when (playground-live?)
+      (sandbox-events/ensure) ; the UiEvent impls live there; loading it IS registering them
+      (sandbox-start))
+    (let (existing (pg-index m))
+      (if existing
+        ;; already open: select it, and un-latch the pane onto the form at point
+        (let (m1 (ed-select m existing)
+              b (pg-buf m1)
+              text (when b (buffer-text b)))
+          (if (nil? b)
+            m1
+            (workings/reopen *spy-spec* m1 (form-index-at text (forms-of text) (:point b 0)))))
+        ;; `:playground` stacks a two-hook layer over the real brood-mode, so the buffer is a
+        ;; Brood file first — highlighting, indent, eldoc and paredit all come for free.
+        ;;
+        ;; The pane opens HERE, with `force`, rather than waiting to earn its split from the
+        ;; first traced reply the way the tutorial's does. The rules differ because the
+        ;; features do: a lesson is prose you are reading and the pane is an aside; a
+        ;; playground IS the pane's subject — you opened it to watch code run.
+        (message (workings/refresh *spy-spec*
+                   (ed-show-named m *buffer-name* *welcome* :playground)
+                   0
+                   true)
+          "playground — type Brood; it runs as you stop typing")))))

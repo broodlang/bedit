@@ -233,17 +233,17 @@
 ;; ---- the parse gate ---------------------------------------------------------------
 
 (describe "tutor--parse-state (the on-type gate)"
-  (test "blank says nothing" (assert= (tutor/tutor-parse-state "  \n") :blank))
+  (test "blank says nothing" (assert= (liveeval/parse-state "  \n") :blank))
   (test "mid-typing (reader E0002) reports WHAT it is waiting for"
     ;; it used to return a bare :incomplete and the box showed nothing — a half-typed
     ;; form is not a mistake, but it isn't nothing either
-    (let (s (tutor/tutor-parse-state "(defn f (x)"))
+    (let (s (liveeval/parse-state "(defn f (x)"))
       (assert= (first s) :incomplete)
       (is (includes? (second s) "unclosed list"))))
   (test "a real syntax error reports without a round-trip"
-    (let (s (tutor/tutor-parse-state "(+ 1 2))"))
+    (let (s (liveeval/parse-state "(+ 1 2))"))
       (assert= (first s) :err)))
-  (test "a complete form is ready" (assert= (tutor/tutor-parse-state "(+ 1 2)") :ok)))
+  (test "a complete form is ready" (assert= (liveeval/parse-state "(+ 1 2)") :ok)))
 
 ;; ---- eval-on-type, headless sync fallback -----------------------------------------
 
@@ -529,7 +529,7 @@
       (assert= (get-in m [:tutor :workings 0]) :none)
       ;; once the pane IS open, it says so for that box rather than showing another's
       (let (open-pane (tutor/cmd-tutorial-workings m nil))
-        (is (includes? (tut-workings open-pane) "nothing traceable")))))
+        (is (includes? (tut-workings open-pane) "called nothing of yours")))))
 
   (test "a LAUNCH opens the pane for a lesson that has workings, showing the box at point"
     ;; the launch-side entry point (`ed-tutor-launch` ends in a refresh): a page where some
@@ -592,7 +592,7 @@
                1 :none}))
       (is (includes? (tutor-workings/body m 0) "fac 3")) ; has a cascade
       (is (includes? (tutor-workings/body m 1) "box 2")) ; ran, traced nothing
-      (is (includes? (tutor-workings/body m 1) "nothing traceable"))
+      (is (includes? (tutor-workings/body m 1) "called nothing of yours"))
       (is (includes? (tutor-workings/body m 7) "box 8")) ; never ran
       (is (includes? (tutor-workings/body m 7) "has not run yet"))
       ;; and in prose, where there is no box at all
@@ -770,6 +770,89 @@
     (let (m (tut-model-at-open))
       (is (not (tutor/tutor-contents? m)))
       (assert= (first (tutor/tutor-group-of (get-in m [:tutor :lesson] 0))) :navigation))))
+
+;; Lesson PROSE is never executed, so it rots silently. The code boxes have a test that runs
+;; them ("a box only raises if the lesson SAYS it should"); the sentences around them had
+;; nothing, and drifted: the strings lesson taught `upper`, `string-length`, `substring` and
+;; `name` — none of which exist any more (they are `string/upper`, `string/length`,
+;; `string/substring`, `->string`) — while its own code box three lines below already used
+;; the right ones. A tutorial that teaches names the language does not have is worse than no
+;; tutorial, and only this notices.
+(def tutor-prose-non-names
+  ;; Backticked things that are deliberately not globals: prose punctuation and typography.
+  ["--"])
+
+(defn tutor-backticked (s)
+  "Every `backticked` span in `s` — the odd-indexed pieces of a split on the tick."
+  (let (parts (string/split (or s "") "`"))
+    (seq/keep (fn (i) (when (= 1 (math/mod i 2)) (nth parts i nil))) (range (count parts)))))
+
+(defn tutor-lesson-prose (lesson)
+  "Every human-facing string of `lesson` — body lines, box titles and hints."
+  (append (or (:body lesson) [])
+    (map :hint (or (:playgrounds lesson) []))
+    (map :title (or (:playgrounds lesson) []))
+    [(:title lesson)]))
+
+(defn tutor-name-like? (w)
+  "Does `w` read as a bare identifier the reader would type, rather than punctuation, a
+keyword, a literal or a fragment of code?"
+  (and (string? w)
+    (> (string/length w) 1)
+    (not (includes? w " "))
+    (not (includes? w "("))
+    (not (includes? w ")"))
+    (not (includes? w "\""))
+    (not (string/starts-with? w ":"))
+    (not (includes? tutor-prose-non-names w))
+    (regex/matches? "[a-zA-Z][a-zA-Z0-9/*!?<>=+-]*" w)))
+
+(describe "the lessons teach names that exist"
+  (test "every backticked identifier in lesson prose is bound (or is a special form)"
+    (let (specials (map ->string (reflect/special-forms))
+          missing (seq/distinct
+                    (fold (fn (acc lesson)
+                            (append acc
+                              (filter (fn (w)
+                                        (and (tutor-name-like? w)
+                                          (not (bound? (symbol w)))
+                                          (not (includes? specials w))))
+                                (fold (fn (a line) (append a (tutor-backticked line)))
+                                  []
+                                  (tutor-lesson-prose lesson)))))
+                      []
+                      tutor-lessons)))
+      (assert= (sort missing) '()))))
+
+;; The edit boundary, stated as the property rather than as a handful of sampled positions.
+;; Boundaries here were repeatedly wrong in ways individual cases kept missing, because the
+;; old mechanism stored the COMPLEMENT of the boxes: an insert lands *between* two characters,
+;; so at every edge "is this frozen?" had no answer from the frozen ranges alone, and the
+;; predicate carried three special cases guessing one. The buffer is narrowed to its boxes
+;; now, so there is one answer at every position — and this asserts it at ALL of them.
+(describe "the edit boundary is exact"
+  (test "on a real lesson page, editable agrees with in-a-box at every position"
+    (let (m (tutor/tutor-show (ed-init (make-buffer "")) 0)
+          b (ed-current-buf m)
+          text (buffer-text b)
+          regions (tutor/tutor-regions text)
+          in-box? (fn (p) (any? (fn (r) (and (>= p (:start r)) (<= p (:end r)))) regions))
+          disagreements (filter (fn (p)
+                                  (let (allowed (try (do (insert (goto-char b p) "x") true)
+                                                  (catch e false)))
+                                    (not= allowed (in-box? p))))
+                          (range (inc (buffer-length b)))))
+      (is (> (count regions) 0)) ; the page really has boxes to be wrong about
+      (assert= (count disagreements) 0)))
+
+  ;; The hub has no boxes, so it narrows to NOTHING — and narrowed-to-nothing must not
+  ;; collapse into not-narrowed. It did once: the regions came from `map` over an empty
+  ;; sequence, and `'()` IS nil in Brood, so the whole hub silently became editable.
+  (test "the hub narrows to nothing, and nothing on it is editable"
+    (let (b (ed-current-buf (tutor/tutor-show-contents (ed-init (make-buffer "")))))
+      (assert= (editor/buffer/editable-regions b) [])
+      (is (not (any? (fn (p) (try (do (insert (goto-char b p) "x") true) (catch e false)))
+                 (range (inc (buffer-length b)))))))))
 
 (describe "the contents hub"
   (test "finishing a section CONTINUES into the next one, saying so in passing"
@@ -988,7 +1071,7 @@
             ;; (English mostly happens to read as a list of symbols, which would let a
             ;; broken code box hide here if we did not filter on the kind)
             (when (not= (:kind pg) :text)
-              (assert= (tutor/tutor-parse-state (:code pg)) :ok)))))))
+              (assert= (liveeval/parse-state (:code pg)) :ok)))))))
 
   (test "a box only raises if the lesson SAYS it should"
     ;; A miss is fine and a deliberate crash is fine -- an accidental one is not.
@@ -1404,7 +1487,7 @@
 
   (test "a blank box still says nothing at all"
     ;; nothing typed yet is not a state worth narrating
-    (assert= (tutor/tutor-parse-state "   \n  ") :blank)))
+    (assert= (liveeval/parse-state "   \n  ") :blank)))
 
 (describe "prose boxes: navigation practises on text, not code"
   (defn text-of (m) (buffer-text (tut-buf m)))
@@ -1614,7 +1697,7 @@
           r2 (first (tutor-regions text2)))
       (assert= (tutor/tutor-note-anchor text2 r2) before)
       ;; and it is the box's last line, which is where a prose verdict belongs
-      (assert= before (tutor/tutor-line-of text (dec (:end r)))))))
+      (assert= before (results/line-of text (dec (:end r)))))))
 
 (describe "C-x C-e inside a box (the :eval-scope service)"
   (defn scope-src (m)

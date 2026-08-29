@@ -12,10 +12,10 @@ story.
 
 Everything derives from the buffer TEXT through one pure parser (`tutor-regions`):
 the fontifier colours prose/borders and delegates box innards to the brood
-highlighter; the prose and borders are READ-ONLY at the edit primitive — each render
-stamps the box regions' complement as the buffer's `:read-only-spans` (ADR-219), so
-`insert`/`delete` themselves refuse a keystroke that would damage the generated text, on
-every path (a held key included), with no `:post-key` comparison to bypass; the evaluator re-sends every
+highlighter; the prose and borders are READ-ONLY at the edit primitive — each render NARROWS the buffer
+to the box regions (`buffer/narrow-to`, ADR-219), so `insert`/`delete` themselves refuse a
+keystroke that would damage the generated text, on every path (a held key included), with no
+`:post-key` comparison to bypass; the evaluator re-sends every
 complete box top-to-bottom (defs persist in the sandbox session, so order stays
 deterministic and a respawn heals itself); notes anchor on each box's last
 top-level form via `sexp/top-level-forms`. Exercise expectations (`:expect`) live
@@ -35,7 +35,6 @@ away. Headless (tests, no `:editor` process) the eval falls back to std's
 (def *tutor-buffer-name* "*Tutorial*")
 (def *tutor-eval-timeout-ms* 2000)
 (def *tutor-box-width* 66)
-(def *tutor-slow-ms* 150) ; past this, a result shows how long it took
 (def *tutor-box-margin* "  ") ; breathing room between a box's edge and its code
 ;; ---- the key vocabulary: ASKED, not hardcoded ---------------------------------
 ;; Lesson prose/titles/hints are TEMPLATES ({{kf}}, {{kill-line}} … — std/template)
@@ -397,15 +396,29 @@ the same three back. When each did it inline the profile re-render forgot
 newline-and-indent, and the guard offered to send you to a box the page does not have."
   (let (m1 (ed-show-named m tutor/*tutor-buffer-name* text :tutor)
         m2 (tutor-bufset m1
-             ;; Freeze everything OUTSIDE the boxes at the EDIT PRIMITIVE: the complement of
-             ;; the box regions becomes the buffer's read-only spans, so `insert`/`delete`
-             ;; themselves refuse a keystroke that would damage the prose or a border — on
-             ;; every path (key, mouse, held-key repeat, macro), not a `:post-key` comparison
-             ;; a dispatch path can bypass. The hub has no boxes, so its whole text freezes.
-             ;; Re-stamped on every render; between renders the spans ride edits (ADR-219).
-             {:read-only-spans (editor/formbuf/protected-spans text (tutor-regions text))
-              :tutor-contents? contents?
-              :tutor-profile (:profile m :emacs)}))
+             ;; NARROW the buffer to its boxes at the EDIT PRIMITIVE: only the box regions
+             ;; are editable, so `insert`/`delete` themselves refuse a keystroke that would
+             ;; damage the prose or a border — on every path (key, mouse, held-key repeat,
+             ;; macro), not a `:post-key` comparison a dispatch path can bypass. The hub has
+             ;; no boxes, so it narrows to nothing and its whole text is frozen. Re-stamped
+             ;; on every render; between renders the regions ride edits (ADR-219).
+             ;;
+             ;; The boxes go in DIRECTLY. This used to hand over their complement
+             ;; (`formbuf/protected-spans`) and let the buffer infer the boundaries back out
+             ;; of it, which it cannot do: an insert lands *between* two characters, so at
+             ;; every edge "is this frozen?" has no answer from the frozen ranges alone, and
+             ;; an emptied box could only be spelled as two abutting spans — the same shape
+             ;; two separately-stamped frozen runs have. Saying which regions are EDITABLE
+             ;; has one answer at every position and needs no inference.
+             {:tutor-contents? contents? :tutor-profile (:profile m :emacs)})
+        ;; Through `narrow-to`, never by assoc'ing the field: a page with no boxes (the hub)
+        ;; yields `'()` from that `map`, and `'()` IS nil in Brood — assigned raw it reads as
+        ;; "not narrowed", which is the exact opposite of what the hub wants. `narrow-to`
+        ;; normalises to a vector so narrowed-to-nothing stays narrowed to nothing.
+        m3 (tutor-bufset-buf m2
+             (fn (bb)
+               (editor/buffer/narrow-to bb
+                 (map (fn (r) [(:start r) (:end r)]) (tutor-regions text))))))
     ;; The workings cache is keyed by box index WITHIN THE PAGE, so it cannot outlive the
     ;; page: box 2 of the lesson you just left is not box 2 of this one. Cleared here, in
     ;; the one place every render passes through — the next idle launch would clear it
@@ -414,7 +427,7 @@ newline-and-indent, and the guard offered to send you to a box the page does not
     ;; avoid. The pane's visibility goes with it (`tutor-workings/*unshown*`, defined with
     ;; the rest of the pane's state below), so it is free to open once on the new page and a
     ;; pane the reader closed there stays closed.
-    (update m2
+    (update m3
       :tutor merge
       (merge (assoc tutor-workings/*unshown* :workings {}) tutor-fields))))
 
@@ -474,10 +487,6 @@ boundary that keeps the pane module from needing anything back."
     (when (tutor-buffer? b)
       (editor/formbuf/region-index (tutor-regions (buffer-text b)) (buffer-point b)))))
 
-(defn- tutor-line-of
-  (text pos)
-  ;; 0-based line of char offset `pos` (clamped) — newlines before it.
-  (dec (count (string/split (string/substring text 0 (math/min pos (string/length text))) "\n"))))
 
 ;; ---- buffer plumbing ----------------------------------------------------------
 
@@ -517,31 +526,15 @@ quotes, and stops being predictable the moment the reader types one — and read
 whatever they like into a prose box. There are no forms in there to anchor to anyway."
   (let (last-in-region (math/max (:start region) (dec (:end region))))
     (if (= (:kind region) :text)
-      (tutor-line-of text last-in-region)
+      (results/line-of text last-in-region)
       (let (src (string/substring text (:start region) (:end region))
             forms (sexp/top-level-forms src)
             pos (if (empty? forms)
                   last-in-region
                   (math/min last-in-region
                     (+ (:start region) (math/max 0 (dec (get (last forms) :end)))))))
-        (tutor-line-of text pos)))))
+        (results/line-of text pos)))))
 
-(defn- tutor-slow-note
-  (reply)
-  ;; how long it took, once that's worth knowing — a box you can feel waiting
-  (let (ms (get reply :ms 0))
-    (if (>= ms *tutor-slow-ms*) (str "  (" ms "ms)") "")))
-
-(defn- tutor-proc-note
-  (reply)
-  ;; concurrency has no return value to look at: say what the evaluation LEFT
-  ;; RUNNING (`:procs` from the eval server). Silent when nothing survived, so it
-  ;; only speaks up on the lessons where processes are the point.
-  (let (alive (get-in reply [:procs :alive] 0))
-    (cond
-      (= alive 0) ""
-      (= alive 1) "  ⚙ 1 process still running"
-      else (str "  ⚙ " alive " processes still running"))))
 
 (defn- tutor-normalize-answer
   (s)
@@ -582,7 +575,7 @@ timeout `✗`. A slow evaluation carries its duration and one that left processe
 running says so — the two things a value alone can't tell you."
   (let (expect (get-in pg [:expect :value])
         hint (tutor-hint-suffix pg)
-        extra (str (tutor-slow-note reply) (tutor-proc-note reply)))
+        extra (str (liveeval/slow-note reply) (liveeval/proc-note reply)))
     (cond
       ;; `:error?` marks "the code ran and blew up" as opposed to "it ran fine but gave
       ;; the wrong answer" — the checker's advisory is redundant on the former (it would
@@ -592,14 +585,10 @@ running says so — the two things a value alone can't tell you."
          :error? true
          :text "✗ timed out — still running? (C-c C-k restarts the sandbox)"}
       (not (get reply :ok)) {:kind :fail :error? true :text (str "✗ " (get reply :error "error"))}
-      (nil? expect)
-        {:kind :info
-         :text (str "=> "
-                 (get reply :value)
-                 (if (= (get reply :output "") "")
-                   ""
-                   (str "   (printed: " (string/trim (get reply :output)) ")"))
-                 extra)}
+      ;; a box with no expected answer is just a result — the same line the playground
+      ;; shows, from the same place (`liveeval/result-note`). No `src`, so no type: a
+      ;; lesson's subject is the value, and a type beside every box would be noise.
+      (nil? expect) (liveeval/result-note reply)
       (= expect (get reply :value)) {:kind :pass :text (str "✓ " (get reply :value) extra)}
       else {:kind :fail :text (str "✗ expected " expect ", got " (get reply :value) hint extra)})))
 
@@ -635,26 +624,6 @@ launch — arms the `:tutor-eval` idle timer (`model/ed-sync-timers`)."
     (and (tutor-buffer? b)
       (not= (buffer-rope b) (:tutor-eval-rope b)))))
 
-(defn- tutor-parse-state
-  (src)
-  ;; :blank | [:incomplete reason] (mid-typing) | [:err msg] | :ok
-  ;;
-  ;; E0002 is the reader saying "this could still become valid" — an unclosed list, an
-  ;; unterminated string. That is the state EVERY box passes through on the way to being
-  ;; typed, so it must not read as a mistake; but it must not read as NOTHING either —
-  ;; silence there is what made a stale `=>` look current. The reason travels with the
-  ;; state ("unterminated string") and is shown in the pending voice, so the line always
-  ;; says something true about the text as it stands. E0001 ("unexpected ')'") is a real
-  ;; error — no further typing fixes it — and reports as one.
-  (cond
-    (= (string/trim src) "") :blank
-    else
-      (try
-        (do (reflect/read-all src) :ok)
-        (catch e
-          (if (and (map? e) (= (:code e) "E0002"))
-            [:incomplete (error-message e)]
-            [:err (error-message e)])))))
 
 (defn- tutor-live? () (not (nil? (proc/whereis :editor))))
 
@@ -828,7 +797,7 @@ map a warning uses to travel from the combined source back to the page."
                     [(+ from n)
                       (cons {:src src
                              :from-line from
-                             :buffer-line (tutor-line-of text (:start region))
+                             :buffer-line (results/line-of text (:start region))
                              :lines n}
                         spans)]))
             [1 '()]
@@ -1020,7 +989,7 @@ Reading order is dependency order here, which is what a tutorial should teach."
                                        (< i from) :carry
                                        ;; prose: never parsed, never sent to the sandbox
                                        (= (:kind pg) :text) :text
-                                       else (tutor-parse-state src)))
+                                       else (liveeval/parse-state src)))
                            (match state
                              ;; a prose box answers locally and instantly, or says nothing
                              (:text
@@ -1155,50 +1124,51 @@ never replayed."
     :tutor merge
     {:sandbox-gen gen :sandbox-ready true :pending {}}))
 
-(impl UiEvent
-  sandbox/sandbox-ready-event
-  (ui-event-fold [e m textrows cols rows]
-    (tutor-sandbox-ready m (sandbox-ready-event-gen e))))
+;; The three sandbox hooks. They used to be `impl UiEvent` blocks right here, which made the
+;; tutorial the router for a resource it shares — and an `impl` is per record type, so no
+;; second client could ever be added beside it. `sandbox-events` owns the impls now and fans
+;; each event to every client; these are what it calls for this one. Behaviour is unchanged:
+;; the id check that ignores a foreign reply was always there (`tutor-apply-reply`), and it is
+;; what makes a fan-out safe.
 
-(impl UiEvent
-  sandbox/sandbox-reply-event
-  ;; replies stamped by a superseded child (pre-reset stragglers) are dropped;
-  ;; the worker answers its own inflight ids `{:timeout true}` BEFORE bumping gen,
-  ;; so those arrive with the current gen and land as ✗ timed out.
-  (ui-event-fold [e m textrows cols rows]
-    (if (= (sandbox-reply-event-gen e) (get-in m [:tutor :sandbox-gen]))
-      (tutor-apply-reply m (sandbox-reply-event-reply e))
-      m)))
+(defn tutor-live-buffer? (m)
+  "Is the *Tutorial* buffer still on screen — i.e. does the tutorial still want a sandbox?
+`sandbox-events` asks every client this before letting a dead child go."
+  (not (nil? (ed-buffer-index-by-name m tutor/*tutor-buffer-name*))))
 
-(impl UiEvent
-  sandbox/sandbox-down-event
-  ;; the child (or the whole worker) went away. Policy by code:
-  ;;   tutorial buffer gone  → the user is done — stop the loop for good (belt for
-  ;;                           the :on-close hook; a respawn must not outlive the UI)
-  ;;   :gave-up / :spawn-failed → the worker already stopped itself — say so once,
-  ;;                           and how to retry
-  ;;   anything else         → an ordinary restart (killed externally, crashed late)
-  (ui-event-fold [e m textrows cols rows]
-    (let (code (sandbox-down-event-code e)
-          m1 (update m :tutor merge {:sandbox-ready false}))
-      (cond
-        (nil? (ed-buffer-index-by-name m1 tutor/*tutor-buffer-name*)) (do (sandbox-shutdown) m1)
-        (= code :gave-up)
-          (message m1 "tutorial sandbox keeps dying — C-c C-k retries, *Messages* may say why")
-        (= code :spawn-failed)
-          (message m1 "could not start the tutorial sandbox (is `nest` on PATH?) — C-c C-k retries")
-        else (message m1 "tutorial sandbox restarting…")))))
+(defn tutor-sandbox-reply (m reply gen)
+  "Fold one sandbox reply for the tutorial. Replies stamped by a superseded child (pre-reset
+stragglers) are dropped; the worker answers its own inflight ids `{:timeout true}` BEFORE
+bumping gen, so those arrive with the current gen and land as ✗ timed out. A reply the
+tutorial never sent falls out of `tutor-apply-reply` untouched."
+  (if (= gen (get-in m [:tutor :sandbox-gen])) (tutor-apply-reply m reply) m))
+
+(defn tutor-sandbox-down (m code)
+  "The child (or the whole worker) went away, and somebody still wants a sandbox (the
+shut-it-down-for-good case belongs to `sandbox-events`, which is the only place that can see
+whether EVERY client is gone). Policy by code:
+  `:gave-up` / `:spawn-failed` → the worker already stopped itself — say so once, and how to
+                                 retry; anything else is an ordinary restart."
+  (let (m1 (update m :tutor merge {:sandbox-ready false}))
+    (cond
+      (not (tutor-live-buffer? m1)) m1 ; not ours to narrate — the playground may have caused it
+      (= code :gave-up)
+        (message m1 "tutorial sandbox keeps dying — C-c C-k retries, *Messages* may say why")
+      (= code :spawn-failed)
+        (message m1 "could not start the tutorial sandbox (is `nest` on PATH?) — C-c C-k retries")
+      else (message m1 "tutorial sandbox restarting…"))))
 
 ;; ---- the :post-key hook: workings-follow + profile re-render -------------------
-;; (the prose is protected at the edit primitive now — `:read-only-spans`, ADR-219 — not here)
+;; (the prose is protected at the edit primitive now — the buffer is narrowed to its boxes,
+;; ADR-219 — not here)
 
 (defn tutor-post-key (m-before m key)
   "The tutor layer's `:post-key` hook: keep the *Workings* pane following the cursor, and
 re-render on a profile switch.
 
 It no longer GUARDS the prose. That protection moved to the edit primitive: every render
-stamps the box regions' complement as the buffer's read-only spans (`tutor-install-page` →
-`buffer/set-read-only-spans`), so `insert`/`delete` refuse a keystroke that would damage the
+narrows the buffer to its box regions (`tutor-install-page` → `buffer/narrow-to`), so
+`insert`/`delete` refuse a keystroke that would damage the
 generated text — on every path, held-key repeat included — instead of this hook detecting the
 damage after the fact and undoing it, which only worked on the dispatch paths that remembered
 to run it (ADR-219). A profile switch re-renders for the new keys (and re-stamps the spans)."
@@ -1314,7 +1284,7 @@ anything is on screen asks you to decide with no context, and the lesson can *sh
 both profiles and let you switch in place (every page re-renders for the keys you
 pick). The eval sandbox starts spawning here, so its boot hides behind reading."
   (do
-    (when (tutor-live?) (sandbox-start))
+    (when (tutor-live?) (do (sandbox-events/ensure) (sandbox-start)))
     (if (ed-buffer-index-by-name m tutor/*tutor-buffer-name*)
       (ed-switch-to-named m tutor/*tutor-buffer-name*)
       ;; Read the saved solves back in on the way in, so the contents page shows what
@@ -1604,7 +1574,9 @@ path when the worker itself gave up or failed to spawn: a dead worker is started
 anew, not reset (reset on a dead worker was a silent no-op)."
   (do
     (when (tutor-live?)
-      (if (sandbox-running?) (sandbox-reset) (sandbox-start)))
+      (do
+        (sandbox-events/ensure) ; the UiEvent impls live there; loading it IS registering them
+        (if (sandbox-running?) (sandbox-reset) (sandbox-start))))
     (message m "restarting the tutorial sandbox…")))
 
 (defn tutor-on-close (buf)

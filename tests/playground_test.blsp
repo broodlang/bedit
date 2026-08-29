@@ -1,0 +1,381 @@
+;; The Brood playground (`src/playground.blsp`) and the vocabulary it shares with the
+;; tutorial (`src/liveeval.blsp`).
+;;
+;; Everything here runs WITHOUT a sandbox. The eval path is a round trip to another OS
+;; process, so the tests drive the two halves it sits between directly: what the launcher
+;; decides to send (`first-changed`, `parse-state`) and what a reply becomes once it lands
+;; (`playground-sandbox-reply` fed a synthetic reply map). That is the same seam the
+;; tutorial's own suite uses, and it is why a feature built on a subprocess is still
+;; testable in 40ms with no window.
+
+(defmodule playground-test
+  (:use test)
+  (:use model)
+  (:use input)
+  (:use editor/buffer)
+  (:use-internals playground))
+
+(defn m-of (text) (ed-init (make-buffer text)))
+(defn press (m keys) (fold (fn (acc k) (ed-update acc k 80 24)) m keys))
+
+;; Open the playground and put `text` in it — the state a launch or a reply acts on.
+(defn pg-open (text)
+  (let (m (playground/cmd-brood-playground (m-of "") :none)
+        i (model/ed-buffer-index-by-name m playground/*buffer-name*))
+    (assoc m
+      :buffers
+        (assoc (:buffers m)
+          i (assoc (nth (:buffers m) i) :rope (buffer-rope (make-buffer text)))))))
+
+(defn pg-buf-of (m)
+  (let (i (model/ed-buffer-index-by-name m playground/*buffer-name*)) (nth (:buffers m) i)))
+
+(defn retext (m text)
+  (let (i (model/ed-buffer-index-by-name m playground/*buffer-name*))
+    (assoc m
+      :buffers
+        (assoc (:buffers m)
+          i (assoc (nth (:buffers m) i) :rope (buffer-rope (make-buffer text)))))))
+
+(defn pg-notes (m)
+  (let (i (model/ed-buffer-index-by-name m playground/*buffer-name*))
+    (or (results/eol-notes-any (nth (:buffers m) i)) {})))
+
+;; ---- liveeval: the shared vocabulary ------------------------------------------------
+
+(describe "liveeval/parse-state — ready, unfinished, or broken"
+  (test "blank text is blank, not an error"
+    (assert= (liveeval/parse-state "") :blank)
+    (assert= (liveeval/parse-state "   \n  ") :blank))
+
+  (test "a complete form is ready to send"
+    (assert= (liveeval/parse-state "(+ 1 2)") :ok))
+
+  ;; The distinction the whole live-eval idea rests on: an unclosed paren is the state every
+  ;; form passes through while being typed, so it must not read as a mistake.
+  (test "an unclosed form is INCOMPLETE, and says what it is waiting for"
+    (let (state (liveeval/parse-state "(+ 1"))
+      (assert= (first state) :incomplete)
+      (is (string? (second state)))))
+
+  (test "an unterminated string is incomplete too, not broken"
+    (assert= (first (liveeval/parse-state "(str \"hi")) :incomplete))
+
+  (test "a stray closer is a real error — no further typing fixes it"
+    (assert= (first (liveeval/parse-state ")")) :err)))
+
+(describe "liveeval/type-hint — what the checker makes of a form"
+  (test "an expression's type"
+    (assert= (liveeval/type-hint "(+ 1 2)") ": int"))
+
+  ;; The question that forced this to exist. A definition form evaluates to its own NAME,
+  ;; so `=> foo` is all a live evaluator had to show — and `foo` is a value, not a type.
+  (test "a definition's SIGNATURE, named, not the symbol it evaluates to"
+    (assert= (liveeval/type-hint "(defn pgt-len (s) (string/length s))")
+      "pgt-len : (string -> int)"))
+
+  ;; `(+ 1 1/2)` is 3/2 and can be nothing else — the checker says so since brood 0.17.
+  (test "a ratio is a ratio"
+    (assert= (liveeval/type-hint "(+ 1 1/2)") ": ratio"))
+
+  (test "no opinion is nil — never a guess, and never a dangling separator"
+    (assert= (liveeval/type-hint "(fn (x) x)") nil)
+    (assert= (liveeval/type-hint "(+ 1") nil)
+    (assert= (liveeval/type-hint "") nil)))
+
+(describe "liveeval — what a reply is worth saying"
+  ;; The value and the type are two different claims — what the code DID and what the
+  ;; language thinks it MAY do — so they travel together and are placed apart: the answer
+  ;; under the form, the type at it (`playground/pg-set-note`).
+  (test "a value, with its type carried alongside rather than inside"
+    (let (note (liveeval/result-note {:ok true :value "3" :ms 0} "(+ 1 2)"))
+      (assert= (:kind note) :info)
+      (assert= (:text note) "=> 3")
+      (assert= (:hint note) ": int")))
+
+  (test "no source, no type — the value alone"
+    (let (note (liveeval/result-note {:ok true :value "3" :ms 0}))
+      (assert= (:text note) "=> 3")
+      (assert= (:hint note) nil)))
+
+  ;; The type is advisory and often absent (an anonymous fn); a missing one must leave no
+  ;; hint entry at all rather than an empty one.
+  (test "an expression the checker has no opinion about shows the value only"
+    (let (note (liveeval/result-note {:ok true :value "#<fn>" :ms 0} "(fn (n) n)"))
+      (assert= (:text note) "=> #<fn>")
+      (assert= (:hint note) nil)))
+
+  (test "what it printed rides along — the half a value alone loses"
+    (is (includes? (:text (liveeval/result-note {:ok true :value "nil" :output "hi\n" :ms 0}))
+          "(printed: hi)")))
+
+  (test "how long it took, once that is worth knowing"
+    (is (not (includes? (:text (liveeval/result-note {:ok true :value "1" :ms 5})) "ms)")))
+    (is (includes? (:text (liveeval/result-note {:ok true :value "1" :ms 400})) "(400ms)")))
+
+  ;; Concurrency has no return value to look at, so what it LEFT RUNNING is the report.
+  (test "processes it left running"
+    (is (includes? (:text (liveeval/result-note {:ok true :value "nil" :ms 0 :procs {:alive 1}}))
+          "1 process still running"))
+    (is (includes? (:text (liveeval/result-note {:ok true :value "nil" :ms 0 :procs {:alive 3}}))
+          "3 processes still running")))
+
+  (test "a raise is a fail, and marked as one that RAN rather than one that was wrong"
+    (let (note (liveeval/result-note {:ok false :error "unbound symbol: nope"}))
+      (assert= (:kind note) :fail)
+      (assert= (:error? note) true)
+      (is (includes? (:text note) "unbound symbol: nope"))))
+
+  (test "a timeout says how to get the sandbox back"
+    (is (includes? (:text (liveeval/result-note {:timeout true})) "C-c C-k")))
+
+  (test "no error is no error-note"
+    (assert= (liveeval/error-note {:ok true :value "1"}) nil)))
+
+(describe "liveeval/spy-lines — the cascade"
+  (test "a call opens a level and its return closes it"
+    (assert= (liveeval/spy-lines [{:kind "call" :fn "fac" :args "(2)"}
+                                   {:kind "call" :fn "fac" :args "(1)"}
+                                   {:kind "return" :value "1"}
+                                   {:kind "return" :value "2"}])
+      (list "fac 2" "  fac 1" "  = 1" "= 2")))
+
+  (test "an args list loses its wrapping parens — it reads better without them"
+    (assert= (first (liveeval/spy-lines [{:kind "call" :fn "f" :args "(1 2)"}])) "f 1 2"))
+
+  (test "nothing traced is no lines"
+    (assert= (liveeval/spy-lines []) '()))
+
+  (test "the body text carries a heading, and the caller chooses it"
+    (is (includes? (liveeval/spy-text {:spy [{:kind "call" :fn "f" :args "(1)"}]} "What ran")
+          "What ran"))))
+
+;; ---- the playground's own pieces -------------------------------------------------------
+
+(describe "form-srcs — the buffer as top-level forms"
+  (test "each top-level form, by index"
+    (let (srcs (playground/form-srcs "(+ 1 2)\n(* 3 4)\n"))
+      (assert= (count srcs) 2)
+      (assert= (get srcs 0) "(+ 1 2)")
+      (assert= (get srcs 1) "(* 3 4)")))
+
+  ;; Error-tolerant by way of `sexp/top-level-forms`: the buffer is mid-typing most of the
+  ;; time, and "which form is this" must still answer while it is.
+  (test "answers over text that doesn't parse"
+    (is (>= (count (playground/form-srcs "(+ 1 2)\n(* 3")) 1)))
+
+  (test "answers over an empty buffer"
+    (assert= (playground/form-srcs "") {})))
+
+;; The anchoring `results` owns, exercised through the shape the playground hands it: an
+;; answer goes BELOW its code (on the opening line it would read as a label on the paren),
+;; a hint goes AT it.
+(describe "results — which line derived text lands on"
+  (test "an answer anchors on the line below the form's last"
+    (let (text "(defn f (n)\n  (* n 2))\n"
+          node (first (sexp/top-level-forms text)))
+      (assert= (results/line-below text (dec (:end node))) 2)))
+
+  (test "a hint anchors on the form's own opening line"
+    (let (text "(+ 1 2)\n\n(defn f (n)\n  (* n 2))\n"
+          nodes (sexp/top-level-forms text))
+      (assert= (results/line-of text (:start (first nodes))) 0)
+      (assert= (results/line-of text (:start (second nodes))) 2)))
+
+  ;; The crash this closes: a form ending at the very end of a buffer with no trailing
+  ;; newline has no line below it, and an anchor past EOF is not merely invisible — a
+  ;; renderer asks the rope for that line and the whole frame dies (`%rope-line: line 4 out
+  ;; of bounds`, seen on `nest run` with the welcome text edited down to one form).
+  (test "text with no line below its last form still anchors somewhere that EXISTS"
+    (let (text ";; note\n\n(+ 1 1/2)"
+          node (first (sexp/top-level-forms text)))
+      (assert= (results/line-count text) 3)
+      (is (< (results/line-below text (dec (:end node))) (results/line-count text)))))
+
+  ;; The rope opens a final empty line for a trailing newline, and `buffer-line-count`
+  ;; reports it — an anchor clamped against a different count is clamped to the wrong line.
+  (test "lines are counted the way the rope counts them"
+    (assert= (results/line-count "a\nb") (buffer-line-count (make-buffer "a\nb")))
+    (assert= (results/line-count "a\nb\n") (buffer-line-count (make-buffer "a\nb\n")))
+    (assert= (results/line-count "") (buffer-line-count (make-buffer "")))))
+
+(describe "first-changed — what a launch re-sends"
+  (test "nothing changed, nothing to send"
+    (assert= (playground/first-changed {0 "(a)" 1 "(b)"} {0 "(a)" 1 "(b)"} 2) nil))
+
+  (test "the first differing form, and it is the FIRST one"
+    (assert= (playground/first-changed {0 "(a)" 1 "(c)"} {0 "(a)" 1 "(b)"} 2) 1))
+
+  ;; Everything below the edit re-runs because definitions flow downward; everything above
+  ;; keeps its result, since a form cannot depend on text beneath it.
+  (test "editing the top means everything below it re-runs"
+    (assert= (playground/first-changed {0 "(z)" 1 "(b)"} {0 "(a)" 1 "(b)"} 2) 0))
+
+  (test "a newly typed form is a change"
+    (assert= (playground/first-changed {0 "(a)" 1 "(b)"} {0 "(a)"} 2) 1))
+
+  (test "a DELETED form is a change too — the count shrinking must not hide it"
+    (assert= (playground/first-changed {0 "(a)"} {0 "(a)" 1 "(b)"} 1) 1)))
+
+(describe "the command"
+  (test "M-x brood-playground opens *Playground*"
+    (let (m (playground/cmd-brood-playground (m-of "x") :none))
+      (is (not (nil? (model/ed-buffer-index-by-name m playground/*buffer-name*))))))
+
+  ;; Reopening must not wipe what you were in the middle of.
+  (test "reopening selects the existing buffer rather than clearing it"
+    (let (m1 (pg-open "(my-work 1)")
+          m2 (playground/cmd-brood-playground m1 :none)
+          i (model/ed-buffer-index-by-name m2 playground/*buffer-name*))
+      (is (includes? (buffer-text (nth (:buffers m2) i)) "my-work")))))
+
+(describe "sandbox replies land as notes"
+  ;; The fan-out router hands every client every reply, so ignoring what isn't yours is not
+  ;; an optimisation — it is what makes routing without an owner tag correct.
+  (test "a reply the playground never sent is ignored"
+    (let (m (pg-open "(+ 1 2)"))
+      (assert= (playground/playground-sandbox-reply m {:id 999 :ok true :value "3"} nil) m)))
+
+  (test "a reply for a live request becomes the form's note"
+    (let (m0 (pg-open "(+ 1 2)")
+          m1 (update m0
+               :playground merge
+               {:sandbox-gen 1 :pending {7 {:region 0 :rope (buffer-rope (pg-buf-of m0))}}})
+          m2 (playground/playground-sandbox-reply m1 {:id 7 :ok true :value "3" :ms 0} 1))
+      (is (includes? (:text (get (pg-notes m2) 0)) "=> 3"))))
+
+  ;; A superseded child's straggler carries an answer computed in a session that no longer
+  ;; exists. Showing it would be showing a confident value for code that never ran here.
+  (test "a reply from a superseded child is dropped"
+    (let (m0 (pg-open "(+ 1 2)")
+          m1 (update m0
+               :playground merge
+               {:sandbox-gen 2 :pending {7 {:region 0 :rope (buffer-rope (pg-buf-of m0))}}})
+          m2 (playground/playground-sandbox-reply m1 {:id 7 :ok true :value "3"} 1))
+      (assert= (pg-notes m2) {})))
+
+  ;; Two entries, two lines: the answer where the form ends, the derived type where it
+  ;; begins. Nothing is inserted into the buffer to make room for either — a hint that
+  ;; appeared on a line of its own would push every line below it down each time the
+  ;; checker changed its mind, which is text jumping under the cursor.
+  (test "the type hint lands AT the form and the answer under it"
+    (let (m0 (pg-open "(defn pgt-len (s)\n  (string/length s))\n")
+          m1 (update m0
+               :playground merge
+               {:sandbox-gen 1 :pending {7 {:region 0 :rope (buffer-rope (pg-buf-of m0))}}})
+          m2 (playground/playground-sandbox-reply m1 {:id 7 :ok true :value "pgt-len" :ms 0} 1)
+          notes (pg-notes m2))
+      (assert= (:text (get notes 0)) "=> pgt-len")
+      (assert= (:line (get notes 0)) 2)
+      (assert= (:text (get notes (results/hint-key 0))) "pgt-len : (string -> int)")
+      (assert= (:line (get notes (results/hint-key 0))) 0)
+      ;; a hint is not a verdict — the gutter leaves the code line alone
+      (assert= (:kind (get notes (results/hint-key 0))) :hint)))
+
+  ;; The one case that cannot have the two-line layout: a single-line form at the very end
+  ;; of the buffer has its answer clamped back onto its own line, which is where the hint
+  ;; would go. Two ghost texts at one line's end overpaint, so there they rejoin.
+  (test "a form with nowhere below it keeps hint and answer on one line"
+    (let (m0 (pg-open "(+ 1 1/2)")
+          m1 (update m0
+               :playground merge
+               {:sandbox-gen 1 :pending {7 {:region 0 :rope (buffer-rope (pg-buf-of m0))}}})
+          m2 (playground/playground-sandbox-reply m1 {:id 7 :ok true :value "3/2" :ms 0} 1)
+          notes (pg-notes m2))
+      (assert= (:text (get notes 0)) "=> 3/2  : ratio")
+      (assert= (:line (get notes 0)) 0)
+      (assert= (get notes (results/hint-key 0)) nil)))
+
+  (test "a reply whose buffer has moved on since the send is dropped"
+    (let (m0 (pg-open "(+ 1 2)")
+          m1 (update m0
+               :playground merge
+               {:sandbox-gen 1 :pending {7 {:region 0 :rope (buffer-rope (make-buffer "other"))}}})
+          m2 (playground/playground-sandbox-reply m1 {:id 7 :ok true :value "3"} 1))
+      (assert= (pg-notes m2) {}))))
+
+(describe "the spy pane"
+  ;; The bug this pins: every ingredient of the pane worked — the cascade cached, the body
+  ;; rendered, the layer registered — and nothing ever put it on screen, because both
+  ;; refresh call sites were gated on it being open already. Assert the OUTCOME.
+  (test "opening the playground opens the pane beside it"
+    (is (playground/spy-on-screen? (playground/cmd-brood-playground (m-of "x") :none))))
+
+  (test "a form that hasn't run says so, rather than showing an empty pane"
+    (is (includes? (workings/body playground/*spy-spec* (m-of "") 0) "has not run yet")))
+
+  ;; ":none" and "no entry" must not look alike: one means the form ran and called nothing
+  ;; traceable, the other means it never ran. A pane that conflated them would report a
+  ;; working session as a broken one.
+  (test "a form that ran and traced nothing says THAT instead"
+    (let (m (assoc-in (m-of "") [:playground :workings 0] :none))
+      (is (includes? (workings/body playground/*spy-spec* m 0) "called nothing of yours"))))
+
+  (test "a cached cascade is the body"
+    (let (m (assoc-in (m-of "") [:playground :workings 0] "fac 3\n= 6"))
+      (assert= (workings/body playground/*spy-spec* m 0) "fac 3\n= 6")))
+
+  ;; Closing it is a choice; a later result must not undo it.
+  (test "a dismissed pane stays dismissed, and M-x playground-spy is the way back"
+    (let (opened (playground/cmd-brood-playground (m-of "x") :none)
+          closed (assoc-in opened [:playground :workings-closed?] true)
+          after (workings/refresh playground/*spy-spec* closed 0 true))
+      (is (not (playground/spy-on-screen? (dissoc after :buffers))))
+      (is (playground/spy-on-screen? (playground/cmd-brood-playground closed :none))))))
+
+;; The two outcome-level tests. The originals asserted on the PIECES — `spy-body` renders,
+;; `refresh-spy` returns a model — and passed while the pane never opened once and a deleted
+;; form's result sat on screen forever. A test that never asks "and then what does the user
+;; see?" can be fully green over a feature that does not work.
+(describe "what the user actually ends up looking at"
+  ;; #1: every ingredient of the pane worked; nothing put it on screen.
+  (test "the pane is on screen after opening the playground, and follows the cursor"
+    (let (m (playground/cmd-brood-playground (m-of "x") :none))
+      (is (playground/spy-on-screen? m))
+      (assert= (get-in m [:playground :workings-region]) 0)))
+
+  ;; #2: notes were patched into the existing map, so a form's result outlived the form.
+  ;; `filter int?` because a form now owns TWO entries — its answer, keyed by index, and its
+  ;; type hint, keyed by `hint-key` — and the hint is asserted separately below rather than
+  ;; conflated into the count, which is what would let one of the two linger unnoticed.
+  (test "deleting a form takes its result — and its type hint — with it"
+    (let (m1 (playground/ed-playground-launch (pg-open "(+ 1 2)\n(* 3 4)\n"))
+          m2 (playground/ed-playground-launch (retext m1 "(+ 1 2)\n")))
+      (assert= (sort (filter int? (map first (pg-notes m1)))) '(0 1))
+      (assert= (sort (filter int? (map first (pg-notes m2)))) '(0))
+      (is (not (nil? (get (pg-notes m1) (results/hint-key 1)))))
+      (assert= (get (pg-notes m2) (results/hint-key 1)) nil)))
+
+  (test "editing a form replaces its result rather than leaving the old one beside it"
+    (let (m1 (playground/ed-playground-launch (pg-open "(+ 1 2)\n"))
+          m2 (playground/ed-playground-launch (retext m1 "(+ 10 20)\n")))
+      (assert= (count (filter int? (map first (pg-notes m2)))) 1)
+      (is (includes? (:text (get (pg-notes m2) 0)) "=> 30"))))
+
+  ;; A headless open must not start a child runtime — nothing could deliver its replies.
+  (test "opening the playground headless starts no sandbox"
+    (do
+      (playground/cmd-brood-playground (m-of "x") :none)
+      (assert= (proc/whereis :sandbox) nil))))
+
+;; ---- the router ------------------------------------------------------------------------
+
+(describe "sandbox-events — one sandbox, several clients"
+  ;; The reason this module exists: `impl` is per record type, so the three sandbox events
+  ;; can have exactly one fold between them, and it cannot belong to any single client.
+  (test "both clients are registered"
+    (let (names (map (fn (c) (->string (get c :reply))) sandbox-events/*clients*))
+      (is (any? (fn (n) (includes? n "tutor")) names))
+      (is (any? (fn (n) (includes? n "playground")) names))))
+
+  (test "fanning out threads the model through every client and returns it"
+    (let (m (m-of "x"))
+      (is (map? (sandbox-events/fan-out m :reply (list {:id 999 :ok true} nil))))))
+
+  ;; With neither buffer open nobody wants a sandbox, and the child is let go for good —
+  ;; the decision that used to be "is the tutorial open?" and could not stay that way.
+  (test "no client buffer open means nobody wants a sandbox"
+    (is (not (sandbox-events/any-client-live? (m-of "x")))))
+
+  (test "an open playground keeps it alive"
+    (is (sandbox-events/any-client-live? (pg-open "(+ 1 2)")))))

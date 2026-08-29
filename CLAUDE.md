@@ -76,6 +76,9 @@ feature work — surfacing it is half the point of this project.
 src/main.blsp               entry point — window / daemon startup (--serve/--attach), runs the ui-run loop
 src/model.blsp              the ui-run model: buffer pool, kill ring, minibuffer, *Messages*, scrolling
 src/config.blsp             ~/.config/bedit/init.blsp — the declarative user config (data, not eval'd)
+src/about.blsp              M-x version · --version · C-h C-a *About bedit* — bedit's version,
+                            the brood under it and the build date, all from project/build-info
+                            (named to dodge std's `version`, whose `version/newer?` packages uses)
 src/theme.blsp              every colour the editor paints (Catppuccin Mocha), referenced by role
 src/panes.blsp              pane-layout geometry + mouse-event folding (model -> model)
 src/view.blsp               pure view: model -> render frame (editor/display ops)
@@ -110,6 +113,12 @@ src/isearch.blsp            incremental search + query-replace (C-s/C-r/M-%) mod
 src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
 src/sandbox.blsp            the persistent eval sandbox: one `nest run` child on std's
                             eval-server (ADR-198), pr-str-line protocol, watchdog + respawn
+src/liveeval.blsp           the live-evaluating buffer as a VOCABULARY, shared by tutor +
+                            playground: parse-state, result/type/timing notes, spy cascade
+src/sandbox-events.blsp     routes the shared sandbox's UiEvents to every client that wants
+                            them (an `impl` is per record type, so one client can't own them)
+src/playground.blsp         M-x brood-playground: a free-text Brood buffer that runs as you
+                            type — results as ghost text, *Playground Spy* pane beside it
 src/tutor.blsp              the interactive Brood tutorial (C-h t): playground boxes that
                             eval-on-type in the sandbox — ✓/✗ gutter, ghost results, prose guard
 src/tutor-workings.blsp     the tutorial's *Workings* pane: the per-box cascade cache, its body
