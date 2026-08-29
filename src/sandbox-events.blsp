@@ -1,0 +1,99 @@
+(defmodule sandbox-events
+  "Where the shared eval sandbox's events land — the router between one sandbox and its
+several clients.
+
+`sandbox` is deliberately consumer-blind: it emits `sandbox-ready-event` /
+`sandbox-reply-event` / `sandbox-down-event` as plain records and says nothing about who
+asked. For a long time the `UiEvent` impls for those three records lived in `tutor`, which
+was fine while the tutorial was the only client and wrong the moment it wasn't: an `impl`
+is per record type, so a second client could not add one, and the tutorial would have had
+to route replies for a feature it knows nothing about.
+
+So the impls live HERE and fan each event out to every client in [[*clients*]]. Fanning out
+rather than addressing one client is what lets the sandbox stay blind: a reply carries an
+`:id`, and every client already drops an id it did not send (`tutor-apply-reply`'s
+`(nil? pend)` branch, and the playground's). \"Not mine\" is therefore already a no-op on
+every path, and the router needs no owner tag on the wire to get a reply to the right place.
+
+The one event that genuinely needs a decision rather than a fan-out is `down` with a dead
+UI: the old code shut the sandbox down when the *Tutorial* buffer was gone, which with two
+clients would kill the sandbox out from under an open playground. That is now a question
+about ALL clients — [[any-client-live?]] — which is exactly the kind of question no single
+client can answer about itself."
+  (:use model) ; the model the folds thread
+  (:use sandbox)) ; the three event records + sandbox-shutdown
+
+;; Each client, as the symbols naming its four hooks. Symbols, resolved at fold time:
+;; `tutor` and `playground` are both DEFERRED modules (loaded on first use), so a
+;; registration call at load time would either force them eager or arrive too late. A
+;; `bound?` guard on the symbol is the same late-binding discipline keymaps use for a
+;; command, and it means an unloaded client simply isn't a client yet.
+;;
+;; Adding a client is one entry here. Its hooks:
+;;   :live?  (m)            -> is this client's buffer on screen? (does it still want a sandbox)
+;;   :ready  (m gen)        -> the child announced itself; the session is empty again
+;;   :reply  (m reply gen)  -> one decoded reply; MUST ignore an id it didn't send
+;;   :down   (m code)       -> the child went away (a respawn usually follows)
+(def *clients*
+  [{:live? 'tutor/tutor-live-buffer?
+    :ready 'tutor/tutor-sandbox-ready
+    :reply 'tutor/tutor-sandbox-reply
+    :down 'tutor/tutor-sandbox-down}
+   {:live? 'playground/playground-live-buffer?
+    :ready 'playground/playground-sandbox-ready
+    :reply 'playground/playground-sandbox-reply
+    :down 'playground/playground-sandbox-down}])
+
+(defn ensure ()
+  "Force this module to load, registering the three `UiEvent` impls with it. Call it wherever
+a client starts the sandbox.
+
+An `impl` is registered by LOADING the file that carries it, and every client here is a
+deferred module — so nothing would have loaded the router until an event arrived, which is
+exactly too late. A qualified call is the load; the nil is incidental."
+  nil)
+
+(defn- call-hook
+  (sym args fallback)
+  ;; Call a registered hook if its module is loaded, else answer `fallback`. Never lets one
+  ;; client's fold take out the loop: a raise here would arrive as a dead editor on an event
+  ;; the user did not cause, so it degrades to "that client saw nothing" instead.
+  (if (not (bound? sym))
+    fallback
+    (try (apply (reflect/eval sym) args) (catch _ fallback))))
+
+(defn fan-out (m hook args)
+  "Thread `m` through every loaded client's `hook` (`:ready` / `:reply` / `:down`), each
+called with `m` followed by `args`. A client that isn't loaded, or whose fold raises, is
+skipped with the model untouched."
+  (fold (fn (acc client) (call-hook (get client hook) (cons acc args) acc)) m *clients*))
+
+(defn any-client-live? (m)
+  "True while at least one client still has its buffer on screen — i.e. somebody still wants
+a sandbox. What decides whether a dead child is restarted or let go: with one client that
+was \"is the tutorial open?\", and with two it can only be asked of all of them."
+  (any? (fn (client) (call-hook (get client :live?) (list m) false)) *clients*))
+
+(impl UiEvent
+  sandbox/sandbox-ready-event
+  (ui-event-fold [e m textrows cols rows]
+    (fan-out m :ready (list (sandbox-ready-event-gen e)))))
+
+(impl UiEvent
+  sandbox/sandbox-reply-event
+  ;; The generation travels to each client rather than being checked here: a superseded
+  ;; child's straggler is only droppable against the generation the CLIENT last saw, and
+  ;; two clients can be a reset apart.
+  (ui-event-fold [e m textrows cols rows]
+    (fan-out m :reply (list (sandbox-reply-event-reply e) (sandbox-reply-event-gen e)))))
+
+(impl UiEvent
+  sandbox/sandbox-down-event
+  ;; The child (or the whole worker) went away. If nobody is watching any more, stop the
+  ;; loop for good — a respawn must not outlive every UI that wanted it. Otherwise each
+  ;; client says its own piece about the restart.
+  (ui-event-fold [e m textrows cols rows]
+    (let (code (sandbox-down-event-code e))
+      (if (not (any-client-live? m))
+        (do (sandbox-shutdown) m)
+        (fan-out m :down (list code))))))

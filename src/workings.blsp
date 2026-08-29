@@ -1,0 +1,142 @@
+(defmodule workings
+  "The **workings pane** — the \"show me how it actually ran\" channel, for any buffer that
+evaluates regions of itself.
+
+A sandbox reply for a traced region carries `:spy` entries; they render as an indented
+call/return tree in a pane beside the page, and the pane shows the workings of the region the
+cursor is IN, following it with no re-evaluation.
+
+**Two clients, one pane discipline.** The tutorial (`tutor-workings`, `*Workings*` beside a
+lesson's boxes) and the playground (`*Playground Spy*` beside its top-level forms) want
+exactly the same behaviour, and it is behaviour with enough judgement in it to be worth
+having once:
+
+  - the pane opens only for a reply that HAS a cascade and belongs to the region you are in
+    — having something to show is what earns a split, and a region that traced nothing is
+    not worth halving the page for;
+  - a reply for any other region updates the cache silently, so a background re-eval never
+    yanks the view off what you are reading;
+  - once open it FOLLOWS you, saying so for the regions that traced nothing;
+  - a pane you closed stays closed, latched — because absence alone cannot tell a pane the
+    reader dismissed from one that has never opened.
+
+**The spec** each client passes as the first argument names where its state lives and what
+its pane is called:
+
+    {:key :playground :buffer \"*Playground Spy*\" :type :playground-spy
+     :noun \"form\" :heading \"What ran\"}
+
+`:key` is the model sub-map holding this pane's state — so two panes never collide:
+
+  `:workings`         region index → its rendered cascade (a string), or `:none` for \"it ran
+                      and traced nothing\". The distinction is load-bearing in both
+                      directions: it is the difference between \"region 3 called
+                      nothing of yours\" and \"region 3 has not run yet\", and only a real
+                      cascade is worth opening a closed pane for.
+  `:workings-region`  which region the pane is showing (nil = not shown).
+  `:workings-closed?` the reader dismissed it — latched.
+
+**The boundary.** This knows about a *pane*, a *cache* and a region INDEX; it never looks at
+the client's buffer, parses a region, or decides which region you are in. The client passes
+the index. That is what keeps it acyclic — the client owns its parser, the pane is downstream
+of it — and what makes the pane testable from a synthetic reply: no lesson, no playground, no
+sandbox, no window."
+  (:use model) ; ed-buffer-index-by-name — is the pane on screen?
+  (:use commands)) ; ed-show-named-aside — put it beside the page, selection untouched
+;; liveeval (the cascade renderer) is referenced qualified below and auto-loads.
+
+(def *unshown*
+  ;; A pane's VISIBILITY state, forgotten: not on screen, and not dismissed either. The
+  ;; cascade cache is deliberately not part of it — the two resets differ, which is the whole
+  ;; reason to name this. A new page clears both; asking for the pane back clears only this
+  ;; pair, so the reopen wins against the close latch while the cached cascades it is about
+  ;; to show survive.
+  {:workings-region nil :workings-closed? false})
+
+(defn- path
+  (spec & rest)
+  ;; The model path to one of this pane's state slots — `[:playground :workings 3]`.
+  (into [(:key spec)] rest))
+
+(defn cascade (spec m i)
+  "Region `i`'s cached cascade text, or nil when it has none (never ran, or traced nothing) —
+also the test for whether the pane has something worth showing."
+  (let (v (get-in m (path spec :workings i)))
+    (when (string? v) v)))
+
+(defn on-page? (spec m)
+  "Whether any region has a cascade — what makes the pane worth having open at all."
+  (any? string? (vals (or (get-in m (path spec :workings)) {}))))
+
+(defn body (spec m i)
+  "What the pane should show for region `i` right now: its cached cascade, else why there
+isn't one. `i` nil means the cursor is not in a region at all."
+  (let (v (when i (get-in m (path spec :workings i)))
+        noun (:noun spec "region")
+        heading (:heading spec "The workings"))
+    (cond
+      (nil? i) (str heading " — put the cursor in a " noun " to see how its code ran.")
+      (string? v) v
+      (= v :none)
+        (str heading " — " noun " " (inc i) " called nothing of yours."
+          "\nThe trace follows the functions THIS session defined; the language's own"
+          "\n(`+`, `map`, `str`, …) run untraced, or every result would arrive under a"
+          "\npage of prelude internals. Define a function, call it, and it appears here.")
+      else
+        (str heading " — " noun " " (inc i) " has not run yet.\n"
+          "Type in it and the calls it makes appear here."))))
+
+(defn forget (spec m from)
+  "Drop the cached workings of every region from `from` down — they were just re-sent, so
+their old cascades describe code that no longer exists. Keeps the regions above, whose
+replies still stand. `from` nil (nothing changed) keeps everything."
+  (if (nil? from)
+    m
+    (assoc-in m (path spec :workings)
+      (into {}
+        (filter (fn (kv) (< (first kv) from))
+          (or (get-in m (path spec :workings)) {}))))))
+
+(defn refresh (spec m i force)
+  "Re-render the pane for region `i`. With `force` it is opened if it isn't there; without,
+only an already-open pane is refreshed.
+
+**A pane the reader closed stays closed** — even against `force`, which is otherwise how the
+pane first appears. Closing it is a choice, and the next reply must not undo it, so the close
+is latched on the model: absence alone cannot tell a pane the reader dismissed from one that
+has never opened. [[reopen]] is the way back, and the only thing that clears the latch."
+  (let (pane (ed-buffer-index-by-name m (:buffer spec))
+        ;; shown before (`:workings-region` set) and gone now = the reader closed it
+        closed? (or (get-in m (path spec :workings-closed?))
+                  (and (nil? pane) (not (nil? (get-in m (path spec :workings-region))))))
+        m1 (assoc-in m (path spec :workings-closed?) closed?))
+    (if (and (nil? pane) (or (not force) closed?))
+      m1
+      (assoc-in (ed-show-named-aside m1 (:buffer spec) (body spec m1 i) (:type spec))
+        (path spec :workings-region)
+        i))))
+
+(defn show (spec m region-idx at reply)
+  "Cache what region `region-idx` just did, then refresh the pane for region `at` (the one at
+point). Opens the pane only for a reply that has a cascade AND belongs to the region the
+reader is in — see the module docstring for why that is the rule."
+  (let (spy (or (:spy reply) ())
+        cached (assoc-in m (path spec :workings region-idx)
+                 (if (empty? spy) :none (liveeval/spy-text reply (:heading spec "The workings")))))
+    (refresh spec cached at (and (not (empty? spy)) (= region-idx at)))))
+
+(defn follow (spec m i)
+  "Keep the pane on region `i` — the `:post-key` half, so a plain motion re-renders from the
+cache with no re-evaluation. Only touches the buffer when the region actually changed.
+
+Moving into a region that HAS a cascade opens the pane; moving into one with nothing to show
+only refreshes a pane already open. So the pane is where the workings are, and a region that
+traced nothing never splits the page on its own."
+  (if (= i (get-in m (path spec :workings-region)))
+    m
+    (refresh spec m i (not (nil? (cascade spec m i))))))
+
+(defn reopen (spec m i)
+  "Bring a dismissed pane back on region `i`, clearing the close latch — the only thing that
+does. What a client's \"show me the workings\" command calls."
+  (refresh spec (update m (:key spec) merge *unshown*) i true))

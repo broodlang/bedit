@@ -1,0 +1,201 @@
+(defmodule liveeval
+  "The **live-evaluating buffer**, as a vocabulary — the half of \"type Brood and watch it
+run\" that has nothing to do with what the buffer is *for*.
+
+Two features want it. The tutorial (`tutor`) evaluates the boxes of a lesson and grades them
+against an expected answer; the playground (`playground`) evaluates a whole free-text file
+and reports what came back. Everything BETWEEN those two — deciding whether a half-typed
+form is an error or just unfinished, saying how long something took, saying what it left
+running, rendering a spy cascade — is the same work, and was written once in the tutorial
+where only the tutorial could reach it.
+
+What lives here is exactly what both need and neither owns:
+
+  [[parse-state]]    is this text blank, mid-form, broken, or ready to send?
+  [[slow-note]]      how long it took, once that is worth knowing
+  [[proc-note]]      what it left running (concurrency has no return value to look at)
+  [[result-note]]    the `=> value` line, with `printed:` when it printed
+  [[type-hint]]      the `: type` / `name : sig` hint that belongs at the form itself
+  [[error-note]]     the `✗ …` line for a raise or a timeout
+  [[spy-lines]]      spy entries → an indented call/return cascade
+  [[spy-text]]       that cascade as a pane's body text, budget caveat included
+
+All pure: a string or a decoded reply map in, a string or a note map out. No model, no
+buffer, no sandbox — which is what makes it testable without any of them, and what stops
+this from quietly becoming a third feature.
+
+**The note shape** every caller stamps through `results/eol-notes`: `{:kind :text}` where
+`:kind` is `:info` (a result), `:pass`, `:fail`, or `:pending` (mid-typing — dim, never a
+verdict colour, because a form you are still writing is not a mistake), plus `:error?` on a
+note that means \"it ran and blew up\" as opposed to \"it ran and was wrong\".")
+;; No imports at all, deliberately. `eval-server/*spy-entry-cap*` and `reflect/expr-type` are
+;; referenced qualified below (each auto-loads); everything else is prelude. A module that
+;; needed the model would be a third feature rather than the vocabulary two features share.
+
+(def *slow-ms* 150) ; past this, a result shows how long it took
+;; ---- is this text ready to evaluate? -------------------------------------------
+
+(defn parse-state (src)
+  "Classify source text for a live evaluator: `:blank`, `[:incomplete reason]` (mid-typing),
+`[:err msg]` (broken, and more typing won't fix it), or `:ok`.
+
+The distinction that matters is the middle one. E0002 is the reader saying \"this could still
+become valid\" — an unclosed list, an unterminated string — and that is the state EVERY form
+passes through on the way to being typed. It must not read as a mistake; it must not read as
+NOTHING either, since silence there is what makes a stale result look current. So the reason
+travels with the state (\"unterminated string\") and callers show it in the pending voice.
+E0001 (\"unexpected ')'\") is a real error — no further typing fixes it — and reports as one."
+  (cond
+    (= (string/trim src) "") :blank
+    else
+      (try
+        (do (reflect/read-all src) :ok)
+        (catch e
+          (if (and (map? e) (= (:code e) "E0002"))
+            [:incomplete (error-message e)]
+            [:err (error-message e)])))))
+
+;; ---- what a reply is worth saying about ----------------------------------------
+
+(defn slow-note (reply)
+  "`\"  (312ms)\"` once an evaluation is slow enough to have been felt, else `\"\"`."
+  (let (ms (get reply :ms 0))
+    (if (>= ms *slow-ms*) (str "  (" ms "ms)") "")))
+
+(defn proc-note (reply)
+  "`\"  ⚙ 2 processes still running\"`, or `\"\"` when nothing survived the evaluation.
+
+Concurrency has no return value to look at, so what an evaluation LEFT RUNNING (`:procs`
+from the eval server) is the only thing that reports it. Silent when nothing did, so it
+only speaks up where processes are actually the point."
+  (let (alive (get-in reply [:procs :alive] 0))
+    (cond
+      (= alive 0) ""
+      (= alive 1) "  ⚙ 1 process still running"
+      else (str "  ⚙ " alive " processes still running"))))
+
+(defn printed-note (reply)
+  "`\"   (printed: hi)\"` when the evaluation wrote to stdout, else `\"\"` — the half of a
+REPL that a value alone loses."
+  (if (= (get reply :output "") "")
+    ""
+    (str "   (printed: " (string/trim (get reply :output)) ")")))
+
+(defn defined-hint (src)
+  "`\"foo : (int -> int)\"` — what the first form of `src` DEFINES and how the checker types
+it, or nil when it defines nothing (or defines something the type grammar cannot write).
+
+The gap this closes: a `(defn foo …)` form evaluates to its own name, so a live evaluator
+has `=> foo` to show and nothing else — and `foo` is a value, not a type. `expr-type` cannot
+help, because the type of that form's VALUE is the type of a symbol. `source-signatures`
+asks the checker the question actually being asked: what did this text define, and what is
+it typed as?"
+  (let (sigs (try (reflect/source-signatures src) (catch _ nil))
+        hit (seq/find (fn (entry) (string? (:sig entry))) (or sigs '())))
+    (when hit (str (:name hit) " : " (:sig hit)))))
+
+(defn expression-hint (src)
+  "`\": int\"` — the type the advisory checker infers for the first form of `src`, or nil
+when it has no opinion (an anonymous `fn`, an unparsable fragment).
+
+`reflect/expr-type` is the primitive this reads; it exists because the checker computes a
+type for every expression it walks and nothing could ask it for one."
+  (let (t (try (reflect/expr-type src) (catch _ nil)))
+    (when t (str ": " t))))
+
+(defn type-hint (src)
+  "The derived-type hint for a form: its signature when it defines something, else the type
+of the value it evaluates to, else nil.
+
+Shown at the form itself rather than beside its result, and that is the point of separating
+it from [[result-note]]: the value is what the code DID and the type is what the language
+thinks it MAY do, so the two belong at different places — the type at the code it describes,
+the answer under it. A definition had nothing to show at all before, which is the case that
+forced the split."
+  (or (defined-hint src) (expression-hint src)))
+
+(defn error-note (reply)
+  "The `✗ …` note for a reply that raised or timed out, or nil when it did neither.
+
+`:error?` marks \"the code ran and blew up\" as distinct from \"it ran and was wrong\" — a
+caller pairing this with a checker advisory wants the advisory on the second and not the
+first, where it would only repeat the error."
+  (cond
+    (get reply :timeout)
+      {:kind :fail
+       :error? true
+       :text "✗ timed out — still running? (C-c C-k restarts the sandbox)"}
+    (not (get reply :ok)) {:kind :fail :error? true :text (str "✗ " (get reply :error "error"))}
+    else nil))
+
+(defn result-note (reply &optional (src nil))
+  "The plain-result note for a successful reply: `=> 6`, plus what it printed, how long it
+took and what it left running. With `src`, the note also carries `:hint` — the form's derived
+type ([[type-hint]]), which a caller anchors at the FORM rather than here, so a type appearing
+or changing never moves the answer. Errors and timeouts are [[error-note]]'s."
+  (or (error-note reply)
+    (let (hint (when src (type-hint src))
+          note {:kind :info
+                :text (str "=> "
+                        (get reply :value)
+                        (printed-note reply)
+                        (slow-note reply)
+                        (proc-note reply))})
+      (if hint (assoc note :hint hint) note))))
+
+;; ---- the spy cascade ------------------------------------------------------------
+
+(defn- strip-parens
+  (s)
+  ;; "(5)" -> "5" — an args list reads better without its wrapping parens
+  (if (and (string? s) (string/starts-with? s "(") (string/ends-with? s ")"))
+    (string/substring s 1 (dec (string/length s)))
+    (or s "")))
+
+(defn spy-lines (entries)
+  "Spy entries → indented lines: a `call` opens a level (`fac 3`), its `return` closes it
+(`= 6`); anything else renders flat."
+  (let (r (fold (fn (acc e)
+                  (let ([depth ls] acc
+                        kind (:kind e))
+                    (cond
+                      (= kind "call")
+                        [(inc depth)
+                          (cons (str (string/repeat "  " depth)
+                                  (:fn e)
+                                  " "
+                                  (strip-parens (:args e)))
+                            ls)]
+                      (= kind "return")
+                        (let (d (math/max 0 (dec depth)))
+                          [d (cons (str (string/repeat "  " d) "= " (:value e)) ls)])
+                      else [depth (cons (str (:form e) " => " (:value e)) ls)])))
+            [0 '()]
+            entries))
+    (reverse (second r))))
+
+(defn budget-spent? (entries)
+  "Whether this cascade is all the sandbox would collect — it stopped at the trace budget
+(`eval-server/*spy-entry-cap*`) rather than because the code stopped calling.
+
+Worth telling the reader, and not a footnote: the loop kept running after this, in constant
+stack and at full speed, because the tracer steps aside once its sink is full
+(`debug/trace-fn`). A pane claiming to show \"every call\" would be lying."
+  (>= (count entries) eval-server/*spy-entry-cap*))
+
+(defn spy-text (reply &optional (heading "The workings"))
+  "A reply's `:spy` entries as a pane's body text, under `heading`, with the trace-budget
+caveat appended when the cascade is a truncation rather than the whole story."
+  (let (entries (or (:spy reply) ()))
+    (string/join "\n"
+      (append (list (if (budget-spent? entries)
+                      (str heading
+                        " — the first "
+                        (count entries)
+                        " traced calls, innermost nested:")
+                      (str heading " — every traced call and return, innermost nested:"))
+                "")
+        (spy-lines entries)
+        (if (budget-spent? entries)
+          (list "" "…the trace budget stops here; the code carried on untraced.")
+          '())))))

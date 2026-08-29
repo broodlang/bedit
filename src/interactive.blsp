@@ -13,8 +13,18 @@ does over `defn` — exactly the role Emacs's `(interactive)` plays.
     (defcommand cmd-newline (m key) (ed-edit m (fn (b) (insert b \"\\n\"))))
     ;; now `M-x newline` runs it, and (command-names) lists it.")
 
-(def *commands* {}) ; name (string) -> command fn
-(def *command-syms* {}) ; name (string) -> command symbol (for describe-function doc lookup)
+;; These are REGISTRIES: every module `defcommand`s into them at load, and they must
+;; accumulate across the whole session — so `defonce`, not `def`. Loading a project re-runs
+;; this file after other modules have already registered (a `require` cycle reached from two
+;; directions; the loader says so: "macro defcommand redefined"), and a plain `def` here reset
+;; the table to `{}` — silently dropping every command registered before that moment.
+;;
+;; What that looked like: `M-x package-list` and `M-x brood-playground` answered "no command"
+;; while `M-x git-status` worked, and which ones survived depended only on whether their
+;; module happened to load before or after the reload. The same hazard `editor/layers`
+;; documents for its own three registries, in the same shape, with the same fix.
+(defonce *commands* {}) ; name (string) -> command fn
+(defonce *command-syms* {}) ; name (string) -> command symbol (for describe-function doc lookup)
 (defn command-friendly-name (s)
   "A command's M-x name: its function name minus a leading `cmd-`."
   (if (string/starts-with? s "cmd-") (string/substring s 4 (string/length s)) s))
@@ -26,13 +36,46 @@ symbol too (for `describe-function`'s docstring lookup). Re-registering replaces
     (def *command-syms* (assoc *command-syms* nm sym))
     (def *commands* (assoc *commands* nm fn))))
 
+;; ---- deferred commands: named by a keymap, not yet loaded ---------------------
+;; `defcommand` registers at MODULE LOAD, so a deferred feature's commands did not exist for
+;; `M-x` until something else had already loaded it — and what loaded the ones that worked
+;; was incidental (a qualified reference from an eager module). `M-x package-list` and
+;; `M-x brood-playground` therefore answered "no command", while `M-x git-status` worked,
+;; for no reason a reader could see.
+;;
+;; A keymap names its commands by SYMBOL, late-bound, precisely so it can name a command
+;; whose module is not loaded. So the keymaps already hold the full list — `keymaps`
+;; harvests them at startup (`editor/keymap/keymap-commands`) and declares them here. A
+;; deferred entry is a name plus the symbol to load; running it loads the module and then
+;; dispatches to the real registration.
+(defonce *deferred* {}) ; name (string) -> command symbol, module not yet loaded
+
+(defn- command-tail
+  (sym)
+  ;; the last segment of a possibly-qualified symbol: `playground/cmd-x` -> `cmd-x`
+  (last (string/split (->string sym) "/")))
+
+(defn- command-module
+  (sym)
+  ;; everything before the last segment: `playground/cmd-x` -> `playground`, nil if unqualified
+  (let (parts (string/split (->string sym) "/"))
+    (if (< (count parts) 2) nil (string/join "/" (take (dec (count parts)) parts)))))
+
+(defn register-deferred (sym)
+  "Declare that `sym` names an interactive command whose module may not be loaded yet, so
+`M-x` can offer it and load it on demand. A name already registered for real wins."
+  (let (nm (command-friendly-name (command-tail sym)))
+    (when (nil? (get *commands* nm)) (def *deferred* (assoc *deferred* nm sym)))
+    nm))
+
 (defn command-sym (nm)
-  "The fully-qualified symbol of the interactive command named `nm`, or nil."
-  (get *command-syms* nm))
+  "The fully-qualified symbol of the interactive command named `nm`, or nil — including one
+that is only declared (its module unloaded), so `describe-function` can find its docstring."
+  (or (get *command-syms* nm) (get *deferred* nm)))
 
 (defn command-names ()
-  "All registered interactive command names, sorted."
-  (sort (keys *commands*)))
+  "All interactive command names, sorted — registered and declared-but-unloaded alike."
+  (sort (seq/distinct (append (keys *commands*) (keys *deferred*)))))
 
 ;; ---- the prefix argument (C-u N) -------------------------------------------
 ;; The numeric prefix a `C-u`/digit sequence builds lives on the model as
@@ -77,9 +120,22 @@ prefix argument flips to. Bidirectional."
 
 (defn run-command (m nm fallback)
   "Run the interactive command named `nm` on model `m` (key = nil), or call
-`(fallback m nm)` when there is no such command."
+`(fallback m nm)` when there is no such command.
+
+A name that is only DECLARED ([[register-deferred]]) loads its module first and then runs
+the registration that appears — so a deferred feature is reachable by name on the first
+call, without every such module being loaded at startup to make `M-x` honest."
   (let (f (get *commands* nm))
-    (if (nil? f) (fallback m nm) (f m nil))))
+    (cond
+      f (f m nil)
+      else
+        (let (sym (get *deferred* nm)
+              mod (when sym (command-module sym)))
+          (if (nil? mod)
+            (fallback m nm)
+            (let (_ (try (require-one (symbol mod)) (catch _ nil))
+                  loaded (get *commands* nm))
+              (if loaded (loaded m nil) (fallback m nm))))))))
 
 (defmacro defcommand (cmd params & body)
   "Like `defn` for an editor command `(model key) -> model`, but also registers it

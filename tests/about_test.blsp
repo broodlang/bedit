@@ -1,0 +1,197 @@
+;; The version surface — `src/about.blsp`. Every renderer here takes the
+;; `project/build-info` map as an argument, so the whole suite runs against SYNTHETIC
+;; info maps: a release bundle's and a source checkout's. That is the point of threading
+;; the map rather than each fn calling `build-info` itself — a test cannot be a release
+;; bundle, and if it could, its assertions would drift with whatever version this repo is
+;; on today. The two live-image tests at the end check only that the real facts arrive
+;; non-empty, never their values.
+
+(defmodule about-test
+  (:use test)
+  (:use model)
+  (:use input)
+  (:use editor/buffer)
+  (:use-internals about))
+
+(defn m-of (text) (ed-init (make-buffer text)))
+(defn press (m keys) (fold (fn (acc k) (ed-update acc k 80 24)) m keys))
+
+;; A release bundle's build-info: `nest release` stamped :built-at / :built-with into the
+;; manifest, so there is no :commit — a bundle has no working tree to name.
+(def bundled
+  {:brood-version "0.16.0"
+   :build-id "0.16.0+d0a85717+18f2e1a9b3c4d5e6"
+   :brood-built-at 1787900000000
+   :features [:gui :jit]
+   :bundled? true
+   :app "bedit"
+   :app-version "0.4.1"
+   :built-at 1788012180000 ; 2026-08-29 14:03 UTC
+   :built-with "0.16.0+d0a85717+00ff"
+   :module-count 42})
+
+;; A source run's: version from the on-disk project.blsp, date + hash from git HEAD.
+(def sourced
+  {:brood-version "0.16.0"
+   :build-id "0.16.0+d0a85717+18f2e1a9b3c4d5e6"
+   :brood-built-at 1787900000000
+   :features [:gui :jit]
+   :bundled? false
+   :app "bedit"
+   :app-version "0.4.1"
+   :built-at 1788012180000
+   :commit "a5e2405"})
+
+(describe "bedit-version — the manifest's version, never a hardcoded copy"
+  (test "reads :app-version off the info map"
+    (assert= (about/bedit-version bundled) "0.4.1"))
+
+  ;; The floor matters: `packages/load-installed!` feeds this straight to
+  ;; `project/enhancers-in`, which compares it against a plugin's `:enhances` constraint.
+  ;; nil there would be a comparison against nothing; "0.0.0" fails every `>=` closed.
+  (test "0.0.0 when the manifest could not be read (fails a constraint closed, never nil)"
+    (assert= (about/bedit-version {:bundled? false}) "0.0.0")))
+
+(describe "brood-text — the runtime, without its mtime field"
+  (test "version plus the git sha out of build-id"
+    (assert= (about/brood-text bundled) "0.16.0 (d0a85717)"))
+
+  (test "version alone when there is no build-id to split"
+    (assert= (about/brood-text {:brood-version "0.16.0"}) "0.16.0")))
+
+(describe "facts — every fact, in one map"
+  (test "ready-to-print strings, not raw values"
+    (let (f (about/facts bundled))
+      (assert= (:bedit f) "0.4.1")
+      (assert= (:brood f) "0.16.0 (d0a85717)")
+      (assert= (:built f) "2026-08-29 14:03 UTC")
+      (assert= (:features f) "gui jit")
+      (assert= (:modules f) "42")))
+
+  ;; A format string is substituted into, never branched on — so an absent fact has to
+  ;; render as nothing. nil would print the word "nil" in the middle of somebody's line.
+  ;; A dev run's build time tracks the TREE, not just HEAD — edit a file, run again, and it
+  ;; moves. The hash then says where the code came from rather than what it is.
+  (test "an edited tree marks its commit as a starting point"
+    (let (line (about/render nil (about/facts (assoc sourced :modified? true))))
+      (is (includes? line "a5e2405 + edits, from source"))))
+
+  (test "a fact this build hasn't got is the empty string, never nil"
+    (let (f (about/facts sourced))
+      (assert= (:modules f) "")
+      (assert= (:built-by f) "")
+      (is (not (nil? (:commit f))))))
+
+  (test "the process start time, and how long it has been up"
+    (let (f (about/facts sourced))
+      (is (includes? (:started f) "UTC"))
+      (is (int? (:started-at f)))
+      (is (not (= (:uptime f) "")))))
+
+  ;; `/` is EXACT in Brood, so a duration divided with it renders as a ratio — an uptime
+  ;; that read `up 2683/125s` on the first live run of the configurable format.
+  (test "an uptime is a plain duration at every scale, never a ratio"
+    (assert= (map about/duration-text [0 21000 60000 125000 11532000])
+      (list "0s" "21s" "1m" "2m" "3h 12m"))))
+
+(describe "render — the display the user configures"
+  (test "the default names editor, start, build and runtime"
+    (let (line (about/render nil (about/facts bundled)))
+      (is (includes? line "bedit 0.4.1"))
+      (is (includes? line "started "))
+      (is (includes? line "built 2026-08-29 14:03 UTC"))
+      (is (includes? line "brood 0.16.0 (d0a85717)"))))
+
+  (test "a {{template}} string reaches any fact"
+    (assert= (about/render "{{bedit}} on {{brood}}" (about/facts bundled))
+      "0.4.1 on 0.16.0 (d0a85717)"))
+
+  (test "a fact the build hasn't got renders as nothing, not a hole"
+    (assert= (about/render "[{{modules}}]" (about/facts sourced)) "[]"))
+
+  ;; Late-bound on purpose: the formatter can be a fn you defn in your init file, or
+  ;; redefine live with C-x C-e, and the next M-x version picks it up.
+  ;; The symbol is the name the fn is actually BOUND under — qualified when it lives in a
+  ;; module, bare for one defined at root (which is what C-x C-e on a scratch buffer gives
+  ;; you, and the case a user's own formatter will normally be).
+  (test "a symbol naming a function of the facts map"
+    (do
+      (defn about-test-fmt (f) (str "<<" (:bedit f) ">>"))
+      (assert= (about/render 'about-test/about-test-fmt (about/facts bundled)) "<<0.4.1>>")))
+
+  ;; This is the surface people reach for when something is already wrong, so a broken
+  ;; format must not be the thing that denies them a version.
+  (test "a broken format falls back to the default rather than failing"
+    (let (unbound (about/render 'no-such-formatter-at-all (about/facts bundled))
+          thrower (do (defn about-test-boom (f) (error "nope"))
+                    (about/render 'about-test/about-test-boom (about/facts bundled))))
+      (is (includes? unbound "bedit 0.4.1"))
+      (is (includes? thrower "bedit 0.4.1")))))
+
+(describe "text — the *About bedit* block"
+  ;; Deliberately NOT user-formatted: a one-line summary is taste, but the full dump is what
+  ;; goes into a bug report and should read the same in every one.
+  (test "one labelled row per fact"
+    (let (t (about/text bundled))
+      (is (includes? t "bedit 0.4.1"))
+      (is (includes? t "built         2026-08-29 14:03 UTC"))
+      (is (includes? t "brood         0.16.0 (d0a85717)"))
+      (is (includes? t "started       "))
+      (is (includes? t "features      gui jit"))
+      (is (includes? t "config"))))
+
+  (test "a bundle also reports its module count and the brood that built it"
+    (let (t (about/text bundled))
+      (is (includes? t "modules       42"))
+      (is (includes? t "built by      0.16.0+d0a85717+00ff"))))
+
+  ;; Those two rows are facts about an artifact. A source run has neither, and printing an
+  ;; empty label would read like a fact that came back blank.
+  (test "a source run omits both rather than showing them empty"
+    (let (t (about/text sourced))
+      (is (not (includes? t "modules")))
+      (is (not (includes? t "built by")))))
+
+  (test "(none) when the runtime was built with no optional features"
+    (is (includes? (about/text (assoc sourced :features [])) "features      (none)"))))
+
+(describe "version-arg? — the CLI check main makes before opening a display"
+  (test "--version"
+    (is (about/version-arg? ["--version"])))
+  (test "-V"
+    (is (about/version-arg? ["-V"])))
+  (test "found among other arguments"
+    (is (about/version-arg? ["--name" "ed" "--version"])))
+  (test "an ordinary launch is not a version request"
+    (is (not (about/version-arg? ["notes.txt"]))))
+  (test "no arguments at all"
+    (is (not (about/version-arg? nil)))))
+
+(describe "the commands"
+  (test "M-x version echoes the line into the echo area and *Messages*"
+    (let (m (about/cmd-version (m-of "x") :none))
+      (is (includes? (:echo m) "bedit "))
+      (is (includes? (:echo m) "brood "))
+      (is (not (nil? (ed-buffer-index-by-name m "*Messages*"))))))
+
+  (test "C-h C-a opens *About bedit*"
+    (let (m (press (m-of "x") [:ctrl-h :ctrl-a])
+          i (ed-buffer-index-by-name m "*About bedit*"))
+      (is (not (nil? i)))
+      (is (includes? (buffer-text (get (:buffers m) i)) "bedit ")))))
+
+;; The only tests that touch the real image. They assert the facts ARRIVE, not what they
+;; say — the version and sha change with every release, and a test that pinned them would
+;; fail on the release commit that made it true.
+(describe "against this actual build"
+  (test "the info map names this app and the runtime under it"
+    (let (i (about/info))
+      (assert= (get i :app) "bedit")
+      (is (not (nil? (get i :app-version))))
+      (is (not (nil? (get i :brood-version))))))
+
+  (test "the version line mentions both editor and runtime"
+    (let (line (about/version-line))
+      (is (includes? line "bedit "))
+      (is (includes? line "brood "))
+      (is (not (includes? line "built unknown"))))))
