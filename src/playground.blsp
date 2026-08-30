@@ -114,8 +114,9 @@ so it is a Brood file first and a playground second."
 ;; what it caches on the buffer is the currency everything else spends:
 ;;
 ;;   `:playground-spans`  index -> [start end], for finding which form a point is in
+;;   `:playground-deps`   index -> what it defines / uses, for what a reply records
 ;;
-;; It describes `:playground-rope`, and is exact for exactly as long as the buffer still
+;; Both describe `:playground-rope`, and are exact for exactly as long as the buffer still
 ;; holds it — an O(1) comparison, and the one both later readers make.
 ;;
 ;; `:playground-evaluated` is a DIFFERENT kind of record and answers to a different event:
@@ -163,10 +164,6 @@ answers \"which form is this?\" — a scan over extents, never a parse."
 because the form is new, because it changed, or because a reply for it never landed."
   (get-in evaluated [i :src]))
 
-(defn evaluated-deps (evaluated i)
-  "What the form the session evaluated at `i` defined and used, or `{}`."
-  (or (get-in evaluated [i :deps]) {}))
-
 (defn pg-unevaluate (evaluated indices)
   "Forget what the session evaluated for every form in `indices` — what a launch does to the
 forms it is SENDING, so that a reply which never lands leaves the form visibly un-evaluated
@@ -211,9 +208,9 @@ downward-only model the buffer documents holds for a vanished definition as for 
             (range total))
         [aligned pairs _] r
         matched (into #{} (map first pairs))
+        ascending (reverse pairs) ; `[old new]`, in old order
         before-of (fn (j)
-                    (or (first (map second (filter (fn (ji) (> (first ji) j)) (reverse pairs))))
-                      total))
+                    (or (second (seq/find (fn (ji) (> (first ji) j)) ascending)) total))
         dropped (map (fn (j) (assoc (get evaluated j) :before (before-of j)))
                   (filter (fn (j) (not (includes? matched j))) olds)))
     {:aligned aligned :dropped dropped}))
@@ -262,9 +259,9 @@ the one you just changed — but most edits are to a CALL, and nothing below a c
 So the question is not \"is this form below the edit?\" but \"does this form use anything the
 edit could have changed?\", which `reflect/source-deps` answers.
 
-Both the OLD and the new `:defines` of a re-run form count, or renaming `foo` to `bar` would
-leave the forms that called `foo` sitting on a stale answer instead of the error they now
-deserve.
+A re-run form provides what it defines NOW; what its previous text defined arrives through
+[[realign-evaluated]]'s `:dropped` records, so renaming `foo` to `bar` still reaches the forms
+that called `foo`, which now deserve an error instead of a stale answer.
 
 Downward only, matching the model the buffer already documents: a form cannot depend on text
 below it. Two things this cannot see, and both are handled by widening rather than by
@@ -273,9 +270,7 @@ tail, and a `deps` that does not line up with `forms` one-for-one falls back to 
 suffix rule."
   (let ({:aligned aligned :dropped dropped} evaluated
         changed (changed-forms srcs aligned total)
-        defines-at (fn (i)
-                     (append (get (nth deps i {}) :defines '())
-                       (get (evaluated-deps aligned i) :defines '())))
+        defines-at (fn (i) (get (nth deps i {}) :defines '()))
         ;; what a dropped record defined, provided from where its form stood (`:before`)
         dropped-at (fn (i)
                      (mapcat (fn (rec) (get (:deps rec) :defines '()))
@@ -391,6 +386,7 @@ blank on its way to the same answer."
                      (assoc bb
                        :playground-rope rope
                        :playground-spans spans
+                       :playground-deps deps
                        ;; A form being SENT is no longer one the session has
                        ;; evaluated — only its reply landing puts it back. A
                        ;; launch that recorded what it asked for would leave a
@@ -482,11 +478,15 @@ request that was IN FLIGHT when a reset killed the child was answered `{:timeout
 the worker before the respawn, so nothing is left dangling."
   (pg-update-buf (update m :playground merge {:sandbox-gen gen :sandbox-ready true})
     (fn (bb)
-      (assoc bb :playground-rope nil :playground-spans [] :playground-evaluated {}))))
+      (assoc bb
+        :playground-rope nil
+        :playground-spans []
+        :playground-deps '()
+        :playground-evaluated {}))))
 
 (defn playground-sandbox-reply (m reply gen)
   "Fold one sandbox reply into the model. A reply the playground never sent, one from a
-superseded child, or one whose buffer has moved on since the send is dropped — the next idle
+superseded child, or one whose form has been edited since the send is dropped — the next idle
 beat re-evaluates. Otherwise the result lands as the form's note and its trace as the pane's
 cascade."
   (let (id (get reply :id)
@@ -500,15 +500,17 @@ cascade."
               i0 (:region pend))
           (if (nil? b)
             m1
-            ;; The extents cached by the last launch are exact while the buffer still holds
-            ;; the text it parsed, which is the ordinary case and costs no parse. When it
-            ;; does not — an edit landed while this was in flight — the answer may still be
-            ;; good, so the extents are re-derived rather than the reply thrown away.
+            ;; The extents and deps cached by the last launch are exact while the buffer
+            ;; still holds the text it parsed, which is the ordinary case and costs no
+            ;; parse. When it does not — an edit landed while this was in flight — the
+            ;; answer may still be good, so both are re-derived rather than the reply thrown
+            ;; away.
             (let (text (buffer-text b)
                   fresh? (= (buffer-rope b) (:playground-rope b))
                   spans (if fresh?
                           (or (:playground-spans b) [])
                           (form-spans-in text (forms-of text)))
+                  deps (if fresh? (or (:playground-deps b) (deps-of text)) (deps-of text))
                   src-at (fn (k)
                            (let (span (nth spans k nil))
                              (when span (string/substring text (first span) (second span)))))
@@ -536,7 +538,7 @@ cascade."
                                          text)
                            i
                            src
-                           (nth (deps-of text) i {})))
+                           (nth deps i {})))
                   ;; `workings/show` caches this form's cascade and opens the pane only if
                   ;; the cascade is real AND belongs to the form the cursor is in — so a
                   ;; background re-eval never yanks the pane off what you are reading.
