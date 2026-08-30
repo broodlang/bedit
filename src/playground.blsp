@@ -180,7 +180,7 @@ reply (or the headless in-image path) leaves behind."
 
 (defn realign-evaluated (srcs evaluated total)
   "Re-key what the session has evaluated to the forms as they are NOW: `{:aligned {index ->
-record} :dropped (record …)}`.
+record} :dropped (record …) :pairs ([old-index new-index] …)}`.
 
 The records are keyed by index, and an index is not an identity: inserting a form (or
 splitting one) shifts every form below it down a slot, and compared slot-for-slot every one
@@ -213,14 +213,14 @@ downward-only model the buffer documents holds for a vanished definition as for 
                     (or (second (seq/find (fn (ji) (> (first ji) j)) ascending)) total))
         dropped (map (fn (j) (assoc (get evaluated j) :before (before-of j)))
                   (filter (fn (j) (not (includes? matched j))) olds)))
-    {:aligned aligned :dropped dropped}))
+    {:aligned aligned :dropped dropped :pairs ascending}))
 
 (defn changed-forms (srcs evaluated total)
   "The indices whose source is not what the session has evaluated — a form someone edited,
 one that has just appeared, and one whose reply never came back. `()` when the session is up
 to date. `evaluated` is compared slot-for-slot, so pass it through [[realign-evaluated]]
 first unless the forms are known not to have moved."
-  (filter (fn (i) (not= (get srcs i) (evaluated-src evaluated i))) (range total)))
+  (filter (fn (i) (not (= (get srcs i) (evaluated-src evaluated i)))) (range total)))
 
 (defn deps-of (text)
   "Per top-level form of `text`, `{:defines (…) :references (…)}` — `reflect/source-deps`,
@@ -307,24 +307,60 @@ would re-run the wrong forms, silently. Re-running too much is the failure worth
 
 ;; ---- notes: a result at the end of its form --------------------------------------
 
+(defn- pg-note-into
+  (bb key note span text)
+  ;; Stamp `note` under `key` on buffer `bb`, anchored to the form at `span`, through the
+  ;; shared anchored-note channel: its answer on the line below the form's last, its `:hint`
+  ;; (the derived type `liveeval/result-note` put there) at the form's opening line.
+  ;; `results/set-note` owns everything else — the owner-keying, the hint key, and the
+  ;; one-line collapse when a form at EOF has no line below it. `key` and `span` are passed
+  ;; apart because a note keeps the index its launch gave it while its form may since have
+  ;; moved to another slot ([[ed-playground-reanchor]]).
+  (if (nil? span)
+    bb
+    (let ([lo hi] span)
+      (results/set-note bb
+        key
+        note
+        (results/answer-line text (dec hi)) ; the extent's end is exclusive
+        (results/line-of text lo)))))
+
 (defn- pg-set-note
   (m i note spans text)
-  ;; Stamp `note` for form `i` through the shared anchored-note channel: its answer on the
-  ;; line below the form's last, its `:hint` (the derived type `liveeval/result-note` put
-  ;; there) at the form's opening line. `results/set-note` owns everything else — the
-  ;; owner-keying, the hint key, and the one-line collapse when a form at EOF has no line
-  ;; below it. `spans`/`text` are passed in because both callers already have them.
-  (let (span (nth spans i nil))
-    (if (nil? span)
-      m
-      (let ([lo hi] span)
-        (pg-update-buf m
-          (fn (bb)
-            (results/set-note bb
-              i
-              note
-              (results/answer-line text (dec hi)) ; the extent's end is exclusive
-              (results/line-of text lo))))))))
+  ;; [[pg-note-into]] for form `i` of the model's playground buffer.
+  (pg-update-buf m (fn (bb) (pg-note-into bb i note (nth spans i nil) text))))
+
+(defn- pg-form-pairs
+  (b srcs total)
+  ;; `([launch-index current-index] …)`: the forms the last launch parsed (its rope and
+  ;; extents are cached on the buffer) matched to the forms as they are now, by text —
+  ;; [[realign-evaluated]]'s pairing over the previous text. What a note's key means
+  ;; against the current buffer: keys are launch indices, and this says which form each
+  ;; now describes. `()` before any launch.
+  (let (prev-rope (:playground-rope b)
+        prev-spans (or (:playground-spans b) []))
+    (if (nil? prev-rope)
+      '()
+      (let (prev-text (buffer-text (assoc b :rope prev-rope))
+            prev-srcs (fold (fn (acc kv)
+                              (let ([j span] kv)
+                                (assoc acc
+                                  j {:src (string/substring prev-text (first span) (second span))})))
+                        {}
+                        (seq/enumerate prev-spans)))
+        (:pairs (realign-evaluated srcs prev-srcs total))))))
+
+(defn- pg-rekey-notes
+  (notes pairs)
+  ;; The form-keyed notes (int keys — a hint is re-derived from its result) re-keyed from
+  ;; launch indices to current ones through `pairs`; a note whose form matches nothing is
+  ;; dropped, since that form changed and the launch re-derives it.
+  (fold (fn (acc ji)
+          (let ([j i] ji
+                note (get notes j))
+            (if note (assoc acc i note) acc)))
+    {}
+    pairs))
 
 (defn- pg-clear-notes
   (bb)
@@ -336,10 +372,43 @@ would re-run the wrong forms, silently. Re-running too much is the failure worth
 ;; ---- eval-on-type: the stale? / launch / apply triple ------------------------------
 
 (defn ed-playground-stale? (m)
-  "O(1): the selected buffer is the playground and its rope moved since the last launch —
-arms the `:playground-eval` idle timer (`model/ed-sync-timers`)."
+  "O(1): the selected buffer is the playground and its rope moved since the last launch — or
+a fresh sandbox session asked for a replay (`:playground-replay`) — arms the
+`:playground-eval` idle timer (`model/ed-sync-timers`)."
   (let (b (ed-current-buf m))
-    (and (playground-buffer? b) (not= (buffer-rope b) (:playground-rope b)))))
+    (and (playground-buffer? b)
+      (or (:playground-replay b) (not (= (buffer-rope b) (:playground-rope b)))))))
+
+(defn ed-playground-reanchor (m)
+  "Re-anchor the playground's notes to the text as it is NOW — on the edit itself, not the
+debounce. A note is stored with the line it sits on, and `results/eol-notes` hides the whole
+set the moment the line count changes, since a stored line may no longer be the form's: so
+every result vanished on Enter and came back a quarter-second later when the launch
+re-stamped them — a flicker of the entire buffer for a keystroke that changed nothing.
+
+Each note follows its form by text ([[pg-form-pairs]]) and keeps its launch-time key; a
+note whose form changed is dropped, which is what the launch would do to it. Evaluation
+stays on the debounce — this parses and moves lines, nothing more. Runs from
+`model/ed-post-step` on every event, and is O(1) unless the buffer moved since the last
+anchor (`:playground-anchor-rope`) or the last launch."
+  (let (b (pg-buf m))
+    (if (or (nil? b)
+          (= (buffer-rope b) (:playground-anchor-rope b))
+          (= (buffer-rope b) (:playground-rope b)))
+      m
+      (let (text (buffer-text b)
+            forms (forms-of text)
+            spans (form-spans-in text forms)
+            pairs (pg-form-pairs b (form-srcs-in text forms) (count forms))
+            notes (or (results/eol-notes-any b) {}))
+        (pg-update-buf m
+          (fn (bb)
+            (fold (fn (acc ji)
+                    (let ([j i] ji
+                          note (get notes j))
+                      (if note (pg-note-into acc j (dissoc note :line) (nth spans i nil) text) acc)))
+              (assoc (pg-clear-notes bb) :playground-anchor-rope (buffer-rope b))
+              pairs)))))))
 
 (defn ed-playground-launch (m)
   "The debounce landed: re-evaluate the forms this edit could have changed the answer of —
@@ -373,7 +442,10 @@ blank on its way to the same answer."
                           (get-in m [:playground :pending] {})))
             known (merge (or (:playground-evaluated b) {}) in-flight)
             deps (deps-of text)
-            old-notes (or (results/eol-notes-any b) {})
+            ;; last launch's notes, keyed by the forms as they are now (a form that moved
+            ;; takes its note with it; a hint is re-derived from its result note)
+            old-notes (pg-rekey-notes (or (results/eol-notes-any b) {})
+                        (pg-form-pairs b srcs (count forms)))
             live (playground-live?)
             stale (launch-plan srcs known deps (count forms))
             start-id (get-in m [:playground :next-id] 1)
@@ -383,7 +455,7 @@ blank on its way to the same answer."
             m0 (pg-update-buf (workings/forget *spy-spec* m (fn (i) (includes? stale i)))
                  (fn (bb)
                    (pg-clear-notes
-                     (assoc bb
+                     (assoc (dissoc bb :playground-replay)
                        :playground-rope rope
                        :playground-spans spans
                        :playground-deps deps
@@ -478,11 +550,12 @@ request that was IN FLIGHT when a reset killed the child was answered `{:timeout
 the worker before the respawn, so nothing is left dangling."
   (pg-update-buf (update m :playground merge {:sandbox-gen gen :sandbox-ready true})
     (fn (bb)
-      (assoc bb
-        :playground-rope nil
-        :playground-spans []
-        :playground-deps '()
-        :playground-evaluated {}))))
+      ;; `:playground-replay` is what makes the next idle beat launch: the buffer has not
+      ;; moved, so [[ed-playground-stale?]]'s rope comparison alone would not. The rope and
+      ;; extents of the last launch STAY — they are what a note's key means against the
+      ;; text ([[pg-form-pairs]]), and forgetting them here dropped every note on the first
+      ;; keystroke after the child came up.
+      (assoc bb :playground-replay true :playground-evaluated {}))))
 
 (defn playground-sandbox-reply (m reply gen)
   "Fold one sandbox reply into the model. A reply the playground never sent, one from a
@@ -493,7 +566,7 @@ cascade."
         pend (get-in m [:playground :pending id]))
     (cond
       (nil? pend) m ; not ours (the tutorial's, or a straggler) — the fan-out's no-op
-      (not= gen (get-in m [:playground :sandbox-gen])) m
+      (not (= gen (get-in m [:playground :sandbox-gen]))) m
       else
         (let (m1 (update m :playground update :pending dissoc id)
               b (pg-buf m1)
@@ -593,7 +666,7 @@ and an image lookup — which is the half you want while typing a call."
     (if (not (playground-buffer? b))
       m
       (let (docs (doc-at-point b)
-            moved? (not= docs (workings/at-point-lines *spy-spec* m))
+            moved? (not (= docs (workings/at-point-lines *spy-spec* m)))
             m1 (if moved? (workings/at-point *spy-spec* m docs) m)
             here (get-in m1 [:playground :workings-region])
             i (when (= (buffer-rope b) (:playground-rope b))
@@ -601,7 +674,7 @@ and an image lookup — which is the half you want while typing a call."
         (cond
           ;; the form changed (or is showing for the first time): `follow` decides whether
           ;; that is worth opening a closed pane for
-          (and i (not= i here)) (workings/follow *spy-spec* m1 i)
+          (and i (not (= i here))) (workings/follow *spy-spec* m1 i)
           ;; same form, new docs: re-render what is already open, never open one for a hover
           (and moved? (not (nil? (or i here)))) (workings/refresh *spy-spec* m1 (or i here) false)
           else m1)))))
