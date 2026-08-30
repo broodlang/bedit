@@ -113,12 +113,19 @@ so it is a Brood file first and a playground second."
 ;; called it per form — N+1 full parses for one keystroke. Now only the LAUNCH parses, and
 ;; what it caches on the buffer is the currency everything else spends:
 ;;
-;;   `:playground-srcs`   index -> source, for finding what changed
 ;;   `:playground-spans`  index -> [start end], for finding which form a point is in
-;;   `:playground-deps`   index -> what it defines / uses, for finding what a change reaches
 ;;
-;; All three describe `:playground-rope`, and are exact for exactly as long as the buffer
-;; still holds it — an O(1) comparison, and the one both later readers make.
+;; It describes `:playground-rope`, and is exact for exactly as long as the buffer still
+;; holds it — an O(1) comparison, and the one both later readers make.
+;;
+;; `:playground-evaluated` is a DIFFERENT kind of record and answers to a different event:
+;; `{index -> {:src … :deps …}}` for what the SESSION has actually evaluated. A launch does
+;; not write it — it clears the entry of every form it sends, and only a reply landing puts
+;; one back. That is the difference between "what we asked for" and "what happened", and
+;; conflating them is a bug with a long tail: a reply dropped because the buffer moved on
+;; (you kept typing) left the launch's record claiming the session had that definition, so
+;; the next launch saw nothing to re-send and the session kept the OLD one — for as long as
+;; that form's text stayed put.
 
 (defn forms-of (text)
   "The buffer's top-level forms as positioned nodes. Error-tolerant, so it answers over text
@@ -151,11 +158,72 @@ answers \"which form is this?\" — a scan over extents, never a parse."
                    (let ([lo hi] (nth spans i)) (and (>= point lo) (<= point hi))))
            (range (count spans)))))
 
-(defn changed-forms (srcs old-srcs total)
-  "The indices whose source differs from last time — a form someone edited, one that has just
-appeared, one whose text a deletion shifted into this slot. `()` when nothing moved."
-  (let (n (math/max total (count old-srcs)))
-    (filter (fn (i) (not= (get srcs i) (get old-srcs i))) (range n))))
+(defn evaluated-src (evaluated i)
+  "The source the session has evaluated for form `i`, or nil when it has evaluated none —
+because the form is new, because it changed, or because a reply for it never landed."
+  (get-in evaluated [i :src]))
+
+(defn evaluated-deps (evaluated i)
+  "What the form the session evaluated at `i` defined and used, or `{}`."
+  (or (get-in evaluated [i :deps]) {}))
+
+(defn pg-unevaluate (evaluated indices)
+  "Forget what the session evaluated for every form in `indices` — what a launch does to the
+forms it is SENDING, so that a reply which never lands leaves the form visibly un-evaluated
+and the next launch sends it again."
+  (into {} (filter (fn (kv) (not (includes? indices (first kv)))) evaluated)))
+
+(defn pg-evaluated (m i src deps)
+  "Record that the session has evaluated `src` for form `i`, with its `deps` — what a landing
+reply (or the headless in-image path) leaves behind."
+  (pg-update-buf m
+    (fn (bb)
+      (assoc bb
+        :playground-evaluated (assoc (or (:playground-evaluated bb) {}) i {:src src :deps deps})))))
+
+(defn realign-evaluated (srcs evaluated total)
+  "Re-key what the session has evaluated to the forms as they are NOW: `{:aligned {index ->
+record} :dropped (record …)}`.
+
+The records are keyed by index, and an index is not an identity: inserting a form (or
+splitting one) shifts every form below it down a slot, and compared slot-for-slot every one
+of them read as changed — adding a line near the top re-evaluated the whole buffer, which is
+exactly the cost the launch plan exists to avoid. So a record follows its TEXT: walking the
+current forms in order, each takes the first not-yet-taken record below the last match whose
+source is identical. In-order, so a duplicated form (two `(f 1)`s) pairs with its own record
+and not its twin's. What matches nothing is `:dropped` — a form that was edited or deleted —
+and its old `:defines` still matter to [[stale-forms]], since the callers of a definition that
+vanished must be re-run to lose the answer it gave them. Each dropped record carries
+`:before`: the current index of the first surviving form that stood below it (`total` when
+none did), which is where it stood, so that what it defined is provided from THERE — the
+downward-only model the buffer documents holds for a vanished definition as for a live one."
+  (let (olds (sort (keys evaluated))
+        r (fold (fn (acc i)
+                  (let ([aligned pairs cursor] acc
+                        src (get srcs i)
+                        j (first (filter (fn (j)
+                                           (and (>= j cursor) (= src (evaluated-src evaluated j))))
+                                   olds)))
+                    (if (nil? j)
+                      acc
+                      [(assoc aligned i (get evaluated j)) (cons [j i] pairs) (inc j)])))
+            [{} '() 0]
+            (range total))
+        [aligned pairs _] r
+        matched (into #{} (map first pairs))
+        before-of (fn (j)
+                    (or (first (map second (filter (fn (ji) (> (first ji) j)) (reverse pairs))))
+                      total))
+        dropped (map (fn (j) (assoc (get evaluated j) :before (before-of j)))
+                  (filter (fn (j) (not (includes? matched j))) olds)))
+    {:aligned aligned :dropped dropped}))
+
+(defn changed-forms (srcs evaluated total)
+  "The indices whose source is not what the session has evaluated — a form someone edited,
+one that has just appeared, and one whose reply never came back. `()` when the session is up
+to date. `evaluated` is compared slot-for-slot, so pass it through [[realign-evaluated]]
+first unless the forms are known not to have moved."
+  (filter (fn (i) (not= (get srcs i) (evaluated-src evaluated i))) (range total)))
 
 (defn deps-of (text)
   "Per top-level form of `text`, `{:defines (…) :references (…)}` — `reflect/source-deps`,
@@ -180,14 +248,12 @@ without deps the launch falls back to re-sending the whole tail, which is what i
   ;; definition and reference into another namespace; `require`/`use` change what a bare name
   ;; resolves to. Neither is an edge dependency analysis can see — the affected forms name
   ;; nothing that changed — so a re-run of one of these takes the whole tail with it.
-  (let (head (try
-               (let (f (reflect/read-first src)) (when (pair? f) (first f)))
-               (catch _ nil)))
-    (includes? (list 'defmodule 'require 'require-one 'use 'in-ns) head)))
+  (includes? (list 'defmodule 'require 'require-one 'use 'in-ns) (liveeval/head-symbol src)))
 
-(defn stale-forms (srcs old-srcs deps old-deps total)
+(defn stale-forms (srcs evaluated deps total)
   "Which forms a launch must re-send: every one whose own source changed, plus every LATER
 form that reaches one of them — directly, or through another form that is being re-run.
+`evaluated` is what [[realign-evaluated]] returns, so a form that only MOVED is not stale.
 
 The rule this replaced was \"everything from the first change down\", which is correct and
 expensive: editing the second of twenty forms re-evaluated nineteen, on every settle of the
@@ -205,12 +271,18 @@ below it. Two things this cannot see, and both are handled by widening rather th
 guessing: a form that changes what names mean below it ([[namespace-form?]]) takes the whole
 tail, and a `deps` that does not line up with `forms` one-for-one falls back to the old
 suffix rule."
-  (let (changed (changed-forms srcs old-srcs total)
+  (let ({:aligned aligned :dropped dropped} evaluated
+        changed (changed-forms srcs aligned total)
         defines-at (fn (i)
                      (append (get (nth deps i {}) :defines '())
-                       (get (nth old-deps i {}) :defines '())))
+                       (get (evaluated-deps aligned i) :defines '())))
+        ;; what a dropped record defined, provided from where its form stood (`:before`)
+        dropped-at (fn (i)
+                     (mapcat (fn (rec) (get (:deps rec) :defines '()))
+                       (filter (fn (rec) (= (:before rec) i)) dropped)))
         r (fold (fn (acc i)
-                  (let ([provided stale tail?] acc
+                  (let ([provided0 stale tail?] acc
+                        provided (append provided0 (dropped-at i))
                         mine? (or tail?
                                 (includes? changed i)
                                 (reaches? (get (nth deps i {}) :references '()) provided)))
@@ -218,23 +290,25 @@ suffix rule."
                       [(append provided (defines-at i))
                         (cons i stale)
                         (or tail? (namespace-form? (get srcs i "")))]
-                      acc)))
+                      [provided stale tail?])))
             ['() '() false]
             (range total)))
     (reverse (second r))))
 
-(defn launch-plan (srcs old-srcs deps old-deps total)
+(defn launch-plan (srcs evaluated deps total)
   "The indices a launch re-sends: [[stale-forms]] when the dependency data lines up with the
-forms one-for-one, else every form from the first change down.
+forms one-for-one, else every form from the first change down. `evaluated` is the session's
+raw `{index -> record}`; it is re-keyed to the current forms here ([[realign-evaluated]]).
 
 The fallback is not defensive padding. `reflect/source-deps` and `sexp/top-level-forms` parse
 the same text with the same notion of a top-level form, so they agree — but a buffer is
 mid-edit half the time, and if they ever disagreed the indices would be off by one and this
 would re-run the wrong forms, silently. Re-running too much is the failure worth having."
-  (if (= (count deps) total)
-    (stale-forms srcs old-srcs deps old-deps total)
-    (let (from (first (changed-forms srcs old-srcs total)))
-      (if (nil? from) '() (range from total)))))
+  (let (realigned (realign-evaluated srcs evaluated total))
+    (if (= (count deps) total)
+      (stale-forms srcs realigned deps total)
+      (let (from (first (changed-forms srcs (:aligned realigned) total)))
+        (if (nil? from) '() (range from total))))))
 
 ;; ---- notes: a result at the end of its form --------------------------------------
 
@@ -292,23 +366,36 @@ blank on its way to the same answer."
             forms (forms-of text)
             srcs (form-srcs-in text forms)
             spans (form-spans-in text forms)
-            old-srcs (or (:playground-srcs b) {})
+            ;; re-keyed to the forms as they are now — a form that moved keeps its record
+            evaluated (:aligned (realign-evaluated srcs
+                                  (or (:playground-evaluated b) {})
+                                  (count forms)))
+            ;; …and a form whose identical text is already IN FLIGHT needs no second request:
+            ;; its answer is coming. Counted for the plan only — never stored as evaluated,
+            ;; since only a reply landing may say that (see the module note).
+            in-flight (into {}
+                        (map (fn (kv) [(:region (second kv)) {:src (:src (second kv))}])
+                          (get-in m [:playground :pending] {})))
+            known (merge (or (:playground-evaluated b) {}) in-flight)
             deps (deps-of text)
-            old-deps (or (:playground-deps b) '())
             old-notes (or (results/eol-notes-any b) {})
             live (playground-live?)
-            stale (launch-plan srcs old-srcs deps old-deps (count forms))
+            stale (launch-plan srcs known deps (count forms))
             start-id (get-in m [:playground :next-id] 1)
             ;; Drop the cached cascades of everything being re-sent (they describe code that
             ;; no longer exists) and clear the notes, before anything runs. Only the re-sent
             ;; ones: a form nobody re-ran keeps a report that is still true.
             m0 (pg-update-buf (workings/forget *spy-spec* m (fn (i) (includes? stale i)))
                  (fn (bb)
-                   (pg-clear-notes (assoc bb
-                                     :playground-rope rope
-                                     :playground-srcs srcs
-                                     :playground-spans spans
-                                     :playground-deps deps))))
+                   (pg-clear-notes
+                     (assoc bb
+                       :playground-rope rope
+                       :playground-spans spans
+                       ;; A form being SENT is no longer one the session has
+                       ;; evaluated — only its reply landing puts it back. A
+                       ;; launch that recorded what it asked for would leave a
+                       ;; lost reply invisible forever (see the note above).
+                       :playground-evaluated (pg-unevaluate evaluated stale)))))
             note-at (fn (mm i note) (pg-set-note mm i note spans text))
             result (if (empty? stale)
                      ;; nothing changed (whitespace the reader ignores, an edit undone):
@@ -360,11 +447,15 @@ blank on its way to the same answer."
                                       (sandbox-eval next-id src *playground-timeout-ms* :all)
                                       [(note-at m1 i {:kind :pending :text "⋯ evaluating…"})
                                         (inc next-id)
-                                        (assoc pending next-id {:region i :rope rope})])
-                                    [(note-at m1
+                                        (assoc pending next-id {:region i :src src})])
+                                    [(pg-evaluated (note-at m1
+                                                     i
+                                                     (liveeval/result-note (eval-server/eval-capturing src
+                                                                             nil)
+                                                       src))
                                        i
-                                       (liveeval/result-note (eval-server/eval-capturing src nil)
-                                         src))
+                                       src
+                                       (nth deps i {}))
                                       next-id pending])))))
                        [m0 start-id {}]
                        (range (count forms))))
@@ -378,12 +469,20 @@ blank on its way to the same answer."
 (defn playground-sandbox-ready (m gen)
   "The child announced itself (first boot, or a reset): remember its generation and clear the
 eval stash so the next idle beat replays the whole buffer against the fresh, empty session.
-Clearing `:playground-srcs` is the load-bearing half — leaving it behind would make the
+Clearing `:playground-evaluated` is the load-bearing half — leaving it behind would make the
 restart re-send nothing, and every form would look evaluated against a session that no longer
-holds any of its definitions."
-  (pg-update-buf (update m :playground merge {:sandbox-gen gen :sandbox-ready true :pending {}})
+holds any of its definitions.
+
+`:pending` is KEPT. A request sent before the banner queued in the worker, and the worker
+flushes its queue to the child that just readied — so those replies are coming, carrying this
+generation, and are the answers to the forms as they stand. Dropping them here is what made
+the first open of a playground answer nothing: the reply landed on no pending entry, the form
+stayed un-evaluated, and every later launch — every settled keystroke — sent it again. A
+request that was IN FLIGHT when a reset killed the child was answered `{:timeout true}` by
+the worker before the respawn, so nothing is left dangling."
+  (pg-update-buf (update m :playground merge {:sandbox-gen gen :sandbox-ready true})
     (fn (bb)
-      (assoc bb :playground-rope nil :playground-srcs {} :playground-spans [] :playground-deps '()))))
+      (assoc bb :playground-rope nil :playground-spans [] :playground-evaluated {}))))
 
 (defn playground-sandbox-reply (m reply gen)
   "Fold one sandbox reply into the model. A reply the playground never sent, one from a
@@ -398,21 +497,50 @@ cascade."
       else
         (let (m1 (update m :playground update :pending dissoc id)
               b (pg-buf m1)
-              i (:region pend))
-          (if (or (nil? b) (not= (buffer-rope b) (:rope pend)))
+              i0 (:region pend))
+          (if (nil? b)
             m1
-            ;; The rope test above has already proved the buffer still holds the text the
-            ;; launch parsed, so its cached extents and sources are exact — a reply lands
-            ;; without parsing anything, where it used to re-parse the whole buffer once per
-            ;; form sent.
+            ;; The extents cached by the last launch are exact while the buffer still holds
+            ;; the text it parsed, which is the ordinary case and costs no parse. When it
+            ;; does not — an edit landed while this was in flight — the answer may still be
+            ;; good, so the extents are re-derived rather than the reply thrown away.
             (let (text (buffer-text b)
-                  spans (or (:playground-spans b) [])
-                  src (get (or (:playground-srcs b) {}) i)
-                  m2 (pg-set-note m1 i (liveeval/result-note reply src) spans text))
-              ;; `workings/show` caches this form's cascade and opens the pane only if the
-              ;; cascade is real AND belongs to the form the cursor is in — so a background
-              ;; re-eval never yanks the pane off what you are reading.
-              (workings/show *spy-spec* m2 i (form-index-in spans (:point b 0)) reply src)))))))
+                  fresh? (= (buffer-rope b) (:playground-rope b))
+                  spans (if fresh?
+                          (or (:playground-spans b) [])
+                          (form-spans-in text (forms-of text)))
+                  src-at (fn (k)
+                           (let (span (nth spans k nil))
+                             (when span (string/substring text (first span) (second span)))))
+                  ;; The form this answers is the one whose source is still what was sent —
+                  ;; at the index it had, or, when a line typed above it moved it down a
+                  ;; slot while this was in flight, the nearest slot holding that text
+                  ;; (nearest, so twin forms take their own reply and not each other's).
+                  i (if (= (src-at i0) (:src pend))
+                      i0
+                      (first (sort (fn (a b) (< (math/abs (- a i0)) (math/abs (- b i0))))
+                               (filter (fn (k) (= (src-at k) (:src pend)))
+                                 (range (count spans))))))
+                  src (when i (src-at i)))
+              ;; Accepted when THE FORM's source is still the one that was sent. The test
+              ;; used to be the whole buffer's rope, which dropped every reply the moment you
+              ;; typed anywhere — and the launch had already recorded the send as evaluated,
+              ;; so nothing re-sent it and the session kept a definition the buffer no longer
+              ;; showed. A form's answer does not go stale because a different form moved.
+              (if (nil? i)
+                m1
+                (let (m2 (pg-evaluated (pg-set-note m1
+                                         i
+                                         (liveeval/result-note reply src)
+                                         spans
+                                         text)
+                           i
+                           src
+                           (nth (deps-of text) i {})))
+                  ;; `workings/show` caches this form's cascade and opens the pane only if
+                  ;; the cascade is real AND belongs to the form the cursor is in — so a
+                  ;; background re-eval never yanks the pane off what you are reading.
+                  (workings/show *spy-spec* m2 i (form-index-in spans (:point b 0)) reply src)))))))))
 
 (defn playground-sandbox-down (m code)
   "The child went away and somebody still wants a sandbox (letting it go for good is
@@ -552,7 +680,8 @@ reopen it behind you; asking for the playground again does, because that is you 
               text (when b (buffer-text b)))
           (if (nil? b)
             m1
-            (workings/reopen *spy-spec* m1
+            (workings/reopen *spy-spec*
+              m1
               (form-index-in (form-spans-in text (forms-of text)) (:point b 0)))))
         ;; `:playground` stacks a two-hook layer over the real brood-mode, so the buffer is a
         ;; Brood file first — highlighting, indent, eldoc and paredit all come for free.

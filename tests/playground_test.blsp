@@ -20,7 +20,7 @@
 
 ;; Open the playground and put `text` in it — the state a launch or a reply acts on.
 ;;
-;; Stamps the same parse cache a launch does (`:playground-rope` + the three index maps),
+;; Stamps the same parse cache a launch does (`:playground-rope` + the extents),
 ;; because that is the state a REPLY arrives into: a reply is only accepted when the rope is
 ;; still the one its request was sent for, and everything it needs to place a note is read
 ;; from that launch's cache rather than re-parsed. A fixture without it would be testing a
@@ -31,12 +31,21 @@
     (assoc b
       :rope rope
       :playground-rope rope
-      :playground-srcs (playground/form-srcs-in text forms)
-      :playground-spans (playground/form-spans-in text forms)
-      :playground-deps (playground/deps-of text))))
+      :playground-spans (playground/form-spans-in text forms))))
 
 (defn pg-open (text)
   (let (m (playground/cmd-brood-playground (m-of "") :none)
+        i (model/ed-buffer-index-by-name m playground/*buffer-name*))
+    (assoc m
+      :buffers
+        (assoc (:buffers m)
+          i (assoc (nth (:buffers m) i) :rope (buffer-rope (make-buffer text)))))))
+
+;; The state a REPLY arrives into — the launch's parse cache, and no results yet. Distinct
+;; from `pg-open` (a buffer nothing has evaluated) because a launch over the same text would
+;; also evaluate it, which is not what a test about placing one reply wants to assert.
+(defn pg-after-launch (text)
+  (let (m (pg-open text)
         i (model/ed-buffer-index-by-name m playground/*buffer-name*))
     (assoc m :buffers (assoc (:buffers m) i (pg-seed (nth (:buffers m) i) text)))))
 
@@ -321,19 +330,52 @@
     (assert= (results/line-count "a\nb\n") (buffer-line-count (make-buffer "a\nb\n")))
     (assert= (results/line-count "") (buffer-line-count (make-buffer "")))))
 
+;; What the session has evaluated, as the launch records it: `{index -> {:src :deps}}`.
+(defn evaluated (srcs) (into {} (map (fn (kv) [(first kv) {:src (second kv)}]) srcs)))
+
 (describe "changed-forms — whose text moved"
   (test "nothing changed, nothing to send"
-    (assert= (playground/changed-forms {0 "(a)" 1 "(b)"} {0 "(a)" 1 "(b)"} 2) '()))
+    (assert= (playground/changed-forms {0 "(a)" 1 "(b)"} (evaluated {0 "(a)" 1 "(b)"}) 2) '()))
 
   (test "the ones that differ, in order"
-    (assert= (playground/changed-forms {0 "(z)" 1 "(c)"} {0 "(a)" 1 "(b)"} 2) (list 0 1))
-    (assert= (playground/changed-forms {0 "(a)" 1 "(c)"} {0 "(a)" 1 "(b)"} 2) (list 1)))
+    (assert= (playground/changed-forms {0 "(z)" 1 "(c)"} (evaluated {0 "(a)" 1 "(b)"}) 2)
+      (list 0 1))
+    (assert= (playground/changed-forms {0 "(a)" 1 "(c)"} (evaluated {0 "(a)" 1 "(b)"}) 2) (list 1)))
 
   (test "a newly typed form is a change"
-    (assert= (playground/changed-forms {0 "(a)" 1 "(b)"} {0 "(a)"} 2) (list 1)))
+    (assert= (playground/changed-forms {0 "(a)" 1 "(b)"} (evaluated {0 "(a)"}) 2) (list 1))))
 
-  (test "a DELETED form is a change too — the count shrinking must not hide it"
-    (assert= (playground/changed-forms {0 "(a)"} {0 "(a)" 1 "(b)"} 1) (list 1))))
+;; An index is not an identity: a record follows its text, so a form that merely moved down
+;; a slot (you typed a form, or a line that split one, above it) is still evaluated.
+(describe "realign-evaluated — a record follows its text"
+  (test "nothing moved: the records stay where they are, nothing dropped"
+    (let (r (playground/realign-evaluated {0 "(a)" 1 "(b)"} (evaluated {0 "(a)" 1 "(b)"}) 2))
+      (assert= (:aligned r) (evaluated {0 "(a)" 1 "(b)"}))
+      (assert= (:dropped r) '())))
+
+  (test "a form inserted at the top shifts the records down with their forms"
+    (let (r (playground/realign-evaluated {0 "(new)" 1 "(a)" 2 "(b)"}
+              (evaluated {0 "(a)" 1 "(b)"})
+              3))
+      (assert= (:aligned r) (evaluated {1 "(a)" 2 "(b)"}))
+      (assert= (:dropped r) '())))
+
+  (test "a deleted form's record is dropped, the rest realign"
+    (let (r (playground/realign-evaluated {0 "(b)"} (evaluated {0 "(a)" 1 "(b)"}) 1))
+      (assert= (:aligned r) (evaluated {0 "(b)"}))
+      (assert= (map :src (:dropped r)) (list "(a)"))
+      ;; it stood above `(b)`, which is now form 0
+      (assert= (map :before (:dropped r)) (list 0))))
+
+  (test "a dropped record with nothing surviving below it stands at the end"
+    (let (r (playground/realign-evaluated {0 "(a)"} (evaluated {0 "(a)" 1 "(b)"}) 1))
+      (assert= (map :before (:dropped r)) (list 1))))
+
+  (test "an edited form's old record is dropped, not handed to a later twin"
+    ;; the first `(f 1)` was edited; the second is the same text it always was
+    (let (r (playground/realign-evaluated {0 "(f 2)" 1 "(f 1)"} (evaluated {0 "(f 1)" 1 "(f 1)"}) 2))
+      (assert= (:aligned r) (evaluated {1 "(f 1)"}))
+      (assert= (count (:dropped r)) 1))))
 
 ;; What a launch re-sends. The rule this replaced was "everything from the first change
 ;; down", which is correct and expensive — editing the second of twenty forms re-evaluated
@@ -342,15 +384,40 @@
 (describe "the launch plan — only what the edit could reach"
   ;; Drives the real path: `srcs`/`deps` derived from text the way a launch derives them, so
   ;; a change to how forms or deps are computed is caught here rather than in a fixture.
+  ;; `before` is what the session has evaluated — the records a launch over it would have
+  ;; left behind, sources and deps alike.
+  (defn evaluated-of (text)
+    (let (deps (playground/deps-of text))
+      (into {}
+        (map (fn (kv) [(first kv) {:src (second kv) :deps (nth deps (first kv) {})}])
+          (playground/form-srcs text)))))
   (defn plan (before after)
     (playground/launch-plan (playground/form-srcs after)
-      (playground/form-srcs before)
+      (evaluated-of before)
       (playground/deps-of after)
-      (playground/deps-of before)
       (count (playground/forms-of after))))
 
   (test "nothing changed, nothing re-sent"
     (assert= (plan "(+ 1 2)\n(+ 3 4)\n" "(+ 1 2)\n(+ 3 4)\n") '()))
+
+  ;; The complaint that motivated realignment: adding a line near the top re-evaluated the
+  ;; whole buffer, because every form below it had moved down a slot.
+  (test "a blank line added between forms re-sends nothing"
+    (assert= (plan "(+ 1 2)\n(+ 3 4)\n" "(+ 1 2)\n\n\n(+ 3 4)\n") '()))
+
+  (test "a form typed above the others re-sends that form alone"
+    (assert= (plan "(defn f (n) n)\n(f 1)\n(+ 3 4)\n"
+               "(+ 0 0)\n(defn f (n) n)\n(f 1)\n(+ 3 4)\n")
+      (list 0)))
+
+  (test "a form typed in the middle re-sends that form alone"
+    (assert= (plan "(defn f (n) n)\n(f 1)\n(+ 3 4)\n"
+               "(defn f (n) n)\n(+ 0 0)\n(f 1)\n(+ 3 4)\n")
+      (list 1)))
+
+  ;; …unless what it defines is used below it — then, as for any definition, its users too.
+  (test "a definition typed above its users re-sends them as well"
+    (assert= (plan "(g 1)\n(+ 3 4)\n" "(defn g (n) n)\n(g 1)\n(+ 3 4)\n") (list 0 1)))
 
   ;; The point of the whole exercise.
   (test "editing a form nothing uses re-sends that form alone"
@@ -390,18 +457,17 @@
   (test "deleting a definition still reaches what called it"
     (assert= (plan "(defn f (n) n)\n(f 1)\n" "(f 1)\n") (list 0)))
 
-  ;; A deleted form's index is past the end of the new buffer, so the walk never visits it —
-  ;; and its callers would keep showing the answer the definition it lost used to give.
-  (test "deleting a definition still reaches what called it"
-    (assert= (plan "(defn f (n) n)\n(f 1)\n" "(f 1)\n") (list 0)))
+  ;; Realigned, `(+ 3 4)` keeps its record; `(f 1)` matches too, and would keep the answer the
+  ;; definition it lost used to give — so a dropped record's defines reach its callers.
+  (test "deleting a definition above unmoved callers still reaches them"
+    (assert= (plan "(defn f (n) n)\n(+ 3 4)\n(f 1)\n" "(+ 3 4)\n(f 1)\n") (list 1)))
 
   ;; The safety valve: if the deps ever failed to line up with the forms one-for-one, the
   ;; indices would be off and this would re-run the WRONG forms, silently. Re-running too
   ;; much is the failure worth having.
   (test "deps that do not line up fall back to the old suffix rule"
     (assert= (playground/launch-plan {0 "(a)" 1 "(b)" 2 "(c)"}
-               {0 "(a)" 1 "(z)" 2 "(c)"}
-               '()
+               (evaluated {0 "(a)" 1 "(z)" 2 "(c)"})
                '()
                3)
       (list 1 2))))
@@ -418,6 +484,41 @@
           i (model/ed-buffer-index-by-name m2 playground/*buffer-name*))
       (is (includes? (buffer-text (nth (:buffers m2) i)) "my-work")))))
 
+(describe "the ready banner and what was already sent"
+  ;; On open, the launch runs before the child has booted: its request QUEUES in the worker,
+  ;; and the worker flushes the queue to the child that then readies. The reply is coming.
+  (test "ready keeps the pending requests and forgets what was evaluated"
+    (let (m0 (pg-after-launch "(+ 1 2)")
+          i (model/ed-buffer-index-by-name m0 playground/*buffer-name*)
+          m1 (update m0
+               :playground merge
+               {:sandbox-gen 1 :pending {7 {:region 0 :src "(+ 1 2)"}}})
+          m2 (playground/playground-sandbox-ready (assoc m1
+                                                    :buffers
+                                                      (assoc (:buffers m1)
+                                                        i
+                                                          (assoc (nth (:buffers m1) i)
+                                                            :playground-evaluated
+                                                              {0 {:src "(+ 1 2)"}})))
+               1))
+      (assert= (get-in m2 [:playground :pending]) {7 {:region 0 :src "(+ 1 2)"}})
+      (assert= (:playground-evaluated (pg-buf-of m2)) {})
+      ;; the reply that follows lands as usual
+      (let (m3 (playground/playground-sandbox-reply m2 {:id 7 :ok true :value "3" :ms 0} 1))
+        (is (includes? (:text (get (pg-notes m3) 0)) "=> 3"))
+        (assert= (get-in (pg-buf-of m3) [:playground-evaluated 0 :src]) "(+ 1 2)"))))
+
+  ;; …and the launch the banner provokes (it drops `:playground-rope`) must not send the
+  ;; same form a second time while the first request is still in flight.
+  (test "a launch does not re-send a form whose identical request is in flight"
+    (let (m0 (pg-after-launch "(+ 1 2)")
+          m1 (update m0
+               :playground merge
+               {:sandbox-gen 1 :pending {7 {:region 0 :src "(+ 1 2)"}}})
+          m2 (playground/playground-sandbox-ready m1 1)
+          m3 (playground/ed-playground-launch m2))
+      (assert= (keys (get-in m3 [:playground :pending])) (list 7)))))
+
 (describe "sandbox replies land as notes"
   ;; The fan-out router hands every client every reply, so ignoring what isn't yours is not
   ;; an optimisation — it is what makes routing without an owner tag correct.
@@ -426,20 +527,20 @@
       (assert= (playground/playground-sandbox-reply m {:id 999 :ok true :value "3"} nil) m)))
 
   (test "a reply for a live request becomes the form's note"
-    (let (m0 (pg-open "(+ 1 2)")
+    (let (m0 (pg-after-launch "(+ 1 2)")
           m1 (update m0
                :playground merge
-               {:sandbox-gen 1 :pending {7 {:region 0 :rope (buffer-rope (pg-buf-of m0))}}})
+               {:sandbox-gen 1 :pending {7 {:region 0 :src "(+ 1 2)"}}})
           m2 (playground/playground-sandbox-reply m1 {:id 7 :ok true :value "3" :ms 0} 1))
       (is (includes? (:text (get (pg-notes m2) 0)) "=> 3"))))
 
   ;; A superseded child's straggler carries an answer computed in a session that no longer
   ;; exists. Showing it would be showing a confident value for code that never ran here.
   (test "a reply from a superseded child is dropped"
-    (let (m0 (pg-open "(+ 1 2)")
+    (let (m0 (pg-after-launch "(+ 1 2)")
           m1 (update m0
                :playground merge
-               {:sandbox-gen 2 :pending {7 {:region 0 :rope (buffer-rope (pg-buf-of m0))}}})
+               {:sandbox-gen 2 :pending {7 {:region 0 :src "(+ 1 2)"}}})
           m2 (playground/playground-sandbox-reply m1 {:id 7 :ok true :value "3"} 1))
       (assert= (pg-notes m2) {})))
 
@@ -448,10 +549,11 @@
   ;; appeared on a line of its own would push every line below it down each time the
   ;; checker changed its mind, which is text jumping under the cursor.
   (test "the type hint lands AT the form and the answer under it"
-    (let (m0 (pg-open "(defn pgt-len (s)\n  (string/length s))\n")
+    (let (m0 (pg-after-launch "(defn pgt-len (s)\n  (string/length s))\n")
           m1 (update m0
                :playground merge
-               {:sandbox-gen 1 :pending {7 {:region 0 :rope (buffer-rope (pg-buf-of m0))}}})
+               {:sandbox-gen 1
+                :pending {7 {:region 0 :src "(defn pgt-len (s)\n  (string/length s))"}}})
           m2 (playground/playground-sandbox-reply m1 {:id 7 :ok true :value "pgt-len" :ms 0} 1)
           notes (pg-notes m2))
       (assert= (:text (get notes 0)) "=> pgt-len")
@@ -465,21 +567,35 @@
   ;; of the buffer has its answer clamped back onto its own line, which is where the hint
   ;; would go. Two ghost texts at one line's end overpaint, so there they rejoin.
   (test "a form with nowhere below it keeps hint and answer on one line"
-    (let (m0 (pg-open "(+ 1 1/2)")
+    (let (m0 (pg-after-launch "(+ 1 1/2)")
           m1 (update m0
                :playground merge
-               {:sandbox-gen 1 :pending {7 {:region 0 :rope (buffer-rope (pg-buf-of m0))}}})
+               {:sandbox-gen 1 :pending {7 {:region 0 :src "(+ 1 1/2)"}}})
           m2 (playground/playground-sandbox-reply m1 {:id 7 :ok true :value "3/2" :ms 0} 1)
           notes (pg-notes m2))
       (assert= (:text (get notes 0)) "=> 3/2  : ratio")
       (assert= (:line (get notes 0)) 0)
       (assert= (get notes (results/hint-key 0)) nil)))
 
-  (test "a reply whose buffer has moved on since the send is dropped"
-    (let (m0 (pg-open "(+ 1 2)")
+  ;; A line typed above the form while its reply was in flight moved it down a slot; the
+  ;; reply still belongs to it, and finds it by its text.
+  (test "a reply for a form that moved since the send lands on the moved form"
+    (let (m0 (pg-after-launch "(+ 1 2)")
           m1 (update m0
                :playground merge
-               {:sandbox-gen 1 :pending {7 {:region 0 :rope (buffer-rope (make-buffer "other"))}}})
+               {:sandbox-gen 1 :pending {7 {:region 0 :src "(+ 1 2)"}}})
+          m2 (retext m1 "(+ 5 5)\n(+ 1 2)")
+          m3 (playground/playground-sandbox-reply m2 {:id 7 :ok true :value "3" :ms 0} 1)
+          notes (pg-notes m3))
+      (is (includes? (:text (get notes 1)) "=> 3"))
+      (assert= (get notes 0) nil)
+      (assert= (get-in (pg-buf-of m3) [:playground-evaluated 1 :src]) "(+ 1 2)")))
+
+  (test "a reply whose form has been edited since the send is dropped"
+    (let (m0 (pg-after-launch "(+ 1 2)")
+          m1 (update m0
+               :playground merge
+               {:sandbox-gen 1 :pending {7 {:region 0 :src "(+ 1 3)"}}})
           m2 (playground/playground-sandbox-reply m1 {:id 7 :ok true :value "3"} 1))
       (assert= (pg-notes m2) {}))))
 
