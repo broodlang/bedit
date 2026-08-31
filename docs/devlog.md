@@ -10,6 +10,39 @@ Language-level changes live in the Brood repo's `docs/devlog.md` + `docs/decisio
 
 ---
 
+## 2026-08-31
+
+### two suite failures reproduce ON DEMAND under `taskset -c 0,1` — the CPU count was the missing variable
+- **Why:** both had been seen only on a CI runner and read as flaky infrastructure.
+  `tests/remote_test.blsp`'s own comment says as much — "observed on a 2-core CI runner
+  (and once locally)" — and its mitigation (one key per await) was pacing rather than a
+  fix, because nobody could make it fail when they wanted to. It turns out the variable
+  is simply **core count**, not luck: pinning the suite to two cores fails both cases
+  *every* run, while all 28 cores pass 3/3 and either case alone passes 3/3.
+
+  ```bash
+  ( ulimit -v 16000000; taskset -c 0,1 nest test )   # both fail, every time
+  nest test                                          # 1378/1378
+  ```
+
+- **What fails, and what it means:**
+  - `tests/remote_test.blsp:203` (two collab sessions) — expected `"Zq"`, got **`"qZ"`**.
+    Exactly the mechanism the comment predicts: A's first press lands, then the attach
+    SEED rewinds the server-side session's point, so the next press splices at 0. The
+    pacing does not close it; the fix the comment already names does — **version-guard
+    the seed against in-flight edits** — and it is a real collab bug, not a test artifact.
+    A remote editor that silently transposes your keystrokes under load is the user-facing
+    shape of this.
+  - `tests/tutor_test.blsp:1612` (every shipped answer solves its exercise) — a note comes
+    back `:fail` where `:pass` is required. The assertion is inside a double `dotimes` with
+    no lesson/box in the message, so the next step is to name them before diagnosing.
+
+- **Not caused by the brood 0.20.0 / data-first migration.** bedit's own CI was red on
+  `0e61442f` and `1b9a03a2` — both pre-migration — and `672952f6` was red only on
+  `nest format --check` (39 files, since fixed in `32bdcf0a`). Found while making brood's
+  `downstream-bedit` gate green for the 0.20.0 release, which is the job that keeps
+  hitting it.
+
 ## 2026-08-02
 
 ### the tail-call lesson stops contradicting itself; every display truncates — Brood ADR-207
