@@ -33,23 +33,22 @@ is skipped — one bad package never blocks the editor."
 (defn- pkg-dir (name) (path/join (user-package-dir) name))
 (defn- pkg-manifest (name) (path/join (pkg-dir name) "project.blsp"))
 
-(defn- plist-get
-  (plist key)
+(defn- plist-get (plist key)
   "The value after `key` in a plist, or nil — a local copy (no dependency on the project tool)."
   (cond
     (or (nil? plist) (nil? (rest plist))) nil
     (= (first plist) key) (first (rest plist))
     :else (plist-get (rest (rest plist)) key)))
 
-(defn- manifest-value
-  (name key)
+(defn- manifest-value (name key)
   "A value from an installed package's `(project …)` manifest, or nil."
   (try
     (let (form (reflect/read-string (file/slurp (pkg-manifest name))))
       (if (and (list? form) (= (first form) 'project))
         (plist-get (rest form) key)
         nil))
-    (catch e nil)))
+    (catch e
+      (do (log/warn (str "packages: cannot read the manifest of " name ": " (error-message e))) nil))))
 
 (defn installed? (name)
   "Whether package `name` is installed in the user package dir."
@@ -63,17 +62,15 @@ is skipped — one bad package never blocks the editor."
   "The names of packages installed in the user package dir (a dir with a project.blsp)."
   (if (not (file/exists? (user-package-dir)))
     []
-    (vec (filter installed? (file/ls (user-package-dir))))))
+    (vec (filter (file/ls (user-package-dir)) installed?))))
 
 ;; ---- apply / unapply a contribution (themes today) -------------------------
 
-(defn- add-to-load-path!
-  (name)
+(defn- add-to-load-path! (name)
   "Put package `name`'s src/ on `*load-path*` so `(require-one 'name)` finds it (idempotent)."
-  (reflect/add-load-path! (path/join (pkg-dir name) "src")))
+  (reflect/add-load-path (path/join (pkg-dir name) "src")))
 
-(defn- plugin-entry
-  (name)
+(defn- plugin-entry (name)
   "Require package `name` (its src must be on the load-path) and return its `(bedit-plugin)`
 contribution map, or nil if it lacks the entry or throws."
   (try
@@ -81,7 +78,8 @@ contribution map, or nil if it lacks the entry or throws."
       (require-one (symbol name))
       (let (entry (reflect/eval (symbol (str name "/bedit-plugin"))))
         (if (fn? entry) (entry) nil)))
-    (catch e nil)))
+    (catch e
+      (do (log/warn (str "packages: no plugin contribution from " name ": " (error-message e))) nil))))
 
 (defn apply-plugin! (name)
   "Load package `name`'s contribution into the LIVE editor: put it on the load-path, require it,
@@ -108,8 +106,7 @@ they leave `M-x theme-select`. The module stays in memory until restart (Brood h
   "At startup: put every installed package on the load-path, then apply each that `:enhances
 bedit`. Returns the vector of names applied. Safe with no packages dir (⇒ [])."
   (doseq (name (installed-packages)) (add-to-load-path! name))
-  (vec (seq/keep (fn (name) (when (apply-plugin! name) name))
-         (project/enhancers-in (user-package-dir) *bedit-name* (about/bedit-version)))))
+  (vec (seq/keep (project/enhancers-in (user-package-dir) *bedit-name* (about/bedit-version)) (fn (name) (when (apply-plugin! name) name)))))
 
 ;; ---- install / remove / update (runtime, from the hive) --------------------
 
@@ -148,8 +145,7 @@ or [] on a network failure."
 ;; Rows are 0-indexed to the buffer line (the git-status/dired discipline), nil for the header
 ;; lines, so `package-row-at` reads the row under point.
 
-(defn- row-status
-  (installed latest)
+(defn- row-status (installed latest)
   (cond
     (nil? installed) :available
     (and latest (version/newer? latest installed)) :update
@@ -160,8 +156,8 @@ or [] on a network failure."
 status, plus any installed package not on the hive (a local/dev one). Each row is
 `{:name :installed :latest :status :description}`."
   (let (avail (available)
-        avail-names (map :name avail)
-        from-hive (map (fn (p)
+        avail-names (map avail :name)
+        from-hive (map avail (fn (p)
                          (let (name (:name p)
                                installed (installed-version name)
                                latest (:latest_version p))
@@ -169,31 +165,26 @@ status, plus any installed package not on the hive (a local/dev one). Each row i
                             :installed installed
                             :latest latest
                             :description (or (:description p) "")
-                            :status (row-status installed latest)}))
-                    avail)
-        orphans (seq/keep (fn (name)
+                            :status (row-status installed latest)})))
+        orphans (seq/keep (installed-packages) (fn (name)
                             (when (not (includes? avail-names name))
                               {:name name
                                :installed (installed-version name)
                                :latest nil
                                :description "(installed — not on the registry)"
-                               :status :installed}))
-                  (installed-packages)))
+                               :status :installed}))))
     (append from-hive orphans)))
 
 (check-allow :non-tail-recursion
   (defn- spaces (n) (if (<= n 0) "" (str " " (spaces (- n 1))))))
-(defn- pad
-  (s width)
+(defn- pad (s width)
   (let (text (str (or s "-")))
     (if (>= (count text) width) text (str text (spaces (- width (count text)))))))
 
-(defn- status-label
-  (status)
+(defn- status-label (status)
   (cond (= status :update) "update" (= status :installed) "installed" :else "available"))
 
-(defn- render-package-row
-  (row)
+(defn- render-package-row (row)
   (str "  "
     (pad (status-label (:status row)) 11)
     (pad (:name row) 30)
@@ -211,14 +202,13 @@ status, plus any installed package not on the hive (a local/dev one). Each row i
       (pad "Latest" 10)
       "Description")))
 
-(defn- render-packages
-  (rows)
+(defn- render-packages (rows)
   "The *Packages* buffer text, and the line→row vector aligned to it (nil for header lines)."
   (let (header-lines *packages-header*
-        body (map render-package-row rows)
+        body (map rows render-package-row)
         ;; rows aligned to buffer lines: one nil per header line, then one row per body line
-        line-rows (append (map (fn (_) nil) header-lines) rows))
-    {:text (string/join "\n" (append header-lines body))
+        line-rows (append (map header-lines (fn (_) nil)) rows))
+    {:text (string/join (append header-lines body) "\n")
      :rows line-rows}))
 
 (defn package-row-at (m)
@@ -281,7 +271,7 @@ theme-select at once. Outside the browser, prompts for a package name."
   (assoc m
     :minibuffer
       (ed-name-prompt "Install package: "
-        (map :name (available))
+        (map (available) :name)
         (fn (mm name)
           (try
             (let (result (install! name))
@@ -319,7 +309,7 @@ Outside the browser, prompts."
       (let (name (:name row))
         (if (not (installed? name))
           (message m (str name " is not installed"))
-          (let (new-version (try (update! name) (catch e :error)))
+          (let (new-version (check-allow :discarded-catch (try (update! name) (catch e :error))))
             (cond
               (= new-version :error) (message m (str "update failed: " name))
               (nil? new-version) (message m (str name " is already up to date"))
@@ -333,7 +323,7 @@ Outside the browser, prompts."
       (ed-name-prompt "Update package: "
         (installed-packages)
         (fn (mm name)
-          (let (new-version (try (update! name) (catch e :error)))
+          (let (new-version (check-allow :discarded-catch (try (update! name) (catch e :error))))
             (cond
               (= new-version :error) (message mm (str "update failed: " name))
               (nil? new-version) (message mm (str name " is already up to date"))

@@ -199,7 +199,7 @@ about what is on screen (e.g. lazy diff loading, paging, centring point)."
   "The mode to show for `buf`: the name of its highest-precedence active layer that
 isn't a `:system` layer (so the always-on `global` layer is skipped — you see
 `brood` on a `.blsp` buffer, `text` otherwise). `\"\"` if there's no non-system layer."
-  (let (hit (seq/find (fn (l) (not (:system l))) (active-layers buf)))
+  (let (hit (seq/find (active-layers buf) (fn (l) (not (:system l)))))
     (if hit (->string (:name hit)) "")))
 
 (defn ed-set-mode (m type)
@@ -216,7 +216,7 @@ first. Each list holds the M-x names the layer claims as mode-specific."
 (defn ed-all-layer-commands ()
   "All command names claimed by any registered layer (all types + system layers) —
 used to subtract layer-owned names from the global M-x set."
-  (let (type-refs (mapcat layers-for-type (keys *type-layers*))
+  (let (type-refs (mapcat (keys *type-layers*) layers-for-type)
         all-refs (append type-refs *system-layers*))
     (apply append (layer-collect {:layers all-refs} :commands))))
 
@@ -363,7 +363,7 @@ matching rope, so its stale result is dropped and `ed-gitdiff-stale?` re-fires n
 Mirrors `ed-apply-diag`."
   (let (rope (:gitdiff-checking m)
         m1 (dissoc m :gitdiff-proc :gitdiff-checking)
-        idx (seq/index-where (fn (b) (= (buffer-rope b) rope)) (:buffers m1)))
+        idx (seq/index-where (:buffers m1) (fn (b) (= (buffer-rope b) rope))))
     (if (< idx 0)
       m1
       ;; stamp the result onto the buffer we diffed (found BY ROPE, so a mid-flight
@@ -378,11 +378,10 @@ Mirrors `ed-apply-diag`."
 `(model buf) -> string|nil` (resolved late, like every mode service). The seam a mode / layer
 uses to put its own info on the status bar (the git layer, a REPL connection, …); blanks and
 nils are dropped. The view appends these (and the global git branch) on the selected pane."
-  (seq/keep (fn (svc)
+  (seq/keep (layer-collect buf :modeline) (fn (svc)
               (let (f (if (symbol? svc) (reflect/eval svc) svc)
                     s (f m buf))
-                (if (or (nil? s) (= "" s)) nil s)))
-    (layer-collect buf :modeline)))
+                (if (or (nil? s) (= "" s)) nil s)))))
 
 (defn ed-web-dirty? (m)
   "True when a web mirror is running (`:server`) and has an unpublished edit/move
@@ -413,7 +412,10 @@ the edit."
     (if (nil? svc)
       (assoc m :eldoc nil :eldoc-point pt)
       (assoc m
-        :eldoc (try (svc (buffer-text buf) pt) (catch e nil))
+        :eldoc
+          (try
+            (svc (buffer-text buf) pt)
+            (catch e (do (log/warn (str "eldoc service failed: " (error-message e))) nil)))
         :eldoc-point pt))))
 
 (defn ed-eldoc-stale? (m)
@@ -440,7 +442,11 @@ stale or a compute is already in flight."
       :else
         (let (text (buffer-text buf)
               pt (buffer-point buf)
-              job (task (fn () (try (svc text pt) (catch e nil)))))
+              job (task (fn ()
+                          (try
+                            (svc text pt)
+                            (catch e
+                              (do (log/warn (str "eldoc service failed: " (error-message e))) nil))))))
           ;; :eldoc-checking records the point AND the rope the hint is being
           ;; computed for — the reply is dropped if the user switched buffers
           ;; (or the text changed) while the task ran, else buffer A's signature
@@ -614,7 +620,7 @@ symbol's name with the module path and `cmd-` prefix stripped (`commands/cmd-fin
 
 (defn ed-keys-label (keys)
   "A space-joined Emacs label for a key sequence (`[:ctrl-x :ctrl-e]` → `C-x C-e`)."
-  (string/join " " (map ed-key-label keys)))
+  (string/join (map keys ed-key-label) " "))
 
 ;; ---- key-accurate help text: ask the keymap, don't hardcode -------------------
 ;; Any text that tells the user which key to press goes stale the moment a key is
@@ -631,15 +637,14 @@ profile routing many keys through one command). With several bindings the choice
 **deterministic** — the shortest sequence, then the alphabetically-first label (so
 `C-n` beats `down`, and re-rendering never reshuffles) rather than whatever the
 map's hash order happens to yield."
-  (let (labels (if (nil? command) '() (map ed-keys-label (keymap-where-is km command)))
+  (let (labels (if (nil? command) '() (map (keymap-where-is km command) ed-keys-label))
         ;; a `[key-count label]` sort key: structural order compares the number
         ;; first (shortest chord wins), then the label as text — deterministic
         ;; without needing a string comparator (`<` is numeric in Brood).
-        best (first (sort-by (fn (l) [(count (string/split l " ")) l]) labels)))
+        best (first (sort-by labels (fn (l) [(count (string/split l " ")) l]))))
     (or best fallback)))
 
-(defn- ed-run-by-name
-  (km name)
+(defn- ed-run-by-name (km name)
   ;; "how you'd run `name` with no key bound": the profile's command-prompt key plus
   ;; the name. The SEPARATOR is part of the answer, not decoration — vim's prompt is
   ;; `:` and you type `:save` with no space, while emacs' is a chord and you type
@@ -649,8 +654,7 @@ map's hash order happens to yield."
         sep (if (= 1 (string/length prompt)) "" " "))
     (str prompt sep name)))
 
-(defn- ed-subst-hole
-  (km hole)
+(defn- ed-subst-hole (km hole)
   ;; One `\\[command]` hole -> the key bound to it, else how to run it by name.
   (let (sym (symbol (string/trim hole)))
     (or (ed-where-is km sym)
@@ -670,14 +674,12 @@ real bindings instead of contradicting them."
       text
       (str (first parts)
         (apply str
-          (map
-            (fn (part)
+          (map (rest parts) (fn (part)
               (let (close (index-of part "]"))
                 (if (< close 0)
                   (str "\\[" part) ; unterminated: leave it alone
                   (str (ed-subst-hole km (string/substring part 0 close))
-                    (string/substring part (inc close) (string/length part))))))
-            (rest parts)))))))
+                    (string/substring part (inc close) (string/length part))))))))))))
 
 (defn ed-command-keys (km specs)
   "A `{name → key-label}` vocabulary derived from the live keymap `km`: `specs` is
@@ -688,19 +690,19 @@ rebinding updates the documentation instead of contradicting it.
 
     (template/render \"press {{save}} to save\"
       (ed-command-keys km {:save ['commands/cmd-save-buffer \"C-x C-s\"]}))"
-  (fold (fn (acc kv)
+  (fold specs {} (fn (acc kv)
           (let ([name spec] kv
                 [command fallback] spec)
-            (assoc acc name (ed-where-is km command fallback))))
-    {}
-    specs))
+            (assoc acc name (ed-where-is km command fallback))))))
 
 (defn ed-doc (sym)
   "The docstring of command `sym` via the `doc` primitive. Tries it as given (a qualified
 keymap binding like `commands/cmd-find-file` resolves directly), then in the `commands/`
 namespace (where the M-x registry's bare `cmd-` symbols live). Nil if neither resolves."
-  (or (try (reflect/eval (list 'doc sym)) (catch e nil))
-    (try (reflect/eval (list 'doc (symbol (str "commands/" (->string sym))))) (catch e nil))))
+  ;; a bare `cmd-` name is unbound outside `commands/` — the first eval failing is the probe, not a fault
+  (check-allow :discarded-catch
+    (or (check-allow :discarded-catch (try (reflect/eval (list 'doc sym)) (catch e nil)))
+      (check-allow :discarded-catch (try (reflect/eval (list 'doc (symbol (str "commands/" (->string sym))))) (catch e nil))))))
 
 (defn ed-first-line (s)
   "The first line of string `s` (the docstring summary shown in the echo area)."
@@ -791,8 +793,7 @@ text (point at end). Stored as the minibuffer's `:edit`."
 narrowable) or a `:candidates-fn` (computed each keystroke)."
   (or (:rank-source mb) (:candidates-fn mb)))
 
-(defn- mb-rank
-  (mb text prev-for prev-ranked)
+(defn- mb-rank (mb text prev-for prev-ranked)
   "`[ranked cands]` for minibuffer `mb` at input `text`. For a `:rank-source` prompt,
 fuzzy-rank the source — narrowing from `prev-ranked` when `text` extends `prev-for`
 (`completion/completion-rank-incremental`) — and cap to `:rank-cap` for display; `ranked`
@@ -805,7 +806,7 @@ result. `[nil ()]` when the prompt has neither source."
                      prev-for
                      prev-ranked
                      (:rank-source mb)))
-        [ranked (take (or (:rank-cap mb) 20) ranked)])
+        [ranked (take ranked (or (:rank-cap mb) 20))])
     (:candidates-fn mb) [nil ((:candidates-fn mb) text)]
     :else [nil ()]))
 
@@ -818,8 +819,7 @@ pending prefix, not yet revealed, or a minibuffer/menu is open)."
       0
       (count (%map-pairs km)))))
 
-(defn- ed-list-rows
-  (n rows)
+(defn- ed-list-rows (n rows)
   "Echo-area height for an `n`-row list below the prompt: 0 → 1 (just the prompt), else
 1 + the list capped to `ed-minibuffer-max` and the screen."
   (if (= n 0) 1 (+ 1 (math/min ed-minibuffer-max n (math/max 1 (- rows 4))))))
@@ -857,8 +857,7 @@ threads in)."
       ;; per-keystroke and direct-text-set paths rely on
       :else (second (mb-rank mb (mb-text mb) (:for cache) (:ranked cache))))))
 
-(defn- mb-debounce?
-  (mb)
+(defn- mb-debounce? (mb)
   "Whether minibuffer `mb`'s candidate ranking should be debounced — a fixed `:rank-source`
 larger than `*complete-debounce-min*` (a `:candidates-fn` prompt computes its own way)."
   (let (src (:rank-source mb))
@@ -923,14 +922,14 @@ pane→buffer references after the pool changes (e.g. after a kill). Pure."
 
 (defn ed-buffer-index-by-name (m nm)
   "The pool index of the buffer named `nm`, or nil if there is none."
-  (let (i (seq/index-where (fn (b) (= (buffer-name b) nm)) (:buffers m)))
+  (let (i (seq/index-where (:buffers m) (fn (b) (= (buffer-name b) nm))))
     (if (< i 0) nil i)))
 
 (defn ed-buffer-index-by-file (m path)
   "The pool index of the buffer visiting file `path`, or nil — a file's identity for
 \"already open?\", distinct from its display name (which may be a project-relative
 path or a basename, so it can't be matched against the on-disk path)."
-  (let (i (seq/index-where (fn (b) (= (buffer-file b) path)) (:buffers m)))
+  (let (i (seq/index-where (:buffers m) (fn (b) (= (buffer-file b) path))))
     (if (< i 0) nil i)))
 
 ;; ---- the `*Messages*` log + echo area ---------------------------------------
@@ -940,8 +939,7 @@ path or a basename, so it can't be matched against the on-disk path)."
 full multi-line text is kept in the `*Messages*` buffer."
   (string/replace s "\n" " "))
 
-(defn- ed-ensure-newline
-  (s)
+(defn- ed-ensure-newline (s)
   "`s` with exactly one trailing newline (logger lines already end in one; echo
 strings don't) — so a log buffer keeps one line per record."
   (if (string/ends-with? s "\n") s (str s "\n")))
@@ -1005,7 +1003,8 @@ the echo area. Never disturbs the current buffer's point. The editor's primary o
 salvaging a line another process's unflushed `print` prefixed (re-parse from the
 first `{` when an event object is plainly present). The decode half every streaming
 runner (testrun / apprun) shares; classifying the event stays theirs."
-  (let (parse (fn (s) (try (json/decode s) (catch e nil)))
+  ;; a runner line that is not JSON is the common case (plain program output) — nil is the answer
+  (let (parse (fn (s) (check-allow :discarded-catch (try (json/decode s) (catch e nil))))
         parsed (or (parse line)
                  (let (i (index-of line "{"))
                    (when (and (includes? line "\"event\":") (>= i 0))
@@ -1045,8 +1044,7 @@ binding)."
 declares its destination by calling this (its `:log-category` / `:log-buffer`)."
   (def *log-routes* (cons {:category category :buffer buffer} *log-routes*)))
 
-(defn- ed-record-category
-  (rec)
+(defn- ed-record-category (rec)
   "The `:category` a log record carries in its `:meta`, or nil (uncategorised)."
   (get-in rec [:meta :category]))
 
@@ -1064,10 +1062,9 @@ per route (records of that `:category` → its buffer) plus the default backend 
 one buffer and the table needs no shared state. Rebuilt at every (re)start of the
 supervised logger, so routes survive a restart."
   (cons (ed-buffer-backend "*Messages*" {:filter (fn (r) (nil? (ed-record-category r)))})
-    (map (fn (rt)
+    (map *log-routes* (fn (rt)
            (ed-buffer-backend (:buffer rt)
-             {:filter (fn (r) (= (ed-record-category r) (:category rt)))}))
-      *log-routes*)))
+             {:filter (fn (r) (= (ed-record-category r) (:category rt)))})))))
 
 ;; ---- OS window title --------------------------------------------------------
 
@@ -1126,7 +1123,9 @@ once per `*auto-save-interval-ms*`. Returns the model with `:auto-saved-at` upda
         (doseq (buf (:buffers m))
           (let (path (buffer-file buf))
             (when (and path (:modified buf))
-              (try (file/spit (ed-auto-save-path path) (buffer-text buf)) (catch e nil)))))
+              (try
+                (file/spit (ed-auto-save-path path) (buffer-text buf))
+                (catch e (log/warn (str "auto-save of " path " failed: " (error-message e))))))))
         (assoc m :auto-saved-at now-ms)))))
 
 ;; ---- scrolling --------------------------------------------------------------

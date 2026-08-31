@@ -18,37 +18,24 @@ rendering live in the shared `completion` framework, which the minibuffer also u
 Pure (data→data) apart from reading the buffer and (for an LSP source) a bounded
 synchronous request; the popup is plain render ops, unit-testable without a window."
   (:use editor/buffer) ; buffer text/point + edit ops
+  (:use editor/highlight) ; symbol-char? / symbol-prefix-at — the one word-boundary rule
   (:use model) ; current-buffer accessors, message
-  (:use completion) ; the shared fuzzy ranking + window/width helpers (+ the look config)
+  (:use completion) ; the shared window/width helpers (+ the look config)
+  (:use mincomplete) ; lcp — the common-prefix expansion Tab shares with the minibuffer
   (:use ui-kit) ; ui-panel / ui-list / ui-clip — the popup is one windowed list in a card
   (:use theme) ; ui-ctx — the kit's semantic-role palette
   (:use editor/display)) ; the `text` render op for the popup
 ;; ---- what counts as a completion word ---------------------------------------
 
 (defn complete-word-char? (c)
-  "True if `c` (a 1-char string) is part of a completion word. Lispy: letters,
-digits, and `- _ ? ! * / < > = +` etc. — i.e. not whitespace or a delimiter."
-  (not (or (= c " ")
-         (= c "\t")
-         (= c "\n")
-         (= c "(")
-         (= c ")")
-         (= c "[")
-         (= c "]")
-         (= c "{")
-         (= c "}")
-         (= c "\"")
-         (= c ";")
-         (= c ",")
-         (= c "'")
-         (= c "`"))))
+  "True if `c` (a 1-char string) is part of a completion word — the language's own
+symbol boundary (`symbol-char?`, std/editor/highlight), so this source, the mode source
+and an LSP source agree on the prefix and merge instead of dropping each other."
+  (symbol-char? c))
 
-(defn- complete-prefix-start
-  (text p)
+(defn- complete-prefix-start (text p)
   "The start index of the word-char run ending at `p`."
-  (if (or (<= p 0) (not (complete-word-char? (string/char-at text (dec p)))))
-    p
-    (complete-prefix-start text (dec p))))
+  (first (symbol-prefix-at text p)))
 
 ;; ---- candidate source (redefine `completion-candidates` to rice) ------------
 
@@ -56,17 +43,15 @@ digits, and `- _ ? ! * / < > = +` etc. — i.e. not whitespace or a delimiter."
 ;; flushed to a string with `list->string` only at the word boundary. The previous
 ;; `(str cur c)` per char rebuilt the whole word string each step — O(wordlen²); this is
 ;; O(wordlen). (`string->list` already walks the text once, so word access stays O(n).)
-(defn- complete-words-step
-  (acc c)
+(defn- complete-words-step (acc c)
   (let (cur (first acc) done (second acc))
     (if (complete-word-char? c)
       [(cons c cur) done]
       (if (empty? cur) acc [() (cons (string/list-> (reverse cur)) done)]))))
 
-(defn- complete-words
-  (text)
+(defn- complete-words (text)
   "Every maximal run of word chars in `text`, as a list (with duplicates)."
-  (let (r (fold complete-words-step [() ()] (string/->list text))
+  (let (r (fold (string/->list text) [() ()] complete-words-step)
         cur (first r)
         done (second r))
     (if (empty? cur) done (cons (string/list-> (reverse cur)) done))))
@@ -76,8 +61,7 @@ digits, and `- _ ? ! * / < > = +` etc. — i.e. not whitespace or a delimiter."
 ; is correct: an edit invalidates the cache, and narrowing keystrokes (no rope change)
 ; reuse it, eliminating the O(buffer) scan on every completion keystroke.
 
-(defn- complete-cached-words
-  (buf)
+(defn- complete-cached-words (buf)
   "The distinct words of `buf`, with a one-entry cache keyed on the buffer's rope identity.
 O(buffer) only on the first call after an edit; O(1) on every subsequent narrowing key."
   (let (rope (buffer-rope buf))
@@ -87,8 +71,7 @@ O(buffer) only on the first call after an edit; O(1) on every subsequent narrowi
         (def *word-cache* [rope words])
         words))))
 
-(defn- complete-buffer-words
-  (m)
+(defn- complete-buffer-words (m)
   "The distinct words of the current buffer — the (prefix-independent) word *universe*
 the baseline completion source draws from."
   (complete-cached-words (ed-current-buf m)))
@@ -96,7 +79,7 @@ the baseline completion source draws from."
 (defn completion-candidates-of (words prefix)
   "The `words` that start with `prefix` and aren't exactly it, sorted — the pure
 prefix-filter shared by the open scan and the cached narrowing path."
-  (sort (filter (fn (w) (and (string/starts-with? w prefix) (not (= w prefix)))) words)))
+  (sort (filter words (fn (w) (and (string/starts-with? w prefix) (not (= w prefix)))))))
 
 (defn completion-candidates (m prefix)
   "Candidates for `prefix`. **Redefine to plug in another source** (global symbols
@@ -156,41 +139,53 @@ word before point. `nil` when there's no word before point."
 
 ;; ---- applying a completion --------------------------------------------------
 
-(defn- complete-apply
-  (m start word)
+(defn- complete-apply (m start word)
   "Replace the text in [start, point) with `word` and close the popup."
   (let (buf (ed-current-buf m)
         p (buffer-point buf)
         buf2 (replace-region buf start p word))
     (assoc (ed-set-buf m buf2) :completion nil :status "modified")))
 
-(defn- complete-at
-  (m)
+(defn- complete-at (m)
   "`[start prefix items]` for completion at point, **merged across every applicable
 source** (`*completion-sources*`). The first non-nil source fixes the region `[start
 prefix]`; the others contribute items only if they agree on `start` (deduped, source
 order kept). `[point \"\" ()]` when nothing applies. The seam that lets a language
 mode (or LSP) supply completions without `complete` naming the language."
-  (let (results (seq/keep (fn (s) ((reflect/eval s) m)) *completion-sources*))
+  (let (results (seq/keep *completion-sources* (fn (s) ((reflect/eval s) m))))
     (if (empty? results)
       [(buffer-point (ed-current-buf m)) "" '()]
       (let ([start prefix _] (first results)
             items (seq/distinct (apply append
-                                  (map (fn (r) (if (= (first r) start) (nth r 2) '())) results))))
+                                  (map results (fn (r) (if (= (first r) start) (nth r 2) '()))))))
         [start prefix items]))))
 
+(defn- complete-order (items)
+  "Completion candidates in presentation order: distinct, alphabetical — Emacs'
+`completions-sort`. Every source already prefix-filters, so no fuzzy re-ranking here (that
+stays the minibuffer's, `mincomplete`): a prefix completer that reorders its own prefix
+matches by fuzzy score puts `foo-bar-baz` above `foo-bar` for no reason a user can see."
+  (sort (seq/distinct items)))
+
 (defn cmd-complete (m key)
-  "Completion-at-point (Tab): complete the symbol/word before point, merged across the
-buffer's completion sources (mode + buffer words + …) and **fuzzy-ranked**. One match
-inserts directly; several open the popup; none echoes a note; an empty prefix is a no-op."
+  "Completion-at-point (Tab), the way Emacs' `completion-at-point` behaves: the symbol
+before point is completed against every source (mode globals + buffer words + …). One
+candidate inserts it. Several: the **longest common prefix** is inserted when it extends
+what was typed — `al` → `alpha-` — and nothing pops up; when nothing more can be expanded,
+the popup lists the candidates (alphabetical) for C-n/C-p + Enter. None echoes a note; an
+empty prefix is a no-op."
   (let ([start prefix items0] (complete-at m)
-        items (completion-rank prefix items0))
+        items (complete-order items0))
     (if (= prefix "")
       (message m "nothing to complete")
       (cond
         (empty? items) (message m (str "no completions for \"" prefix "\""))
         (= (count items) 1) (complete-apply m start (first items))
-        else (assoc m :completion {:items items :index 0 :start start :prefix prefix})))))
+        else
+          (let (common (lcp items))
+            (if (> (string/length common) (string/length prefix))
+              (complete-apply m start common)
+              (assoc m :completion {:items items :index 0 :start start :prefix prefix})))))))
 
 ;; ---- popup navigation (input routes control keys here) ----------------------
 
@@ -202,14 +197,13 @@ inserts directly; several open the popup; none echoes a note; an empty prefix is
   "Whether the open popup consumes `input`: a nav/accept/cancel key, **a printable
 word-char** (Corfu-style live-narrow — it's inserted and the list re-filters), or
 Backspace (narrow back). Any other key dismisses the popup and is processed normally."
-  (or (any? (fn (k) (= k input)) *completion-keys*)
+  (or (any? *completion-keys* (fn (k) (= k input)))
     (= input :backspace)
     (and (string? input) (complete-word-char? input))))
 
 (defn complete-cancel (m) "Dismiss the completion popup." (assoc m :completion nil))
 
-(defn- complete-move
-  (m d)
+(defn- complete-move (m d)
   (let (c (:completion m) n (count (:items c)))
     (assoc m :completion (assoc c :index (math/mod (+ (:index c) d) n)))))
 
@@ -217,20 +211,18 @@ Backspace (narrow back). Any other key dismisses the popup and is processed norm
   (let (c (:completion m))
     (complete-apply m (:start c) (nth (:items c) (:index c)))))
 
-(defn- complete-edit
-  (m f)
+(defn- complete-edit (m f)
   "Apply a `buffer -> buffer` edit `f` to the current buffer (marking it modified) —
 the narrowing keystroke's insert/delete."
   (assoc (ed-set-buf m (f (ed-current-buf m))) :status "modified"))
 
-(defn- complete-refresh
-  (m)
+(defn- complete-refresh (m)
   "Recompute the popup from the current point after a narrowing edit, closing it when the
 prefix is empty or nothing matches. Re-queries every source through `complete-at` so the
 merge stays correct across all of them (a mode/LSP source can't be prefix-cached the way a
 single word universe could) — the word at point changed, so the sources rescan it."
   (let ([start prefix items0] (complete-at m)
-        items (completion-rank prefix items0))
+        items (complete-order items0))
     (if (or (= prefix "") (empty? items))
       (assoc m :completion nil)
       (assoc m :completion {:items items :index 0 :start start :prefix prefix}))))
@@ -244,8 +236,7 @@ re-narrows; Backspace deletes and re-narrows; Esc/C-g cancel."
     (or (= input :enter) (= input :tab)) (complete-accept m)
     (= input :backspace) (complete-refresh (complete-edit m delete-backward-char))
     (and (string? input) (complete-word-char? input))
-      (complete-refresh (complete-edit m
-                          (fn (b) (insert b input))))
+      (complete-refresh (complete-edit m (fn (b) (insert b input))))
     else (complete-cancel m))) ; :escape / :ctrl-g
 ;; ---- rendering (overlay the menu; view splices these ops in) ----------------
 
@@ -272,7 +263,7 @@ paints AND hit-tests the card, the same one behind the context menu."
             ;; is exactly `vis` rows tall, so no frame rows to reserve.
             vis (math/max 1 (math/min *completion-max* total (- rows 2)))
             wstart (completion-window-start total idx vis)
-            window (take vis (drop wstart items))
+            window (take (drop items wstart) vis)
             ;; label field width; the card is +3 (1 pad each side + the pill's 1-cell inset)
             textw (completion-menu-width window)
             rowfn (fn (it i sel?) {:label (ui-clip it textw) :enabled true})

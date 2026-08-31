@@ -37,6 +37,7 @@ responses (the common case) are unaffected. Document positions use 0-based
 document sync (no incremental edits)."
   (:use model) ; ed-current-buf — the source reads the current buffer
   (:use editor/buffer) ; buffer-file / buffer-text / buffer-point / line+column
+  (:use editor/highlight) ; symbol-prefix-at — the shared completion word boundary
   (:use lsp-requests)) ; the request-kind records + the LspRequest ability (shape impls below)
 ;; ---- tunables (redefine live) -----------------------------------------------
 
@@ -56,8 +57,7 @@ document sync (no incremental edits)."
 
 ;; ---- pure protocol: framing -------------------------------------------------
 
-(defn- lsp-frame
-  (body)
+(defn- lsp-frame (body)
   "Wrap a JSON `body` string in an LSP `Content-Length` frame. The length is the body's
 UTF-8 **byte** count (LSP's unit) — not its char count, which differs whenever the body
 carries a multi-byte char (e.g. a `didOpen` of a source file with unicode)."
@@ -73,8 +73,7 @@ carries a multi-byte char (e.g. a `didOpen` of a source file with unicode)."
 
 ;; ---- pure protocol: decoding a byte stream into messages --------------------
 
-(defn- lsp-content-length
-  (header)
+(defn- lsp-content-length (header)
   "The `Content-Length` value in a frame `header` block (the text before the blank
 line), or `nil` if absent/malformed."
   (let (i (index-of header "Content-Length:"))
@@ -92,8 +91,7 @@ line), or `nil` if absent/malformed."
 ;; than in chars, and a char-based length check would wait forever for bytes that, as
 ;; chars, never arrive. The header up to `\r\n\r\n` is ASCII (LSP spec), so the
 ;; separator's char index equals its byte offset and only the body needs byte math.
-(defn- lsp-decode-acc
-  (buf acc)
+(defn- lsp-decode-acc (buf acc)
   (let (sep (index-of buf "\r\n\r\n"))
     (if (< sep 0)
       [(reverse acc) buf] ; no complete header yet — keep buffering
@@ -105,9 +103,15 @@ line), or `nil` if absent/malformed."
                 total (bytes/length bytes))
             (if (< (- total body-start) clen)
               [(reverse acc) buf] ; body's bytes not fully arrived — wait for more
-              (let (body (string/bytes-> (take clen (drop body-start bytes)))
-                    rest (string/bytes-> (drop (+ body-start clen) bytes))
-                    msg (try (json/decode body) (catch e nil)))
+              (let (body (string/bytes-> (take (drop bytes body-start) clen))
+                    rest (string/bytes-> (drop bytes (+ body-start clen)))
+                    msg (try
+                          (json/decode body)
+                          (catch e
+                            (do
+                              (log/warn (str "lsp: undecodable message from the server: "
+                                          (error-message e)))
+                              nil))))
                 (lsp-decode-acc rest (if (nil? msg) acc (cons msg acc)))))))))))
 
 (defn lsp-decode (buf)
@@ -127,7 +131,7 @@ either a `CompletionItem[]` (a vector) or a `{:items [...] :isIncomplete b}` obj
                 (nil? result) '()
                 (vector? result) result
                 :else (:items result '())))
-    (seq/keep :label items)))
+    (seq/keep items :label)))
 
 ;; ---- pure protocol: documentSymbol shapes (imenu, M-g i) --------------------
 ;; `textDocument/documentSymbol` returns either a flat `SymbolInformation[]` (each with a
@@ -170,8 +174,7 @@ either a `CompletionItem[]` (a vector) or a `{:items [...] :isIncomplete b}` obj
   "The short display tag for an LSP SymbolKind integer (`*lsp-symbol-kinds*`), or \"?\"."
   (get *lsp-symbol-kinds* kind "?"))
 
-(defn- lsp-symbol-pos
-  (sym)
+(defn- lsp-symbol-pos (sym)
   "The 0-based `[line char]` to jump to for `sym` — its `:selectionRange` start (a
 hierarchical DocumentSymbol), else its `:range` start, else its `:location`'s range start
 (a flat SymbolInformation). `[0 0]` if none is present."
@@ -179,17 +182,15 @@ hierarchical DocumentSymbol), else its `:range` start, else its `:location`'s ra
         start (when rand/rng (:start rand/rng)))
     [(:line start 0) (:character start 0)]))
 
-(defn- lsp-flatten-symbols
-  (syms prefix acc)
+(defn- lsp-flatten-symbols (syms prefix acc)
   "Fold `syms` (a DocumentSymbol/SymbolInformation vector) into `acc` as `{:name :kind
 :line :char}` entries, depth-first, qualifying each child's name with `prefix` (its parent
 chain). `acc` is built reversed."
-  (fold (fn (a sym)
+  (fold syms acc (fn (a sym)
           (let ([line char] (lsp-symbol-pos sym)
                 qname (if (= prefix "") (:name sym) (str prefix "." (:name sym)))
                 entry {:name qname :kind (:kind sym) :line line :char char})
-            (lsp-flatten-symbols (:children sym []) qname (cons entry a))))
-    acc syms))
+            (lsp-flatten-symbols (:children sym []) qname (cons entry a))))))
 
 (defn lsp-document-symbols (result)
   "The `textDocument/documentSymbol` `result` (a vector of DocumentSymbol or
@@ -199,14 +200,12 @@ before children, in document order."
 
 ;; ---- pure protocol: location / hover / edit shapes (goto, refs, hover, rename) ----
 
-(defn- lsp-uri->path
-  (uri)
+(defn- lsp-uri->path (uri)
   "The filesystem path of a `file://` `uri` (the inverse of `lsp-path->uri`); `uri`
 unchanged if it has no scheme."
   (if (string/starts-with? uri "file://") (string/substring uri 7 (string/length uri)) uri))
 
-(defn- lsp-location
-  (loc)
+(defn- lsp-location (loc)
   "Normalise one LSP `Location` (`:uri`+`:range`) or `LocationLink` (`:targetUri`+
 `:targetSelectionRange`/`:targetRange`) to `{:path :line :char}` (0-based)."
   (let (uri (or (:uri loc) (:targetUri loc) "")
@@ -219,11 +218,10 @@ unchanged if it has no scheme."
 a vector of them, or nil — as a list of `{:path :line :char}`."
   (cond
     (nil? result) '()
-    (vector? result) (map lsp-location result)
+    (vector? result) (map result lsp-location)
     :else (list (lsp-location result))))
 
-(defn- lsp-marked
-  (x)
+(defn- lsp-marked (x)
   "The text of one hover content item — a plain string, or a `{:value …}` (MarkupContent /
 MarkedString object)."
   (cond (string? x) x (map? x) (:value x "") :else ""))
@@ -237,11 +235,10 @@ MarkedString object)."
       (cond
         (nil? c) ""
         (string? c) c
-        (vector? c) (string/join "\n\n" (seq/remove empty? (map lsp-marked c)))
+        (vector? c) (string/join (seq/remove (map c lsp-marked) empty?) "\n\n")
         :else (lsp-marked c)))))
 
-(defn- lsp-text-edit
-  (e)
+(defn- lsp-text-edit (e)
   "Normalise one `TextEdit` (`:range {:start :end}` + `:newText`) to
 `{:start-line :start-char :end-line :end-char :text}` (0-based)."
   (let (rand/rng (:range e) s (:start rand/rng) en (:end rand/rng))
@@ -254,7 +251,7 @@ MarkedString object)."
 (defn lsp-text-edits (result)
   "A `TextEdit[]` (`textDocument/formatting`, or null) as a list of normalised edits
 (`lsp-text-edit`)."
-  (if (nil? result) '() (map lsp-text-edit result)))
+  (if (nil? result) '() (map result lsp-text-edit)))
 
 (defn lsp-workspace-edit (result)
   "A `WorkspaceEdit` (`textDocument/rename` result) as `{path -> [edit …]}` (paths, not
@@ -268,20 +265,16 @@ shapes; `{}` when nil."
         changes
         ;; JSON object keys parse to keywords, so a `:changes` uri arrives as `:file:///a`,
         ;; not a string — coerce back with `name` before stripping the scheme.
-        (reduce (fn (acc uri)
-                  (assoc acc
-                    (lsp-uri->path (if (keyword? uri) (->string uri) uri))
-                      (map lsp-text-edit (get changes uri))))
-          {}
-          (keys changes))
-          docs
-        (reduce (fn (acc dc)
-                  (assoc acc
-                    (lsp-uri->path (get-in dc [:textDocument :uri])) (map lsp-text-edit (:edits dc))))
-          {}
-          docs)
-          :else
-        {}))))
+          (reduce (keys changes) {} (fn (acc uri)
+                    (assoc acc
+                      (lsp-uri->path (if (keyword? uri) (->string uri) uri))
+                        (map (get changes uri) lsp-text-edit))))
+        docs
+          (reduce docs {} (fn (acc dc)
+                    (assoc acc
+                      (lsp-uri->path (get-in dc [:textDocument :uri]))
+                        (map (:edits dc) lsp-text-edit))))
+        :else {}))))
 
 ;; ---- pure connection logic (state -> [state effects]) -----------------------
 ;; The connection process's state:
@@ -291,13 +284,11 @@ shapes; `{}` when nil."
 ;; state plus the IO the shell must perform (messages to send / frames to write), so
 ;; correlation and framing are testable without a process or a server.
 
-(defn- lsp-did-open
-  (uri lang text)
+(defn- lsp-did-open (uri lang text)
   (lsp-notification "textDocument/didOpen"
     {:textDocument {:uri uri :languageId lang :version 1 :text text}}))
 
-(defn- lsp-did-change
-  (uri version text)
+(defn- lsp-did-change (uri version text)
   (lsp-notification "textDocument/didChange"
     {:textDocument {:uri uri :version version}
      :contentChanges [{:text text}]}))
@@ -307,40 +298,32 @@ shapes; `{}` when nil."
 ;; hover/rename) carries.
 (defn- lsp-pos (line char) {:line line :character char})
 
-(defn- lsp-completion-request
-  (id uri line char)
+(defn- lsp-completion-request (id uri line char)
   (lsp-request id
     "textDocument/completion"
     {:textDocument {:uri uri} :position (lsp-pos line char)}))
-(defn- lsp-document-symbol-request
-  (id uri)
+(defn- lsp-document-symbol-request (id uri)
   (lsp-request id "textDocument/documentSymbol" {:textDocument {:uri uri}}))
-(defn- lsp-definition-request
-  (id uri line char)
+(defn- lsp-definition-request (id uri line char)
   (lsp-request id
     "textDocument/definition"
     {:textDocument {:uri uri} :position (lsp-pos line char)}))
-(defn- lsp-references-request
-  (id uri line char)
+(defn- lsp-references-request (id uri line char)
   (lsp-request id
     "textDocument/references"
     {:textDocument {:uri uri} :position (lsp-pos line char) :context {:includeDeclaration true}}))
-(defn- lsp-hover-request
-  (id uri line char)
+(defn- lsp-hover-request (id uri line char)
   (lsp-request id "textDocument/hover" {:textDocument {:uri uri} :position (lsp-pos line char)}))
-(defn- lsp-formatting-request
-  (id uri)
+(defn- lsp-formatting-request (id uri)
   (lsp-request id
     "textDocument/formatting"
     {:textDocument {:uri uri} :options {:tabSize 2 :insertSpaces true}}))
-(defn- lsp-rename-request
-  (id uri line char new-name)
+(defn- lsp-rename-request (id uri line char new-name)
   (lsp-request id
     "textDocument/rename"
     {:textDocument {:uri uri} :position (lsp-pos line char) :newName new-name}))
 
-(defn- lsp-issue
-  (state corr reply-to uri lang text kind make-request)
+(defn- lsp-issue (state corr reply-to uri lang text kind make-request)
   "Pure: the frames + next state for one request. Syncs the document first (`didOpen` the
 first time a uri is seen — tagged with `lang`, the LSP languageId — else a full-text
 `didChange`), then `(make-request id)` (a framed request), recording `[reply-to corr kind]`
@@ -359,8 +342,7 @@ hover, formatting, rename. Returns `[state' frames]`."
                  :pending (assoc (:pending state) id [reply-to corr kind])))
     [state2 [sync-frame (make-request id)]]))
 
-(defn- lsp-request-complete
-  (state corr reply-to uri lang text line char)
+(defn- lsp-request-complete (state corr reply-to uri lang text line char)
   "Completion at `(uri, line, char)` — see `lsp-issue`. `[state' frames]`."
   (lsp-issue state
     corr
@@ -371,8 +353,7 @@ hover, formatting, rename. Returns `[state' frames]`."
     (lsp-completion)
     (fn (id) (lsp-completion-request id uri line char))))
 
-(defn- lsp-request-symbols
-  (state corr reply-to uri lang text)
+(defn- lsp-request-symbols (state corr reply-to uri lang text)
   "documentSymbol on `uri` — see `lsp-issue`. `[state' frames]`."
   (lsp-issue state
     corr
@@ -408,15 +389,13 @@ hover, formatting, rename. Returns `[state' frames]`."
   lsp-requests/lsp-rename
   (lsp-request-shape [_ result] [:lsp-workspace-edit (lsp-workspace-edit result)]))
 
-(defn- lsp-shape
-  (kind result)
+(defn- lsp-shape (kind result)
   "The `[reply-tag value]` for a response of the given request `kind` (an `LspRequest`
 record — `lsp-request-shape`), shaping the raw `result` into what the waiting command
 wants. Completion is the fallback for an untagged (2-element) pending entry."
   (lsp-request-shape (or kind (lsp-completion)) result))
 
-(defn- lsp-dispatch
-  (acc msg)
+(defn- lsp-dispatch (acc msg)
   ;; Fold step: route one decoded message. A response whose `:id` is pending is shaped by
   ;; its `:pending` kind tag (`lsp-shape`) and sent to its waiter as `[tag corr value]`; an
   ;; absent tag (the original 2-element `[reply-to corr]` entries) shapes as completion. A
@@ -433,23 +412,20 @@ wants. Completion is the fallback for an untagged (2-element) pending entry."
         [(assoc state :pending (dissoc (:pending state) id))
           (cons [reply-to [tag corr value]] replies)]))))
 
-(defn- lsp-ingest
-  (state chunk)
+(defn- lsp-ingest (state chunk)
   "Pure: fold a stdout `chunk` into the connection. Appends it to the frame buffer,
 decodes every complete message, and routes each. Returns `[state' replies]` where each
 reply is `[pid message]` for the shell to `send`."
   (let (buf (str (:buf state) chunk)
         [msgs remaining] (lsp-decode buf))
-    (fold lsp-dispatch [(assoc state :buf remaining) '()] msgs)))
+    (fold msgs [(assoc state :buf remaining) '()] lsp-dispatch)))
 
 ;; ---- the connection process (the thin IO shell) -----------------------------
 
-(defn- lsp-send-all
-  (proc frames)
+(defn- lsp-send-all (proc frames)
   (doseq (f frames) (os/write proc f)))
 
-(defn- lsp-await-init
-  (state id)
+(defn- lsp-await-init (state id)
   "Read frames until the `initialize` response (jsonrpc `id`) arrives, returning the
 state with the consumed bytes drained. Bounded so a server that never replies can't
 hang the connection process forever."
@@ -457,15 +433,14 @@ hang the connection process forever."
     ([:proc p chunk] (let (buf (str (:buf state) chunk)
                            [msgs remaining] (lsp-decode buf)
                            st (assoc state :buf remaining))
-                       (if (any? (fn (msg) (= (:id msg) id)) msgs)
+                       (if (any? msgs (fn (msg) (= (:id msg) id)))
                          st
                          (lsp-await-init st id))))
     ([:proc-err p chunk] (lsp-await-init state id))
     ([:proc-closed p code] state)
     (after 10000 state)))
 
-(defn- lsp-loop
-  (state)
+(defn- lsp-loop (state)
   "The connection's main receive loop: server output folds in via `lsp-ingest` (replies
 routed to waiters); a `[:complete …]` request is turned into frames and written to the
 server; `:shutdown` or the server dying stops it."
@@ -548,16 +523,14 @@ server; `:shutdown` or the server dying stops it."
                                                                 (lsp-loop st2)))
     ([:shutdown] (do (os/close (:proc state)) :lsp-stopped))))
 
-(defn- lsp-init-params
-  (root-uri)
+(defn- lsp-init-params (root-uri)
   {:processId nil
    :rootUri root-uri
    :clientInfo {:name "bedit"}
    :capabilities {:textDocument {:completion {:completionItem {:snippetSupport false}}
                                  :documentSymbol {:hierarchicalDocumentSymbolSupport true}}}})
 
-(defn- lsp-run
-  (cmd cmd-args root-uri)
+(defn- lsp-run (cmd cmd-args root-uri)
   "The connection process body: spawn the server, do the `initialize`/`initialized`
 handshake, then loop. Must call `proc-spawn` itself so it owns the handle (is the
 subscriber for the server's `[:proc …]` output)."
@@ -622,16 +595,10 @@ only on an explicit trigger, not per keystroke."
 
 ;; ---- the completion source --------------------------------------------------
 
-(defn- lsp-word-char?
-  (c)
-  (not (includes? " \t\n()[]{}\";',`" c)))
-
-(defn- lsp-prefix-start
-  (text p)
-  "The start of the word-char run ending at `p` — the completion region's left edge."
-  (if (or (<= p 0) (not (lsp-word-char? (string/char-at text (dec p)))))
-    p
-    (lsp-prefix-start text (dec p))))
+(defn- lsp-prefix-start (text p)
+  "The start of the symbol before `p` — the completion region's left edge, by the same
+boundary rule the other sources use (`symbol-prefix-at`), so the merge keeps this source."
+  (first (symbol-prefix-at text p)))
 
 (defn lsp-path->uri (path)
   (str "file://" path))
