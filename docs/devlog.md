@@ -269,3 +269,43 @@ commits (`git log --since=2026-06-16 --until=2026-07-10`) have the detail:
   XDG state dir for projects/recent/bookmarks/bshell-history.
 - **Files:** `src/bshell.blsp`, `src/projects.blsp`, `src/commands.blsp`, `src/modes.blsp`,
   and more. The project-files speedup is what motivated the `string-split` ADR-109 work.
+
+### Tab completion like Emacs; one symbol boundary; playground drops are logged — uncommitted
+- **Why:** Tab on a function just written in the buffer often offered nothing: the
+  mode source (`symbol-prefix-at`) and the buffer-word source (`complete-word-char?`)
+  disagreed on where a prefix starts after `'`, `` ` ``, `~`, `^`, so `complete-at`
+  dropped the buffer words; and the fuzzy re-rank reordered prefix matches for no
+  visible reason.
+- **What:** every source uses std's `symbol-char?`/`symbol-prefix-at`. `cmd-complete`
+  follows `completion-at-point`: unique → insert; several → longest common prefix; the
+  popup only when nothing more expands; candidates alphabetical. `/` is a word boundary
+  for `M-d`/`M-DEL`/`M-f`/`M-b` (std `buffer-word-char?`), so `math/floor` is two words.
+  `playground-sandbox-reply` logs (`log/warn`) the reason whenever it drops a reply.
+- **Files:** `src/complete-at-point.blsp`, `src/lsp.blsp`, `src/playground.blsp`.
+  **Tests:** +10 (`tests/complete_test.blsp`).
+
+### 2026-08-30 — no catch swallows an error unread (`:discarded-catch` at zero) — uncommitted
+- **Why:** bedit ran for hours with ten unbound `gui/font!`-style references (renamed by
+  brood ADR-302) because each sat in `(try … (catch e nil))`. brood's new `:discarded-catch`
+  lint flagged 55 more handlers of that shape across `src/` and `tests/`.
+- **What:** each site got the honest fix, none a refactor. *Best-effort I/O* (init/auto-save/
+  persist/cache writes, `file/rm` of an auto-save or the sandbox script, `os/close` — which is
+  idempotent, so a throw there is a fault — clipboard read, `require-one` of a deferred
+  command module, the eldoc/doc-at/gutter-click/close-context mode services, `git`
+  subprocesses, a project-walk `file/ls`, LSP-frame and web-key JSON decodes, the package
+  manifest and plugin-entry reads) now `log/warn`s `error-message` into *Messages* and
+  returns the same fallback. *Probes where the error is the answer* (reading half-typed text:
+  `liveeval`, `eval-command`, `brood-arglist-of`/`brood-doc-block`, the two `parse-int`s,
+  `tutor` box checking; path completion against a directory that may not exist yet in
+  `mincomplete`/`bshell`; `ed-doc`'s first-of-two `doc` evals; `ed-json-event-line` on
+  non-JSON runner output; `os/exe-path` and the candidate-runtime `os/spawn` in `sandbox`;
+  the SSE emit / keepalive whose failure IS the browser-gone signal in `web`) keep their
+  catch under `(check-allow :discarded-catch …)` with a one-line reason at the site.
+  *Tests* (`apprun`, `testrun`, `tutor`) return sentinels (`:close-failed`, `:inserted`/
+  `:refused`) instead of nil/false. `theme/gui-only` no longer matches the error string: it
+  is `(when (gui/available?) (apply f args))`.
+- **Files:** `src/{about,bshell,commands,compile,config,eval-command,interactive,liveeval,
+  lsp,mincomplete,model,modes,packages,panes,playground,procstream,projects,sandbox,theme,
+  tutor,web}.blsp`, `tests/{apprun,testrun,tutor}_test.blsp`. `nest check` reports zero
+  "catch discards" warnings; the suite is red from the in-flight data-first argument-order
+  migration (`empty?: expected collection, got fn`), not from these edits.
