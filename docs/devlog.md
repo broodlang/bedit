@@ -37,6 +37,13 @@ Language-level changes live in the Brood repo's `docs/devlog.md` + `docs/decisio
     back `:fail` where `:pass` is required. The assertion is inside a double `dotimes` with
     no lesson/box in the message, so the next step is to name them before diagnosing.
 
+  **Both are now fixed** (same day). Naming the lesson took the second straight to its
+  cause: **lesson 32 box 2**, `first: … got keyword (:noproc)` — the tutorial's own answer
+  for *"When a process dies"* failing its own exercise, because `(spawn …)` then
+  `(monitor p)` is racy and brood had no atomic form. That became **brood ADR-309**
+  (`spawn-monitor`), and the lesson now teaches it. The collab one was the seed clobber the
+  `link-fold` guard closes (brood 9ddcfd8a). 1378/1378 twice under two cores.
+
 - **Not caused by the brood 0.20.0 / data-first migration.** bedit's own CI was red on
   `0e61442f` and `1b9a03a2` — both pre-migration — and `672952f6` was red only on
   `nest format --check` (39 files, since fixed in `32bdcf0a`). Found while making brood's
