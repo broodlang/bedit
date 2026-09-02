@@ -23,7 +23,10 @@ ed = Session("term-tutor.blsp", rows=44, cols=150).start()
 
 r.check(ed.wait_for("Watching it run", 40), "opened at the lesson that teaches the pane")
 r.check(ed.wait_for("=> 12", 60), "the box evaluated in the sandbox (the verdict note)")
-r.check(ed.wait_for("The workings — every traced call", 40), "the pane opened on its own")
+# The pane's own heading (`workings/body`): "The workings — box N:". Never the lesson's
+# prose, which says "*Workings*" — the point of this driver is to assert on what only a
+# rendered pane puts on screen.
+r.check(ed.wait_for("The workings — box", 40), "the pane opened on its own")
 r.check(ed.wait_for("sum-doubles [1 2 3]", 20), "…showing the traced call with its args")
 r.check(ed.wait_for("double- 1", 20), "…including the inner call, nested under it")
 r.check(ed.wait_for("= 12", 20), "…and its RETURN — a line only a real cascade produces")
