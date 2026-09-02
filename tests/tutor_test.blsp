@@ -1,4 +1,4 @@
-;; The interactive Brood tutorial (`src/tutor.blsp`) — pure model tests: the box
+;; The interactive bedit tutorial (`src/tutor.blsp`) — pure model tests: the box
 ;; parser and skeleton, the lesson render + re-stash across navigation, the
 ;; read-only prose (protected spans) through real `ed-update` dispatch, the parse gate
 ;; (E0002 = mid-typing = silence), the eval triple's headless sync fallback
@@ -300,6 +300,24 @@
       ;; both anchors moved down one line — and NOTHING remains at the old lines
       (assert= lines-after (map lines-before inc))))
 
+  ;; The playground's lesson, applied back to the feature it came from: `results/eol-notes`
+  ;; hides the whole set the moment the line count changes, so Enter used to blank every
+  ;; verdict on the page until the debounce landed a quarter-second later.
+  (test "Enter keeps every verdict on screen — the edit re-anchors, the debounce evaluates"
+    (let (m (ed-tutor-launch (tut-model))
+          before (tut-note-texts m)
+          ;; a newline typed INSIDE the first box — the prose around it is protected, so an
+          ;; edit anywhere else is refused and would prove nothing
+          r (first (tut-regions m))
+          typed (ed-edit m (fn (b) (insert (goto-char b (:start r)) "\n")))
+          after (model/ed-post-step typed :none))
+      (is (not (empty? before))) ; the fixture is worth something
+      (is (not (= (tut-text typed) (tut-text m)))) ; …and the edit really landed
+      (is (not (nil? (results/eol-notes (tut-buf after))))) ; renderable, not merely stored
+      ;; the box's own verdict goes (its text changed, so it is no longer that answer's);
+      ;; every OTHER box keeps its result, where the extra line put it
+      (is (not (empty? (tut-note-texts after))))))
+
   (test "a note dims out via the rope stamp (staleness is detectable)"
     (let (m (ed-tutor-launch (tut-model))
           b (tut-buf m))
@@ -309,31 +327,51 @@
 
 ;; ---- reply application (the async half, folded purely) ----------------------------
 
+(defn tut-box-src (m i)
+  (let (r (nth (tut-regions m) i)) (string/substring (tut-text m) (:start r) (:end r))))
+
+;; The state a reply arrives into: box `i`'s request in flight, keyed by the source it was
+;; sent for — `tutor-apply-reply` accepts on that, not on the rope of the whole page.
+(defn tut-pending (m i id)
+  (update m :tutor merge {:pending {id {:region i :src (tut-box-src m i)}}}))
+
 (describe "tutor-apply-reply"
   (test "an unknown id is dropped"
     (let (m (tut-model))
       (assert= (tut-notes (tutor/tutor-apply-reply m {:id 999 :ok true :value "1"})) {})))
 
-  (test "a reply whose rope moved since the send is dropped (and unpended)"
+  (test "a reply whose box was edited since the send is dropped (and unpended)"
     (let (m (tut-model)
-          rope (buffer-rope (tut-buf m))
-          pended (update m :tutor merge {:pending {7 {:region 0 :rope rope}}})
-          moved (ed-edit pended (fn (b) (insert b "x")))
+          pended (tut-pending m 0 7)
+          r (first (tut-regions pended))
+          moved (ed-edit pended (fn (b) (insert (goto-char b (:start r)) "x")))
           m2 (tutor/tutor-apply-reply moved {:id 7 :ok true :value "3"}))
       (assert= (tut-notes m2) {})
       (assert= (get-in m2 [:tutor :pending]) {})))
 
+  ;; Why the test is the BOX and not the page: two boxes' answers are independent, and
+  ;; dropping this one because you kept typing somewhere else is how fast typing lost
+  ;; results — the launch had already recorded the send, so nothing re-sent them and the
+  ;; box sat on its running indicator until its own text changed.
+  (test "a reply still lands when the typing was in a DIFFERENT box"
+    (let (m (tut-model)
+          pended (tut-pending m 0 7)
+          r (second (tut-regions pended))
+          moved (ed-edit pended (fn (b) (insert (goto-char b (:start r)) "x")))
+          m2 (tutor/tutor-apply-reply moved {:id 7 :ok true :value "3" :output ""}))
+      (is (seq/find (tut-note-texts m2) (fn (t) (= t "=> 3"))))
+      ;; …and only now is the box on the books as evaluated
+      (assert= (get-in (tut-buf m2) [:tutor-srcs 0]) (tut-box-src m 0))))
+
   (test "a current reply lands as the box's note"
     (let (m (tut-model)
-          rope (buffer-rope (tut-buf m))
-          pended (update m :tutor merge {:pending {7 {:region 0 :rope rope}}})
+          pended (tut-pending m 0 7)
           m2 (tutor/tutor-apply-reply pended {:id 7 :ok true :value "3" :output ""}))
       (is (seq/find (tut-note-texts m2) (fn (t) (= t "=> 3"))))))
 
   (test "a timeout reply is a ✗ that names the restart key"
     (let (m (tut-model)
-          rope (buffer-rope (tut-buf m))
-          pended (update m :tutor merge {:pending {7 {:region 0 :rope rope}}})
+          pended (tut-pending m 0 7)
           m2 (tutor/tutor-apply-reply pended {:id 7 :ok false :timeout true}))
       (is (seq/find (tut-note-texts m2) (fn (t) (includes? t "timed out")))))))
 
@@ -583,9 +621,9 @@
     ;; pane keeps up with a motion
     (let (m (tut-with-cascade (tut-page "Functions")
               0 "fac")
-          before (get-in m [:tutor :next-id])
+          before (sandbox/sandbox-next-id m)
           moved (tut-goto-box m 1))
-      (assert= (get-in moved [:tutor :next-id]) before) ; nothing was sent
+      (assert= (sandbox/sandbox-next-id moved) before) ; nothing was sent
       (is (not (nil? (tut-workings moved))))))
 
   ;; `tutor--workings-body` is the whole vocabulary of the pane, so it is worth pinning
@@ -1159,7 +1197,7 @@ keyword, a literal or a fragment of code?"
           again (ed-tutor-launch m))
       (assert= (tut-note-texts again) (tut-note-texts m))
       (assert= (get-in again [:tutor :pending]) {}) ; nothing in flight
-      (assert= (get-in again [:tutor :next-id]) (get-in m [:tutor :next-id]))))
+      (assert= (sandbox/sandbox-next-id again) (sandbox/sandbox-next-id m))))
 
   (test "mid-typing replaces the previous note with the reader's reason, and never clears"
     (let (m (ed-tutor-launch (tut-model))
@@ -1248,14 +1286,36 @@ keyword, a literal or a fragment of code?"
       (assert= (get-in ready [:tutor :pending]) {})
       (assert= (get-in ready [:tutor :sandbox-gen]) 3))))
 
+(describe "results that are on the buffer but not on the screen"
+  ;; A reply stamps its note against the text of the moment it LANDS. Type a newline, get a
+  ;; result, delete the newline again and the page is back at exactly what the launch parsed
+  ;; — while its notes describe a line count that is gone, so `results/eol-notes` hands the
+  ;; renderer nothing. The rope comparison alone called that "nothing to do", and every
+  ;; verdict on the page stayed invisible until the next real edit.
+  (test "a page whose notes were stranded re-arms the debounce, and the launch restores them"
+    (let (m (ed-tutor-launch (tut-model))
+          rope0 (buffer-rope (tut-buf m))
+          pended (tut-pending m 0 7)
+          r (second (tut-regions pended))
+          ;; Enter in a LATER box: box 0's request is untouched, the page's lines are not
+          typed (ed-edit pended (fn (b) (insert (goto-char b (:start r)) "\n")))
+          landed (tutor/tutor-apply-reply typed {:id 7 :ok true :value "3" :output ""})
+          ;; …and the newline taken back again
+          back (ed-edit landed (fn (b) (assoc b :rope rope0))))
+      (is (= (buffer-rope (tut-buf back)) (:tutor-eval-rope (tut-buf back)))) ; the old guard: "nothing to do"
+      (is (nil? (results/eol-notes (tut-buf back)))) ; …yet the reader sees nothing
+      (is (ed-tutor-stale? back)) ; so the debounce must re-arm
+      (is (seq/find (tut-note-texts (ed-tutor-launch back)) (fn (t) (= t "=> 3")))))))
+
 (describe "the running indicator's lifecycle"
   (test "a box above the edit keeps its in-flight id, so its ⋯ can still resolve"
     ;; carrying the note but dropping the pending entry stranded `⋯ evaluating…`
     ;; permanently: the reply arrived and was discarded as unknown
     (let (m (ed-tutor-launch (tut-model))
-          rope (buffer-rope (tut-buf m))
+          box0 (let (r (first (tut-regions m)))
+                 (string/substring (tut-text m) (:start r) (:end r)))
           ;; pretend box 0 is in flight, then edit box 1 (below it) and re-launch
-          pending (update m :tutor merge {:pending {99 {:region 0 :rope rope}}})
+          pending (update m :tutor merge {:pending {99 {:region 0 :src box0}}})
           r (second (tut-regions pending))
           edited (ed-edit pending
                    (fn (b)
@@ -1705,15 +1765,17 @@ keyword, a literal or a fragment of code?"
     ;; bracket changed what the 'last form' was, and the note jumped line
     (let (m (tutor/tutor-show (ed-init (make-buffer "")) (lesson-idx "Moving around"))
           text (buffer-text (tut-buf m))
+          rope (buffer-rope (tut-buf m))
           r (first (tut-regions m))
-          before (tutor/tutor-note-anchor text r)
+          before (tutor/tutor-note-anchor rope text r)
           ;; type an unbalanced "(" into the middle of the prose
           typed (ed-edit m (fn (b) (insert (goto-char b (+ (:start r) 5)) "(")))
           text2 (buffer-text (tut-buf typed))
+          rope2 (buffer-rope (tut-buf typed))
           r2 (first (tutor-regions text2)))
-      (assert= (tutor/tutor-note-anchor text2 r2) before)
+      (assert= (tutor/tutor-note-anchor rope2 text2 r2) before)
       ;; and it is the box's last line, which is where a prose verdict belongs
-      (assert= before (results/line-of text (dec (:end r)))))))
+      (assert= before (results/line-of rope (dec (:end r)))))))
 
 (describe "C-x C-e inside a box (the :eval-scope service)"
   (defn scope-src (m)
@@ -1883,7 +1945,9 @@ keyword, a literal or a fragment of code?"
     ;; `check-string-structured` returns some diagnostics with :line nil; defaulting
     ;; those to 1 painted them on the first box's first line, so a warning about `fac`
     ;; appeared on a `countdown` defined four lines earlier
-    (let (spans (tutor/tutor-box-spans "  (a)\n  (b)"
+    (let (text "  (a)\n  (b)"
+          spans (tutor/tutor-box-spans (buffer-rope (make-buffer text))
+                  text
                   (list {:start 0 :end 5 :open-line 0 :kind :code})))
       ;; the guard is upstream of merge: a line outside every span maps to nowhere,
       ;; and a nil :line never reaches the mapper at all

@@ -14,7 +14,8 @@
   (:use input)
   (:use editor/buffer)
   (:use-internals playground)
-  (:use-internals view)) ; ed-eol-note-ops — the ghost-text layout
+  (:use-internals view) ; ed-eol-note-ops / ed-eol-note-face — the ghost-text layout
+  (:use-internals modes)) ; mark-note-glyph — the margin mark for a note kind
 (defn m-of (text) (ed-init (make-buffer text)))
 (defn press (m keys) (fold keys m (fn (acc k) (ed-update acc k 80 24))))
 
@@ -90,6 +91,31 @@
 
   (test "a stray closer is a real error — no further typing fixes it"
     (assert= (first (liveeval/parse-state ")")) :err)))
+
+(describe "liveeval/in-flight — which regions are already waiting"
+  ;; Tagged, so a caller can merge these over its record of what the session has actually
+  ;; evaluated, align the one map to the current text in a single pass, and still tell the
+  ;; promises from the facts afterwards.
+  (test "the request book, read by region, each answer marked a promise"
+    (assert= (liveeval/in-flight {7 {:region 0 :src "(a)"} 8 {:region 2 :src "(c)"}})
+      {0 {:src "(a)" :in-flight? true} 2 {:src "(c)" :in-flight? true}}))
+
+  ;; Edit a region again before its first request answers and there are two out for it. The
+  ;; newest is the one whose source is closest to the buffer, so it is the one that decides
+  ;; whether the region needs sending again — and `into` over the map left that to whichever
+  ;; entry iteration happened to visit last.
+  (test "two requests for one region: the newest id wins, always"
+    (assert= (:src (get (liveeval/in-flight {3 {:region 0 :src "(old)"}
+                                             9 {:region 0 :src "(new)"}})
+                     0))
+      "(new)")
+    (assert= (:src (get (liveeval/in-flight {9 {:region 0 :src "(new)"}
+                                             3 {:region 0 :src "(old)"}})
+                     0))
+      "(new)"))
+
+  (test "nothing out, nothing waiting"
+    (assert= (liveeval/in-flight {}) {})))
 
 (describe "liveeval/type-hint — what the checker makes of a form"
   (test "an expression's type"
@@ -250,9 +276,11 @@
 ;; answer goes BELOW its code (on the opening line it would read as a label on the paren),
 ;; a hint goes AT it.
 (describe "results — which line derived text lands on"
+  ;; Line arithmetic is asked of the ROPE (it indexes lines); the text is only for parsing.
+  (defn rope-of (text) (buffer-rope (make-buffer text)))
   (defn answer-at (text n)
     ;; where form `n`'s answer goes, the way `playground/pg-set-note` asks for it
-    (results/answer-line text (dec (:end (nth (sexp/top-level-forms text) n)))))
+    (results/answer-line (rope-of text) (dec (:end (nth (sexp/top-level-forms text) n)))))
 
   (test "an answer goes on the blank line below its form"
     (assert= (answer-at "(defn f (n)\n  (* n 2))\n" 0) 2))
@@ -260,8 +288,8 @@
   (test "a hint anchors on the form's own opening line"
     (let (text "(+ 1 2)\n\n(defn f (n)\n  (* n 2))\n"
           nodes (sexp/top-level-forms text))
-      (assert= (results/line-of text (:start (first nodes))) 0)
-      (assert= (results/line-of text (:start (second nodes))) 2)))
+      (assert= (results/line-of (rope-of text) (:start (first nodes))) 0)
+      (assert= (results/line-of (rope-of text) (:start (second nodes))) 2)))
 
   ;; The overlap this closes, and the reason the rule is "the line below IF BLANK" rather
   ;; than "the line below": forms written with no blank line between them — the normal way
@@ -283,7 +311,7 @@
   ;; of bounds`, seen on `nest run` with the welcome text edited down to one form).
   (test "text with no line below its last form still anchors somewhere that EXISTS"
     (let (text ";; note\n\n(+ 1 1/2)")
-      (assert= (results/line-count text) 3)
+      (assert= (results/line-count (rope-of text)) 3)
       (assert= (answer-at text 0) 2)))
 
   ;; Whatever the producer does, no two notes may end up drawn at one cell — so every
@@ -326,9 +354,9 @@
   ;; The rope opens a final empty line for a trailing newline, and `buffer-line-count`
   ;; reports it — an anchor clamped against a different count is clamped to the wrong line.
   (test "lines are counted the way the rope counts them"
-    (assert= (results/line-count "a\nb") (buffer-line-count (make-buffer "a\nb")))
-    (assert= (results/line-count "a\nb\n") (buffer-line-count (make-buffer "a\nb\n")))
-    (assert= (results/line-count "") (buffer-line-count (make-buffer "")))))
+    (assert= (results/line-count (rope-of "a\nb")) (buffer-line-count (make-buffer "a\nb")))
+    (assert= (results/line-count (rope-of "a\nb\n")) (buffer-line-count (make-buffer "a\nb\n")))
+    (assert= (results/line-count (rope-of "")) (buffer-line-count (make-buffer "")))))
 
 ;; What the session has evaluated, as the launch records it: `{index -> {:src :deps}}`.
 (defn evaluated (srcs) (into {} (map srcs (fn (kv) [(first kv) {:src (second kv)}]))))
@@ -410,11 +438,15 @@
       (into {}
         (map (playground/form-srcs text)
           (fn (kv) [(first kv) {:src (second kv) :deps (nth deps (first kv) {})}])))))
+  ;; `launch-plan` takes the ALIGNMENT (its caller has one anyway), so a plan over a raw
+  ;; record map aligns first — the one line the launch itself also writes.
   (defn plan (before after)
-    (playground/launch-plan (playground/form-srcs after)
-      (evaluated-of before)
-      (playground/deps-of after)
-      (count (playground/forms-of after))))
+    (let (srcs (playground/form-srcs after)
+          total (count (playground/forms-of after)))
+      (playground/launch-plan srcs
+        (playground/realign-evaluated srcs (evaluated-of before) total)
+        (playground/deps-of after)
+        total)))
 
   (test "nothing changed, nothing re-sent"
     (assert= (plan "(+ 1 2)\n(+ 3 4)\n" "(+ 1 2)\n(+ 3 4)\n") '()))
@@ -481,7 +513,9 @@
   ;; much is the failure worth having.
   (test "deps that do not line up fall back to the old suffix rule"
     (assert= (playground/launch-plan {0 "(a)" 1 "(b)" 2 "(c)"}
-               (evaluated {0 "(a)" 1 "(z)" 2 "(c)"})
+               (playground/realign-evaluated {0 "(a)" 1 "(b)" 2 "(c)"}
+                 (evaluated {0 "(a)" 1 "(z)" 2 "(c)"})
+                 3)
                '()
                3)
       (list 1 2))))
@@ -502,18 +536,14 @@
   ;; `results/eol-notes` hides every note the moment the line count changes; the launch
   ;; used to be what re-stamped them, a debounce later — so Enter blanked every result
   ;; for a quarter-second. Now the edit re-anchors them and the debounce only evaluates.
+  ;; the real stamping path (`pg-set-note`), so the note is remembered as well as anchored —
+  ;; a fixture that only wrote `:eol-notes` would be testing a buffer no launch can produce
   (defn with-note (m i note)
-    (let (b (pg-buf-of m)
-          spans (:playground-spans b)
-          k (model/ed-buffer-index-by-name m playground/*buffer-name*))
-      (assoc m
-        :buffers
-          (assoc (:buffers m)
-            k
-              (results/set-note b
-                i
-                note
-                (results/answer-line (buffer-text b) (dec (second (nth spans i)))))))))
+    (let (b (pg-buf-of m))
+      (playground/pg-set-note m
+        i
+        note
+        (playground/pg-placement (buffer-rope b) (buffer-text b) (:playground-spans b)))))
 
   (test "Enter at the end keeps every note visible, at its line"
     (let (m0 (with-note (pg-after-launch "(+ 1 2)") 0 {:kind :info :text "=> 3"})
@@ -535,6 +565,34 @@
           b (pg-buf-of m1))
       (assert= (or (results/eol-notes b) {}) {})))
 
+  ;; …dropped from the SCREEN, not forgotten. Typing a character and taking it back leaves
+  ;; the buffer exactly as the last launch parsed it, so no launch runs to re-derive the
+  ;; note — if the re-anchor had destroyed it, that form would show nothing until it was
+  ;; edited again.
+  (test "un-placing a note is not forgetting it: undo the edit and it comes back"
+    (let (m0 (with-note (pg-after-launch "(+ 1 2)") 0 {:kind :info :text "=> 3"})
+          m1 (playground/ed-playground-reanchor (retext m0 "(+ 1 3)"))
+          m2 (playground/ed-playground-reanchor (retext m1 "(+ 1 2)"))
+          b (pg-buf-of m2))
+      (assert= (:text (get (results/eol-notes b) 0)) "=> 3")))
+
+  ;; The stuck-with-no-output bug. A reply stamps its note against the text of the moment it
+  ;; lands; if the buffer then returns to what the launch parsed, a guard keyed on the launch
+  ;; rope says "already anchored" while the notes describe a line count that is gone —
+  ;; `eol-notes` answers nil, and `ed-playground-stale?` (the same comparison) arms nothing.
+  (test "a reply that landed on a shifted buffer still shows once the edit is undone"
+    (let (m0 (update (pg-after-launch "(+ 1 2)")
+               :playground merge
+               {:sandbox-gen 1 :pending {7 {:region 0 :src "(+ 1 2)"}}})
+          ;; Enter, before the reply came back…
+          m1 (playground/ed-playground-reanchor (retext m0 "(+ 1 2)\n\n"))
+          m2 (playground/playground-sandbox-reply m1 {:id 7 :ok true :value "3" :ms 0} 1)
+          ;; …and backspaced away again: the buffer is exactly what the launch parsed
+          m3 (playground/ed-playground-reanchor (retext m2 "(+ 1 2)"))
+          b (pg-buf-of m3))
+      (is (not (nil? (results/eol-notes b)))) ; renderable, not merely stored
+      (is (includes? (:text (get (results/eol-notes b) 0)) "=> 3"))))
+
   (test "it runs from the post-event step, and is a no-op until the buffer moves"
     (let (m0 (with-note (pg-after-launch "(+ 1 2)") 0 {:kind :info :text "=> 3"})
           m1 (model/ed-post-step (retext m0 "(+ 1 2)\n\n") :none)
@@ -553,6 +611,29 @@
           notes (pg-notes m1))
       (is (includes? (:text (get notes 0)) "=> 10"))
       (is (includes? (:text (get notes 2)) "=> 3")))))
+
+(describe "the notes that are not results"
+  ;; The playground used to spell these itself, and spelled the KIND wrong: `:pending` is in
+  ;; neither renderer's table, so `⋯ evaluating…` painted in the result colour with a `·` in
+  ;; the margin — the "stale verdict looking current" its own docstring promises never to
+  ;; show. Both features now take them from `liveeval`, and both renderers branch on
+  ;; `results/note-pending?` rather than on a list of kinds each keeps its own copy of.
+  (test "a half-typed form wears the pending voice, not a verdict"
+    (let (m (playground/ed-playground-launch (pg-open "(+ 1 "))
+          note (get (pg-notes m) 0))
+      (is (results/note-pending? (:kind note)))
+      (assert= (first (modes/mark-note-glyph note false)) "⋯")
+      (is (:italic (view/ed-eol-note-face (:kind note) false)))))
+
+  (test "a form no further typing can fix is a failure, and says so once"
+    (let (m (playground/ed-playground-launch (pg-open ")"))
+          note (get (pg-notes m) 0))
+      (assert= (:kind note) :fail)
+      (is (:error? note)) ; so a checker advisory does not repeat the error beside it
+      (is (string/starts-with? (:text note) "✗ "))))
+
+  (test "an in-flight form says so in the same voice"
+    (is (results/note-pending? (:kind (liveeval/running-note))))))
 
 (describe "the ready banner and what was already sent"
   ;; On open, the launch runs before the child has booted: its request QUEUES in the worker,
@@ -612,7 +693,10 @@
                :playground merge
                {:sandbox-gen 2 :pending {7 {:region 0 :src "(+ 1 2)"}}})
           m2 (playground/playground-sandbox-reply m1 {:id 7 :ok true :value "3"} 1))
-      (assert= (pg-notes m2) {})))
+      (assert= (pg-notes m2) {})
+      ;; …and unpended: nothing further is coming for it, so the next launch must be free
+      ;; to re-send the form rather than treat it as still in flight
+      (assert= (get-in m2 [:playground :pending]) {})))
 
   ;; Two entries, two lines: the answer where the form ends, the derived type where it
   ;; begins. Nothing is inserted into the buffer to make room for either — a hint that
@@ -657,9 +741,31 @@
           m2 (retext m1 "(+ 5 5)\n(+ 1 2)")
           m3 (playground/playground-sandbox-reply m2 {:id 7 :ok true :value "3" :ms 0} 1)
           notes (pg-notes m3))
-      (is (includes? (:text (get notes 1)) "=> 3"))
-      (assert= (get notes 0) nil)
+      ;; keyed by the REQUEST (region 0), anchored on the line the form moved to
+      (is (includes? (:text (get notes 0)) "=> 3"))
+      (assert= (:line (get notes 0)) 1)
       (assert= (get-in (pg-buf-of m3) [:playground-evaluated 1 :src]) "(+ 1 2)")))
+
+  ;; …and the key is the request's for a reason. Under the form's NEW index the answer landed
+  ;; on whatever key the launch had given the form now standing there — those two differ
+  ;; exactly when the forms have shifted, so the slot this one moved into is somebody else's.
+  ;; The visible half: the launch's own `⋯ evaluating…` sat at the old key on the same line,
+  ;; and `results/notes-on-line` paints every note a line carries — so the running indicator
+  ;; stayed on screen beside the result it had just produced.
+  (test "the result REPLACES the running indicator, rather than joining it"
+    (let (m0 (pg-after-launch "(+ 1 2)")
+          m1 (with-note (update m0
+                          :playground merge
+                          {:sandbox-gen 1 :pending {7 {:region 0 :src "(+ 1 2)"}}})
+               0
+               (liveeval/running-note))
+          ;; the keystroke re-anchors the indicator onto the line the form moved to…
+          m2 (playground/ed-playground-reanchor (retext m1 "(+ 5 5)\n(+ 1 2)"))
+          ;; …and the reply must land on that same note, not beside it
+          m3 (playground/playground-sandbox-reply m2 {:id 7 :ok true :value "3" :ms 0} 1)
+          on-line-1 (map (filter (pg-notes m3) (fn (kv) (= (:line (second kv)) 1))) second))
+      (assert= (count on-line-1) 1)
+      (is (includes? (:text (first on-line-1)) "=> 3"))))
 
   (test "a reply whose form has been edited since the send is dropped"
     (let (m0 (pg-after-launch "(+ 1 2)")
