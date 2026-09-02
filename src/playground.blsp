@@ -355,6 +355,29 @@ would re-run the wrong forms, silently. Re-running too much is the failure worth
   ;; file, on the KEYSTROKE path.
   {:rope rope :text text :spans spans})
 
+;; A note's form is remembered as ONE MARKER at its END — `std/editor/buffer`'s
+;; edit-surviving positions, the facility built for "overlays, diagnostics, and remote
+;; participants' cursors". Every editing op shifts it with the text, so after a keystroke the
+;; form is still `[end - length, end)` with no parsing to find it again. That is what makes
+;; [[ed-playground-reanchor]] O(notes) instead of O(buffer): one marker read and one slice
+;; per note, where it used to re-parse the whole buffer and re-pair every form.
+;;
+;; **The start is derived, not marked, and that is the point.** Markers have LEFT gravity —
+;; an insert exactly AT one leaves it put, so that text typed at your cursor lands after a
+;; collaborator's sitting in the same spot. Right for a cursor, wrong for a form's opening
+;; bracket: type at the very start of a form and its start marker would stay behind while the
+;; form moved down, and the note would read its own form as changed. The end has the gravity
+;; a form's end wants (text typed at it belongs to what follows, not to this form), and while
+;; the source is UNCHANGED — the only case where the note still applies — its length gives
+;; the start exactly. When the source did change the note is un-placed anyway, so a wrong
+;; start there costs nothing.
+(defn- pg-note-marker (bb key hi) (buffer-marker-set bb [:pg-end key] hi))
+
+(defn- pg-note-region (bb key src)
+  ;; `[lo hi]` for `key`'s form as the text stands now, or nil when it has no marker.
+  (let (hi (buffer-marker bb [:pg-end key]))
+    (when hi (let (lo (- hi (string/length src))) (when (>= lo 0) [lo hi])))))
+
 (defn- pg-note-into (bb key note span place)
   ;; Stamp `note` under `key` on buffer `bb`, anchored to the form at `span`, through the
   ;; shared anchored-note channel: its answer on the line below the form's last, its `:hint`
@@ -370,10 +393,14 @@ would re-run the wrong forms, silently. Re-running too much is the failure worth
     bb
     (let ([lo hi] span
           {:rope rope :text text} place)
-      (results/set-note (assoc bb
-                          :playground-notes
-                            (assoc (or (:playground-notes bb) {})
-                              key {:src (string/substring text lo hi) :note (dissoc note :line)}))
+      (results/set-note (pg-note-marker (assoc bb
+                                           :playground-notes
+                                             (assoc (or (:playground-notes bb) {})
+                                               key
+                                                 {:src (string/substring text lo hi)
+                                                  :note (dissoc note :line)}))
+                          key
+                          hi)
         key
         note
         (results/answer-line rope (dec hi)) ; the extent's end is exclusive
@@ -431,6 +458,51 @@ a fresh sandbox session asked for a replay (`:playground-replay`) — arms the
     (and (playground-buffer? b)
       (or (:playground-replay b) (not (= (buffer-rope b) (:playground-rope b)))))))
 
+(defn- pg-reanchor-marked (bb rope stash)
+  ;; The fast path: one marker read and one slice per note, no parsing. A note whose form
+  ;; still holds the source it was stamped for is re-placed at the line it now sits on; one
+  ;; whose form changed is un-placed but not forgotten, so reverting the edit puts it back.
+  (fold stash
+    (pg-clear-anchors bb)
+    (fn (acc kv)
+      (let ([key entry] kv
+            region (pg-note-region acc key (:src entry)))
+        (if (nil? region)
+          acc
+          (let ([lo hi] region)
+            (if (not (= (text/slice rope lo hi) (:src entry)))
+              acc
+              (results/set-note acc
+                key
+                (:note entry)
+                (results/answer-line rope (dec hi))
+                (results/line-of rope lo)))))))))
+
+(defn- pg-reanchor-by-text (bb rope stash)
+  ;; The slow path, for when a note has lost its marker: find each form by TEXT instead.
+  ;; Undo restores the markers its snapshot recorded, and a snapshot taken before a note was
+  ;; stamped has none — so undoing PAST a landed reply takes that note's marker with it. The
+  ;; note is still right and its form is still there; only the shortcut to it is gone. This
+  ;; costs one parse, and running it unconditionally is what the marker exists to avoid.
+  (let (text (text/->string rope)
+        forms (forms-of text)
+        spans (form-spans-in text forms)
+        pairs (:pairs (realign-evaluated (form-srcs-in text forms) stash (count forms))))
+    (fold pairs
+      (pg-clear-anchors bb)
+      (fn (acc ji)
+        (let ([key i] ji
+              entry (get stash key)
+              span (nth spans i nil))
+          (if (or (nil? entry) (nil? span))
+            acc
+            (let ([lo hi] span)
+              (results/set-note (pg-note-marker acc key hi) ; re-mark it, so the next edit is fast again
+                key
+                (:note entry)
+                (results/answer-line rope (dec hi))
+                (results/line-of rope lo)))))))))
+
 (defn ed-playground-reanchor (m)
   "Re-anchor the playground's notes to the text as it is NOW — on the edit itself, not the
 debounce. A note is stored with the line it sits on, and `results/eol-notes` hides the whole
@@ -438,10 +510,16 @@ set the moment the line count changes, since a stored line may no longer be the 
 every result vanished on Enter and came back a quarter-second later when the launch
 re-stamped them — a flicker of the entire buffer for a keystroke that changed nothing.
 
-Each note follows its form by text ([[pg-form-pairs]]) and keeps its launch-time key; a note
-whose form changed is un-placed rather than forgotten (`:playground-notes` keeps what it
-says), so reverting the edit puts it back. Evaluation stays on the debounce — this parses and
-moves lines, nothing more. Runs from `model/ed-post-step` on every event.
+**Each note's form is two MARKERS**, which the toolkit shifts with the text on every edit
+([[pg-note-markers]]). So this reads two markers and one slice per note: unchanged source,
+and the note is re-placed at the line it now sits on; changed, and it is un-placed but not
+forgotten (`:playground-notes` keeps what it says), so reverting the edit puts it back.
+Evaluation stays on the debounce — this moves lines and nothing else.
+
+It used to re-parse the whole buffer and re-pair every form against the last launch's, which
+is O(buffer) work on the KEYSTROKE path: 40 ms on a 500-form file, where the notes it had to
+move numbered 500 and the parse was pure overhead to find them again. Markers are what the
+toolkit built for this — the same facility that carries overlays and remote cursors.
 
 **The guard is the annotation's own currency, not a remembered rope.** It used to skip
 whenever the buffer still held the rope of the last anchor or the last launch, on the
@@ -456,21 +534,15 @@ against THIS rope is the same O(1) test and cannot drift from what it is guardin
   (let (b (pg-buf m))
     (if (or (nil? b) (not (results/eol-notes-stale? b)))
       m
-      (let (text (buffer-text b)
-            forms (forms-of text)
-            place (pg-placement (buffer-rope b) text (form-spans-in text forms))
-            pairs (pg-form-pairs b (form-srcs-in text forms) (count forms))
-            notes (pg-rekey-notes (or (:playground-notes b) {}) pairs))
+      (let (rope (buffer-rope b)
+            stash (or (:playground-notes b) {})
+            ;; every note still carries its marker? then no parsing is needed at all
+            marked? (every? (keys stash) (fn (k) (not (nil? (buffer-marker b [:pg-end k]))))))
         (pg-update-buf m
           (fn (bb)
-            (fold pairs
-              (pg-clear-anchors bb)
-              (fn (acc ji)
-                (let ([j i] ji
-                      note (get notes i))
-                  (if note
-                    (pg-note-into acc j note (nth (:spans place) i nil) place)
-                    acc))))))))))
+            (if marked?
+              (pg-reanchor-marked bb rope stash)
+              (pg-reanchor-by-text bb rope stash))))))))
 
 (defn ed-playground-launch (m)
   "The debounce landed: re-evaluate the forms this edit could have changed the answer of —
