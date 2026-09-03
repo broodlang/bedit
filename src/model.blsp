@@ -297,6 +297,50 @@ checking on `:diag-checking`, so a stale reply can't clobber a newer cache. Head
               job (task (fn () (svc text))))
           (assoc m :diag-proc job :diag-checking (buffer-rope buf))))))
 
+(defdyn *warm-tree-min*
+  ;; Below this many characters a whole-file parse is already imperceptible, so warming
+  ;; it would only spend a task. Around 40 KB is where the cold parse starts to be felt.
+  40000)
+
+(defn ed-tree-warm-stale? (m)
+  "True when the current buffer is a tree-sitter buffer big enough to be worth warming,
+and the tree cached for it is not the one it has now."
+  (let (buf (ed-current-buf m))
+    (and (ed-mode-service buf :ts-lang)
+      (> (buffer-length buf) *warm-tree-min*)
+      (not (= (buffer-rope buf) (:tree-warm m)))
+      (not (:tree-warm-proc m)))))
+
+(defn ed-launch-tree-warm (m)
+  "Parse the current buffer's whole text in a spawned task, so the tree is already in the
+runtime's cache when something asks for it.
+
+The queries an editor makes of a tree — the enclosing chain for RET, the sibling list for
+`C-M-f` — are cheap once the tree exists and dominated by the parse when it does not: on
+a 250 KB Elixir file the FIRST of them costs ~650 ms and every one after it ~1 ms. That
+first one used to land on whichever keypress happened to need it, which is precisely the
+key that then felt broken. Incremental reparse cannot help it — there is no previous tree
+to reparse from — so the answer is to stop it landing on a keypress at all.
+
+Runs on the idle beat beside the diff-hl and diagnostics launches, and for the same
+reason. The cache it warms lives in the runtime, not the model, so a task warming it is
+visible to the editor process without anything being sent back; the reply exists only to
+clear the in-flight flag."
+  (if (or (not (ed-tree-warm-stale? m)) (ed-headless?))
+    m
+    (let (buf (ed-current-buf m)
+          text (buffer-text buf)
+          lang (ed-mode-service buf :ts-lang)
+          job (task (fn () (check-allow :discarded-catch
+                             (try (do (%tree-sitter-chain text lang 0) :warm)
+                               (catch _ :failed))))))
+      (assoc m :tree-warm-proc job :tree-warming (buffer-rope buf)))))
+
+(defn ed-apply-tree-warm (m result)
+  "A finished warm: record which rope is now parsed and clear the in-flight handle. If
+the buffer moved on while it ran, `ed-tree-warm-stale?` fires again on the next beat."
+  (assoc m :tree-warm (:tree-warming m) :tree-warm-proc nil :tree-warming nil))
+
 (defn ed-apply-diag (m result)
   "Fold a finished diagnostics check's `result` (its `[:task-done …]` value, `()` if it
 errored / timed out) into the model: store it against the rope it was computed for
