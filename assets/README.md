@@ -30,9 +30,21 @@ an app with no id gets the generic fallback no matter what it draws.
 
 ## The icon
 
-A brood cell (the hexagon) holding a Lisp paren pair with the editor's caret
-between them, in the editor's own Catppuccin Mocha palette (`src/theme.blsp`):
-a mauve→blue plate, ink knocked out to the window background, caret in peach.
+A brood cell (the hexagon) holding two lines of text with the editor's caret at
+the end of the second, in the editor's own Catppuccin Mocha palette
+(`src/theme.blsp`): a mauve→blue plate, ink knocked out to the window background,
+caret in peach.
+
+It was a Lisp paren pair with the caret between them until 2026-09-03. Two arcs
+curving toward each other around a vertical bar is an **enclosure**, and an
+enclosure is what the eye resolves before it resolves punctuation — so the parens
+read as a boundary rather than as a form, and at 16 px they fused into a single
+almond with the caret dropping out below as a separate dot. The rule the
+replacement follows is simply that **no shape encloses another**: horizontal bars
+survive smallest, and the mark still reads as text with a cursor in it at every
+size the desktop asks for (64 px alt-tab, 32 px dash, 24 px title bar, 16 px
+"Open with"). Check a candidate by rasterising to 16 px and magnifying the
+pixels — scaled vectors will flatter a mark that does not actually hold up.
 
 `bedit.svg` is hand-written and is the only source — flat shapes, no
 embedded raster, so it stays legible down to 16 px. Nothing needs rasterising:
