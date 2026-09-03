@@ -16,49 +16,70 @@ and a dead one (e.g. after a crash) is replaced transparently."
 (def *compile-buf* "*compilation*")
 
 ;; ---- error line parser -------------------------------------------------------
-;; Recognises three common output formats:
-;;   GCC / clang / Mix / Brood:  file:line[:col]: …
-;;   Rust (cargo build):         …  --> file:line:col
-;;   Python traceback:           …  File "path", line N
+;; Emacs keeps `compilation-error-regexp-alist-alist`: a table of (REGEXP FILE LINE
+;; COL) rows where the numbers say which capture group holds what, and teaching
+;; `next-error` a new tool is adding a row. bedit could not have that table until
+;; Brood's regex engine grew capture groups — with a boolean `match?` there is no
+;; way to say "group 1 is the file" — so this was three hand-written
+;; string-splitting parsers, one per format someone had bothered to code, and a
+;; fourth format meant a fourth function.
+;;
+;; The order is the priority: a `-->` line also contains `file:line:col`, and a
+;; Python traceback must be read before anything hunts for colons in it.
 
-(defn- compile-digits? (s)
-  (and (> (string/length s) 0) (regex/matches? "\\d+" s)))
+(def *error-patterns*
+  [;; rustc / cargo:      -->  src/main.rs:10:5
+   {:name :rust :pattern "--> +([^\\s:]+):(\\d+):(\\d+)" :file 1 :line 2 :col 3}
+   ;; python traceback:   File "app.py", line 12, in foo
+   {:name :python :pattern "File \"([^\"]+)\", line (\\d+)" :file 1 :line 2 :col nil}
+   ;; gcc / clang / mix / elixir / brood:   path:12:5: message
+   {:name :gnu :pattern "([^\\s:()]*[^\\s:()\\d][^\\s:()]*):(\\d+):(\\d+)" :file 1 :line 2 :col 3}
+   ;; the same without a column — ExUnit's `test/foo_test.exs:12`, mix warnings,
+   ;; and every `file:line:` message whose next field is prose rather than a number
+   {:name :gnu-line
+    :pattern "([^\\s:()]*[^\\s:()\\d][^\\s:()]*):(\\d+)"
+    :file 1
+    :line 2
+    :col nil}])
+
+;; The file group is spelled `[^\s:()]*[^\s:()\d][^\s:()]*` — path characters, at
+;; least one of which is not a digit — rather than a plain `[^\s:()]+`, so that a
+;; bare `12:34:56` in a log is not read as line 34 of a file called `12`. The old
+;; parser, which split on `:` and asked only whether the next field was numeric,
+;; reported exactly that.
 
 (defn- compile-parse-int (s)
   ;; `s` is a token scraped from compiler output — not reading as a number is the answer
   (check-allow :discarded-catch
     (try (let (v (reflect/read-string s)) (if (int? v) v nil)) (catch e nil))))
 
-(defn- compile-parse-colon-loc (s)
-  "Parse `file:line[:col]` from `s` (GCC / clang / Mix / Brood format)."
-  (let (parts (string/split s ":"))
-    (when (>= (count parts) 2)
-      (let (file (first parts)
-            rest-parts (rest parts))
-        (when (and (> (string/length file) 0) (compile-digits? (first rest-parts)))
-          (let (ln (compile-parse-int (first rest-parts)))
-            (if (and (>= (count rest-parts) 2) (compile-digits? (second rest-parts)))
-              {:file file :line ln :col (compile-parse-int (second rest-parts))}
-              {:file file :line ln :col 1})))))))
+(defn- compile-group-text (match k)
+  "The text of capture group `k` of `match`, or nil — for a group index that is
+itself nil (a pattern with no column), and for a group that did not participate."
+  (when k
+    (let (g (nth (get match :groups) (dec k) nil))
+      (when g (get g :text)))))
 
-(defn- compile-parse-python-loc (line)
-  "Parse a Python traceback line: `  File \"path\", line N[, in …]`."
-  (let (parts (string/split line ", line "))
-    (when (and (>= (count parts) 2) (includes? (first parts) "File \""))
-      (let (fp-parts (string/split (first parts) "File \"")
-            raw (when (>= (count fp-parts) 2) (second fp-parts))
-            file (when (and raw (string/ends-with? raw "\""))
-                   (string/substring raw 0 (dec (string/length raw))))
-            ln (compile-parse-int (first (string/split (second parts) ","))))
+(defn- compile-loc-from (pattern line)
+  "Apply one `*error-patterns*` row to `line`; returns `{:file :line :col}` or nil.
+A row that matches but yields no usable file or line counts as no match, so the
+next row still gets its turn."
+  (let (m (regex/find (get pattern :pattern) line))
+    (when m
+      (let (file (compile-group-text m (get pattern :file))
+            ln (compile-parse-int (compile-group-text m (get pattern :line))))
         (when (and file (> (string/length file) 0) ln)
-          {:file file :line ln :col 1})))))
+          ;; a column the pattern does not capture is column 1, as it was
+          {:file file :line ln :col (or (compile-parse-int (compile-group-text m (get pattern :col))) 1)})))))
+
+(defn- compile-first-loc (patterns line)
+  (when (not (empty? patterns))
+    (or (compile-loc-from (first patterns) line) (compile-first-loc (rest patterns) line))))
 
 (defn- compile-parse-error-line (line)
-  "Parse a compiler error/warning location from `line`. Tries three formats in order:
-Rust `-->`, Python `File`, then GCC/clang/Mix/Brood `file:line[:col]`."
-  (or (when (includes? line " --> ") (compile-parse-colon-loc (second (string/split line " --> "))))
-    (compile-parse-python-loc line)
-    (compile-parse-colon-loc line)))
+  "Parse a compiler error/warning location from `line` — the first `*error-patterns*`
+row that matches it, or nil."
+  (compile-first-loc *error-patterns* line))
 
 (defn- compile-parse-errors (text)
   (seq/remove (map (string/split text "\n") compile-parse-error-line) nil?))
@@ -180,24 +201,61 @@ stay hot.)"
 
 ;; ---- M-x compile ------------------------------------------------------------
 
+(defn compile-run (m cmd)
+  "Start `cmd` in the project root, streaming its output into `*compilation*` and
+arming `next-error` over whatever locations it prints.
+
+This is the body of `M-x compile` once the command is known, lifted out so it is
+also what a non-Brood toolchain's test and run commands go through: \"stream a
+subprocess and parse the file:line it prints\" is one behaviour, and Emacs reaches
+it the same way — running `mix test` there is `M-x compile` with a different
+command, not a second runner. It deliberately does NOT remember `cmd` as the
+compile default; `M-x compile` records that itself, so running the tests does not
+change what the next build offers."
+  (let (root (or (:project-root m) (file/cwd))
+        proc (spawn :compile (compile-loop))
+        m2 (compile-reset m cmd))
+    (send proc [:compile-run cmd root])
+    (message (assoc m2 :compile-proc proc :compile-errors '() :compile-error-idx -1)
+      (str "Running: " cmd))))
+
 (defcommand cmd-compile
   (m key)
-  "Run a shell command in the project root, streaming output to `*compilation*` (M-x compile)."
-  (let (default (or (:compile-last-cmd m) "make"))
+  "Run a shell command in the project root, streaming output to `*compilation*` (M-x compile).
+The prompt is prefilled with what you last compiled here, else with what this
+project's toolchain builds with — `mix compile` in a mix project, `cargo build` in a
+cargo one — which is Emacs' buffer-local `compile-command` with projectile filling
+it in, rather than the bare `make` that used to be every project's answer."
+  (let (default (or (:compile-last-cmd m) (toolchain/compile-command m) "make"))
     (assoc m
       :minibuffer
         {:edit (ed-mb-edit "Compile command: " default)
-         :on-complete (fn (m2 cmd)
-                        (let (root (or (:project-root m2) (file/cwd))
-                              proc (spawn :compile (compile-loop))
-                              m3 (compile-reset m2 cmd))
-                          (send proc [:compile-run cmd root])
-                          (message (assoc m3
-                                     :compile-proc proc
-                                     :compile-last-cmd cmd
-                                     :compile-errors '()
-                                     :compile-error-idx -1)
-                            (str "Compiling: " cmd))))})))
+         :on-complete (fn (m2 cmd) (assoc (compile-run m2 cmd) :compile-last-cmd cmd))})))
+
+;; ---- M-x project-task -------------------------------------------------------
+
+(defcommand cmd-project-task
+  (m key)
+  "Run one of this project's build-tool tasks (M-x project-task) — a `mix` task, a
+script from a `package.json` — streaming it into `*compilation*`.
+
+The list comes from the TOOL, the way `mix.el`'s `mix-execute-task` completes over
+`mix help` rather than over a list someone typed into the editor: `mix help` includes
+the tasks a project defines for itself, so `mix ecto.migrate` shows up in a project
+that has Ecto and nowhere else."
+  (let (tasks (toolchain/tasks m)
+        label (toolchain/name-of m))
+    (if (empty? tasks)
+      (message m (str "no tasks to list for a " label " project"))
+      (assoc m
+        :minibuffer
+          (ed-name-prompt (str label " task: ")
+            tasks
+            (fn (m2 task)
+              (let (cmd (toolchain/task-command m2 task))
+                (if (nil? cmd)
+                  (message m2 (str "no way to run a task in a " label " project"))
+                  (compile-run m2 cmd)))))))))
 
 ;; ---- next-error / previous-error (C-x ` · M-g n / M-g p) --------------------
 ;; One walk parameterised by `step` (±1) — the cursor into `:compile-errors` moves either

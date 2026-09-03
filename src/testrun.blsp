@@ -34,6 +34,7 @@ suite's own output is visible rather than lost."
 (defrecord test-result-event (result gen)) ; one finished test; `gen` = the run it belongs to
 (defrecord test-summary-event (summary gen)) ; the run's structured summary map
 (defrecord test-output-event (text gen)) ; a non-JSON stdout line (the suite's own prints)
+(defrecord test-line-event (line gen)) ; one RAW stdout line, decoded in the fold
 (defrecord test-done-event (code gen)) ; the runner subprocess exited
 ;; ---- the generated runner script ---------------------------------------------
 ;; Built as quoted FORMS and pr-str'd — no string escaping, and the per-run spec
@@ -99,52 +100,17 @@ suite's own output is visible rather than lost."
 
 (defn- testrun-editor () (proc/whereis :editor))
 
-(defn- testrun-progress-noise? (line)
-  "Whether `line` is only the runner's progress marks (`.`/`F`/`○` waves) — shown in
-a terminal run, noise in *Tests*."
-  (let (t (string/trim line))
-    (and (not (= t ""))
-      (= "" (string/replace (string/replace (string/replace t "." "") "F" "") "○" "")))))
-
-(defn- testrun-decode-line (line)
-  "Classify one stdout line — `[:test m]` / `[:summary m]` / `[:output s]` / `[:drop]`.
-The driver's progress dots print WITHOUT a newline from another process, so a JSON
-line can arrive with a `F..`-style prefix — salvage by re-parsing from the first
-`{` when the line plainly carries an event object."
-  (let (parsed (ed-json-event-line line)
-        event (when parsed (get parsed :event)))
-    (cond
-      (= event "test") [:test parsed]
-      (= event "summary") [:summary parsed]
-      (= event "spy") [:spy parsed]
-      (= (string/trim line) "") [:drop]
-      (testrun-progress-noise? line) [:drop]
-      else [:output line])))
-
-(defn- testrun-dispatch-line (line gen)
-  "Decode one stdout line (`testrun-decode-line`) and forward its event record,
-stamped with the run `gen` so a previous run's straggler is discarded."
-  (let (kv (testrun-decode-line line))
-    (case (first kv)
-      :test (send (testrun-editor) (test-result-event (second kv) gen))
-      :summary (send (testrun-editor) (test-summary-event (second kv) gen))
-      ;; a spy entry from test code: rendered like *Run*'s (the shared renderer)
-      :spy
-        (send (testrun-editor)
-          (test-output-event (str "~ "
-                               (debugger/debugger-spy-body (get (second kv) :kind)
-                                 (get (second kv) :form)
-                                 (get (second kv) :value)
-                                 (get (second kv) :fn)
-                                 (get (second kv) :args)))
-            gen))
-      :output (send (testrun-editor) (test-output-event (second kv) gen))
-      nil)))
-
 (defn- testrun-handlers ()
-  "The `procstream` handlers (each takes the run token): stdout decodes into event
-records, stderr forwards as plain output, the exit becomes the done event."
-  {:on-line testrun-dispatch-line
+  "The `procstream` handlers (each takes the run token): every stdout line is
+forwarded RAW, stderr as plain output, the exit as the done event.
+
+Decoding used to happen here, in the worker, because Brood's runner emits one
+self-contained JSON object per line and a stateless fn could classify it. ExUnit
+cannot be read that way — a test's verdict arrives after its line — so the decoder
+needs state, and these handlers are plain fns captured at spawn with nowhere to keep
+any. The state lives in the model instead, which is where a TEA program keeps state,
+and both runners now take the same route: raw line in, `testadapter` events out."
+  {:on-line (fn (line gen) (send (testrun-editor) (test-line-event line gen)))
    :on-err-line (fn (line gen) (send (testrun-editor) (test-output-event line gen)))
    :on-done (fn (code gen) (send (testrun-editor) (test-done-event code gen)))})
 
@@ -156,13 +122,28 @@ run's verdicts replace the last run's."
       (into []
         (map (:buffers m) (fn (b) (dissoc b :test-marks :describe-marks :line-links))))))
 
+(defn- testrun-invocation (m specs)
+  "`[prog argv adapter-id]` for this project's test run.
+
+Brood's is generated: a script is written to a temp path and booted by `nest run`,
+because the editor needs `*test-report-sink*` installed inside the image and there
+is no flag for that. Every other toolchain names a program and its arguments in
+`toolchain/*toolchains*` and is read back through its adapter — the only reason this
+function has two arms rather than one table lookup."
+  (if (toolchain/brood? m)
+    (do (file/spit *testrun-script-path* (testrun-script-source specs))
+      ["nest" ["run" *testrun-script-path*] :brood])
+    (let (inv (toolchain/test-invocation m specs))
+      (when inv [(first inv) (second inv) (toolchain/adapter-id m)]))))
+
 (defn testrun-start (m specs root label)
-  "Write the runner script for `specs`, (re)start the `:testrun` worker, reset the
-*Tests* buffer (and every buffer's old verdict marks), and remember the invocation
-for `g`/rerun."
-  (file/spit *testrun-script-path* (testrun-script-source specs))
-  (let (proc (spawn :testrun (procstream/procstream-loop (testrun-handlers)))
-        argv ["run" *testrun-script-path*]
+  "Start a test run: (re)start the `:testrun` worker on this project's runner, reset
+the *Tests* buffer (and every buffer's old verdict marks), and remember the
+invocation for `g`/rerun. The runner differs per toolchain; everything after the
+first decoded line does not."
+  (let (inv (testrun-invocation m specs)
+        [prog argv adapter-id] (or inv ["" [] nil])
+        proc (spawn :testrun (procstream/procstream-loop (testrun-handlers)))
         ;; a fresh run generation — events tagged with an older gen (a superseded
         ;; run's in-flight stragglers) are dropped by the folds
         gen (inc (or (get-in m [:testrun :gen]) 0))
@@ -172,7 +153,7 @@ for `g`/rerun."
                    (fn (spec)
                      (let (i (testrun-buffer-for m (get spec :file)))
                        (and i (:modified (ed-buf-at m i)))))))
-    (send proc [:run "nest" argv root gen])
+    (send proc [:run prog argv root gen])
     (ed-show-named-aside (message (assoc (testrun-clear-marks m)
                                     :testrun
                                       {:specs specs
@@ -181,7 +162,10 @@ for `g`/rerun."
                                        :gen gen
                                        :passed 0
                                        :failed 0
-                                       :last-group nil})
+                                       :last-group nil
+                                       :adapter-id adapter-id
+                                       :decoder (testadapter/init
+                                                  (testadapter/for-toolchain adapter-id))})
                            (str "testing "
                              label
                              "…"
@@ -361,64 +345,116 @@ edited. A test with no recorded position, or whose file isn't open, marks nothin
 superseded run (rapid re-runs) is dropped so it can't corrupt the fresh report."
   (= gen (get-in m [:testrun :gen])))
 
-(impl UiEvent
-  test-result-event
+(defn- testrun-apply-result (m r cols rows)
   ;; A finished test streams into *Tests* — under a describe HEADER emitted the first
   ;; time a group is seen (its tests indent below it) — AND stamps its ✓/✗ into the
   ;; test file's margin; failures bump the model's count so the summary echo can say
-  ;; "3 failed" before the summary lands. Stale-run events are ignored.
+  ;; "3 failed" before the summary lands.
+  ;;
+  ;; A plain function, not the event fold itself, because the same result arrives two
+  ;; ways: as a `test-result-event` (what the tests send), and out of `testadapter`
+  ;; when a raw line is decoded. Whichever runner produced it, this is what it means.
+  (let (group (or (get r :group) "")
+        key (if (get r :passed) :passed :failed)
+        m1 (update-in m [:testrun key] (fn (n) (inc (or n 0))))
+        ;; a header line when the group changes (arrival order; a re-header on
+        ;; interleaved parallel groups is informative, not wrong)
+        m2 (if (= group (get-in m1 [:testrun :last-group]))
+                 m1
+             (testrun-append-link (assoc-in m1 [:testrun :last-group] group)
+               (testrun-group-header group)
+               (testrun-describe-loc m1 r)
+               cols
+               rows)))
+    (testrun-annotate (testrun-append-link m2
+                        (testrun-result-lines r)
+                        (testrun-where->loc (get r :where))
+                        cols
+                        rows)
+      r)))
+
+(impl UiEvent
+  test-result-event
   (ui-event-fold [e m textrows cols rows]
     (if (not (testrun-current? m (test-result-event-gen e)))
       m
-      (let (r (test-result-event-result e)
-            group (or (get r :group) "")
-            key (if (get r :passed) :passed :failed)
-            m1 (update-in m [:testrun key] (fn (n) (inc (or n 0))))
-            ;; a header line when the group changes (arrival order; a re-header on
-            ;; interleaved parallel groups is informative, not wrong)
-            m2 (if (= group (get-in m1 [:testrun :last-group]))
-                 m1
-                 (testrun-append-link (assoc-in m1 [:testrun :last-group] group)
-                   (testrun-group-header group)
-                   (testrun-describe-loc m1 r)
-                   cols
-                   rows)))
-        (testrun-annotate (testrun-append-link m2
-                            (testrun-result-lines r)
-                            (testrun-where->loc (get r :where))
-                            cols
-                            rows)
-          r)))))
+      (testrun-apply-result m (test-result-event-result e) cols rows))))
+
+(defn- testrun-apply-summary (m s cols rows)
+  (let (line (str "\n"
+               (get s :total)
+               " tests, "
+               (get s :passed)
+               " passed, "
+               (get s :failed)
+               " failed ("
+               (get s :ms)
+               " ms)\n"))
+    (message (ed-append-follow m *tests-buffer* line cols rows)
+      (str "tests: "
+        (get s :passed)
+        "/"
+        (get s :total)
+        " passed"
+        (if (> (get s :failed) 0) (str ", " (get s :failed) " FAILED") "")))))
 
 (impl UiEvent
   test-summary-event
   (ui-event-fold [e m textrows cols rows]
     (if (not (testrun-current? m (test-summary-event-gen e)))
       m
-      (let (s (test-summary-event-summary e)
-            line (str "\n"
-                   (get s :total)
-                   " tests, "
-                   (get s :passed)
-                   " passed, "
-                   (get s :failed)
-                   " failed ("
-                   (get s :ms)
-                   " ms)\n"))
-        (message (ed-append-follow m *tests-buffer* line cols rows)
-          (str "tests: "
-            (get s :passed)
-            "/"
-            (get s :total)
-            " passed"
-            (if (> (get s :failed) 0) (str ", " (get s :failed) " FAILED") "")))))))
+      (testrun-apply-summary m (test-summary-event-summary e) cols rows))))
+
+(defn- testrun-apply-output (m text cols rows)
+  (ed-append-follow m *tests-buffer* (str "  | " text "\n") cols rows))
 
 (impl UiEvent
   test-output-event
   (ui-event-fold [e m textrows cols rows]
     (if (not (testrun-current? m (test-output-event-gen e)))
       m
-      (ed-append-follow m *tests-buffer* (str "  | " (test-output-event-text e) "\n") cols rows))))
+      (testrun-apply-output m (test-output-event-text e) cols rows))))
+
+;; ---- one raw line, whichever runner produced it ------------------------------
+;; The join between the two runners. A line arrives, the run's adapter decodes it
+;; into zero or more events in the shared vocabulary, and each is applied by the same
+;; function a `test-result-event` would reach. The decoder's state rides on the model
+;; between lines, which is what lets an adapter hold a test back until it knows
+;; whether it passed.
+
+(defn- testrun-apply-event (m ev cols rows)
+  (case (first ev)
+    :test (testrun-apply-result m (second ev) cols rows)
+    :summary (testrun-apply-summary m (second ev) cols rows)
+    ;; a spy entry from test code: rendered like *Run*'s (the shared renderer)
+    :spy
+      (testrun-apply-output m
+        (str "~ "
+          (debugger/debugger-spy-body (get (second ev) :kind)
+            (get (second ev) :form)
+            (get (second ev) :value)
+            (get (second ev) :fn)
+            (get (second ev) :args)))
+        cols
+        rows)
+    :output (testrun-apply-output m (second ev) cols rows)
+    m))
+
+(defn- testrun-fold-line (m line cols rows)
+  "Decode one stdout line with this run's adapter and apply what it yields."
+  (let (adapter (testadapter/for-toolchain (get-in m [:testrun :adapter-id])))
+    (if (nil? adapter)
+      m
+      (let ([state events] (testadapter/decode adapter (get-in m [:testrun :decoder]) line))
+        (fold events (assoc-in m [:testrun :decoder] state)
+          (fn (acc ev) (testrun-apply-event acc ev cols rows)))))))
+
+(impl UiEvent
+  test-line-event
+  (ui-event-fold [e m textrows cols rows]
+    (if (not (testrun-current? m (test-line-event-gen e)))
+      m
+      (testrun-fold-line m (test-line-event-line e) cols rows))))
 
 (impl UiEvent
   test-done-event
@@ -436,38 +472,54 @@ superseded run (rapid re-runs) is dropped so it can't corrupt the fresh report."
 (defn- testrun-root (m)
   (or (:project-root m) (file/cwd)))
 
+;; ---- the three scopes, one route --------------------------------------------
+;; `C-c t f` / `C-c t t` / `C-c t p` mean the same thing in every project. Where a
+;; toolchain has an ADAPTER (`testadapter`) its runner streams into *Tests* exactly
+;; as Brood's does — ✓/✗ rows, margin verdicts, live counters, RET to jump. Where it
+;; only has a shell command, the run goes to the compilation buffer, which needs no
+;; knowledge of its output format and still gives `C-x \`` over the failures. Where
+;; it has neither, the editor says so instead of guessing.
+
+(defn- testrun-go (m specs label fallback)
+  (cond
+    (toolchain/adapter-id m) (testrun-start m specs (testrun-root m) label)
+    (nil? fallback) (message m (str "no test command for a " (toolchain/name-of m) " project"))
+    else (compile/compile-run m fallback)))
+
 (defcommand cmd-test-file
   (m key)
-  "Run the current test file natively (C-c t f): the runner subprocess loads it and
-streams per-test results into *Tests*."
+  "Run the current file's tests (C-c t f) — `nest test <file>`, `mix test <file>`, or
+whatever this project's toolchain scopes a file with."
   (let (file (buffer-file (ed-current-buf m)))
     (if (nil? file)
       (message m "buffer has no file to test")
-      (testrun-start m
+      (testrun-go m
         (list {:file file :line nil})
-        (testrun-root m)
-        (path/basename file)))))
+        (path/basename file)
+        (toolchain/test-file-command m file)))))
 
 (defcommand cmd-test-at-point
   (m key)
-  "Run the test under point (C-c t t): the framework's own FILE:LINE resolution —
-the last test declared at or before this line."
+  "Run the test under point (C-c t t): the framework's own FILE:LINE resolution — the
+last test declared at or before this line. `mix test path:12` and `nest test path:12`
+address a test the same way; a toolchain that addresses tests by name instead (cargo)
+falls back to running the whole file, which is nearer the ask than running everything."
   (let (buf (ed-current-buf m)
         file (buffer-file buf))
     (if (nil? file)
       (message m "buffer has no file to test")
       (let (line (inc (buffer-current-line buf)))
-        (testrun-start m
+        (testrun-go m
           (list {:file file :line line})
-          (testrun-root m)
-          (str (path/basename file) ":" line))))))
+          (str (path/basename file) ":" line)
+          (toolchain/test-at-point-command m file line))))))
 
 (defcommand cmd-test-project
   (m key)
-  "Run the whole project suite natively (C-c t p) — streamed per-test into *Tests*.
-(On a memory-tight machine prefer file/at-point scope; the runner already lowers
-the parallel batch.)"
-  (testrun-start m '() (testrun-root m) "project suite"))
+  "Run the whole project suite (C-c t p), streamed per-test into *Tests*.
+(On a memory-tight machine prefer file/at-point scope; the native runner already
+lowers the parallel batch.)"
+  (testrun-go m '() "project suite" (toolchain/test-command m)))
 
 (defcommand cmd-test-rerun
   (m key)

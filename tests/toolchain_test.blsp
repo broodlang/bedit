@@ -1,0 +1,123 @@
+;; The project TYPE as data (src/toolchain.blsp): which commands build, test and run
+;; here. Detection is filesystem-shaped, so these build real fixture directories
+;; rather than stubbing — a marker file is the whole mechanism, and a test that
+;; mocked it would be testing the mock.
+
+(defmodule toolchain-test (:use test) (:use toolchain) (:use projects))
+
+(defn tct-dir (name)
+  (let (dir (str "/tmp/bedit-tc-" name "-" (:id (proc/info (self)))))
+    (file/mkdir dir)
+    dir))
+
+(defn tct-with (name markers)
+  "A fresh directory holding each of `markers` as an empty file; returns its path."
+  (let (dir (tct-dir name))
+    (fold markers nil (fn (_ marker) (file/spit (path/join dir marker) "")))
+    dir))
+
+(describe "toolchain detection"
+  (test "a marker file names the project's type"
+    (assert= (get (detect (tct-with "mix" ["mix.exs"])) :id) :elixir)
+    (assert= (get (detect (tct-with "brood" ["project.blsp"])) :id) :brood)
+    (assert= (get (detect (tct-with "rust" ["Cargo.toml"])) :id) :rust)
+    (assert= (get (detect (tct-with "node" ["package.json"])) :id) :node)
+    (assert= (get (detect (tct-with "go" ["go.mod"])) :id) :go)
+    (assert= (get (detect (tct-with "py" ["pyproject.toml"])) :id) :python)
+    (assert= (get (detect (tct-with "make" ["Makefile"])) :id) :make))
+
+  ;; The table's order is the tie-break, and this is the case it exists for: a mix
+  ;; project with a Makefile in it is an Elixir project, not a Make one.
+  (test "a manifest beats a Makefile"
+    (assert= (get (detect (tct-with "both" ["mix.exs" "Makefile"])) :id) :elixir)
+    (assert= (get (detect (tct-with "both2" ["Cargo.toml" "Makefile"])) :id) :rust))
+
+  (test "an unrecognised directory is not a failure — it is the historical default"
+    (let (tc (detect (tct-dir "bare")))
+      (assert= (get tc :id) :unknown)
+      (assert= (get tc :compile) "make"))
+    (assert= (get (detect nil) :id) :unknown))
+
+  (test "detection follows the model's project root"
+    (assert= (get (for-model {:project-root (tct-with "m1" ["mix.exs"])}) :id) :elixir)
+    (assert= (name-of {:project-root (tct-with "m2" ["mix.exs"])}) "Elixir")))
+
+(describe "the commands a toolchain offers"
+  (def tct-mix {:project-root (tct-with "cmds" ["mix.exs"])})
+  (def tct-cargo {:project-root (tct-with "cargo" ["Cargo.toml"])})
+  (def tct-bare {:project-root (tct-dir "nothing")})
+
+  (test "compile / test / run / repl come from the table"
+    (assert= (compile-command tct-mix) "mix compile")
+    (assert= (test-command tct-mix) "mix test")
+    (assert= (run-command tct-mix) "mix run")
+    (assert= (repl-command tct-mix) "iex -S mix"))
+
+  (test "a file-scoped and a line-scoped test command"
+    (assert= (test-file-command tct-mix "test/a_test.exs") "mix test test/a_test.exs")
+    (assert= (test-at-point-command tct-mix "test/a_test.exs" 12) "mix test test/a_test.exs:12"))
+
+  ;; cargo addresses tests by name, so it has no line-scoped form. Falling back to the
+  ;; whole file is nearer what was asked than falling back to the whole project.
+  (test "a toolchain with no line addressing falls back to the file"
+    (assert= (test-at-point-command tct-cargo "tests/a.rs" 12) "cargo test"))
+
+  (test "an unknown project answers nil rather than guessing"
+    (is (nil? (test-command tct-bare)))
+    (is (nil? (run-command tct-bare)))
+    (is (nil? (test-invocation tct-bare '())))
+    (is (nil? (adapter-id tct-bare)))))
+
+(describe "the native test invocation"
+  (def tct-mix2 {:project-root (tct-with "inv" ["mix.exs"])})
+
+  ;; `[prog argv]`, not a shell string: the streaming worker spawns the program
+  ;; directly, so there is no shell to quote for.
+  (test "mix runs with --trace, which is what makes per-test rows possible"
+    (let ([prog argv] (test-invocation tct-mix2 '()))
+      (assert= prog "mix")
+      (assert= argv ["test" "--trace"])))
+
+  (test "specs become path and path:line arguments"
+    (let ([_ argv] (test-invocation tct-mix2 (list {:file "test/a_test.exs" :line nil})))
+      (assert= argv ["test" "--trace" "test/a_test.exs"]))
+    (let ([_ argv] (test-invocation tct-mix2 (list {:file "test/a_test.exs" :line 12})))
+      (assert= argv ["test" "--trace" "test/a_test.exs:12"])))
+
+  (test "and it names the adapter that reads the output back"
+    (assert= (adapter-id tct-mix2) :elixir)))
+
+;; The marker list `projects` searches for a root is DERIVED from the table above, so
+;; teaching bedit a language also teaches it to recognise that language's checkouts.
+(describe "project markers derive from the toolchain table"
+  (test "every root-marking manifest is a project marker"
+    (is (includes? *project-markers* "mix.exs"))
+    (is (includes? *project-markers* "project.blsp"))
+    (is (includes? *project-markers* "Cargo.toml"))
+    (is (includes? *project-markers* ".git")))
+
+  ;; A Makefile sits in subdirectories all the time; treating it as a root marker
+  ;; would make half a monorepo its own project.
+  (test "a Makefile is a type marker, not a root marker"
+    (is (not (includes? *project-markers* "Makefile")))))
+
+;; `mix help` lists the tasks the PROJECT defines as well as mix's own, which is the
+;; whole reason the list is asked for rather than baked in.
+(when (= 0 (:exit (%os-cmd "sh" ["-c" "command -v mix >/dev/null"])))
+  (describe "task listing, from the tool itself"
+    :isolated (test "mix help's tasks come back, project included"
+      (let (dir (tct-dir "tasks"))
+        (file/spit (path/join dir "mix.exs")
+          (string/join
+            ["defmodule T.MixProject do"
+             "  use Mix.Project"
+             "  def project, do: [app: :t, version: \"0.1.0\"]"
+             "end"]
+            "\n"))
+        (let (all (tasks {:project-root dir}))
+          (is (> (count all) 20))
+          (is (includes? all "test"))
+          (is (includes? all "deps.get"))
+          ;; the bare `mix` line in the listing is the default task, not a task name
+          (is (not (includes? all "")))
+          (assert= (task-command {:project-root dir} "deps.get") "mix deps.get"))))))

@@ -1,0 +1,247 @@
+;; The adapter seam (src/testadapter.blsp): one result vocabulary, two runners.
+;; The ExUnit half is asserted against output captured from a real `mix test --trace`
+;; run (see the fixture below), not against remembered formatting — the parser was
+;; wrong about two things until it was shown the real bytes: a failing test's trace
+;; line is indistinguishable from a passing one, and the start/finish records for one
+;; test arrive on the SAME line.
+
+(defmodule testadapter-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use-internals testrun)
+  (:use testadapter))
+
+;; A real `mix test --trace` run over a fixture project with one passing test, one
+;; failing, one skipped, and one outside any describe.
+(def ta-trace-output
+  (string/join
+    ["Compiling 1 file (.ex)"
+     "Generated ledger app"
+     "Running ExUnit with seed: 24496, max_cases: 1"
+     ""
+     ""
+     "LedgerTest [test/ledger_test.exs]"
+     "  * test one that is skipped [L#15]  * test one that is skipped (skipped) [L#15]"
+     "  * test post/2 rejects a negative amount [L#9]  * test post/2 rejects a negative amount (2.5ms) [L#9]"
+     ""
+     "  1) test post/2 rejects a negative amount (LedgerTest)"
+     "     test/ledger_test.exs:9"
+     "     Assertion with == failed"
+     "     code:  assert Ledger.post(:a, -5) == {:ok, -5}"
+     "     left:  {:error, :negative}"
+     "     right: {:ok, -5}"
+     "     stacktrace:"
+     "       test/ledger_test.exs:10: (test)"
+     ""
+     "  * test post/2 accepts a positive amount [L#5]  * test post/2 accepts a positive amount (0.00ms) [L#5]"
+     "  * test a plain ungrouped test [L#19]  * test a plain ungrouped test (0.00ms) [L#19]"
+     ""
+     "Finished in 0.01 seconds (0.00s async, 0.01s sync)"
+     ""
+     "Result: 2/3 passed, 1 skipped"
+     "Failed: 1 test"]
+    "\n"))
+
+(defn ta-drive (adapter text)
+  "Every event `adapter` yields for `text`, flush included — what the model folds."
+  (let ([state out] (fold (string/split text "\n")
+                      [(testadapter/init adapter) []]
+                      (fn (acc line)
+                        (let ([st seen] acc
+                              [st2 events] (testadapter/decode adapter st line))
+                          [st2 (into seen (into [] events))])))
+        [_ tail] (testadapter/flush adapter state))
+    (into out (into [] tail))))
+
+(defn ta-results (events)
+  (into [] (map (filter events (fn (e) (= (first e) :test))) second)))
+
+(describe "the ExUnit adapter, on real mix output"
+  (def ta-events (ta-drive testadapter/exunit-adapter ta-trace-output))
+  (def ta-tests (ta-results ta-events))
+
+  (test "every test in the run comes out, once"
+    (assert= (count ta-tests) 4)
+    (assert= (into [] (map ta-tests (fn (r) (get r :name))))
+      ["one that is skipped"
+        "post/2 rejects a negative amount"
+        "post/2 accepts a positive amount"
+        "a plain ungrouped test"]))
+
+  ;; The one that cost a rewrite: in `--trace` the failing test's own line says
+  ;; nothing about failing. Only the numbered block that FOLLOWS it does, so the
+  ;; adapter must hold each test until the next line arrives.
+  (test "the verdict comes from the block after the line, not the line"
+    (assert= (into [] (map ta-tests (fn (r) (get r :passed)))) [true false true true]))
+
+  (test "a skipped test is skipped, not merely passing"
+    (assert= (get (first ta-tests) :skipped) true)
+    (assert= (get (nth ta-tests 1) :skipped) false))
+
+  (test "each result carries its declaration site, so the margin and RET can find it"
+    (assert= (into [] (map ta-tests (fn (r) (get r :where))))
+      ["test/ledger_test.exs:15"
+        "test/ledger_test.exs:9"
+        "test/ledger_test.exs:5"
+        "test/ledger_test.exs:19"]))
+
+  (test "the group is the module the header named"
+    (is (every? ta-tests (fn (r) (= (get r :group) "LedgerTest")))))
+
+  (test "timings survive"
+    (assert= (get (nth ta-tests 1) :ms) 2.5)
+    (assert= (get (first ta-tests) :ms) 0))
+
+  (test "a failure carries the location and the assertion prose"
+    (let (f (first (get (nth ta-tests 1) :failures)))
+      (assert= (get f :loc) ["test/ledger_test.exs" 9 1])
+      (is (includes? (get f :details) "Assertion with == failed"))
+      (is (includes? (get f :details) "left:  {:error, :negative}"))))
+
+  (test "passing tests carry no failures"
+    (is (every? (filter ta-tests (fn (r) (get r :passed))) (fn (r) (empty? (get r :failures))))))
+
+  (test "the summary is the run's own accounting"
+    (let (s (second (first (filter ta-events (fn (e) (= (first e) :summary))))))
+      (assert= (get s :total) 3)
+      (assert= (get s :passed) 2)
+      (assert= (get s :failed) 1)
+      (assert= (get s :ms) 10)))
+
+  ;; Compilation output is deliberately NOT filtered. A mix run that fails to compile
+  ;; prints its errors here and runs no tests at all, so a filter tidy enough to drop
+  ;; "Compiling 1 file (.ex)" is also tidy enough to hide the reason nothing ran. The
+  ;; progress marks are the only thing dropped, because they carry nothing.
+  (test "compiler output survives — it is how a run that never started explains itself"
+    (let (output (into [] (map (filter ta-events (fn (e) (= (first e) :output))) second)))
+      (is (any? output (fn (l) (includes? l "Compiling 1 file"))))))
+
+  (test "but the failure block's prose does not also arrive as loose output"
+    (let (output (into [] (map (filter ta-events (fn (e) (= (first e) :output))) second)))
+      (is (not (any? output (fn (l) (includes? l "Assertion with == failed")))))
+      (is (not (any? output (fn (l) (includes? l "1) test post/2"))))))))
+
+(describe "the Brood adapter is the same vocabulary, without the parsing"
+  (test "a structured line becomes a result directly"
+    (let (events (ta-drive testadapter/brood-adapter
+                   "{\"event\":\"test\",\"name\":\"adds\",\"group\":\"core\",\"passed\":true,\"ms\":1}"))
+      (assert= (get (first (ta-results events)) :name) "adds")))
+  (test "it holds nothing back — there is nothing to hold"
+    (let ([state _] (testadapter/decode testadapter/brood-adapter
+                      (testadapter/init testadapter/brood-adapter)
+                      "{\"event\":\"test\",\"name\":\"n\",\"passed\":true}")
+          [_ flushed] (testadapter/flush testadapter/brood-adapter state))
+      (assert= (into [] flushed) []))))
+
+;; The join: raw lines folded into the model reach the SAME *Tests* buffer and the
+;; same counters, whichever adapter decoded them. This is the property the whole
+;; abstraction exists for, so it is asserted for both runners side by side.
+(describe "both runners land in one *Tests* buffer"
+  (defn ta-fold-lines (adapter-id text)
+    (let (m0 (assoc (ed-init (make-buffer ""))
+               :testrun
+                 {:gen 1
+                  :passed 0
+                  :failed 0
+                  :last-group nil
+                  :adapter-id adapter-id
+                  :decoder (testadapter/init (testadapter/for-toolchain adapter-id))}))
+      (fold (string/split text "\n") m0
+        (fn (m line) (ui-event-fold (test-line-event line 1) m 24 80 24)))))
+
+  (test "mix output fills *Tests* with ✓/✗ rows under the module header"
+    (let (m (ta-fold-lines :elixir ta-trace-output)
+          idx (ed-buffer-index-by-name m "*Tests*")
+          text (when idx (buffer-text (nth (:buffers m) idx))))
+      (is (not (nil? text)))
+      (is (includes? text "LedgerTest"))
+      (is (includes? text "✓ post/2 accepts a positive amount"))
+      (is (includes? text "✗ post/2 rejects a negative amount"))
+      (is (includes? text "· one that is skipped"))
+      (assert= (get-in m [:testrun :failed]) 1)
+      (assert= (get-in m [:testrun :passed]) 3)))
+
+  (test "Brood output fills the same buffer the same way"
+    (let (m (ta-fold-lines :brood
+              (string/join
+                ["{\"event\":\"test\",\"group\":\"core\",\"name\":\"adds\",\"passed\":true,\"ms\":1}"
+                 "{\"event\":\"test\",\"group\":\"core\",\"name\":\"subs\",\"passed\":false,\"ms\":2}"]
+                "\n"))
+          idx (ed-buffer-index-by-name m "*Tests*")
+          text (when idx (buffer-text (nth (:buffers m) idx))))
+      (is (includes? text "core"))
+      (is (includes? text "✓ adds"))
+      (is (includes? text "✗ subs"))
+      (assert= (get-in m [:testrun :failed]) 1)
+      (assert= (get-in m [:testrun :passed]) 1))))
+
+;; ---- and against a real `mix test` subprocess --------------------------------
+;; The fixture above is captured output; this runs the actual thing, so a change in
+;; how ExUnit formats its output fails here rather than in someone's editor. Skipped
+;; where `mix` is not installed, the way brood's own grammar tests skip.
+
+(defn ta-mix? () (= 0 (:exit (%os-cmd "sh" ["-c" "command -v mix >/dev/null"]))))
+
+(defn ta-write-mix-fixture (dir)
+  (file/mkdir dir)
+  (file/mkdir (str dir "/lib"))
+  (file/mkdir (str dir "/test"))
+  (file/spit (str dir "/mix.exs")
+    (string/join
+      ["defmodule Ledger.MixProject do"
+       "  use Mix.Project"
+       "  def project, do: [app: :ledger, version: \"0.1.0\", elixir: \"~> 1.14\", deps: []]"
+       "end"]
+      "\n"))
+  (file/spit (str dir "/lib/ledger.ex")
+    (string/join
+      ["defmodule Ledger do"
+       "  def post(_a, amount) when amount < 0, do: {:error, :negative}"
+       "  def post(_a, amount), do: {:ok, amount}"
+       "end"]
+      "\n"))
+  (file/spit (str dir "/test/test_helper.exs") "ExUnit.start()\n")
+  (file/spit (str dir "/test/ledger_test.exs")
+    (string/join
+      ["defmodule LedgerTest do"
+       "  use ExUnit.Case"
+       "  describe \"post/2\" do"
+       "    test \"accepts a positive amount\" do"
+       "      assert Ledger.post(:a, 5) == {:ok, 5}"
+       "    end"
+       "    test \"rejects a negative amount\" do"
+       "      assert Ledger.post(:a, -5) == {:ok, -5}"
+       "    end"
+       "  end"
+       "end"]
+      "\n")))
+
+(when (ta-mix?)
+  (describe "the ExUnit adapter against a live mix test run"
+    :isolated (test "a real subprocess yields the same vocabulary the fixture does"
+      (let (dir (str "/tmp/bedit-mix-fixture-" (:id (proc/info (self)))))
+        (ta-write-mix-fixture dir)
+        (let (proc (os/spawn "mix" ["test" "--trace"] {:cwd dir})
+              out (letrec (drain (fn (acc)
+                                   (receive
+                                     ([:proc pp data] (drain (str acc data)))
+                                     ([:proc-err pp data] (drain (str acc data)))
+                                     ([:proc-closed pp code]
+                                       (do (check-allow :discarded-catch
+                                             (try (os/close proc) (catch e :close-failed)))
+                                         acc))
+                                     (after 120000 acc))))
+                    (drain ""))
+              tests (ta-results (ta-drive testadapter/exunit-adapter out)))
+          ;; both tests come back, correctly judged, from output nobody transcribed
+          (assert= 2 (count tests))
+          (let (ok (seq/find tests (fn (r) (includes? (get r :name) "accepts")))
+                bad (seq/find tests (fn (r) (includes? (get r :name) "rejects"))))
+            (is (not (nil? ok)))
+            (is (not (nil? bad)))
+            (assert= true (get ok :passed))
+            (assert= false (get bad :passed))
+            (assert= "LedgerTest" (get ok :group))
+            (is (includes? (get bad :where) "ledger_test.exs:"))
+            (is (not (empty? (get bad :failures))))))))))
