@@ -1,0 +1,275 @@
+(defmodule testadapter
+  "**One shape for \"a test finished\", whatever ran it.**
+
+`C-c t f` / `C-c t t` / `C-c t p` should mean the same thing in every project: the
+*Tests* buffer fills with a ✓/✗ row per test under its group, the verdicts land in
+the source file's margin, the counters move, and RET on a row jumps to it. None of
+that is Brood-specific — only the *decoding* is. So the runner-specific part is one
+value, an **adapter**, and everything downstream consumes the vocabulary below.
+
+## The vocabulary
+
+A **result** — one finished test — is a map:
+
+    {:group   \"LedgerTest\"        ; the enclosing group; \"\" for none
+     :name    \"rejects a negative amount\"
+     :passed  true                ; false for a failure
+     :skipped false
+     :ms      2                   ; wall time, 0 when the runner does not say
+     :where   \"test/ledger_test.exs:9\"   ; declaration site, ROOT-RELATIVE
+     :failures [{:loc [file line col] :details [\"…\" \"…\"]}]}
+
+A **summary** is `{:total :passed :failed :ms}`. Both are plain data, deliberately:
+they are what `testrun`'s folds already consumed when Brood was the only runner,
+so adopting a second runner added a decoder rather than a second *Tests* buffer.
+
+## An adapter
+
+    {:id      :exunit
+     :init    (fn () state)             ; the decoder's starting state
+     :decode  (fn (state line) [state events])
+     :flush   (fn (state) [state events])}
+
+`events` is a list of `[:test result]` / `[:summary map]` / `[:output text]`. An
+adapter may be **stateful**, and ExUnit is the reason: it prints a test's line
+before it knows the verdict, and reports the failure in a numbered block after it,
+so a result is only complete once the following line arrives. `flush` is how the
+last pending one gets out when the process exits.
+
+Decoding runs in the **model fold**, not in the streaming worker — the worker's
+handlers are plain fns with nowhere to keep state, and the model is where a TEA
+program keeps things anyway. `testrun` therefore forwards raw lines and folds the
+events the adapter returns.
+
+## Why ExUnit needs `--trace`
+
+Plain `mix test` prints one dot per passing test and nothing else — no name, no
+location — so a ✓ row per test simply cannot be built from it. `--trace` prints
+each test's name, time and `[L#line]`, which is exactly the vocabulary above. The
+cost is that `--trace` runs the suite synchronously; that is a real trade and it is
+why the flag sits in `toolchain/*toolchains*` as data, one edit from being dropped."
+  (:use model)) ; ed-json-event-line — the Brood runner's line shape
+
+;; ---- the Brood adapter -------------------------------------------------------
+;; Brood's runner does not need parsing: `std`'s `*test-report-sink*` hands the
+;; editor a structured record per test, which the runner script pr-str's as one
+;; JSON object per line. This adapter is stateless because there is nothing to
+;; remember — the seam upstream did the work. That is the shape ExUnit lacks, and
+;; the reason the other adapter is forty lines longer.
+
+(defn- brood-progress-noise? (line)
+  "Whether `line` is only the runner's progress marks (`.`/`F`/`○` waves) — shown in
+a terminal run, noise in *Tests*."
+  (let (t (string/trim line))
+    (and (not (= t ""))
+      (= "" (string/replace (string/replace (string/replace t "." "") "F" "") "○" "")))))
+
+(defn brood-decode-line (line)
+  "Classify one stdout line — `[:test m]` / `[:summary m]` / `[:spy m]` / `[:output s]`
+/ `[:drop]`. The driver's progress dots print WITHOUT a newline from another
+process, so a JSON line can arrive with a `F..`-style prefix — salvage by re-parsing
+from the first `{` when the line plainly carries an event object."
+  (let (parsed (ed-json-event-line line)
+        event (when parsed (get parsed :event)))
+    (cond
+      (= event "test") [:test parsed]
+      (= event "summary") [:summary parsed]
+      (= event "spy") [:spy parsed]
+      (= (string/trim line) "") [:drop]
+      ;; a bare progress-dot line carries no information the *Tests* buffer wants
+      (brood-progress-noise? line) [:drop]
+      else [:output line])))
+
+(def brood-adapter
+  {:id :brood
+   :init (fn () nil)
+   :decode (fn (state line) [state (list (brood-decode-line line))])
+   :flush (fn (state) [state '()])})
+
+;; ---- the ExUnit adapter ------------------------------------------------------
+;; Written against real `mix test --trace` output, which looks like this (the start
+;; and finish lines for one test arrive concatenated, because the start line is
+;; rewritten in place rather than terminated):
+;;
+;;   LedgerTest [test/ledger_test.exs]
+;;     * test post/2 accepts … [L#5]  * test post/2 accepts … (0.00ms) [L#5]
+;;     * test one that is skipped [L#15]  * test … (skipped) [L#15]
+;;
+;;     1) test post/2 rejects a negative amount (LedgerTest)
+;;        test/ledger_test.exs:9
+;;        Assertion with == failed
+;;        code:  assert Ledger.post(:a, -5) == {:ok, -5}
+;;        stacktrace:
+;;          test/ledger_test.exs:10: (test)
+;;
+;;   Finished in 0.01 seconds (0.00s async, 0.01s sync)
+;;   Result: 2/3 passed, 1 skipped
+;;
+;; The one thing to know: **a failing test's trace line is identical to a passing
+;; one's.** The verdict is only knowable from the numbered block that follows it, so
+;; a test is held PENDING until the next trace line, the next failure block, or the
+;; end of the run says which it was.
+
+(defn- ex-num (s)
+  (check-allow :discarded-catch
+    (try (let (v (reflect/read-string s)) (if (number? v) v nil)) (catch _ nil))))
+
+(defn- ex-ms (time-text)
+  "The integer milliseconds in `(2.5ms)` / `(0.00ms)`, or 0 — `(skipped)` has none."
+  (let (m (regex/find "^([0-9.]+)ms" time-text))
+    (if (nil? m) 0 (or (ex-num (get (first (get m :groups)) :text)) 0))))
+
+(defn- ex-module-line (line)
+  "`LedgerTest [test/ledger_test.exs]` — the group header, and the file every
+following `[L#n]` is a line of. Returns `[module file]` or nil."
+  (let (m (regex/find "^([\\w.]+) \\[([^\\]]+\\.exs)\\]" line))
+    (when m
+      [(get (nth (get m :groups) 0) :text) (get (nth (get m :groups) 1) :text)])))
+
+(defn- ex-trace-line (line)
+  "One completed test from a `--trace` line: `[name time-text line-no]`, or nil.
+
+Read from the LAST `* test ` on the line rather than by one regex over the whole of
+it, because the start and finish records share a line and a greedy match would
+swallow the first into the second's name."
+  (let (i (string/last-index-of line "* test "))
+    (when (and i (>= i 0))
+      (let (tail (string/substring line (+ i 7) (string/length line))
+            m (regex/find "^(.+) \\(([^()]+)\\) \\[L#(\\d+)\\]" tail))
+        (when m
+          (let (g (get m :groups))
+            [(get (nth g 0) :text) (get (nth g 1) :text) (ex-num (get (nth g 2) :text))]))))))
+
+(defn- ex-failure-head (line)
+  "`  1) test NAME (MODULE)` — the start of a failure block. Returns the name, or nil."
+  (let (m (regex/find "^ *\\d+\\) test (.+) \\(([\\w.]+)\\)" line))
+    (when m (get (nth (get m :groups) 0) :text))))
+
+(defn- ex-summary (line)
+  "The run's counts, from either wording ExUnit has used:
+`Result: 2/3 passed, 1 skipped` (1.21) or `4 tests, 1 failure` (older). Returns
+`{:total :passed :failed}` or nil; `:ms` is filled in by the caller from `Finished in`."
+  (let (modern (regex/find "^Result: (\\d+)/(\\d+) passed" line)
+        classic (regex/find "^(\\d+) tests?, (\\d+) failures?" line))
+    (cond
+      modern
+        (let (passed (ex-num (get (nth (get modern :groups) 0) :text))
+              total (ex-num (get (nth (get modern :groups) 1) :text)))
+          {:total total :passed passed :failed (- total passed)})
+      classic
+        (let (total (ex-num (get (nth (get classic :groups) 0) :text))
+              failed (ex-num (get (nth (get classic :groups) 1) :text)))
+          {:total total :passed (- total failed) :failed failed})
+      else nil)))
+
+(defn- ex-finished-ms (line)
+  "The wall time out of `Finished in 0.01 seconds (…)`, in milliseconds, or nil."
+  (let (m (regex/find "^Finished in ([0-9.]+) seconds" line))
+    (when m (let (s (ex-num (get (first (get m :groups)) :text))) (when s (math/round (* 1000.0 s)))))))
+
+(defn- ex-loc (line)
+  "A `file:line` location on its own in a failure block — the test's own site, and
+each stacktrace frame. Returns `[file line 1]` or nil."
+  (let (m (regex/find "^ *([^\\s:()]*[^\\s:()\\d][^\\s:()]*):(\\d+)" line))
+    (when m
+      (let (g (get m :groups))
+        [(get (nth g 0) :text) (ex-num (get (nth g 1) :text)) 1]))))
+
+;; The decoder's state:
+;;   :module / :file  the group header most recently seen
+;;   :pending         a test whose verdict is not yet known — [name ms line skipped]
+;;   :failing         the name of the failure block being read, nil outside one
+;;   :loc / :details  that block's location and prose, accumulating
+;;   :ms              the run's wall time, once `Finished in` says
+
+(defn- ex-init ()
+  {:module "" :file "" :pending nil :failing nil :loc nil :details [] :ms 0})
+
+(defn- ex-result (state passed?)
+  "Turn the pending test into a result, with the failure block's findings if it failed."
+  (let ([name ms line skipped] (get state :pending))
+    {:group (get state :module)
+     :name name
+     :passed passed?
+     :skipped skipped
+     :ms ms
+     :where (str (get state :file) ":" line)
+     :failures (if passed?
+                 []
+                 [{:loc (or (get state :loc) [(get state :file) line 1])
+                   :details (get state :details)}])}))
+
+(defn- ex-flush (state passed?)
+  "Emit the pending test (if any) and clear the failure-block scratch."
+  (if (nil? (get state :pending))
+    [(assoc (assoc (assoc state :failing nil) :loc nil) :details []) '()]
+    [(assoc (assoc (assoc (assoc state :pending nil) :failing nil) :loc nil) :details [])
+      (list [:test (ex-result state passed?)])]))
+
+(defn- ex-decode (state line)
+  (let (trimmed (string/trim line)
+        header (ex-module-line line)
+        trace (ex-trace-line line)
+        fail-head (ex-failure-head line)
+        summary (ex-summary trimmed)
+        finished (ex-finished-ms trimmed))
+    (cond
+      ;; a new group: whatever was pending passed (no failure block intervened)
+      header
+        (let ([st events] (ex-flush state true))
+          [(assoc (assoc st :module (nth header 0)) :file (nth header 1)) events])
+      ;; a test finished: the PREVIOUS one passed, this one becomes pending
+      trace
+        (let ([st events] (ex-flush state true)
+              [name time-text line-no] trace)
+          [(assoc st :pending [name (ex-ms time-text) line-no (= time-text "skipped")]) events])
+      ;; a failure block: the pending test is the one that failed, but its details
+      ;; are still arriving, so hold it and keep reading
+      fail-head [(assoc (assoc (assoc state :failing fail-head) :loc nil) :details []) '()]
+      ;; inside a failure block: the first bare location is the test's site, and
+      ;; every other line is a detail worth showing under the ✗ row
+      (get state :failing)
+        (cond
+          (= trimmed "") (ex-flush state false)
+          (and (nil? (get state :loc)) (ex-loc line)) [(assoc state :loc (ex-loc line)) '()]
+          else [(assoc state :details (into (get state :details) [trimmed])) '()])
+      finished [(assoc state :ms finished) '()]
+      summary
+        (let ([st events] (ex-flush state true))
+          [st (append events (list [:summary (assoc summary :ms (get st :ms))]))])
+      ;; mix's own chatter — compilation notices, the seed line, progress dots
+      (= trimmed "") [state '()]
+      (regex/matches? "[.*a-z]+" trimmed) [state '()]
+      else [state (list [:output line])])))
+
+(def exunit-adapter
+  {:id :exunit
+   :init ex-init
+   :decode ex-decode
+   ;; the process exited with a test still pending only when nothing followed it,
+   ;; which means it passed
+   :flush (fn (state) (ex-flush state true))})
+
+;; ---- choosing one ------------------------------------------------------------
+
+(def *adapters*
+  {:brood brood-adapter
+   :elixir exunit-adapter})
+
+(defn for-toolchain (id)
+  "The adapter for a toolchain id, or nil when that toolchain's runner has no decoder
+yet — the caller reports that rather than guessing at someone else's output format."
+  (get *adapters* id))
+
+(defn init (adapter)
+  "The adapter's starting decoder state; nil for no adapter, so a run with no decoder
+is still safe to fold."
+  (when adapter ((get adapter :init))))
+
+(defn decode (adapter state line)
+  "Fold one stdout line through `adapter`; returns `[state events]`."
+  ((get adapter :decode) state line))
+
+(defn flush (adapter state)
+  "End of run: emit anything the adapter was still holding; returns `[state events]`."
+  ((get adapter :flush) state))

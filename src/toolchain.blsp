@@ -1,0 +1,282 @@
+(defmodule toolchain
+  "Which commands build, test and run **this** project — the project TYPE as data.
+
+Emacs keys this on a marker file: projectile sees `mix.exs` and knows that `mix
+compile` / `mix test` / `mix run` are what compile, test and run should default to
+here, while `compile-command` stays a dumb `make -k` only for a project nothing
+recognised. bedit had the dumb default and nothing else — `M-x compile` offered
+`make`, and the test and run commands spawned `nest` unconditionally, which is
+right for exactly one project type: the one this editor is written in.
+
+A toolchain is a plain map, and teaching bedit a language is adding one to
+`*toolchains*`:
+
+    {:id :elixir
+     :name \"Elixir\"
+     :markers [\"mix.exs\"]
+     :compile \"mix compile\"
+     :test \"mix test\"
+     :test-file (fn (file) (str \"mix test \" file))
+     :test-at-point (fn (file line) (str \"mix test \" file \":\" line))
+     :run \"mix run\"
+     :repl \"iex -S mix\"}
+
+`:test-file` and `:test-at-point` are FUNCTIONS rather than templates because the
+argument shape genuinely differs per tool — `mix test path:12` addresses a line,
+`cargo test name` addresses a test by name — and a format string with holes in it
+would only be a worse function. Any entry may be nil: a toolchain that cannot do
+something says so by omission, and the caller falls back or reports it.
+
+**Detection is by marker file, nearest root wins**, and the order of `*toolchains*`
+is the tie-break — a repo with both `mix.exs` and a `Makefile` is an Elixir project
+with a Makefile in it, not the other way round, so the generic `make` row is last.
+Detection never *fails*: an unrecognised project gets `*unknown-toolchain*`, whose
+compile command is `make` — exactly the behaviour bedit had for everything.
+
+`projects.blsp` derives its root markers from the `:markers` here rather than
+keeping a second list, so teaching bedit a language also teaches it to recognise
+that language's checkouts as projects — one edit, not two that drift. That is why
+nothing is imported here: this module is a table those modules read, never a layer
+they go through, and an import back to `projects` would be a cycle.")
+
+;; ---- the table ---------------------------------------------------------------
+;; Ordered most specific to least. Every row is data except the two test-scoping
+;; functions; nothing here knows about the editor, so this file is a lookup table
+;; the commands consult rather than a layer they go through.
+
+(defn- tc-spec-args (specs)
+  "The `{:file :line}` specs as command arguments — `path` for a whole file, and
+`path:line` for one test, which is the addressing `mix test` and `nest test` share."
+  (into [] (map specs (fn (s) (if (get s :line) (str (get s :file) ":" (get s :line)) (get s :file))))))
+
+(defn- tc-mix-test-at (file line) (str "mix test " file ":" line))
+(defn- tc-nest-test-at (file line) (str "nest test " file ":" line))
+
+;; ---- what tasks does this toolchain offer? -----------------------------------
+;; `mix.el`/alchemist's `mix-execute-task` completes over the output of `mix help`,
+;; which is the right idea for any tool that can list its own subcommands: the
+;; editor should not carry a hand-written list of tasks that goes stale the moment
+;; a project adds one of its own (`mix help` includes the project's, which is
+;; exactly why asking the tool beats hardcoding).
+
+(defn- tc-in-dir (root prog args)
+  "Run `prog args` with `root` as the working directory; `{:exit :stdout :stderr}`.
+Via `sh -c cd`, because `%os-cmd` takes no working directory — the async
+`proc-spawn` path does, and `git` is asked with `-C`, so this is the one caller with
+nowhere to put it. A `:dir` option on `%os-cmd` is the fix, in Brood."
+  (%os-cmd "sh" ["-c" (str "cd '" root "' && " prog " " (string/join args " ") " 2>/dev/null")]))
+
+(defn- tc-mix-tasks (root)
+  "The tasks `mix help` lists here — the project's own included."
+  (let (r (tc-in-dir root "mix" ["help"]))
+    (if (not (= (get r :exit) 0))
+      []
+      ;; Every listed task is a line beginning `mix <task>`; the trailing prose is not.
+      ;; Matched line by line rather than with one `find-all` over the whole output,
+      ;; because `^` in `std/regex` anchors to the start of the STRING — there is no
+      ;; multiline mode — so a single pass would find only the first line's task.
+      (seq/keep (string/split (get r :stdout) "\n")
+        (fn (line)
+          (let (m (regex/find "^mix ([\\w.]+) " line))
+            (when m (get (first (get m :groups)) :text))))))))
+
+(defn- tc-npm-tasks (root)
+  "The scripts `package.json` declares — npm's equivalent listing, read from the
+manifest rather than from a subprocess because npm has no terse `help` for them."
+  (let (manifest (path/join root "package.json"))
+    (if (not (file/exists? manifest))
+      []
+      (check-allow :discarded-catch
+        (try (into [] (map (get (json/decode (file/slurp manifest)) :scripts {}) first))
+          (catch _ []))))))
+
+(def *toolchains*
+  [{:id :elixir
+    :name "Elixir"
+    :markers ["mix.exs"]
+    :compile "mix compile"
+    :test "mix test"
+    :test-file (fn (file) (str "mix test " file))
+    :test-at-point tc-mix-test-at
+    :run "mix run"
+    ;; `-S mix` starts the REPL with the project compiled and loaded, which is the
+    ;; only form of it anyone wants inside a project
+    :repl "iex -S mix"
+    :tasks tc-mix-tasks
+    :task-command (fn (task) (str "mix " task))
+    ;; The native test path: a program + argv (not a shell string), because the
+    ;; streaming worker spawns it directly, and an adapter id naming the decoder that
+    ;; turns its output back into results. `--trace` is what makes per-test rows
+    ;; possible at all — plain `mix test` prints one dot per pass and no name — at the
+    ;; cost of running the suite synchronously. Drop the flag here to trade back.
+    :test-prog "mix"
+    :test-argv (fn (specs) (into ["test" "--trace"] (tc-spec-args specs)))
+    :adapter :elixir}
+   {:id :brood
+    :name "Brood"
+    :markers ["project.blsp"]
+    ;; `nest check` is the closest thing to "compile and tell me what is wrong" —
+    ;; Brood has no separate build step to run.
+    :compile "nest check"
+    :test "nest test"
+    :test-file (fn (file) (str "nest test " file))
+    :test-at-point tc-nest-test-at
+    :run "nest run"
+    :repl "nest repl"}
+   {:id :rust
+    :name "Rust"
+    :markers ["Cargo.toml"]
+    :compile "cargo build"
+    :test "cargo test"
+    :test-file (fn (file) "cargo test")
+    :test-at-point nil ; cargo addresses tests by NAME, not by line
+    :run "cargo run"
+    :repl nil}
+   {:id :node
+    :name "Node"
+    :markers ["package.json"]
+    :compile "npm run build"
+    :test "npm test"
+    :test-file (fn (file) (str "npm test -- " file))
+    :test-at-point nil
+    :run "npm start"
+    :repl "node"
+    :tasks tc-npm-tasks
+    :task-command (fn (task) (str "npm run " task))}
+   {:id :python
+    :name "Python"
+    :markers ["pyproject.toml" "setup.py"]
+    :compile nil ; nothing to build
+    :test "pytest"
+    :test-file (fn (file) (str "pytest " file))
+    :test-at-point nil
+    :run nil
+    :repl "python3"}
+   {:id :go
+    :name "Go"
+    :markers ["go.mod"]
+    :compile "go build ./..."
+    :test "go test ./..."
+    :test-file (fn (file) (str "go test " file))
+    :test-at-point nil
+    :run "go run ."
+    :repl nil}
+   {:id :make
+    :name "Make"
+    :markers ["Makefile" "makefile" "GNUmakefile"]
+    ;; A Makefile says what a directory can DO, not that it is a project root — they
+    ;; sit in subdirectories all the time — so `projects/*project-markers*` skips this
+    ;; row when it derives the root markers. Every other row's marker is a manifest,
+    ;; which does mean a root.
+    :root? false
+    :compile "make"
+    :test "make test"
+    :test-file nil
+    :test-at-point nil
+    :run nil
+    :repl nil}])
+
+(def *unknown-toolchain*
+  {:id :unknown
+   :name "unknown"
+   :markers []
+   ;; the historical default, kept for a project nothing recognises
+   :compile "make"
+   :test nil
+   :test-file nil
+   :test-at-point nil
+   :run nil
+   :repl nil})
+
+;; ---- detection ---------------------------------------------------------------
+
+(defn- tc-marker-here? (root tc)
+  (any? (get tc :markers) (fn (marker) (file/exists? (path/join root marker)))))
+
+(defn detect (root)
+  "The toolchain for the project at `root` — the first `*toolchains*` entry one of
+whose marker files is present, or `*unknown-toolchain*`. Never nil, so a caller can
+always ask for a command and get an answer or an explicit nil."
+  (if (nil? root)
+    *unknown-toolchain*
+    (or (seq/find *toolchains* (fn (tc) (tc-marker-here? root tc))) *unknown-toolchain*)))
+
+(defn for-model (m)
+  "The toolchain for the model's current project (`:project-root`, else the cwd)."
+  (detect (or (:project-root m) (file/cwd))))
+
+(defn name-of (m)
+  "The toolchain's display name for this model — what the status line and the
+prompts call this project."
+  (get (for-model m) :name))
+
+;; ---- the commands ------------------------------------------------------------
+;; Each returns a shell command string, or nil when this toolchain has no such
+;; thing. Callers decide what nil means: `M-x compile` falls back to `make`, and a
+;; command with no sensible fallback says so in the echo area instead of running
+;; something arbitrary.
+
+(defn compile-command (m)
+  "The default `M-x compile` command here."
+  (get (for-model m) :compile))
+
+(defn test-command (m)
+  "The command that runs the whole suite here."
+  (get (for-model m) :test))
+
+(defn test-file-command (m file)
+  "The command that runs just `file`'s tests, or nil if this toolchain cannot scope
+a run to one file."
+  (let (f (get (for-model m) :test-file))
+    (when f (f file))))
+
+(defn test-at-point-command (m file line)
+  "The command that runs the single test at `file`:`line`, or nil when the toolchain
+addresses tests some other way (cargo names them; pytest wants a node id). Falls
+back to the whole-file command rather than to nothing, since running the file is
+always closer to what was asked than running the project."
+  (let (tc (for-model m)
+        f (get tc :test-at-point))
+    (if f (f file line) (test-file-command m file))))
+
+(defn run-command (m)
+  "The command that runs the project."
+  (get (for-model m) :run))
+
+(defn repl-command (m)
+  "The command that opens this project's REPL — `iex -S mix`, `nest repl`, … — or
+nil for a toolchain with no REPL."
+  (get (for-model m) :repl))
+
+(defn test-invocation (m specs)
+  "`[prog argv]` for streaming this toolchain's test run into *Tests*, or nil when it
+has no decoder for its runner's output — in which case the caller falls back to the
+compilation buffer, which needs no format knowledge at all."
+  (let (tc (for-model m)
+        prog (get tc :test-prog)
+        f (get tc :test-argv))
+    (when (and prog f) [prog (f specs)])))
+
+(defn adapter-id (m)
+  "The `testadapter` id that decodes this toolchain's test output, or nil."
+  (get (for-model m) :adapter))
+
+(defn tasks (m)
+  "The task names this project's toolchain can list — `mix help`'s tasks, the scripts
+in a `package.json` — or an empty vector for a toolchain that cannot enumerate them.
+Asking the tool is what keeps a project's OWN tasks in the list."
+  (let (tc (for-model m)
+        f (get tc :tasks))
+    (if f (f (or (:project-root m) (file/cwd))) [])))
+
+(defn task-command (m task)
+  "The shell command that runs `task` here — `mix deps.get`, `npm run build` — or nil
+when this toolchain has no notion of a task."
+  (let (f (get (for-model m) :task-command))
+    (when f (f task))))
+
+(defn brood? (m)
+  "Is this a Brood project? The one place the editor's own toolchain is special: the
+native test runner and the app runner speak Brood's structured reporting seams, and
+every other toolchain is streamed as text instead."
+  (= (get (for-model m) :id) :brood))

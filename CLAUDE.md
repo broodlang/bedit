@@ -125,7 +125,18 @@ src/tutor-workings.blsp     the tutorial's *Workings* pane: the per-box cascade 
                             text, and its open/follow/close (knows a pane + a box INDEX; the
                             tutorial owns the box parser and passes the index — acyclic)
 src/tutor-lessons.blsp      the tutorial's CONTENT only — the lessons vector (grow the course here)
-src/compile.blsp            M-x compile: run a build in the project root, C-x ` next-error
+src/toolchain.blsp          the project TYPE as data: marker file -> which commands compile,
+                            test, run and REPL here (mix / nest / cargo / npm / go / make),
+                            and which tasks it can list. projects.blsp derives its root
+                            markers from this table, so a language is ONE edit
+src/testadapter.blsp        one result vocabulary, two runners: Brood's structured
+                            *test-report-sink* lines and ExUnit's `mix test --trace` text
+                            both decode into the same {:group :name :passed :where …}, so
+                            C-c t means the same thing in every project
+src/compile.blsp            M-x compile: run a build in the project root, C-x ` next-error,
+                            M-x project-task (mix tasks / npm scripts). The error locations
+                            are an Emacs-style regexp TABLE (`*error-patterns*`), which
+                            needed brood's regex captures to be expressible at all
 src/projects.blsp           project root + file walk (find-file-in-project)
 src/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e)
 src/git.blsp                git porcelain: C-x g status buffer, diff/log/commit, C-x v = vc-diff
