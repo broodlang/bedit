@@ -1,0 +1,110 @@
+(defmodule format
+  "Run the language's own formatter over a buffer — `M-x format-buffer`, and on save.
+
+**Why the language's formatter and not the indenter.** bedit can indent Elixir line for
+line, and does. It cannot decide where to break a long call, how to align a pipeline, or
+whether a keyword list fits on one line — and those are the changes `mix format` makes.
+Emacs learned the same thing: `elixir-ts-mode` indents, and `mix format` formats, and the
+sensible default is to let the language's own tool own the whole answer on save. A
+formatter is also the ground truth the indenter is checked against
+(`tests/modes_test.blsp` diffs a real module against `mix format`), so running it is not
+a second opinion — it is the one this editor already defers to.
+
+**How.** A formatter is a service on the buffer's mode (`:format-command`, declared by
+`modes/deflanguage`), so nothing here names a language: ask the buffer what formats it,
+append the file, run it, re-read. Almost every formatter is file-in-place — `mix format
+FILE`, `black FILE`, `rustfmt FILE` — which decides the order:
+
+  1. write the buffer, so the formatter sees what you typed;
+  2. run the formatter on the FILE;
+  3. re-read the file into the buffer, keeping point where it was.
+
+If the formatter fails, step 3 finds the file exactly as step 1 wrote it, so a broken
+formatter or a syntax error costs nothing but a message. That is the whole reason it goes
+through the file rather than piping the buffer: a formatter that refuses to parse a
+half-written function must leave the text alone, and a pipe would hand back its empty
+output."
+  (:use model) ; ed-mode-service / ed-current-buf / ed-set-buf / message
+  (:use commands) ; ed-find-file / save-buffer
+  (:use interactive) ; defcommand
+  (:use editor/buffer)) ; buffer-file / buffer-text / goto-char / buffer-point
+
+(defdyn *format-on-save*
+  ;; Off by default: reformatting a file someone did not ask to reformat is a large,
+  ;; surprising diff, and in a shared repo it is a diff with someone else's name on the
+  ;; lines. Turn it on per user (`~/.config/bedit/init.blsp`), where the person who owns
+  ;; the repo's conventions is the one deciding.
+  false)
+
+(defn format-command-for (buf)
+  "`[prog arg … file]` that formats `buf`, or nil when its mode declares no formatter or
+the buffer has no file. The file is appended because every formatter worth having takes
+it last."
+  (let (cmd (ed-mode-service buf :format-command)
+        file (buffer-file buf))
+    (when (and cmd file (not (empty? cmd))) (into (into [] cmd) [file]))))
+
+(defn format-file (buf)
+  "Run `buf`'s formatter over its file. Returns `[ok? detail]` — `detail` is the
+formatter's own complaint on failure, which is the useful half (a syntax error names the
+line)."
+  (let (argv (format-command-for buf))
+    (if (nil? argv)
+      [false "no formatter for this buffer"]
+      (let (root (or (:dir buf) (path/dirname (buffer-file buf)))
+            r (os/cmd (first argv) (into [] (rest argv)) root)
+            out (string/trim (str (get r :stderr) (get r :stdout))))
+        (if (= (get r :exit) 0)
+          [true (first argv)]
+          [false (if (= out "") (str (first argv) " exited " (get r :exit)) out)])))))
+
+(defn format-buffer-now (m)
+  "Save, format, re-read — the whole cycle, as a `model -> model`.
+
+Point is restored by OFFSET rather than by line, deliberately: a formatter may join or
+split lines, so a line number means something different afterwards, while an offset is
+merely approximate. Clamped to the new length, so a formatter that shortened the file
+cannot leave point past its end."
+  (let (buf (ed-current-buf m)
+        file (buffer-file buf))
+    (cond
+      (nil? file) (message m "no file to format")
+      (nil? (format-command-for buf))
+        (message m (str "no formatter for " (or (ed-buf-mode-name buf) "this buffer")))
+      else
+        (check-allow :discarded-catch
+          (try
+            (do
+              (save-buffer buf)
+              (let ([ok detail] (format-file buf))
+                (if (not ok)
+                  (message m (str "format failed: " detail))
+                  (let (formatted (file/slurp file)
+                        point (math/min (buffer-point buf) (string/length formatted))
+                        reread (goto-char (editor/buffer/replace-region buf
+                                            0
+                                            (buffer-length buf)
+                                            formatted)
+                                 point))
+                    (if (= formatted (buffer-text buf))
+                      ;; already canonical: say so rather than reporting a no-op as work
+                      (message (ed-set-buf m (dissoc reread :modified))
+                        (str "saved " file " (already formatted)"))
+                      (message (ed-set-buf m (dissoc reread :modified))
+                        (str "saved and formatted " file)))))))
+            (catch e (message m (str "format failed: " (error-message e)))))))))
+
+(defcommand cmd-format-buffer
+  (m key)
+  "Format the current buffer with its language's own formatter (M-x format-buffer):
+`mix format` in Elixir, `black` in Python, whatever `modes/deflanguage` declared. Saves
+first, so the formatter sees what you typed, and re-reads afterwards. A buffer whose
+language declares no formatter says so and changes nothing."
+  (format-buffer-now m))
+
+(defn on-save (m)
+  "The save path's hook: format when `*format-on-save*` is on and this buffer has a
+formatter, else leave the plain save alone. Returns nil when it did not act, so the
+caller keeps its own message."
+  (let (buf (ed-current-buf m))
+    (when (and *format-on-save* (format-command-for buf)) (format-buffer-now m))))

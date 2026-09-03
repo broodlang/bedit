@@ -87,7 +87,15 @@ src/input.blsp              dispatch: fold a key/mouse/tick event into the next 
 src/commands.blsp           the editing commands, each a (model key) -> model
 src/keymaps.blsp            keybinding profiles (emacs / modal vim) as model-scope layers
 src/interactive.blsp        the `defcommand` macro + the M-x command registry
-src/modes.blsp              modes as layers: the keymaps (data) + brood-mode services
+src/modes.blsp              modes as layers: the keymaps (data) + brood-mode services.
+                            `deflanguage` declares a tree-sitter language from ONE spec
+                            (faces, indent, heredocs, formatter) and generates its whole
+                            service set — checked against
+                            editor/treesit/language-contract, so an incomplete language
+                            fails at load rather than at the keypress that needed it
+src/format.blsp             M-x format-buffer + format-on-save: the language's own
+                            formatter (mix format, black, rubocop), declared per language
+                            and run over the FILE, so a failing formatter costs nothing
 src/complete-at-point.blsp  completion-at-point (the in-buffer Tab popup) — multi-source merge
                             (named to dodge std's `tool/complete`, which shadows a bare `complete`)
 src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, goto-def/references, hover, rename, format, imenu
