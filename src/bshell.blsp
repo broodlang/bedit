@@ -188,9 +188,16 @@ here, because the whole point is that the REPL evaluates it."
                           else
                             (let (p (os/spawn "sh" ["-c" line] {:cwd (:root state)}))
                               (bshell-loop (assoc state :proc p)))))
+    ;; A REPL's output is sent RAW. Its escapes are the layout — an interactive line
+    ;; editor echoes what you typed, then moves up and erases to reprint it with a
+    ;; prompt — so stripping them here would leave both copies and show the input
+    ;; twice. `ansi/render` applies them, and it has to happen on the editor side
+    ;; where the buffer's existing text is. A plain shell's output IS append-only,
+    ;; and keeps the cheaper strip.
     ([:proc p data] (do
                       (send (proc/whereis :editor)
-                        (bshell/bshell-output-event (:buffer state) (ansi/strip data)))
+                        (bshell/bshell-output-event (:buffer state)
+                          (if (:repl state) data (ansi/strip data))))
                       (bshell-loop state)))
     ([:proc-err p data] (do
                           (send (proc/whereis :editor)
@@ -199,6 +206,14 @@ here, because the whole point is that the REPL evaluates it."
     ([:proc-closed p code] (do
                              (send (proc/whereis :editor) (bshell/bshell-done-event (:buffer state) code))
                              (bshell-loop (assoc state :proc nil))))
+    ;; The window changed: tell the child, which is how a program that lays out
+    ;; against its terminal learns to redraw. Only a pty has a size; a piped child is
+    ;; told nothing and needs nothing.
+    ([:bshell-resize cols rows]
+      (do (when (and (:repl state) (:proc state))
+            (check-allow :discarded-catch
+              (try (os/resize-pty (:proc state) cols rows) (catch _ nil))))
+        (bshell-loop state)))
     ([:shutdown] (do (when (:proc state) (os/close (:proc state))) :bshell-stopped))))
 
 (defn bshell-connect (buffer root)
@@ -212,6 +227,19 @@ and stays with it for the buffer's life. The child is spawned INSIDE the worker 
 worker owns it — that is what makes its output arrive in this mailbox, and what makes
 it die with the worker rather than outlive the buffer."
   (spawn (bshell-repl-boot {:buffer buffer :root root :proc nil :repl true :command command})))
+
+(defn bshell-resize-all (m cols rows)
+  "Tell every live REPL session its terminal is now `cols` × `rows`.
+
+Sent to the WORKER rather than applied here: the worker owns the child, and the model
+has no handle on it. A worker with no pty ignores it, so this stays a broadcast rather
+than the editor tracking which buffers happen to have one."
+  (do (fold (:buffers m)
+        nil
+        (fn (_ b)
+          (when (and (:bshell-repl b) (:bshell-proc b))
+            (send (:bshell-proc b) [:bshell-resize cols rows]))))
+    m))
 
 (defn bshell-shutdown (pid)
   "Stop a shell process: kill any running child and end the process."
@@ -236,6 +264,21 @@ preserves the buffer's other fields (`:bshell-*`), so its per-buffer state survi
     (if (nil? idx)
       (update m :buffers into [(ed-stamp (insert (ed-log-buffer nm) s))])
       (update m :buffers assoc idx (insert (end-of-buffer (nth (:buffers m) idx)) s)))))
+
+(defn- bshell-settext (m nm s)
+  "Replace buffer `nm`'s whole text with `s`, point at the end — what terminal output
+needs, since it may rewrite what it wrote a moment ago rather than only extend it.
+Rebuilt through `insert` on an emptied buffer so the `:bshell-*` fields, the buffer
+type and the layer registration all survive; `make-buffer` would drop them."
+  (let (idx (ed-buffer-index-by-name m nm))
+    (if (nil? idx)
+      (bshell-append m nm s)
+      (let (b (nth (:buffers m) idx))
+        (update m
+          :buffers
+          assoc
+          idx
+          (end-of-buffer (editor/buffer/replace-region b 0 (buffer-length b) s)))))))
 
 (defn- bshell-buffer-end (m nm)
   "The char length of buffer `nm` — where freshly-emitted input begins."
@@ -288,11 +331,33 @@ is wherever the child last stopped writing, and it moves with every chunk. In a
 shell buffer that boundary is reset by the command's EXIT instead, which is the
 right answer there and the wrong one here: a REPL never exits between lines."
   (let (nm (bshell-output-event-buffer event)
-        m1 (bshell-append m nm (bshell-output-event-text event)))
-    (ed-scroll (if (bshell-repl-buffer? m1 nm)
-                 (bshell-bufset m1 nm :bshell-input-start (bshell-buffer-end m1 nm))
-                 m1)
-      textrows)))
+        text (bshell-output-event-text event))
+    (if (bshell-repl-buffer? m nm)
+      (let (m1 (bshell-render m nm text))
+        (ed-scroll (bshell-bufset m1 nm :bshell-input-start (bshell-buffer-end m1 nm)) textrows))
+      (ed-scroll (bshell-append m nm text) textrows))))
+
+;; How much of the buffer a chunk of terminal output may rewrite. The sequences
+;; `ansi/render` models reach up a line or two — a line editor redrawing its input — so
+;; a window this size is far more than any of them can touch, while keeping the cost of
+;; a chunk independent of how long the session has run. Rendering the whole buffer would
+;; make a REPL quadratic in its own output.
+(def *bshell-render-lines* 40)
+
+(defn- bshell-render (m nm chunk)
+  "Apply `chunk` to the tail of buffer `nm` as TERMINAL output — cursor movements and
+erases included — rather than appending it."
+  (let (i (ed-buffer-index-by-name m nm))
+    (if (nil? i)
+      (bshell-append m nm (ansi/strip chunk))
+      (let (b (nth (:buffers m) i)
+            lines (into [] (string/split (buffer-text b) "\n"))
+            keep (math/max 0 (- (count lines) *bshell-render-lines*))
+            head (string/join (into [] (take lines keep)) "\n")
+            tail (string/join (into [] (drop lines keep)) "\n")
+            rendered (ansi/render tail chunk)
+            joined (if (= keep 0) rendered (str head "\n" rendered)))
+        (bshell-settext m nm joined)))))
 
 (defn ed-ev-bshell-done (m event textrows cols rows)
   "A `bshell-done-event` → on a line of its own, a non-zero `[exit N]` (a clean exit
