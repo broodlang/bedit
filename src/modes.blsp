@@ -339,6 +339,13 @@ brood, markdown, env, docker, ruby, elixir; a future json-/python-mode is one mo
     (keymap-bind [:ctrl-meta-d] 'commands/cmd-down-list) ; C-M-d down-list
     (keymap-bind [:ctrl-meta-a] 'commands/cmd-beginning-of-defun) ; C-M-a beginning-of-defun
     (keymap-bind [:ctrl-meta-e] 'commands/cmd-end-of-defun) ; C-M-e end-of-defun
+    ;; C-M-SPC (also C-M-@) — mark the next sexp, extending on repeat. Key encoding for
+    ;; the space chord mirrors C-SPC's `"ctrl- "`; both spellings bound to be safe. It
+    ;; rides the same polymorphic motion as C-M-f, so it marks a tree-sitter node in a
+    ;; tree-sitter mode — which its own docstring already claimed while it sat on
+    ;; `brood-keymap`, where no `.ex` buffer could reach it.
+    (keymap-bind [(keyword "ctrl-meta- ")] 'commands/cmd-mark-sexp) ; C-M-SPC
+    (keymap-bind [(keyword "ctrl-meta-@")] 'commands/cmd-mark-sexp) ; C-M-@
     ;; the structural kills + whole-form reindent: they ride the motions above, so they
     ;; work over a tree-sitter tree too and belong here rather than on brood-keymap.
     (keymap-bind [:ctrl-meta-k] 'commands/cmd-kill-sexp) ; C-M-k kill-sexp
@@ -351,6 +358,95 @@ brood, markdown, env, docker, ruby, elixir; a future json-/python-mode is one mo
    :commands '("forward-sexp" "backward-sexp"
                 "forward-list" "backward-list" "up-list" "backward-up-list" "down-list"
                 "beginning-of-defun" "end-of-defun" "kill-sexp" "backward-kill-sexp" "indent-sexp")})
+
+(defmacro deflanguage (name spec)
+  "Declare a tree-sitter language mode from ONE spec, and register it.
+
+    (deflanguage elixir
+      {:lang :elixir
+       :pattern \"[.](ex|exs)$\"
+       :faces elixir-face-table
+       :indent elixir-indent-spec
+       :heredocs *elixir-heredocs*
+       :comment \"# \"})
+
+Every language used to spell out the same five definitions — a `-fontify`, a
+`-fontify-restart`, an `-indent`, a layer naming all three, and the registration — of
+which only the tables differed. Three copies is where a language quietly gets less than
+the others: the mode was the place a service could be forgotten, and a forgotten service
+is invisible until someone presses the key. Here a language supplies DATA and gets the
+whole service set, or fails at load saying which part is missing.
+
+The services are generated as named globals rather than closures because
+`model/ed-mode-service` resolves a service SYMBOL late (`reflect/eval`) — which is what
+lets a redefined fontify take effect on the next frame without reloading the mode. A
+closure in the layer would be resolved once and frozen.
+
+`:format` is the language's formatter as a command vector — `[\"mix\" \"format\"]`, to which
+the file path is appended. It becomes the `:format-command` service that `M-x
+format-buffer` and format-on-save consult, so neither names a language.
+
+`:heredocs` is optional and produces the `:fontify-restart` a windowed fontify uses;
+`:restart` names one directly when the rule is more than counting paired markers (Ruby
+must also notice `=begin`). A language with neither declines to restart, which is a fact
+about the language — `editor/treesit/language-contract` says which services are required
+and which are optional.
+
+The generated one is `<name>-heredoc-restart`, not `<name>-fontify-restart`: the obvious
+name is the one a language with a CUSTOM restart has already used, and generating it
+silently replaced Ruby's — which then answered \"restart anywhere\" and coloured the prose
+inside its `=begin` blocks as code. A generated definition must not be able to take a
+hand-written name."
+  (let (base (->string name)
+        fontify (symbol (str base "-fontify"))
+        restart (symbol (str base "-heredoc-restart"))
+        indent (symbol (str base "-indent"))
+        layer (symbol (str base "-mode-layer"))
+        fontify-ref (symbol (str "modes/" base "-fontify"))
+        restart-ref (symbol (str "modes/" base "-heredoc-restart"))
+        indent-ref (symbol (str "modes/" base "-indent"))
+        layer-ref (symbol (str "modes/" base "-mode-layer")))
+    `(do
+       (defn ~fontify (text)
+         (editor/treesit/fontify text (get ~spec :lang) (get ~spec :faces)))
+       (defn ~indent (text bol)
+         (editor/treesit/indent-column text (get ~spec :lang) bol (get ~spec :indent)))
+       (defn ~restart (src pos)
+         (let (hd (get ~spec :heredocs))
+           (if (nil? hd) pos (editor/treesit/column0-restart src pos hd))))
+       (def ~layer
+         (modes/language-layer '~name ~spec '~fontify-ref '~indent-ref '~restart-ref))
+       (register-prog-mode '~layer-ref (get ~spec :lang)))))
+
+(defn language-layer (name spec fontify-ref indent-ref restart-ref)
+  "The mode layer for a `deflanguage`, checked against `editor/treesit/language-contract`.
+
+Raises on an incomplete language rather than registering one. A mode missing `:indent`
+would register happily and simply do nothing on RET — a failure that surfaces as a key
+which feels broken, in one language, much later."
+  (let (layer {:name name
+               :parser :tree-sitter
+               :ts-lang (get spec :lang)
+               :file-pattern (get spec :pattern)
+               :fontify fontify-ref
+               :indent indent-ref
+               ;; `:restart` names its own when the rule is more than counting paired
+               ;; markers (Ruby must also see `=begin`); `:heredocs` gets the derived
+               ;; one; a language with neither declines, which is a fact about the
+               ;; language rather than a hole in the mode.
+               :fontify-restart (or (get spec :restart)
+                                  (when (get spec :heredocs) restart-ref))
+               :comment-syntax (get spec :comment)
+               ;; The language's own formatter, as `[prog arg …]` with the file appended
+               ;; — `mix format <file>`. A service like any other, so `M-x format-buffer`
+               ;; and format-on-save ask the BUFFER what formats it and never name a
+               ;; language. Absent for a language with no formatter, which is a fact
+               ;; about the language.
+               :format-command (get spec :format)}
+        gaps (editor/treesit/missing-services layer))
+    (when (not (empty? gaps))
+      (error "deflanguage " name ": missing required service(s) " (->string gaps)))
+    layer))
 
 (defn register-prog-mode (layer-ref type)
   "Like `register-language-mode`, but for a **code** mode: it stacks the shared
@@ -368,14 +464,11 @@ so every code language inherits the same navigation keys and overrides only its 
 ;; one string to change which files get brood-mode.
 
 (def brood-keymap
-  ;; The structural motions/kills come from the shared `prog-mode-layer`; brood-keymap adds
-  ;; only what's specific to Brood *source* — mark-sexp, RET-indent, the paredit
-  ;; delimiter edits (incl. C-M-t transpose), and the sexp-aware C-k.
+  ;; The structural motions/kills/marks come from the shared `prog-mode-layer`;
+  ;; brood-keymap adds only what is specific to Brood *source* — the paredit delimiter
+  ;; edits (incl. C-M-t transpose) and the sexp-aware C-k, all of which manipulate
+  ;; parentheses and so mean nothing over a tree-sitter tree.
   (-> {}
-    ;; C-M-SPC (also C-M-@) — mark the next sexp, extending on repeat. Key encoding for
-    ;; the space chord mirrors C-SPC's `"ctrl- "`; both spellings bound to be safe.
-    (keymap-bind [(keyword "ctrl-meta- ")] 'commands/cmd-mark-sexp) ; C-M-SPC
-    (keymap-bind [(keyword "ctrl-meta-@")] 'commands/cmd-mark-sexp) ; C-M-@
     ;; paredit-style structural editing. Chord encodings are best-guesses (the
     ;; shifted-Ctrl ones especially — see ROADMAP "Loose ends"); all reachable via M-x
     ;; (slurp-forward, …) and rebindable live. C-M-s for splice since M-s is the search
@@ -729,16 +822,12 @@ twice."
    :brackets #{:anonymous_function :list :map :tuple :bitstring}
    :dedent #{"end" "else" "catch" "rescue" "after" "]" "}" ")"}
    :dedent-levels 1})
-(defn elixir-indent (text bol)
-  (editor/treesit/indent-column text :elixir bol modes/elixir-indent-spec))
 
 (def ruby-indent-spec
   {:width 2
    :blocks #{:body_statement :then :else} ; a method/class body, and if/else arms
    :dedent #{"end" "else" "elsif" "rescue" "ensure" "when"}
    :dedent-levels 0})
-(defn ruby-indent (text bol)
-  (editor/treesit/indent-column text :ruby bol modes/ruby-indent-spec))
 
 (def ruby-face-table
   {:comment :syntax/comment
@@ -754,7 +843,6 @@ twice."
    :instance_variable :syntax/function
    :global_variable :syntax/function
    :class_variable :syntax/function})
-(defn ruby-fontify (text) (editor/treesit/fontify text :ruby modes/ruby-face-table))
 
 ;; ---- ruby's fontify restart ---------------------------------------------------
 ;; Elixir decides restart safety by counting PAIRED heredoc markers; Ruby has no pair to
@@ -800,16 +888,16 @@ opens above it in this window — in which case keep the whole lead-in, as befor
       0
       candidate)))
 
-(def ruby-mode-layer
-  {:name 'ruby
-   :parser :tree-sitter
-   :ts-lang :ruby
-   :file-pattern "\\.rb$"
-   :fontify 'modes/ruby-fontify
-   :fontify-restart 'modes/ruby-fontify-restart
-   :indent 'modes/ruby-indent
-   :comment-syntax "# "}) ; C-M-* structural motions inherited from prog-mode-layer
-(register-prog-mode 'modes/ruby-mode-layer :ruby)
+(deflanguage ruby
+  {:lang :ruby
+   :pattern "\\.rb$"
+   :faces modes/ruby-face-table
+   :indent modes/ruby-indent-spec
+   ;; its own: a heredoc terminator is arbitrary text, and `=begin` blocks count too
+   :restart 'modes/ruby-fontify-restart
+   ;; the community standard, and what a Ruby project has if it has anything
+   :format ["rubocop" "-a" "--stderr" "--format" "quiet"]
+   :comment "# "})
 
 ;; Elixir: def/defmodule are macros (parsed as calls, not keywords), so they
 ;; aren't keyword-coloured — `do`/`end`/`fn`/`when`/… are. Atoms and module
@@ -824,24 +912,19 @@ opens above it in this window — in which case keep the whole lead-in, as befor
    :atom :syntax/special
    :alias :syntax/special
    :keyword :syntax/special})
-(defn elixir-fontify (text) (editor/treesit/fontify text :elixir modes/elixir-face-table))
 
 ;; Elixir's paired multi-line string markers — what the restart counts to decide whether a
 ;; column-0 line is real code or prose inside an `@moduledoc`.
 (def *elixir-heredocs* ["\"\"\"" "'''"])
-(defn elixir-fontify-restart (src pos)
-  (editor/treesit/column0-restart src pos modes/*elixir-heredocs*))
 
-(def elixir-mode-layer
-  {:name 'elixir
-   :parser :tree-sitter
-   :ts-lang :elixir
-   :file-pattern "\\.(ex|exs)$"
-   :fontify 'modes/elixir-fontify
-   :fontify-restart 'modes/elixir-fontify-restart
-   :indent 'modes/elixir-indent
-   :comment-syntax "# "}) ; C-M-* structural motions inherited from prog-mode-layer
-(register-prog-mode 'modes/elixir-mode-layer :elixir)
+(deflanguage elixir
+  {:lang :elixir
+   :pattern "\\.(ex|exs)$"
+   :faces modes/elixir-face-table
+   :indent modes/elixir-indent-spec
+   :heredocs modes/*elixir-heredocs*
+   :format ["mix" "format"]
+   :comment "# "})
 
 ;; ---- python-mode: a language the runtime was never built with ---------------
 ;; The proof that a language is a data entry rather than a build: nothing in Brood knows
@@ -860,25 +943,18 @@ opens above it in this window — in which case keep the whole lead-in, as befor
    :true :syntax/special
    :false :syntax/special
    :none :syntax/special})
-(defn python-fontify (text) (editor/treesit/fontify text :python modes/python-face-table))
-(defn python-fontify-restart (src pos)
-  ;; Python's multi-line strings are paired triple quotes, exactly Elixir's case
-  (editor/treesit/column0-restart src pos modes/*elixir-heredocs*))
 
 (def python-indent-spec {:width 4 :blocks #{:block} :dedent #{} :dedent-levels 0})
-(defn python-indent (text bol)
-  (editor/treesit/indent-column text :python bol modes/python-indent-spec))
 
-(def python-mode-layer
-  {:name 'python
-   :parser :tree-sitter
-   :ts-lang :python
-   :file-pattern "\\.py$"
-   :fontify 'modes/python-fontify
-   :fontify-restart 'modes/python-fontify-restart
-   :indent 'modes/python-indent
-   :comment-syntax "# "})
-(register-prog-mode 'modes/python-mode-layer :python)
+(deflanguage python
+  {:lang :python
+   :pattern "\\.py$"
+   :faces modes/python-face-table
+   :indent modes/python-indent-spec
+   ;; paired triple quotes, exactly Elixir's case
+   :heredocs modes/*elixir-heredocs*
+   :format ["black" "-q"]
+   :comment "# "})
 
 
 ;; ---- process-menu-mode: the read-only, killable *Process List* --------------

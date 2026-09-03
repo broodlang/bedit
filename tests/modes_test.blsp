@@ -218,23 +218,30 @@
 ;; which is only safe where a heredoc is not open: measured against a WHOLE-FILE parse
 ;; (the only honest baseline — comparing against the windowed status quo made a broken
 ;; alternative look merely different), the restart is right everywhere the lead-in is.
+;; Asks the MODE for its `:fontify-restart` rather than naming the function: which
+;; function provides it is the language's business (Elixir gets a generated one from its
+;; heredoc markers, Ruby writes its own), and a test that names the function breaks when
+;; that changes — as it did the moment `deflanguage` started generating them.
+(defn elixir-restart-svc (src pos)
+  ((model/ed-mode-service (cur (file-cm "x = 1\n" "x.ex")) :fontify-restart) src pos))
+
 (describe "elixir-mode's fontify restart"
   (test "cuts the lead-in at the previous top-level form"
     (let (src "defmodule A do\n  def a, do: 1\nend\ndefmodule B do\n  def b, do: 2\nend\n"
           pos (index-of src "defmodule B"))
-      (assert= (modes/elixir-fontify-restart src pos) pos)))
+      (assert= (elixir-restart-svc src pos) pos)))
 
   ;; the case that makes the naive version wrong: prose inside @moduledoc that looks like
   ;; code. Restarting there colours the prose as Elixir; the guard declines instead.
   (test "declines inside an open heredoc, keeping the full window"
     (let (src "defmodule A do\n  @moduledoc \"\"\"\ndef looks_like_code(x) do\nstill prose\n"
           pos (index-of src "still prose"))
-      (assert= (modes/elixir-fontify-restart src pos) 0)))
+      (assert= (elixir-restart-svc src pos) 0)))
 
   (test "accepts again below a closed heredoc"
     (let (src "defmodule A do\n  @moduledoc \"\"\"\nprose\n  \"\"\"\nend\ndefmodule B do\n"
           pos (index-of src "defmodule B"))
-      (assert= (modes/elixir-fontify-restart src pos) pos)))
+      (assert= (elixir-restart-svc src pos) pos)))
 
   (test "both tree-sitter modes have one"
     (is (not (nil? (model/ed-mode-service (cur (file-cm "def f\nend\n" "x.rb")) :fontify-restart))))
@@ -1033,3 +1040,219 @@ failure names the line rather than answering false."
       (assert= (reindent (model/ed-mode-service (cur (file-cm ex-real-module "real.ex")) :indent)
                  flat)
         ex-real-module))))
+
+;; ---- every structural key, in every language ---------------------------------
+;; The bug this exists for has now happened three times, always the same way: a command
+;; written to be mode-POLYMORPHIC (it dispatches on the buffer's `:ts-lang` and works
+;; over a tree-sitter tree) gets bound on `brood-keymap`, where no `.ex` buffer can reach
+;; it. RET was one. `C-M-SPC` (mark-sexp) was another — its own docstring said "in a
+;; tree-sitter mode it marks a tree-sitter node" while sitting somewhere no such mode
+;; could see. Each was found by someone pressing the key.
+;;
+;; So this asserts the property rather than the instances: for EVERY key that
+;; `prog-structural-keymap` binds, every tree-sitter mode resolves it to the same command
+;; — and the polymorphic ones actually do something to a real buffer of that language.
+
+(def prog-keys-expected
+  ;; the keys `prog-structural-keymap` binds, spelled as the keymap spells them
+  [[:enter 'commands/cmd-newline-and-indent]
+   [:ctrl-meta-f 'commands/cmd-forward-sexp]
+   [:ctrl-meta-b 'commands/cmd-backward-sexp]
+   [:ctrl-meta-n 'commands/cmd-forward-list]
+   [:ctrl-meta-p 'commands/cmd-backward-list]
+   [:ctrl-meta-u 'commands/cmd-backward-up-list]
+   [:ctrl-meta-d 'commands/cmd-down-list]
+   [:ctrl-meta-a 'commands/cmd-beginning-of-defun]
+   [:ctrl-meta-e 'commands/cmd-end-of-defun]
+   [:ctrl-meta-k 'commands/cmd-kill-sexp]
+   [:ctrl-meta-q 'commands/cmd-indent-sexp]
+   [(keyword "ctrl-meta- ") 'commands/cmd-mark-sexp]
+   [(keyword "ctrl-meta-@") 'commands/cmd-mark-sexp]])
+
+;; one small, valid buffer per tree-sitter language
+(def prog-mode-samples
+  [["a.ex" "defmodule A do\n  def one(x) do\n    x + 1\n  end\nend\n" "elixir"]
+   ["a.rb" "class A\n  def one(x)\n    x + 1\n  end\nend\n" "ruby"]
+   ["a.blsp" "(defn one (x)\n  (+ x 1))\n" "brood"]])
+
+;; Resolving is not working — pressing the key is. These press each one on a real buffer
+;; of each language and assert the buffer moved or changed, which is what "does not work
+;; in elixir" means when someone reports it.
+
+(describe "the structural keys DO something in each language"
+  (defn prog-at (file text needle)
+    (let (m (ed-init (make-buffer text file file))
+          i (model/ed-current-index m)
+          pos (index-of text needle))
+      (assoc m :buffers (assoc (:buffers m) i (goto-char (nth (:buffers m) i) pos)))))
+
+  (test "C-M-f moves point forward in every language"
+    (is (every? prog-mode-samples
+          (fn (s)
+            (let (m (prog-at (nth s 0) (nth s 1) "one")
+                  before (buffer-point (cur m))
+                  after (buffer-point (cur (ed-update m :ctrl-meta-f 80 24))))
+              (> after before))))))
+
+  (test "C-M-SPC marks a region in every language — the reported failure"
+    (is (every? prog-mode-samples
+          (fn (s)
+            (let (m (prog-at (nth s 0) (nth s 1) "one")
+                  b (cur (ed-update m (keyword "ctrl-meta- ") 80 24)))
+              ;; a mark was set, past point, so a region is active and non-empty
+              (and (not (nil? (:mark b))) (> (:mark b) (buffer-point b))))))))
+
+  (test "C-M-d descends in every language"
+    (is (every? prog-mode-samples
+          (fn (s)
+            (let (m (prog-at (nth s 0) (nth s 1) (nth s 1)) ; point 0
+                  before (buffer-point (cur m))
+                  after (buffer-point (cur (ed-update m :ctrl-meta-d 80 24))))
+              (> after before))))))
+
+  (test "C-M-e ends the defun in every language"
+    (is (every? prog-mode-samples
+          (fn (s)
+            (let (m (prog-at (nth s 0) (nth s 1) "x + 1")
+                  before (buffer-point (cur m))
+                  after (buffer-point (cur (ed-update m :ctrl-meta-e 80 24))))
+              (>= after before)))))))
+
+;; ---- a bulk reindent leaves blank lines alone --------------------------------
+;; Reindenting used to put the block's indentation on every BLANK line too, which is
+;; invisible on screen and a line in the diff: reindenting a `mix.exs` rewrote all three
+;; of its blank lines and nothing else, so the change was impossible to see and
+;; impossible to miss in review.
+;;
+;; The column for a blank line is not wrong — RET wants exactly that, since the line is
+;; empty precisely because you are about to type there. It is the CALLER that differs, so
+;; the rule lives with the bulk reindent rather than with the indenter.
+(describe "reindenting does not write whitespace onto blank lines"
+  (def rb-mixfile
+    (string/join
+      ["defmodule Benefits.MixProject do"
+       "  use Mix.Project"
+       ""
+       "  def project do"
+       "    ["
+       "      app: :benefits,"
+       "      version: \"0.1.0\""
+       "    ]"
+       "  end"
+       ""
+       "  def cli do"
+       "    ["
+       "      preferred_envs: [precommit: :test]"
+       "    ]"
+       "  end"
+       "end"]
+      "\n"))
+
+  (test "reindenting every line of a canonical mix.exs changes nothing at all"
+    (let (buf (cur (file-cm rb-mixfile "mix.exs"))
+          out (fold (range (buffer-line-count buf)) buf commands/ed-reindent-line-at))
+      (assert= (buffer-text out) rb-mixfile)))
+
+  (test "and the blank lines are still empty, not two spaces wide"
+    (let (buf (cur (file-cm rb-mixfile "mix.exs"))
+          out (fold (range (buffer-line-count buf)) buf commands/ed-reindent-line-at)
+          blanks (filter (string/split (buffer-text out) "\n") (fn (l) (= (string/trim l) ""))))
+      (is (> (count blanks) 0))
+      (is (every? blanks (fn (l) (= l ""))))))
+
+  ;; the other half of the rule: RET still indents the empty line it just made
+  (test "but RET still puts you at the right column on the new line"
+    (let (src "defmodule A do\n  def f do\n    :ok"
+          m (ed-init (make-buffer src "a.ex" "a.ex"))
+          i (model/ed-current-index m)
+          m1 (assoc m :buffers (assoc (:buffers m) i (goto-char (nth (:buffers m) i) (string/length src))))
+          after (buffer-text (cur (ed-update m1 :enter 80 24))))
+      (assert= (last (string/split after "\n")) "    "))))
+
+;; ---- navigation across comments and ghost text -------------------------------
+;; Two things sit on the screen that are NOT the program, and a structural motion has to
+;; treat them differently:
+;;
+;;   a COMMENT is in the buffer but is not a form — Emacs gives comments whitespace
+;;   syntax so `forward-sexp` steps over them, while a tree-sitter tree makes them
+;;   ordinary named nodes, so `C-M-f` from a comment used to land at the comment's end
+;;   and `C-M-b` from a definition used to land ON the comment above it;
+;;
+;;   GHOST TEXT (a `:eol-notes` annotation — a playground result, a type hint) is on the
+;;   screen but not in the buffer at all, so it must not move point, motion or the
+;;   cursor's column by one character.
+
+(def nav-commented
+  (string/join
+    ["defmodule A do"
+     "  # a leading comment"
+     "  def one(x) do"
+     "    x + 1  # trailing"
+     "  end"
+     "end"]
+    "\n"))
+
+(defn nav-at (text file pos)
+  (let (m (ed-init (make-buffer text file file))
+        i (model/ed-current-index m))
+    (assoc m :buffers (assoc (:buffers m) i (goto-char (nth (:buffers m) i) pos)))))
+
+(defn nav-press (text file pos k)
+  (buffer-point (cur (ed-update (nav-at text file pos) k 80 24))))
+
+(describe "structural motion steps over comments, not into them"
+  (test "C-M-f from a comment moves over the FORM after it, not to the comment's end"
+    (let (at-comment (index-of nav-commented "# a leading")
+          after (nav-press nav-commented "a.ex" at-comment :ctrl-meta-f)
+          end-of-comment (index-of nav-commented "\n  def one"))
+      ;; it must get past the whole `def one … end`, so well beyond the comment
+      (is (> after (index-of nav-commented "  end")))
+      (refute (= after end-of-comment))))
+
+  (test "C-M-b from a definition does not stop on the comment above it"
+    (let (at-def (index-of nav-commented "def one")
+          before (nav-press nav-commented "a.ex" at-def :ctrl-meta-b)
+          at-comment (index-of nav-commented "# a leading"))
+      (refute (= before at-comment))))
+
+  (test "a trailing comment does not become the next form"
+    (let (at-expr (index-of nav-commented "x + 1")
+          after (nav-press nav-commented "a.ex" at-expr :ctrl-meta-f))
+      ;; over `x + 1`, not stopping at the `# trailing` that follows it on the line
+      (is (>= after (+ at-expr 5)))
+      (refute (= after (+ (index-of nav-commented "# trailing") (string/length "# trailing"))))))
+
+  ;; and the comment is still COLOURED as a comment — skipping it for motion must not
+  ;; make it invisible to fontify, which is a different service entirely
+  (test "comments are still fontified"
+    (let (spans (modes/elixir-fontify nav-commented)
+          comment-face (editor/face/face :syntax/comment))
+      (is (>= (count (filter spans (fn (s) (= (nth s 2) comment-face)))) 2)))))
+
+(describe "ghost text is on the screen, not in the buffer"
+  (def nav-plain "defmodule A do\n  def one(x) do\n    x + 1\n  end\nend\n")
+
+  (defn nav-with-note (m)
+    (let (i (model/ed-current-index m))
+      (assoc m
+        :buffers
+        (assoc (:buffers m) i
+          (editor/buffer/annotate (nth (:buffers m) i) :eol-notes {2 {:text " => 6"}})))))
+
+  (test "a note changes nothing about point, motion, column or text"
+    (let (pos (index-of nav-plain "x + 1")
+          plain (nav-at nav-plain "a.ex" pos)
+          noted (nav-with-note plain)
+          fwd (fn (m) (buffer-point (cur (ed-update m :ctrl-meta-f 80 24))))
+          col (fn (m) (view/ed-visual-column (cur m))))
+      (assert= (buffer-point (cur noted)) (buffer-point (cur plain)))
+      (assert= (fwd noted) (fwd plain))
+      (assert= (col noted) (col plain))
+      (assert= (buffer-text (cur noted)) (buffer-text (cur plain)))))
+
+  ;; …while still being drawn: an invariant that held by accident would be worth nothing
+  (test "but it IS drawn, so the test above is not vacuous"
+    (let (pos (index-of nav-plain "x + 1")
+          plain (nav-at nav-plain "a.ex" pos)
+          noted (nav-with-note plain))
+      (refute (= (str (ed-view noted 80 24)) (str (ed-view plain 80 24)))))))
