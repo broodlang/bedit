@@ -93,6 +93,9 @@ src/modes.blsp              modes as layers: the keymaps (data) + brood-mode ser
                             service set — checked against
                             editor/treesit/language-contract, so an incomplete language
                             fails at load rather than at the keypress that needed it
+src/grammars.blsp           M-x grammar-list / grammar-reload: what tree-sitter grammars
+                            are installed (ABI, path), the recipe to build one, and a live
+                            swap — drop a new .so in and reload, no restart
 src/format.blsp             M-x format-buffer + format-on-save: the language's own
                             formatter (mix format, black, rubocop), declared per language
                             and run over the FILE, so a failing formatter costs nothing
