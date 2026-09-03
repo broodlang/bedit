@@ -1,0 +1,121 @@
+;; The project REPL (`C-x p r`): a long-lived interpreter hosted in a buffer.
+;;
+;; This is the one bedit feature that could not exist before `os/spawn-pty`. On a pipe
+;; an interpreter asks `isatty`, is told no, and drops its prompt, its line editing and
+;; its unbuffered output — so the tests that matter are the ones that drive a REAL
+;; interpreter and watch it answer, not ones that assert the shape of a spawn call.
+
+(defmodule repl-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use commands)
+  (:use-internals bshell)
+  (:use toolchain))
+
+(defn rt-drain (nm acc want deadline)
+  "Fold `bshell-output-event`s into `acc` until it contains `want`. An interpreter
+never exits and never falls quiet on its own, so waiting for EOF would mean waiting
+out the timeout for an answer that arrived at once."
+  (if (includes? acc want)
+    acc
+    (receive
+      ;; the worker sends `bshell-output-event` RECORDS to whatever is registered as
+      ;; `:editor`, so match the message and read it with its accessor
+      (msg (rt-drain nm
+             (str acc
+               (check-allow :discarded-catch
+                 (try (bshell/bshell-output-event-text msg) (catch _ ""))))
+             want
+             deadline))
+      (after deadline acc))))
+
+;; The worker sends UiEvent records to the process registered as :editor, so a test
+;; that wants to see them registers ITSELF under that name.
+(defn rt-as-editor (f)
+  (let (previous (proc/whereis :editor))
+    (proc/register :editor (self))
+    (let (out (f))
+      (when previous (proc/register :editor previous))
+      out)))
+
+(describe "the REPL runs the toolchain's command, not a hardcoded one"
+  (test "each project type names its own"
+    (assert= (repl-command {:project-root "/tmp"}) nil) ; nothing there to recognise
+    (is (includes? (str (get (detect "/home/wilhelm/src/broodlang/bedit") :repl)) "nest repl")))
+  (test "a project with no REPL is told so rather than given someone else's"
+    (let (m (ed-init (make-buffer "" "x" "x"))
+          m1 (assoc m :project-root "/tmp"))
+      ;; no toolchain recognised at /tmp, so no REPL command
+      (is (nil? (repl-command m1))))))
+
+;; `sh -i` stands in for `iex`/`nest repl` here: it is an interpreter, it prompts, and
+;; it is present on every machine this suite runs on. What is being tested is the
+;; hosting — that a line typed in the buffer reaches the child and its answer comes
+;; back — and that is identical whichever interpreter it is.
+(describe "a hosted interpreter answers what the buffer sends it"
+  :isolated (test "a line reaches the child and its output comes back"
+    (rt-as-editor
+      (fn ()
+        (let (nm "*repl: test*"
+              pid (bshell/bshell-connect-repl nm "/tmp" "sh -i")
+              _ (send pid [:bshell-run "echo forty-two"])
+              out (rt-drain nm "" "forty-two" 8000))
+          (bshell/bshell-shutdown pid)
+          ;; the child echoed the line AND ran it — neither happens on a pipe
+          (is (includes? out "forty-two"))))))
+
+  :isolated (test "the session is LONG-LIVED: a second line goes to the same child"
+    (rt-as-editor
+      (fn ()
+        (let (nm "*repl: test2*"
+              pid (bshell/bshell-connect-repl nm "/tmp" "sh -i")
+              _ (send pid [:bshell-run "X=99"])
+              _ (rt-drain nm "" "X=99" 8000)
+              _ (send pid [:bshell-run "echo value-is-$X"])
+              out (rt-drain nm "" "value-is-99" 8000))
+          (bshell/bshell-shutdown pid)
+          ;; a variable set by the first line survives into the second — which is the
+          ;; whole difference between a REPL and `sh -c` per line
+          (is (includes? out "value-is-99")))))))
+
+;; The plain project shell rides the same worker, and the same latent bug: it built its
+;; `bshell-output-event` by BARE name inside a spawned closure, where only the qualified
+;; name resolves, so the worker died with "unbound symbol" the first time it had anything
+;; to say. Nothing caught it because the folds were tested directly and the worker never
+;; was — so this drives it, for both kinds of session.
+(describe "the project shell rides the same worker"
+  :isolated (test "a command runs and its output comes back"
+    (rt-as-editor
+      (fn ()
+        (let (nm "*shell: test*"
+              pid (bshell/bshell-connect nm "/tmp")
+              _ (send pid [:bshell-run "echo hello-there"])
+              out (rt-drain nm "" "hello-there" 8000))
+          (bshell/bshell-shutdown pid)
+          (is (includes? out "hello-there")))))))
+
+;; The buffer half: the editor prints no prompt of its own, and the input region
+;; follows whatever the child last wrote.
+(describe "the REPL buffer lets you type after the child's own prompt"
+  (test "output moves the input boundary to the end"
+    (let (buf (assoc (editor/layers/set-buffer-type (make-buffer "" "*repl: x*") :bshell)
+                :bshell-repl true
+                :bshell-input-start 0)
+          m (ed-open-buffer (ed-init (make-buffer "" "scratch" "scratch")) buf)
+          m1 (ed-ev-bshell-output m (bshell/bshell-output-event "*repl: x*" "iex(1)> ") 24 80 24)
+          i (ed-buffer-index-by-name m1 "*repl: x*")
+          b (nth (:buffers m1) i))
+      ;; typing begins after the prompt the CHILD printed, not at 0
+      (assert= (:bshell-input-start b) (string/length (buffer-text b)))
+      (assert= (buffer-text b) "iex(1)> ")))
+
+  (test "a plain shell buffer keeps its own prompt behaviour"
+    (let (buf (assoc (editor/layers/set-buffer-type (make-buffer "" "*shell: x*") :bshell)
+                :bshell-input-start 0)
+          m (ed-open-buffer (ed-init (make-buffer "" "scratch" "scratch")) buf)
+          m1 (ed-ev-bshell-output m (bshell/bshell-output-event "*shell: x*" "some output\n") 24 80 24)
+          i (ed-buffer-index-by-name m1 "*shell: x*")
+          b (nth (:buffers m1) i))
+      ;; unchanged: a shell's boundary is reset by the command's exit, not by output
+      (assert= (:bshell-input-start b) 0))))

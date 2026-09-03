@@ -138,7 +138,10 @@ src/compile.blsp            M-x compile: run a build in the project root, C-x ` 
                             are an Emacs-style regexp TABLE (`*error-patterns*`), which
                             needed brood's regex captures to be expressible at all
 src/projects.blsp           project root + file walk (find-file-in-project)
-src/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e)
+src/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e), and the
+                            project's own REPL under a PTY (C-x p r): iex -S mix, nest
+                            repl, python3 — on a pipe an interpreter sees no tty and
+                            drops its prompt, so os/spawn-pty is what makes it possible
 src/git.blsp                git porcelain: C-x g status buffer, diff/log/commit, C-x v = vc-diff
 src/gitdiff.blsp            diff-hl change gutter: per-line added/modified/deleted vs HEAD
 src/web.blsp                live HTTP mirror of the selected buffer (C-x w)

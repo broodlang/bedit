@@ -132,30 +132,63 @@ a REPL — and off the editor loop), then push the formatted result + a success 
         out (eval-source line))
     ; never throws: captured output then `=> value`, or `error: …`
     (do
-      (send (proc/whereis :editor) (bshell-output-event buf (str out "\n")))
-      (send (proc/whereis :editor) (bshell-done-event buf 0))
+      (send (proc/whereis :editor) (bshell/bshell-output-event buf (str out "\n")))
+      (send (proc/whereis :editor) (bshell/bshell-done-event buf 0))
       (bshell-loop state))))
+
+
+;; The record constructors below are named QUALIFIED, and have to be. These sends run
+;; inside a `spawn`ed process: the closure ships, and its free globals re-resolve on
+;; the receiver — where the BARE name is not bound (only `bshell/bshell-output-event`
+;; is), so the worker died with "unbound symbol: bshell-output-event" the moment it
+;; had anything to say. Nothing caught it because the worker was only ever driven by
+;; a running editor, whose image happens to have the name; the folds it feeds were
+;; tested directly, never through the process. `tests/repl_test.blsp` drives it.
+
+(defn- bshell-repl-boot (state)
+  "Start a REPL session's long-lived child, under a PSEUDO-TERMINAL.
+
+A pipe is the wrong shape for this. `iex`, `python`, `nest repl` — each asks
+`isatty` and, told no, drops its prompt, drops line editing, and line-buffers its
+output so nothing arrives until it exits. None of that is misbehaviour; it is a
+program correctly declining to be interactive, and it is why an editor could not
+host one until `os/spawn-pty` existed (brood 57b02227).
+
+Via `sh -c`, because a toolchain's REPL is configured as a command line
+(`iex -S mix`), and splitting that into argv here would be a worse shell than the
+one already installed."
+  (let (p (os/spawn-pty "sh" ["-c" (:command state)] {:cwd (:root state) :cols 100 :rows 30}))
+    (bshell-loop (assoc state :proc p))))
 
 (defn- bshell-loop (state)
   "The shell process's receive loop: `[:bshell-run line]` evaluates `line` as Brood when it
 starts with `(`, else spawns `sh -c line` in `:root`; the child's stdout/stderr forward to
 the editor as a `bshell-output-event`; its exit as a `bshell-done-event`; `:shutdown` kills any
-live child and stops."
+live child and stops.
+
+In a REPL session (`:repl`) the child is LONG-LIVED and owns the conversation, so a
+line is input written to it rather than a command to spawn — and it is never `eval`'d
+here, because the whole point is that the REPL evaluates it."
   (receive
-    ([:bshell-run line] (if (bshell-brood-form? line)
-                          (bshell-eval-and-reply state line)
-                          (let (p (os/spawn "sh" ["-c" line] {:cwd (:root state)}))
-                            (bshell-loop (assoc state :proc p)))))
+    ([:bshell-run line] (cond
+                          (:repl state)
+                            (do (check-allow :discarded-catch
+                                  (try (os/write (:proc state) (str line "\n")) (catch _ nil)))
+                              (bshell-loop state))
+                          (bshell-brood-form? line) (bshell-eval-and-reply state line)
+                          else
+                            (let (p (os/spawn "sh" ["-c" line] {:cwd (:root state)}))
+                              (bshell-loop (assoc state :proc p)))))
     ([:proc p data] (do
                       (send (proc/whereis :editor)
-                        (bshell-output-event (:buffer state) (ansi/strip data)))
+                        (bshell/bshell-output-event (:buffer state) (ansi/strip data)))
                       (bshell-loop state)))
     ([:proc-err p data] (do
                           (send (proc/whereis :editor)
-                            (bshell-output-event (:buffer state) (ansi/strip data)))
+                            (bshell/bshell-output-event (:buffer state) (ansi/strip data)))
                           (bshell-loop state)))
     ([:proc-closed p code] (do
-                             (send (proc/whereis :editor) (bshell-done-event (:buffer state) code))
+                             (send (proc/whereis :editor) (bshell/bshell-done-event (:buffer state) code))
                              (bshell-loop (assoc state :proc nil))))
     ([:shutdown] (do (when (:proc state) (os/close (:proc state))) :bshell-stopped))))
 
@@ -163,6 +196,13 @@ live child and stops."
   "Spawn the shell process for `buffer` rooted at `root`; returns its pid (stored on that
 buffer under `:bshell-proc`). `(bshell-shutdown pid)` stops it."
   (spawn (bshell-loop {:buffer buffer :root root :proc nil})))
+
+(defn bshell-connect-repl (buffer root command)
+  "Spawn a REPL session's worker for `buffer`: it starts `command` under a pty in `root`
+and stays with it for the buffer's life. The child is spawned INSIDE the worker so the
+worker owns it — that is what makes its output arrive in this mailbox, and what makes
+it die with the worker rather than outlive the buffer."
+  (spawn (bshell-repl-boot {:buffer buffer :root root :proc nil :repl true :command command})))
 
 (defn bshell-shutdown (pid)
   "Stop a shell process: kill any running child and end the process."
@@ -225,11 +265,25 @@ starting at the new end (`:bshell-input-start`, on the buffer)."
   bshell-done-event
   (ui-event-fold [e m textrows cols rows] (ed-ev-bshell-done m e textrows cols rows)))
 
+(defn- bshell-repl-buffer? (m nm)
+  (let (i (ed-buffer-index-by-name m nm))
+    (and i (:bshell-repl (nth (:buffers m) i)))))
+
 (defn ed-ev-bshell-output (m event textrows cols rows)
   "A `bshell-output-event` from the shell process → append the (ANSI-stripped)
-chunk to that buffer and keep the viewport following the output."
-  (ed-scroll (bshell-append m (bshell-output-event-buffer event) (bshell-output-event-text event))
-    textrows))
+chunk to that buffer and keep the viewport following the output.
+
+In a REPL buffer the input region follows the output as well. The editor prints no
+prompt there — the REPL prints its own, `iex(1)> ` — so \"where does typing begin\"
+is wherever the child last stopped writing, and it moves with every chunk. In a
+shell buffer that boundary is reset by the command's EXIT instead, which is the
+right answer there and the wrong one here: a REPL never exits between lines."
+  (let (nm (bshell-output-event-buffer event)
+        m1 (bshell-append m nm (bshell-output-event-text event)))
+    (ed-scroll (if (bshell-repl-buffer? m1 nm)
+                 (bshell-bufset m1 nm :bshell-input-start (bshell-buffer-end m1 nm))
+                 m1)
+      textrows)))
 
 (defn ed-ev-bshell-done (m event textrows cols rows)
   "A `bshell-done-event` → on a line of its own, a non-zero `[exit N]` (a clean exit
@@ -558,6 +612,48 @@ the command) with its prompt, its shell process rooted at `root`, and all its st
               :bshell-hist-idx nil
               :bshell-draft nil))
     (ed-open-buffer m buf)))
+
+(defn- bshell-repl-buffer-name (root) (str "*repl: " (bshell-abbrev-home root) "*"))
+
+(defn- bshell-repl-start (m root command)
+  "Open this project's REPL buffer: `command` running under a pty in `root`, with the
+buffer's input region tracking whatever the child last printed.
+
+No prompt is inserted. A shell buffer draws its own (`~/src/bedit $ `) because `sh -c`
+has none to give; a REPL has one of its own and prints it, so drawing a second would
+be the editor talking over the thing it is hosting."
+  (let (nm (bshell-repl-buffer-name root)
+        raw (end-of-buffer (make-buffer "" nm))
+        typed (editor/layers/set-buffer-type raw :bshell)
+        pid (bshell-connect-repl nm root command)
+        buf (assoc typed
+              :dir root
+              :bshell-proc pid
+              :bshell-repl true ; the input region follows OUTPUT, not a command's exit
+              :bshell-running false
+              :bshell-input-start 0
+              :bshell-history (bshell-load-history)
+              :bshell-hist-idx nil
+              :bshell-draft nil))
+    (message (ed-open-buffer m buf) (str command))))
+
+(defcommand cmd-project-repl
+  (m key)
+  "Open this project's REPL (C-x p r): `iex -S mix` in a mix project, `nest repl` in a
+Brood one, `python3`, `node` — whatever `toolchain/*toolchains*` says this project's is.
+
+It runs under a pseudo-terminal, which is the only way it works: on a pipe an
+interpreter sees no tty, drops its prompt and line editing, and buffers its output
+until it exits. Each project gets its own REPL buffer, like its own shell."
+  (let (root (ed-project-root m))
+    (if (nil? root)
+      (message m "not in a project")
+      (let (command (toolchain/repl-command m))
+        (if (nil? command)
+          (message m (str "no REPL for a " (toolchain/name-of m) " project"))
+          (let (nm (bshell-repl-buffer-name root)
+                idx (ed-buffer-index-by-name m nm))
+            (if (nil? idx) (bshell-repl-start m root command) (ed-select m idx))))))))
 
 (defcommand cmd-project-bshell
   (m key)
