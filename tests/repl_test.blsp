@@ -113,6 +113,72 @@ out the timeout for an answer that arrived at once."
           (bshell/bshell-shutdown pid)
           (is (includes? out "has exited")))))))
 
+;; ---- terminal output is applied, not stripped -------------------------------
+;; A REPL redraws. `iex` echoes what you typed, then moves up a line, erases, and
+;; prints the line again with its prompt — so stripping the escapes leaves BOTH copies
+;; and the buffer shows the input twice. `ansi/render` applies them instead, which has
+;; to happen on the editor side because it needs the buffer's existing text.
+(describe "a REPL buffer renders its child's redraw"
+  (defn rt-esc (s) (str (string/int->char 27) s))
+
+  ;; the exact bytes a real `iex` writes for `1 + 41`
+  (def rt-iex-chunk
+    (str "1 + 41
+" (rt-esc "[A") (rt-esc "[J") "iex(1)> 1 + 41
+"
+      (rt-esc "[33m") "42" (rt-esc "[0m") "
+iex(2)> "))
+
+  (defn rt-repl-model ()
+    (let (buf (assoc (editor/layers/set-buffer-type (make-buffer "" "*repl: r*") :bshell)
+                :bshell-repl true
+                :bshell-input-start 0))
+      (ed-open-buffer (ed-init (make-buffer "" "scratch" "scratch")) buf)))
+
+  (test "the echo is replaced, not doubled"
+    (let (m (ed-ev-bshell-output (rt-repl-model)
+              (bshell/bshell-output-event "*repl: r*" rt-iex-chunk)
+              24 80 24)
+          i (ed-buffer-index-by-name m "*repl: r*")
+          text (buffer-text (nth (:buffers m) i)))
+      (assert= text "iex(1)> 1 + 41\n42\niex(2)> ")
+      ;; the input appears once, under the prompt that redrew it
+      (assert= (count (filter (string/split text "\n") (fn (l) (includes? l "1 + 41")))) 1)))
+
+  (test "and typing still begins after whatever the child last printed"
+    (let (m (ed-ev-bshell-output (rt-repl-model)
+              (bshell/bshell-output-event "*repl: r*" rt-iex-chunk)
+              24 80 24)
+          i (ed-buffer-index-by-name m "*repl: r*")
+          b (nth (:buffers m) i))
+      (assert= (:bshell-input-start b) (string/length (buffer-text b)))))
+
+  ;; A shell buffer is append-only output and keeps the cheaper strip — the same chunk
+  ;; there is text, not layout.
+  (test "a plain shell buffer is unaffected"
+    (let (buf (assoc (editor/layers/set-buffer-type (make-buffer "" "*shell: s*") :bshell)
+                :bshell-input-start 0)
+          m (ed-open-buffer (ed-init (make-buffer "" "scratch" "scratch")) buf)
+          m1 (ed-ev-bshell-output m (bshell/bshell-output-event "*shell: s*" "a\nb\n") 24 80 24)
+          i (ed-buffer-index-by-name m1 "*shell: s*")
+          text (buffer-text (nth (:buffers m1) i)))
+      (assert= text "a\nb\n"))))
+
+;; ---- the window size reaches the child ---------------------------------------
+;; A pty child lays out against a size it is TOLD; it has no other way to learn one.
+;; A REPL opened in an 80-column window kept wrapping at 80 after the window widened.
+(describe "a resize reaches the hosted REPL"
+  (test "every live REPL worker is told, and nothing else is"
+    (let (repl (assoc (make-buffer "" "*repl: a*") :bshell-repl true :bshell-proc (self))
+          shell (assoc (make-buffer "" "*shell: b*") :bshell-proc (self))
+          m (ed-open-buffer (ed-open-buffer (ed-init (make-buffer "" "s" "s")) repl) shell)
+          _ (bshell/bshell-resize-all m 120 40)
+          ;; exactly one message, for the REPL buffer only
+          first-msg (receive ([:bshell-resize c r] [c r]) (after 500 :none))
+          second-msg (receive ([:bshell-resize c r] [c r]) (after 200 :none)))
+      (assert= first-msg [120 40])
+      (assert= second-msg :none))))
+
 ;; The buffer half: the editor prints no prompt of its own, and the input region
 ;; follows whatever the child last wrote.
 (describe "the REPL buffer lets you type after the child's own prompt"
