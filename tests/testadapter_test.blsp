@@ -245,3 +245,117 @@
             (assert= "LedgerTest" (get ok :group))
             (is (includes? (get bad :where) "ledger_test.exs:"))
             (is (not (empty? (get bad :failures))))))))))
+
+;; ---- where the ✓/✗ actually lands --------------------------------------------
+;; The margin verdict resolves a result's `:where` to the test's declaration line,
+;; and the two runners disagree about what `:where` already points at. Brood's names
+;; the first BODY form, so it resolves upward to the `(test …)` head; ExUnit's names
+;; the `test "…" do` line itself. Sharing the upward scan looked harmless and was
+;; not: the scan matches Brood syntax, so on an Elixir buffer it found nothing, ran
+;; off the top of the file, and every verdict in the run landed on line 0.
+
+(defn ta-marks (m file)
+  (let (idx (ed-buffer-index-by-name m file))
+    (when idx (editor/buffer/annotation-value (nth (:buffers m) idx) :test-marks))))
+
+(defn ta-model-with (file text adapter-id)
+  (assoc (ed-init (make-buffer text file file))
+    :testrun
+      {:gen 1
+       :passed 0
+       :failed 0
+       :last-group nil
+       :adapter-id adapter-id
+       :decoder (testadapter/init (testadapter/for-toolchain adapter-id))}))
+
+(describe "the margin verdict lands on the test's own line"
+  ;; line 0 defmodule / 2 describe / 3 test "a" do / 4 assert / 5 end
+  (def ta-ex-source
+    (string/join
+      ["defmodule LedgerTest do"
+       "  use ExUnit.Case"
+       "  describe \"post/2\" do"
+       "    test \"accepts\" do"
+       "      assert true"
+       "    end"
+       "  end"
+       "end"]
+      "\n"))
+
+  (test "an Elixir result marks its own declaration line, not line 0"
+    (let (m (ta-model-with "ledger_test.exs" ta-ex-source :elixir)
+          m1 (ui-event-fold (test-result-event {:group "LedgerTest"
+                                                :name "accepts"
+                                                :passed true
+                                                :ms 1
+                                                :where "ledger_test.exs:4"
+                                                :failures []}
+                              1)
+               m
+               24
+               80
+               24)
+          marks (ta-marks m1 "ledger_test.exs"))
+      ;; `[L#4]` is 1-based and names the `test "accepts" do` line — 0-based 3
+      (assert= (get marks 3) true)
+      (is (nil? (get marks 0)))))
+
+  ;; the Brood half of the same property, so the two cannot silently converge
+  (test "a Brood result still resolves upward from its body form to the (test …) head"
+    (let (src "(describe \"g\"\n  (test \"n\"\n    (is true)))"
+          m (ta-model-with "g_test.blsp" src :brood)
+          m1 (ui-event-fold (test-result-event {:group "g"
+                                                :name "n"
+                                                :passed false
+                                                :ms 1
+                                                ;; the sink reports the body form (line 3)
+                                                :where "g_test.blsp:3"
+                                                :failures []}
+                              1)
+               m
+               24
+               80
+               24)
+          marks (ta-marks m1 "g_test.blsp"))
+      ;; …which belongs to the `(test "n"` head above it, 0-based 1
+      (assert= (get marks 1) false)
+      (is (nil? (get marks 2)))))
+
+  (test "the two runners disagree, and the adapter is what records that"
+    (assert= (testadapter/where-points-at testadapter/exunit-adapter) :head)
+    (assert= (testadapter/where-points-at testadapter/brood-adapter) :body)
+    ;; an unknown runner is assumed to behave like Brood's, which is what the
+    ;; resolution was written against
+    (assert= (testadapter/where-points-at nil) :body)))
+
+;; ---- the four wordings of a summary ------------------------------------------
+;; Captured from a real ExUnit, one run per wording. The bare `N passed` form is the
+;; one that matters most and was missed at first: it appears exactly when nothing
+;; failed, so a parser that only reads `P/T passed` reports no summary on a GREEN
+;; run — the common one, and the one where a silent echo area looks like a hang.
+
+(defn ta-summary-of (text)
+  (let (events (ta-drive testadapter/exunit-adapter text))
+    (second (first (filter events (fn (e) (= (first e) :summary)))))))
+
+(describe "the ExUnit summary, in every wording ExUnit uses"
+  (test "some failed, whole suite: Result: 2/3 passed, 1 skipped"
+    (assert= (ta-summary-of "Finished in 0.01 seconds\nResult: 2/3 passed, 1 skipped")
+      {:total 3 :passed 2 :failed 1 :ms 10}))
+
+  (test "some failed, filtered run: Result: 0/1 passed, 3 excluded"
+    (assert= (ta-summary-of "Finished in 0.02 seconds\nResult: 0/1 passed, 3 excluded")
+      {:total 1 :passed 0 :failed 1 :ms 20}))
+
+  ;; `C-c t t` on a test that passes — the ratio is dropped entirely
+  (test "ALL passed, filtered: Result: 1 passed, 3 excluded"
+    (assert= (ta-summary-of "Finished in 0.01 seconds\nResult: 1 passed, 3 excluded")
+      {:total 1 :passed 1 :failed 0 :ms 10}))
+
+  (test "ALL passed, whole suite: Result: 3 passed, 1 skipped"
+    (assert= (ta-summary-of "Finished in 0.05 seconds\nResult: 3 passed, 1 skipped")
+      {:total 3 :passed 3 :failed 0 :ms 50}))
+
+  (test "and the older ExUnit wording still parses"
+    (assert= (ta-summary-of "Finished in 0.01 seconds\n4 tests, 1 failure")
+      {:total 4 :passed 3 :failed 1 :ms 10})))

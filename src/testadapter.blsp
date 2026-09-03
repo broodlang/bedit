@@ -28,13 +28,21 @@ so adopting a second runner added a decoder rather than a second *Tests* buffer.
     {:id      :exunit
      :init    (fn () state)             ; the decoder's starting state
      :decode  (fn (state line) [state events])
-     :flush   (fn (state) [state events])}
+     :flush   (fn (state) [state events])
+     :where-points-at :head}            ; what a result's `:where` line names
 
 `events` is a list of `[:test result]` / `[:summary map]` / `[:output text]`. An
 adapter may be **stateful**, and ExUnit is the reason: it prints a test's line
 before it knows the verdict, and reports the failure in a numbered block after it,
 so a result is only complete once the following line arrives. `flush` is how the
 last pending one gets out when the process exits.
+
+`:where-points-at` is the other thing runners disagree about, and it decides where
+the ✓/✗ margin mark lands. Brood's `*test-report-sink*` reports a test's first BODY
+form (`:body`), so the mark has to resolve upward to the `(test …)` head above it.
+ExUnit's `[L#9]` is the `test \"…\" do` line itself (`:head`), so resolving upward
+would be wrong — and since the upward scan looks for Brood syntax, on an Elixir file
+it finds nothing, walks off the top, and stacks every verdict on line 0.
 
 Decoding runs in the **model fold**, not in the streaming worker — the worker's
 handlers are plain fns with nowhere to keep state, and the model is where a TEA
@@ -82,6 +90,8 @@ from the first `{` when the line plainly carries an event object."
 
 (def brood-adapter
   {:id :brood
+   ;; `*test-report-sink*` reports the test's first body form, not its head
+   :where-points-at :body
    :init (fn () nil)
    :decode (fn (state line) [state (list (brood-decode-line line))])
    :flush (fn (state) [state '()])})
@@ -146,16 +156,28 @@ swallow the first into the second's name."
     (when m (get (nth (get m :groups) 0) :text))))
 
 (defn- ex-summary (line)
-  "The run's counts, from either wording ExUnit has used:
-`Result: 2/3 passed, 1 skipped` (1.21) or `4 tests, 1 failure` (older). Returns
-`{:total :passed :failed}` or nil; `:ms` is filled in by the caller from `Finished in`."
-  (let (modern (regex/find "^Result: (\\d+)/(\\d+) passed" line)
+  "The run's counts. ExUnit says this four ways, and all four are real output:
+
+    Result: 2/3 passed, 1 skipped     some failed, whole suite
+    Result: 0/1 passed, 3 excluded    some failed, filtered run
+    Result: 3 passed, 1 skipped       ALL passed — the ratio is dropped
+    4 tests, 1 failure                older ExUnit
+
+The bare `N passed` form is the one to be careful of: it appears exactly when
+nothing failed, so reading only `P/T` means a green run reports no summary at all —
+and a green run is the common one. Returns `{:total :passed :failed}` or nil; `:ms`
+is filled in by the caller from `Finished in`."
+  (let (ratio (regex/find "^Result: (\\d+)/(\\d+) passed" line)
+        all-passed (regex/find "^Result: (\\d+) passed" line)
         classic (regex/find "^(\\d+) tests?, (\\d+) failures?" line))
     (cond
-      modern
-        (let (passed (ex-num (get (nth (get modern :groups) 0) :text))
-              total (ex-num (get (nth (get modern :groups) 1) :text)))
+      ratio
+        (let (passed (ex-num (get (nth (get ratio :groups) 0) :text))
+              total (ex-num (get (nth (get ratio :groups) 1) :text)))
           {:total total :passed passed :failed (- total passed)})
+      all-passed
+        (let (passed (ex-num (get (first (get all-passed :groups)) :text)))
+          {:total passed :passed passed :failed 0})
       classic
         (let (total (ex-num (get (nth (get classic :groups) 0) :text))
               failed (ex-num (get (nth (get classic :groups) 1) :text)))
@@ -244,6 +266,8 @@ each stacktrace frame. Returns `[file line 1]` or nil."
 
 (def exunit-adapter
   {:id :exunit
+   ;; `[L#9]` is the `test "…" do` line itself
+   :where-points-at :head
    :init ex-init
    :decode ex-decode
    ;; the process exited with a test still pending only when nothing followed it,
@@ -269,6 +293,13 @@ is still safe to fold."
 (defn decode (adapter state line)
   "Fold one stdout line through `adapter`; returns `[state events]`."
   ((get adapter :decode) state line))
+
+(defn where-points-at (adapter)
+  "`:head` when a result's `:where` line is the test's declaration line, `:body` when
+it is the first form inside it and the caller must resolve upward. `:body` is the
+default, because that is what the Brood runner does and what the resolution in
+`testrun` was written against."
+  (or (when adapter (get adapter :where-points-at)) :body))
 
 (defn flush (adapter state)
   "End of run: emit anything the adapter was still holding; returns `[state events]`."
