@@ -173,6 +173,8 @@ src/web.blsp                live HTTP mirror of the selected buffer (C-x w)
 src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclient model over node links
 src/collab.blsp             shared-buffer collaboration: presence carets, delta merges, follow/mirror
 tests/*_test.blsp           pure model/view tests, one suite per area (no window needed)
+tests/strict_ratchet_test   the `nest check --strict` ceiling: the count may only shrink —
+                            a new function that adds a finding declares its contract instead
 tools/drive*.py            live pty drivers: run the real editor, assert on what it paints —
                            the wiring the model tests can't see (`make drive`, tools/README.md)
 assets/                     the desktop identity: the icon (SVG) + the .desktop entry the
