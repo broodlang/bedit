@@ -77,7 +77,7 @@ src/main.blsp               entry point — window / daemon startup (--serve/--a
 src/model.blsp              the ui-run model: buffer pool, kill ring, minibuffer, *Messages*, scrolling
 src/config.blsp             ~/.config/bedit/init.blsp — the declarative user config (data, not eval'd)
 src/about.blsp              M-x version · --version · C-h C-a *About bedit* — bedit's version,
-                            the brood under it and the build date, all from project/build-info
+                            the brood under it and the build date, all from project-release/build-info
                             (named to dodge std's `version`, whose `version/newer?` packages uses)
 src/theme.blsp              every colour the editor paints (Catppuccin Mocha), referenced by role
 src/themes.blsp             the theme registry (M-x theme-select): a live picker that swaps the
