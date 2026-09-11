@@ -80,9 +80,18 @@ src/about.blsp              M-x version · --version · C-h C-a *About bedit* �
                             the brood under it and the build date, all from project/build-info
                             (named to dodge std's `version`, whose `version/newer?` packages uses)
 src/theme.blsp              every colour the editor paints (Catppuccin Mocha), referenced by role
+src/themes.blsp             the theme registry (M-x theme-select): a live picker that swaps the
+                            whole palette AND the window font — a theme is a plain map, so
+                            adding one is data (theme.blsp is the palette; this is the registry)
+src/packages.blsp           bedit's package manager (M-x package-list): install / update / remove
+                            hive packages that `:enhances bedit` at RUNTIME, into
+                            ~/.config/bedit/packages (the elpa model) — never the build's _deps
 src/panes.blsp              pane-layout geometry + mouse-event folding (model -> model)
 src/view.blsp               pure view: model -> render frame (editor/display ops)
 src/statusbar.blsp          the mode line as extensible segments (render ops + click/hover zones in one pass)
+src/ui-kit.blsp             the widget kit over editor/display: a widget is `(area ctx) ->
+                            {:ops :zones}` — paint and hit-test in ONE pass, styled by semantic
+                            role. The shared shape behind the context menu, popup, plume, which-key
 src/input.blsp              dispatch: fold a key/mouse/tick event into the next model
 src/commands.blsp           the editing commands, each a (model key) -> model
 src/keymaps.blsp            keybinding profiles (emacs / modal vim) as model-scope layers
@@ -140,6 +149,11 @@ src/toolchain.blsp          the project TYPE as data: marker file -> which comma
                             test, run and REPL here (mix / nest / cargo / npm / go / make),
                             and which tasks it can list. projects.blsp derives its root
                             markers from this table, so a language is ONE edit
+src/results.blsp            the results-buffer abstraction behind *Tests* / *Run* / *compilation* /
+                            *Occur* / *git-status*: the `file:line[:col]` location vocabulary, the
+                            `location-jump-layer` that makes every such row navigable, and
+                            `ed-append-follow` — the streaming append that follows the tail
+                            only in a pane already at the bottom
 src/testadapter.blsp        one result vocabulary, two runners: Brood's structured
                             *test-report-sink* lines and ExUnit's `mix test --trace` text
                             both decode into the same {:group :name :passed :where …}, so
