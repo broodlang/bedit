@@ -1,0 +1,100 @@
+;; tools/profile-turn.blsp — where a loop turn's time goes, headless.
+;;
+;; Opens a file into a model at the GUI window's grid, then samples `ed-view` and
+;; `ed-update` (a cursor-blink timer, a typed character, the idle beat) under the
+;; runtime's sampling profiler (`dev/profile-start`), printing each phase's wall time
+;; per call and the hottest stacks. The numbers `BROOD_UI_TRACE=1` prints for a live
+;; run, attributed. Pure model + view, no window:
+;;
+;;     nest run tools/profile-turn.blsp -- src/view.blsp 213 49
+(require-one 'project)
+(project/load-config)
+(let (root (project/find-root (file/cwd)))
+  (when root
+    (project/setup root)
+    (project/load-sources root)))
+
+(def *args* (let (a (system/argv) i (index-of a "--")) (if i (drop a (inc i)) (list))))
+(def *file* (or (first *args*) "src/view.blsp"))
+(def *cols* (let (n (string/->number (or (second *args*) "213"))) (if (int? n) n 213)))
+(def *rows* (let (n (string/->number (or (nth *args* 2) "49"))) (if (int? n) n 49)))
+(def *reps* 40)
+
+(defn model-of (file cols rows)
+  "A model with `file` visited, its span cache warm — the state after the first frame."
+  (let (m0 (commands/ed-find-file
+             (assoc (model/ed-init (editor/buffer/make-buffer (main/welcome-text :emacs {}) "*scratch*"))
+               :recent-files true
+               :os-clipboard true)
+             file)
+        ;; a loop turn refreshes the caches at its tail; run one so the steady state is measured
+        m1 (input/ed-update m0 [:timer :cursor-blink] cols rows)
+        m2 (input/ed-update m1 [:timer :idle-recompute] cols rows)
+        m3 (input/ed-update m2 [:timer :cursor-blink] cols rows))
+    m3))
+
+(defn ms-per (label thunk reps)
+  "Run `thunk` `reps` times, print the mean wall ms, return the last result."
+  (let (t0 (os/now-ns)
+        r (fold (range reps) nil (fn (_ _) (thunk)))
+        ms (/ (- (os/now-ns) t0) (* reps 1000000.0)))
+    (io/puts (str (string/pad-right label 34) (string/pad-left (string/format "%.2f" ms) 8) " ms/call"))
+    r))
+
+(defn inclusive (hist)
+  "Per-function INCLUSIVE sample counts: a function on a stack anywhere gets the sample
+once (a self-recursive frame is not double-counted). `{name -> count}`."
+  (fold hist {}
+    (fn (acc e)
+      (fold (seq/distinct (:stack e)) acc
+        (fn (a nm) (assoc a nm (+ (or (get a nm) 0) (:count e))))))))
+
+(defn top-stacks (hist n)
+  "Print the `n` functions with the most inclusive samples — a share of the phase's
+time spent inside each — skipping the anonymous bucket and the entry itself."
+  (let (total (fold hist 0 (fn (acc e) (+ acc (:count e))))
+        inc (inclusive hist)
+        ranked (sort-by (seq/reject (seq inc) (fn ([nm _]) (= nm "<anonymous>")))
+                 (fn ([_ c]) (- c))))
+    (doseq (e (take ranked n))
+      (io/puts (string/format "  %.1f%%  %s" (* 100.0 (/ (second e) (math/max 1 total))) (first e))))))
+
+(defn profiled (label thunk reps)
+  "`ms-per` under the sampler, then the hottest stacks."
+  (dev/profile-start 2000)
+  (ms-per label thunk reps)
+  (let (hist (dev/profile-stop))
+    (top-stacks hist 18)))
+
+(let (m (model-of *file* *cols* *rows*))
+  (io/puts (str "== " *file* " at " *cols* "x" *rows* ", " *reps* " reps each"))
+  (profiled "view" (fn () (view/ed-view m *cols* *rows*)) *reps*)
+  (profiled "update [:timer :cursor-blink]"
+    (fn () (input/ed-update m [:timer :cursor-blink] *cols* *rows*)) *reps*)
+  (profiled "update :ctrl-n" (fn () (input/ed-update m :ctrl-n *cols* *rows*)) *reps*)
+  (profiled "update \"x\"" (fn () (input/ed-update m "x" *cols* *rows*)) *reps*)
+  (profiled "update [:timer :idle-recompute]"
+    (fn () (input/ed-update m [:timer :idle-recompute] *cols* *rows*)) *reps*))
+
+;; the callers of `require-one`, fully — it should never sit on a per-frame path
+(let (m (model-of *file* *cols* *rows*))
+  (dev/profile-start 4000)
+  (fold (range 60) nil (fn (_ _) (view/ed-view m *cols* *rows*)))
+  (let (hist (dev/profile-stop)
+        req (seq/filter hist (fn (e) (= (first (:stack e)) "require-one"))))
+    (io/puts "== require-one stacks in view")
+    (doseq (e (take req 8))
+      (io/puts (str "  " (:count e) "  " (string/join (take (:stack e) 10) " < "))))))
+
+;; the memoised view (ADR-336): a second turn whose fragments all hit
+(let (m (model-of *file* *cols* *rows*)
+      first-frame (binding (*ui-memo* {}) (view/ed-view m *cols* *rows*))
+      [_ table] (editor/ui/ui-harvest first-frame))
+  (io/puts (str "== memo: " (count table) " fragments"))
+  (ms-per "view (memo, all hit)" (fn () (binding (*ui-memo* table) (view/ed-view m *cols* *rows*))) *reps*)
+  (ms-per "view + harvest (memo, all hit)"
+    (fn () (editor/ui/ui-harvest (binding (*ui-memo* table) (view/ed-view m *cols* *rows*)))) *reps*)
+  (let (m2 (input/ed-update m :ctrl-n *cols* *rows*))
+    (ms-per "view after C-n (memo)" (fn () (binding (*ui-memo* table) (view/ed-view m2 *cols* *rows*))) *reps*))
+  (let (m3 (input/ed-update m "x" *cols* *rows*))
+    (ms-per "view after typing x (memo)" (fn () (binding (*ui-memo* table) (view/ed-view m3 *cols* *rows*))) *reps*)))

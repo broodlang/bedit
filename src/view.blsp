@@ -22,6 +22,7 @@ old full-screen one (mode line at `rows-2`, echo at `rows-1`)."
   (:use theme) ; the curated palette + semantic chrome faces (src/theme.blsp)
   (:use statusbar) ; the status-bar segment model + layout + zones + hover tooltip
   (:use ui-kit) ; the widget kit (ui-panel / ui-list) — the context menu is one list
+  (:use editor/ui) ; ui-memo — memoised view fragments, one per visible line (ADR-336)
   (:use editor/display)) ; clear / text / cursor / frame / zone-at render ops
 ;; results/eol-notes and results/eol-note-at (the shared end-of-line annotation) are
 ;; referenced qualified below — each `mod/name` auto-loads its module.
@@ -263,13 +264,26 @@ bracket `overrides` merged), tiled from the visible slice's absolute `base` offs
       (ed-chunks->ops row x (ed-line-chunks vis base (or spans '()) hl-ranges overrides)))))
 
 (sig ed-visible-lines (buffer int int int int int any any any int -> any))
-(defn ed-visible-lines (buf top textrows x y w hl-ranges spans overrides hscroll)
+(defn ed-visible-lines (buf top textrows x y w hl-ranges spans overrides hscroll &optional (memo? false))
   "`text` ops for the lines visible in a `textrows`-tall pane whose text area starts
 at `(x, y)`, is `w` wide and scrolled `hscroll` columns left, from line `top`; `hl-ranges`
-`[lo hi face]` highlight the region/overlays, `spans` syntax-colour (with `overrides`)."
-  (let (last-line (math/min (dec (buffer-line-count buf)) (dec (+ top textrows))))
+`[lo hi face]` highlight the region/overlays, `spans` syntax-colour (with `overrides`).
+
+With `memo?`, each line is a memoised fragment (`editor/ui/ui-memo`, ADR-336) keyed by
+its screen cell `[:line x row]`: its ops are reused from the previous turn while the
+rope, the line, the width and scroll, the span band and the highlights are `=` — all
+of them values the model keeps between turns, so a cursor blink, a mouse move or a
+motion that touches no bracket re-renders no line at all. Off (the default) outside
+the loop and for a scaled pane, whose ops are transformed after this."
+  (let (last-line (math/min (dec (buffer-line-count buf)) (dec (+ top textrows)))
+        rope (buffer-rope buf))
     (mapcat (range top (inc last-line))
-      (fn (line) (ed-line-ops buf line top x y w hl-ranges spans overrides hscroll)))))
+      (fn (line)
+        (if memo?
+          (ui-memo [:line x (+ y (- line top))]
+            [rope line w hscroll spans hl-ranges overrides]
+            (fn () (ed-line-ops buf line top x y w hl-ranges spans overrides hscroll)))
+          (ed-line-ops buf line top x y w hl-ranges spans overrides hscroll))))))
 
 ;; ---- a pane: its buffer body + its mode line --------------------------------
 
@@ -447,19 +461,27 @@ as a distinct band — dark-UI chrome is anchored by a 1px border, not a shadow 
         row (+ y (dec h))
         base (if sel face-modeline face-modeline-inactive)
         hovered-id (if sel (get-in m [:hover :id]) nil)
-        laid (statusbar-layout (ed-statusbar-segments m pane buf) x row w base hovered-id (:gui m)))
-    (append (:ops laid)
-      ;; top + bottom hairlines frame the bar as a distinct band (GUI only); both sit flush
-      ;; on the row's edges — not over the text — so the labels keep their full height.
-      (if (:gui m)
-        [(frect (* 1.0 x) (* 1.0 row) (* 1.0 w) *modeline-hairline* face-border)
-          ; top edge
-          (frect (* 1.0 x)
-            (- (* 1.0 (inc row)) *modeline-hairline*)
-            (* 1.0 w)
-            *modeline-hairline*
-            face-border)] ; bottom edge
-        []))))
+        segments (ed-statusbar-segments m pane buf)
+        gui? (:gui m))
+    ;; The layout is a memoised fragment (ADR-336) of the segments and the bar's
+    ;; geometry: the segments are plain data rebuilt each turn and `=` across turns until
+    ;; something on the bar changes, so the layout — the expensive half — is reused.
+    (ui-memo [:modeline x row]
+      [segments x row w base hovered-id gui?]
+      (fn ()
+        (append (:ops (statusbar-layout segments x row w base hovered-id gui?))
+          ;; top + bottom hairlines frame the bar as a distinct band (GUI only); both sit
+          ;; flush on the row's edges — not over the text — so the labels keep their full
+          ;; height.
+          (if gui?
+            [(frect (* 1.0 x) (* 1.0 row) (* 1.0 w) *modeline-hairline* face-border)
+              ; top edge
+              (frect (* 1.0 x)
+                (- (* 1.0 (inc row)) *modeline-hairline*)
+                (* 1.0 w)
+                *modeline-hairline*
+                face-border)] ; bottom edge
+            []))))))
 
 ;; ---- status-bar hit-testing + hover tooltip (the mouse side) ----------------
 ;; The mouse handler recomputes the *selected* pane's segment layout — the same one the view
@@ -609,21 +631,28 @@ chunks (`web-gutter-html`)."
                                ops)]
                            [(+ col (string/length t)) (cons (text row col t f) ops)])))))))
 
-(defn ed-gutter-ops (cells bx by gui?)
+(defn ed-gutter-ops (cells bx by gui? &optional (memo? false))
   "Render ops for prebuilt gutter `cells` (one `[text face]` / `[:bar colour]` chunk list
 per visible line, from `panes/ed-pane-gutter-cells` — cached across frames, since typing
 never changes them), placed at column `bx`, rows from `by`. `gui?` picks the change bar's
-rendering (frect vs `▌`). `()` when `cells` is nil (gutter hidden / no service)."
+rendering (frect vs `▌`). `()` when `cells` is nil (gutter hidden / no service). With
+`memo?` the ops are a memoised fragment (ADR-336) — off for a scaled pane, whose ops
+are transformed after this."
   (if (nil? cells)
     '()
-    ;; cons each line's ops + reverse once, NOT `append acc` (which recopies the
-    ;; accumulator every visible line — O(rows²) per frame in the gutter).
-    (reverse (first (fold cells
-                      ['() by]
-                      (fn (acc cell)
-                        (let ([ops row] acc)
-                          [(fold (ed-gutter-line-ops row bx cell gui?) ops (fn (a op) (cons op a)))
-                            (inc row)])))))))
+    ;; A memoised fragment (ADR-336): `cells` is the model's cached vector, the same
+    ;; object turn after turn, so the ops are reused until the gutter itself changes.
+    (ui-memo (if memo? [:gutter bx by] nil)
+      [cells bx by gui?]
+      (fn ()
+        ;; cons each line's ops + reverse once, NOT `append acc` (which recopies the
+        ;; accumulator every visible line — O(rows²) per frame in the gutter).
+        (reverse (first (fold cells
+                          ['() by]
+                          (fn (acc cell)
+                            (let ([ops row] acc)
+                              [(fold (ed-gutter-line-ops row bx cell gui?) ops (fn (a op) (cons op a)))
+                                (inc row)])))))))))
 
 ;; ---- per-pane scrollbar (rightmost column) ----------------------------------
 
@@ -672,7 +701,7 @@ visible buffer lines. At scale 1 the body renders straight into the rect (`[x y]
 the origin, then every op is scaled `s`× and re-anchored to `[x y]`, so the gutter
 magnifies in lock-step with the text."
   (if (= s 1)
-    (append (ed-gutter-ops cells x y gui?)
+    (append (ed-gutter-ops cells x y gui? true)
       (ed-visible-lines buf
         top
         text-h
@@ -682,7 +711,8 @@ magnifies in lock-step with the text."
         hl-ranges
         spans
         overrides
-        hscroll))
+        hscroll
+        true))
     (let (vh (math/max 1 (math/quot text-h s))
           vw (math/max 1 (math/quot (dec w) s))
           body (append (ed-gutter-ops cells 0 0 gui?)
