@@ -321,6 +321,12 @@ tests share."
       m
       (assoc m :diagnostics (svc (buffer-text buf)) :diag-rope rope))))
 
+(defn- ed-buffer-dir (buf)
+  "The directory `buf` lives in — its `:dir`, else its file's folder, else the working
+dir (the `commands/ed-default-dir` rule, for a given buffer)."
+  (or (:dir buf)
+    (let (f (buffer-file buf)) (if (nil? f) (file/cwd) (path/dirname f)))))
+
 ;; How long a sandboxed check may run before the child answers `:timeout` (and the
 ;; next idle beat re-sends). A large file's check is hundreds of ms; a project's first
 ;; check also loads its modules in the child.
@@ -351,12 +357,20 @@ in-image task, which sees only the editor's own image."
       :else
         (let (text (buffer-text buf)
               rope (buffer-rope buf)
-              remote? (ed-mode-service buf :check-remote)
+              ;; the sandbox is off for this model once its worker gave up (`:diag-sandbox-off`,
+              ;; set by the down hook): from then on the in-image task checks, so a project
+              ;; whose child cannot boot is not respawned on every idle beat
+              remote? (and (ed-mode-service buf :check-remote) (not (:diag-sandbox-off m)))
               id (sandbox/sandbox-next-id m)
               sent? (and remote?
                       (do
                         (sandbox-events/ensure)
-                        (sandbox/sandbox-start (or (:project-root m) (sandbox/sandbox-projectless-root)))
+                        ;; the CURRENT buffer's project, resolved live from its directory —
+                        ;; `:project-root` is the last visit's, which another project's
+                        ;; buffer switched to by C-x b must not inherit
+                        (sandbox/sandbox-start (or (projects/project-root (ed-buffer-dir buf))
+                                               (:project-root m)
+                                               (sandbox/sandbox-projectless-root)))
                         (sandbox/sandbox-check id text *diag-check-timeout-ms*))))
           (if sent?
             (assoc (sandbox/sandbox-ids-used m (inc id)) :diag-req id :diag-sent (os/now) :diag-checking rope)
@@ -379,13 +393,23 @@ its `:diagnostics` (or `()` for a timeout / a checker error, so the next idle be
 re-sends) become the cache, against the rope they were computed for. Any other id
 is another client's, untouched."
   (if (and (:diag-req m) (= (get reply :id) (:diag-req m)))
-    (dissoc (ed-apply-diag m (if (get reply :ok) (or (get reply :diagnostics) '()) '())) :diag-req)
+    (if (get reply :ok)
+      (dissoc (ed-apply-diag m (or (get reply :diagnostics) '())) :diag-req)
+      ;; a timeout (the child was re-rooted or reset mid-check, or a first check that
+      ;; loaded a large project overran) or a checker error: keep the old cache and
+      ;; leave `:diag-rope` as it was, so the buffer stays stale and the next idle beat
+      ;; sends again — `ed-apply-diag` would record the rope as checked
+      (dissoc m :diag-req :diag-checking))
     m))
 
 (defn ed-diag-sandbox-down (m code)
   "The child went away: forget the check in flight (the worker answered it `:timeout`
-or never will), so the next idle beat re-sends."
-  (dissoc m :diag-req))
+or never will), so the next idle beat re-sends. A worker that GAVE UP (`:gave-up` —
+the child died three times in a row, e.g. a project whose manifest it cannot load —
+or `:spawn-failed`) turns the sandbox off for this model's checks (`:diag-sandbox-off`):
+they run in-image from then on rather than respawning a doomed child on every idle beat."
+  (let (m1 (dissoc m :diag-req :diag-checking))
+    (if (or (= code :gave-up) (= code :spawn-failed)) (assoc m1 :diag-sandbox-off true) m1)))
 
 (defdyn *warm-tree-min*
   ;; Below this many characters a whole-file parse is already imperceptible, so warming
