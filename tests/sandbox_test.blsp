@@ -12,6 +12,7 @@
 ;; A worker state with no live child: :proc is a token — pure paths never proc-send.
 (defn st0 ()
   {:proc :fake-proc
+   :sink (self) ; this test process is the editor the worker emits to (`sandbox-emit`)
    :buf ""
    :ready false
    :queue ()
@@ -24,14 +25,30 @@
 
 ;; ---- line assembly + protocol folding (pure: no editor process, empty queue) --
 
+(defn- emitted-ids ()
+  "The `:id`s of every reply event now in the mailbox, oldest first — and drains the
+ready events too, so nothing leaks into a later test's `receive`."
+  (letrec (drain (fn (acc)
+                   (receive
+                     ((record sandbox/sandbox-reply-event {:reply r}) (drain (cons (:id r) acc)))
+                     ((record sandbox/sandbox-ready-event {}) (drain acc))
+                     (after 0 (reverse acc)))))
+    (drain '())))
+
 (describe "sandbox--feed (stdout line assembly)"
+  ;; Each folded line is ALSO an event to the editor — asserted alongside the state. `st0`
+  ;; names this test process as the worker's `:sink`, so the event lands here (and not in
+  ;; whichever parallel test had registered a global `:editor` first).
   (test "a partial line waits in :buf; completing it folds it"
     (let (s1 (sandbox/sandbox-feed (st0) "{:rea")
           s2 (sandbox/sandbox-feed s1 "dy true}\n"))
       (assert= (:buf s1) "{:rea")
       (assert= (:ready s1) false)
       (assert= (:ready s2) true)
-      (assert= (:buf s2) "")))
+      (assert= (:buf s2) "")
+      ;; the partial emitted nothing; the completed banner emitted exactly one ready
+      (assert= 1 (receive ((record sandbox/sandbox-ready-event {:gen g}) g) (after 1000 :no-event)))
+      (assert= '() (emitted-ids))))
 
   (test "several lines in one chunk all fold; the trailing partial carries"
     (let (s (sandbox/sandbox-feed (assoc (st0) :ready true :inflight {1 99 2 99})
@@ -39,21 +56,30 @@
                 (reply-line {:id 2 :ok true :value "4"})
                 "{:id 3")))
       (assert= (:inflight s) {})
-      (assert= (:buf s) "{:id 3")))
+      (assert= (:buf s) "{:id 3")
+      ;; two complete lines, two reply events, in order; the partial third emitted nothing
+      (assert= '(1 2) (emitted-ids))))
 
   (test "stray output between protocol lines is dropped, not fatal"
     (let (s (sandbox/sandbox-feed (assoc (st0) :ready true :inflight {7 99})
               (str "some late print from a spawned process\n"
                 (reply-line {:id 7 :ok true :value "1"}))))
-      (assert= (:inflight s) {}))))
+      (assert= (:inflight s) {})
+      ;; the stray line is not an event; the reply is
+      (assert= '(7) (emitted-ids)))))
 
 (describe "sandbox--handle-line"
-  (test "the ready banner flips :ready"
-    (assert= (:ready (sandbox/sandbox-handle-line (st0) "{:ready true}")) true))
-  (test "a reply settles exactly its own inflight id"
+  ;; A protocol line does two things: folds the worker's state AND tells the editor
+  ;; (`sandbox-emit`, to the state's `:sink` — this test process). Both halves are asserted.
+  (test "the ready banner flips :ready — and tells the editor"
+    (assert= (:ready (sandbox/sandbox-handle-line (st0) "{:ready true}")) true)
+    (assert= 1 (receive ((record sandbox/sandbox-ready-event {:gen g}) g)
+                 (after 1000 :no-event))))
+  (test "a reply settles exactly its own inflight id — and hands the reply to the editor"
     (let (s (sandbox/sandbox-handle-line (assoc (st0) :inflight {4 99 5 99})
               (eval-server/evsrv-encode-reply {:id 4 :ok false :error "boom"})))
-      (assert= (:inflight s) {5 99})))
+      (assert= (:inflight s) {5 99})
+      (assert= '(4) (emitted-ids))))
   (test "garbage leaves the state untouched"
     (let (s (assoc (st0) :inflight {1 99}))
       (assert= (sandbox/sandbox-handle-line s "not protocol") s))))
@@ -186,7 +212,7 @@
     ;; this every editor run would leave one behind
     (file/spit *sandbox-script-path* (sandbox/sandbox-script-source))
     (is (file/exists? *sandbox-script-path*))
-    (let (state {:gen 1 :inflight {} :queue '() :ready false :proc nil}
+    (let (state {:gen 1 :inflight {} :queue '() :ready false :proc nil :sink (self)}
           after (sandbox/sandbox-handle-line state (pr-str {:ready true})))
       (is (:ready after))
       (is (not (file/exists? *sandbox-script-path*))))))

@@ -115,10 +115,15 @@ won't say where we live)."
       (fold (sandbox-runtimes) nil (fn (found prog) (or found (sandbox-spawn-with prog)))))
     (catch e (do (log/warn (str "sandbox: could not start a child: " (error-message e))) nil))))
 
-(defn- sandbox-emit (ev)
-  ;; The editor process may be gone (shutdown race) — a send to the registered name
-  ;; drops the event then, which is right.
-  (send :editor ev))
+(defn- sandbox-emit (state ev)
+  "Hand `ev` to the editor: the worker state's `:sink` when it names one, else the
+registered `:editor`. The live worker has no `:sink` and goes by name — late-bound, so
+an editor process that is replaced under a running sandbox keeps receiving, and one that
+is gone (a shutdown race) drops the event, which is right. A `:sink` is what a TEST sets:
+its step functions are pure over `state`, and a global name is exactly the dependency a
+pure step must not have — tests run in parallel, each its own process, and every one
+registering the same `:editor` handed one test's events to another."
+  (send (or (:sink state) :editor) ev))
 
 ;; ---- the worker ---------------------------------------------------------------
 ;; State is one map threaded through the tail-recursive loop:
@@ -173,11 +178,11 @@ settles its inflight entry and forwards; anything else is a stray print — drop
           (try
             (file/rm *sandbox-script-path*)
             (catch e (log/warn (str "sandbox: could not remove its script: " (error-message e)))))
-          (sandbox-emit (sandbox-ready-event (:gen state)))
+          (sandbox-emit state (sandbox-ready-event (:gen state)))
           (sandbox-flush-queue (assoc state :ready true :strikes 0)))
       (int? (get reply :id))
         (do
-          (sandbox-emit (sandbox-reply-event reply (:gen state)))
+          (sandbox-emit state (sandbox-reply-event reply (:gen state)))
           (update state :inflight dissoc (get reply :id)))
       else state)))
 
@@ -193,7 +198,7 @@ each complete line through `sandbox-handle-line`."
 paths' obligation: no request may vanish without an answer."
   (doseq (kv (:inflight state))
     (let ([id _] kv)
-      (sandbox-emit (sandbox-reply-event (merge {:id id :ok false} why) (:gen state)))))
+      (sandbox-emit state (sandbox-reply-event (merge {:id id :ok false} why) (:gen state)))))
   (assoc state :inflight {}))
 
 (defn- sandbox-respawn (state)
@@ -207,7 +212,7 @@ first (they died with the old session). `:sandbox-stopped` (after a
     (let (child (sandbox-spawn-child))
       (if (nil? child)
         (do
-          (sandbox-emit (sandbox-down-event :spawn-failed (:gen st)))
+          (sandbox-emit st (sandbox-down-event :spawn-failed (:gen st)))
           :sandbox-stopped)
         {:proc child
          :buf ""
@@ -225,7 +230,7 @@ first (they died with the old session). `:sandbox-stopped` (after a
   (let (strikes (inc (or (:strikes state) 0)))
     (if (>= strikes *sandbox-max-strikes*)
       (do
-        (sandbox-emit (sandbox-down-event :gave-up (:gen state)))
+        (sandbox-emit state (sandbox-down-event :gave-up (:gen state)))
         (let (st (sandbox-fail-inflight state {:timeout true}))
           (try
             (os/close (:proc st))
@@ -264,7 +269,7 @@ answering entirely (the server's own per-request kill should have replied
     ([:proc-closed p code]
       (if (= p (:proc state))
         (do
-          (sandbox-emit (sandbox-down-event code (:gen state)))
+          (sandbox-emit state (sandbox-down-event code (:gen state)))
           ;; a death soon after spawn = the child itself is broken — strike (and
           ;; possibly give up); a late death (killed externally) just respawns
           (if (< (- (os/now) (or (:spawned-at state) 0)) *sandbox-fast-death-ms*)
@@ -300,7 +305,7 @@ answering entirely (the server's own per-request kill should have replied
 a `:spawn-failed` / `:gave-up` stop — see the events)."
   (let (child (sandbox-spawn-child))
     (if (nil? child)
-      (do (sandbox-emit (sandbox-down-event :spawn-failed 1)) :sandbox-stopped)
+      (do (sandbox-emit {} (sandbox-down-event :spawn-failed 1)) :sandbox-stopped)
       (sandbox-loop {:proc child
                      :buf ""
                      :ready false
