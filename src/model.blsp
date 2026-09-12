@@ -309,18 +309,6 @@ the previous newline (0 at the first line). Tail-recursive."
 ;; back to a synchronous check. The check is the buffer mode's `:diagnostics` service
 ;; (brood-mode → the in-process type checker); buffers whose mode offers none never pay.
 
-(defn ed-diag-prepare (m)
-  "Put the current project's `src/` on the module search path before a check, so the
-checker's inferred loads resolve the BUFFER's own modules — a DSL macro like
-`(aarch64/asm …)` expands instead of every word inside it reading as unbound. This is
-what `bedit .` inside a project got by accident (a bundle's boot sets up the cwd's
-project); a launch from elsewhere gets it here, deliberately. Idempotent: the path is
-prepended only when absent. Returns `m`."
-  (let (root (:project-root m)
-        src (if root (path/join root "src") nil))
-    (when (and src (file/dir? src)) (reflect/add-load-path src))
-    m))
-
 (defn ed-refresh-diagnostics (m)
   "The model with `:diagnostics` (a list of `{:line :col :message}`) + `:diag-rope`
 refreshed iff the current buffer has a `:diagnostics` service and its rope changed since
@@ -331,25 +319,73 @@ tests share."
         rope (buffer-rope buf))
     (if (or (nil? svc) (= rope (:diag-rope m)))
       m
-      (assoc (ed-diag-prepare m) :diagnostics (svc (buffer-text buf)) :diag-rope rope))))
+      (assoc m :diagnostics (svc (buffer-text buf)) :diag-rope rope))))
+
+;; How long a sandboxed check may run before the child answers `:timeout` (and the
+;; next idle beat re-sends). A large file's check is hundreds of ms; a project's first
+;; check also loads its modules in the child.
+(def *diag-check-timeout-ms* 20000)
 
 (defn ed-launch-diag (m)
   "Start the deferred diagnostics check. A no-op when nothing is stale or a check is
-already in flight (`:diag-proc`). With a live `:editor` process, run the check in a
-spawned task (std/task) — recording its handle on `:diag-proc` and the rope it is
-checking on `:diag-checking`, so a stale reply can't clobber a newer cache. Headless (no
-`:editor`) → synchronous (`ed-refresh-diagnostics`)."
+already in flight (`:diag-proc` — an in-image task — or `:diag-req`, a sandbox
+request). Headless (no `:editor`) → synchronous (`ed-refresh-diagnostics`).
+
+A mode marked `:check-remote` (brood-mode) is checked in the SANDBOX CHILD, the way
+an LSP server checks its language: `sandbox-check` sends the text as a `:check`
+request to a child rooted in the buffer's project (`sandbox-start root` — it is
+re-rooted when the project changes), whose checker resolves that project's modules
+in its own image; the reply folds back through `sandbox-events` as the model's
+`:reply` client. Nothing of the project is ever loaded into the editor. When the
+sandbox cannot take the request (no runtime to spawn), the check falls back to the
+in-image task, which sees only the editor's own image."
   (let (buf (ed-current-buf m)
         svc (ed-mode-service buf :diagnostics))
     (cond
       (or (nil? svc) (not (ed-diag-stale? m))) m
       (:diag-proc m) m
+      ;; a sandbox check in flight — unless it is overdue (a worker that was shutting
+      ;; down took the request and never answered): forget it and send again
+      (and (:diag-req m) (< (- (os/now) (or (:diag-sent m) 0)) (+ *diag-check-timeout-ms* 5000))) m
       (ed-headless?) (ed-refresh-diagnostics m)
       :else
         (let (text (buffer-text buf)
-              _ (ed-diag-prepare m) ; the load path is process-global: set before the task runs
-              job (task (fn () (svc text))))
-          (assoc m :diag-proc job :diag-checking (buffer-rope buf))))))
+              rope (buffer-rope buf)
+              remote? (ed-mode-service buf :check-remote)
+              id (sandbox/sandbox-next-id m)
+              sent? (and remote?
+                      (do
+                        (sandbox-events/ensure)
+                        (sandbox/sandbox-start (or (:project-root m) (sandbox/sandbox-projectless-root)))
+                        (sandbox/sandbox-check id text *diag-check-timeout-ms*))))
+          (if sent?
+            (assoc (sandbox/sandbox-ids-used m (inc id)) :diag-req id :diag-sent (os/now) :diag-checking rope)
+            (let (job (task (fn () (svc text))))
+              (assoc m :diag-proc job :diag-checking rope)))))))
+
+;; ---- the sandbox's diagnostics client (registered in `sandbox-events`) --------
+
+(defn ed-diag-client-live? (m)
+  "Somebody still wants the sandbox for checks: the current buffer's mode checks remotely."
+  (not (nil? (ed-mode-service (ed-current-buf m) :check-remote))))
+
+(defn ed-diag-sandbox-ready (m gen)
+  "The child came up (or back): nothing to do — a queued check flushes on its own."
+  m)
+
+(defn ed-diag-sandbox-reply (m reply gen)
+  "Fold a sandbox reply: ours iff its `:id` is the check in flight (`:diag-req`) — then
+its `:diagnostics` (or `()` for a timeout / a checker error, so the next idle beat
+re-sends) become the cache, against the rope they were computed for. Any other id
+is another client's, untouched."
+  (if (and (:diag-req m) (= (get reply :id) (:diag-req m)))
+    (dissoc (ed-apply-diag m (if (get reply :ok) (or (get reply :diagnostics) '()) '())) :diag-req)
+    m))
+
+(defn ed-diag-sandbox-down (m code)
+  "The child went away: forget the check in flight (the worker answered it `:timeout`
+or never will), so the next idle beat re-sends."
+  (dissoc m :diag-req))
 
 (defdyn *warm-tree-min*
   ;; Below this many characters a whole-file parse is already imperceptible, so warming

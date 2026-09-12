@@ -38,7 +38,9 @@ discipline.") ; no imports — proc-spawn / proc-send / string ops are prelude; 
 ;; name like "/tmp/bedit-eval-server.blsp": that is one file two editors fight over,
 ;; and a path anyone on the machine can create first as a symlink, so this `spit`
 ;; would overwrite their choice of file with our privileges and then run it.
-(def *sandbox-script-path* (path/temp "bedit-eval-server-"))
+;; `.blsp`, because the child may run INSIDE A PROJECT (rooted there for its checks), and
+;; `nest run` takes a non-`.blsp` file in a project for a document to open, not a script.
+(def *sandbox-script-path* (str (path/temp "bedit-eval-server-") ".blsp"))
 
 ;; The request timeout applied when the caller passes nil (mirrors the server's own
 ;; default, so both ends agree on how long an eval may run).
@@ -96,23 +98,29 @@ won't say where we live)."
     (into []
       (seq/filter (list (sandbox-sibling "nest") (sandbox-sibling "brood")) (fn (p) (not (nil? p)))))))
 
-(defn- sandbox-spawn-with (prog)
+(def *sandbox-default-root* "/tmp")
+;; The child's cwd when no project asked for it: projectless — a bare std image, no
+;; project sources, so it starts fast and the session begins empty (the tutorial's case).
+
+(defn- sandbox-spawn-with (prog root)
   ;; `nest` needs the `run` subcommand; `brood` takes the script directly.
   (let (args (if (= "nest" (path/basename prog))
                ["run" *sandbox-script-path*]
                [*sandbox-script-path*]))
     ;; `prog` is one candidate runtime of several — failing to spawn it means try the next
-    (check-allow :discarded-catch (try (os/spawn prog args {:cwd "/tmp"}) (catch _ nil)))))
+    (check-allow :discarded-catch (try (os/spawn prog args {:cwd root}) (catch _ nil)))))
 
-(defn- sandbox-spawn-child ()
-  ;; cwd /tmp: the sandbox is deliberately projectless — a bare std image, no
-  ;; project sources, so it starts fast and the session begins empty. nil when NO
+(defn- sandbox-spawn-child (root)
+  ;; cwd `root`: a PROJECT root puts that project's sources on the child's load path
+  ;; (`nest run` sets up the project it is started in — lazily, nothing eagerly loaded),
+  ;; which is what lets a `:check` resolve the project's own modules there and never in
+  ;; the editor; `*sandbox-default-root*` is the projectless session. nil when NO
   ;; candidate runtime can be spawned (none on PATH, none beside us, unwritable script
   ;; path) — the callers turn that into a `:spawn-failed` event rather than a worker crash.
   (try
     (do
       (file/spit *sandbox-script-path* (sandbox-script-source))
-      (fold (sandbox-runtimes) nil (fn (found prog) (or found (sandbox-spawn-with prog)))))
+      (fold (sandbox-runtimes) nil (fn (found prog) (or found (sandbox-spawn-with prog root)))))
     (catch e (do (log/warn (str "sandbox: could not start a child: " (error-message e))) nil))))
 
 (defn- sandbox-emit (state ev)
@@ -145,9 +153,13 @@ pushed the next box past its deadline and the watchdog killed a HEALTHY child."
   (let (base (fold inflight t (fn (acc kv) (math/max acc (second kv)))))
     (+ base (or timeout-ms *sandbox-default-timeout-ms*) *sandbox-grace-ms*)))
 
-(defn- sandbox-send-request (state id src timeout-ms trace)
+(defn- sandbox-send-request (state id src timeout-ms trace &optional (check? false))
+  ;; `check?`: a `:check` request (the checker's verdict, structured) instead of an eval
   (os/write (:proc state)
-    (str (eval-server/evsrv-encode-request id src timeout-ms trace) "\n"))
+    (str (if check?
+           (eval-server/evsrv-encode-check id src timeout-ms)
+           (eval-server/evsrv-encode-request id src timeout-ms trace))
+      "\n"))
   (update state
     :inflight assoc
     id
@@ -158,8 +170,8 @@ pushed the next box past its deadline and the watchdog killed a HEALTHY child."
   (fold (reverse (:queue state))
     (assoc state :queue ())
     (fn (st req)
-      (let ([id src timeout-ms trace] req)
-        (sandbox-send-request st id src timeout-ms trace)))))
+      (let ([id src timeout-ms trace check?] req)
+        (sandbox-send-request st id src timeout-ms trace check?)))))
 
 (defn- sandbox-handle-line (state line)
   "Fold one complete stdout line: the ready banner flips `:ready` (flushing the
@@ -209,7 +221,7 @@ first (they died with the old session). `:sandbox-stopped` (after a
     (try
       (os/close (:proc st))
       (catch e (log/warn (str "sandbox: close failed: " (error-message e)))))
-    (let (child (sandbox-spawn-child))
+    (let (child (sandbox-spawn-child (or (:root st) *sandbox-default-root*)))
       (if (nil? child)
         (do
           (sandbox-emit st (sandbox-down-event :spawn-failed (:gen st)))
@@ -221,6 +233,7 @@ first (they died with the old session). `:sandbox-stopped` (after a
          :inflight {}
          :gen (inc (:gen st))
          :spawned-at (os/now)
+         :root (or (:root st) *sandbox-default-root*)
          :strikes (or (:strikes st) 0)}))))
 
 (defn- sandbox-strike (state)
@@ -251,7 +264,7 @@ answering entirely (the server's own per-request kill should have replied
   (and (not (:ready state))
     (> (os/now) (+ (or (:spawned-at state) 0) *sandbox-boot-timeout-ms*))))
 
-(defn- sandbox-check (state)
+(defn- sandbox-watchdog (state)
   ;; the watchdog beat: a wedged child or an overdue boot is a strike
   (if (or (sandbox-wedged? state) (sandbox-boot-overdue? state))
     (sandbox-strike state)
@@ -263,9 +276,25 @@ answering entirely (the server's own per-request kill should have replied
     ([:eval id src timeout-ms trace] (if (:ready state)
                                        (sandbox-send-request state id src timeout-ms trace)
                                        (update state
-                                         :queue (fn (q) (cons [id src timeout-ms trace] q)))))
+                                         :queue (fn (q) (cons [id src timeout-ms trace false] q)))))
+    ([:check id src timeout-ms] (if (:ready state)
+                                  (sandbox-send-request state id src timeout-ms nil true)
+                                  (update state
+                                    :queue (fn (q) (cons [id src timeout-ms nil true] q)))))
+    ;; a client wants the child rooted in another project: respawn there (a session in
+    ;; the old root ends — inflight answered timeout — the way a reset does); a no-op
+    ;; when already there
+    ([:reroot root] (if (= root (:root state))
+                      state
+                      (let (st (sandbox-respawn (assoc state :root root)))
+                        (if (= st :sandbox-stopped) st (assoc st :strikes 0)))))
     ([:proc p data] (if (= p (:proc state)) (sandbox-feed state data) state))
-    ([:proc-err _ _] state) ; child stderr is not protocol — ignore
+    ;; child stderr is not protocol — but it is the only trace a child that failed to
+    ;; boot leaves (a project it cannot set up, a missing module), so it is logged
+    ([:proc-err p data] (do
+                          (when (and (= p (:proc state)) (not (string/blank? data)))
+                            (log/warn (str "sandbox child: " (string/trimr data))))
+                          state))
     ([:proc-closed p code]
       (if (= p (:proc state))
         (do
@@ -298,12 +327,12 @@ answering entirely (the server's own per-request kill should have replied
       (receive
         (msg (sandbox-loop (sandbox-step state msg)))
         (after *sandbox-poll-ms*
-          (sandbox-loop (sandbox-check state))))))
+          (sandbox-loop (sandbox-watchdog state))))))
 
-(defn sandbox-worker ()
-  "The `:sandbox` process body: spawn the child and serve until `[:shutdown]` (or
-a `:spawn-failed` / `:gave-up` stop — see the events)."
-  (let (child (sandbox-spawn-child))
+(defn sandbox-worker (root)
+  "The `:sandbox` process body: spawn the child in `root` and serve until `[:shutdown]`
+(or a `:spawn-failed` / `:gave-up` stop — see the events)."
+  (let (child (sandbox-spawn-child root))
     (if (nil? child)
       (do (sandbox-emit {} (sandbox-down-event :spawn-failed 1)) :sandbox-stopped)
       (sandbox-loop {:proc child
@@ -313,6 +342,7 @@ a `:spawn-failed` / `:gave-up` stop — see the events)."
                      :inflight {}
                      :gen 1
                      :spawned-at (os/now)
+                     :root root
                      :strikes 0}))))
 
 ;; ---- the client API (what tutor calls) ----------------------------------------
@@ -321,11 +351,23 @@ a `:spawn-failed` / `:gave-up` stop — see the events)."
   "Whether the `:sandbox` worker process is alive."
   (not (nil? (proc/whereis :sandbox))))
 
-(defn sandbox-start ()
-  "Ensure the `:sandbox` worker is up (named spawn is idempotent) and return its pid.
-The child runtime starts spawning immediately — call this when the tutorial opens,
-so its startup hides behind the user reading."
-  (spawn :sandbox (sandbox-worker)))
+(defn sandbox-projectless-root ()
+  "The root of the projectless session (`*sandbox-default-root*`) — for a client that wants
+to ask for it by name from another module (an ambient `*var*` is bare, not namespaced)."
+  *sandbox-default-root*)
+
+(defn sandbox-start (&optional (root nil))
+  "Ensure the `:sandbox` worker is up (named spawn is idempotent) and return its pid,
+the child rooted in `root` — a project root, whose sources the child then resolves.
+A worker already running in another root is re-rooted (`[:reroot]`: a respawn there)
+when `root` is given; nil means any root will do (the tutorial's case): a new worker
+starts projectless, a running one is left where it is. The child runtime starts spawning
+immediately — call this when the tutorial opens, so its startup hides behind the
+user reading."
+  (let (running (proc/whereis :sandbox))
+    (if running
+      (do (when root (send running [:reroot root])) running)
+      (spawn :sandbox (sandbox-worker (or root *sandbox-default-root*))))))
 
 (defn sandbox-next-id (m)
   "The next request id to put on the wire, from the model. One counter for the whole
@@ -353,6 +395,14 @@ record it as in flight, or the form it belongs to waits on an answer that is not
 and, being already \"in flight\", is never re-sent either."
   (let (p (proc/whereis :sandbox))
     (if (nil? p) false (do (send p [:eval id src timeout-ms trace]) true))))
+
+(defn sandbox-check (id src timeout-ms)
+  "Fire-and-forget: ask the child's CHECKER about `src` — the reply's `:diagnostics` is
+the list of `{:line :col :message}` maps, whole (eval-server's `:check`). The reply
+arrives as a `sandbox-reply-event` carrying `:id id`; queued while the child boots.
+Answers whether the request was accepted, like [[sandbox-eval]]."
+  (let (p (proc/whereis :sandbox))
+    (if (nil? p) false (do (send p [:check id src timeout-ms]) true))))
 
 (defn sandbox-reset ()
   "Restart the sandbox session: respawn the child (fresh image, empty session),

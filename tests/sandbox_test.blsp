@@ -251,3 +251,63 @@ ready events too, so nothing leaks into a later test's `receive`."
     ;; if this fails, the suite is running somewhere the editor could not sandbox either
     (is (not (empty? (seq/filter (into [] (sandbox/sandbox-runtimes))
                        (fn (c) (or (= c "nest") (= c "brood") (file/exists? c)))))))))
+
+(describe "sandbox live check — a project's own modules resolve in the child, never in the editor"
+  :isolated (test "spawn rooted in a project → :check resolves its macro → reroot → shutdown"
+    (let (root (path/temp "bedit-sbx-proj-")
+          _ (file/mkdir (path/join root "src"))
+          _ (file/spit (path/join root "project.blsp") "(project :name \"sbxproj\")\n")
+          _ (file/spit (path/join root "src" "dsl.blsp")
+              "(defmodule dsl \"\")\n(defmacro listing (& forms) (list 'quote forms))\n")
+          _ (proc/register :editor (self))
+          ;; the previous live test's shutdown is asynchronous: wait for its worker to go
+          _ (letrec (gone (fn (n) (when (and (sandbox-running?) (> n 0)) (do (sleep 20) (gone (dec n)))))) (gone 200))
+          _ (sandbox-start root))
+      (assert= (sbt-await-ready) :ready)
+      ;; the DSL words inside the project's own macro are not unbound in the child…
+      (sandbox-check 1 "(def image (dsl/listing (mov x0 1) (adr x1 message)))" 20000)
+      (let (r (sbt-await-reply 1))
+        (assert= (get r :ok) true)
+        (is (not (any? (get r :diagnostics) (fn (d) (includes? (get d :message) "unbound symbol: mov")))))
+        (is (not (any? (get r :diagnostics) (fn (d) (includes? (get d :message) "dsl/listing"))))))
+      ;; …while the editor's own image never loaded the module
+      (is (not (bound? 'dsl/listing)))
+      ;; a genuinely unbound name still reports, with a line and a column
+      (sandbox-check 2 "(defn f () (no-such-fn-zz 1))" 20000)
+      (let (r (sbt-await-reply 2))
+        (is (any? (get r :diagnostics) (fn (d) (and (includes? (get d :message) "no-such-fn-zz") (int? (get d :line)))))))
+      ;; re-rooting to the projectless session respawns: the macro is unknown there
+      (sandbox-start *sandbox-default-root*)
+      (assert= (sbt-await-ready) :ready)
+      (sandbox-check 3 "(def image (dsl/listing (mov x0 1)))" 20000)
+      (let (r (sbt-await-reply 3))
+        (is (any? (get r :diagnostics) (fn (d) (includes? (get d :message) "mov")))))
+      (sandbox-shutdown))))
+
+(describe "the model's diagnostics ride the sandbox — the buffer's project, checked in the child"
+  :isolated (test "ed-launch-diag sends a :check; the reply folds into :diagnostics through sandbox-events"
+    (let (root (path/temp "bedit-sbx-diag-")
+          _ (file/mkdir (path/join root "src"))
+          _ (file/spit (path/join root "project.blsp") "(project :name \"sbxdiag\")\n")
+          _ (file/spit (path/join root "src" "dsl.blsp")
+              "(defmodule dsl \"\")\n(defmacro listing (& forms) (list 'quote forms))\n")
+          src "(def image\n  (dsl/listing\n    (mov x0 1)))\n"
+          path (path/join root "src" "image.blsp")
+          _ (file/spit path src)
+          _ (proc/register :editor (self))
+          _ (letrec (gone (fn (n) (when (and (sandbox-running?) (> n 0)) (do (sleep 20) (gone (dec n)))))) (gone 200))
+          m0 (commands/ed-find-file (model/ed-init (editor/buffer/make-buffer "" "*scratch*")) path)
+          m1 (model/ed-launch-diag m0))
+      (assert= (:project-root m1) root)
+      (is (int? (:diag-req m1))) ; a sandbox request, not an in-image task
+      (is (nil? (:diag-proc m1)))
+      ;; the reply arrives as a sandbox event; fold it the way the loop does
+      (let (ev (receive ((and whole (record sandbox/sandbox-reply-event {})) whole) (after 20000 :timed-out)))
+        (is (not (= ev :timed-out)))
+        (let (m2 (model/ui-event-fold ev m1 24 80 24)
+              messages (map (or (:diagnostics m2) '()) :message))
+          (is (nil? (:diag-req m2)))
+          (assert= (:diag-rope m2) (editor/buffer/buffer-rope (model/ed-current-buf m2)))
+          (is (not (any? messages (fn (s) (includes? s "unbound symbol: mov")))))
+          (is (not (bound? 'dsl/listing)))))
+      (sandbox-shutdown))))
