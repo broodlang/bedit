@@ -107,9 +107,10 @@ line reads it, and dispatch composes its keymap). Also gives a *file* buffer its
 `:dir` (default-directory = the file's folder) if it has none yet — every buffer
 carries a `:dir`; a fileless one inherits it where it's opened (see `ed-open-buffer`)."
   (let (b (init-buffer-layers buf))
-    (if (and (nil? (:dir b)) (buffer-file b))
-      (assoc b :dir (path/dirname (buffer-file b)))
-      b)))
+    (let (file (buffer-file b))
+      (if (and (nil? (:dir b)) file)
+        (assoc b :dir (path/dirname file))
+        b))))
 
 (defn ed-pane (idx)
   "A pane payload showing pool buffer `idx`, scrolled to the top, at font scale 1
@@ -130,7 +131,14 @@ carries a `:dir`; a fileless one inherits it where it's opened (see `ed-open-buf
   :done bool
   :timers map
   :view-rows (optional int)
-  :view-cols (optional int)))
+  :view-cols (optional int)
+  ;; per-feature state a command reads back with arithmetic — declared here so the
+  ;; read is typed at its one producer rather than guessed at every consumer
+  :cycle-spacing (optional (record &open :orig (optional (record &open :text string :offset int))))
+  :diagnostics (optional (or nil (list (record &open :line (optional int) :col (optional int)))))
+  :query-replace (optional (record &open :match (or nil int) :from string :to string :count int))
+  :completion (optional (record &open :items list :index int))
+  :compile-errors (optional (or nil (list (record &open :file string :line int))))))
 
 (sig ed-init (buffer -> model))
 (defn ed-init (buf)
@@ -276,6 +284,7 @@ and the web mirror (`web/web-gutter-html`) share, so the two can never drift apa
 ;; command (src/commands.blsp): a char offset's line start and column, computed
 ;; from the text alone so they're testable without a buffer/rope.
 
+(sig ed-line-start-offset (string int -> int))
 (defn ed-line-start-offset (text off)
   "The offset of the start of the line containing char offset `off` — just after
 the previous newline (0 at the first line). Tail-recursive."
@@ -283,6 +292,7 @@ the previous newline (0 at the first line). Tail-recursive."
     off
     (ed-line-start-offset text (dec off))))
 
+(sig ed-column-at (string int -> int))
 (defn ed-column-at (text off)
   "The 0-based column of char offset `off` in `text` (chars since the line start)."
   (- off (ed-line-start-offset text off)))
@@ -425,10 +435,12 @@ with file size and blocks the loop — the very failure the user hit on a 12k-li
     (ed-headless?) (ed-set-buf m (gitdiff/gitdiff-annotate (ed-current-buf m)))
     :else
       (let (b (ed-current-buf m)
-            path (buffer-file b)
-            text (buffer-text b)
-            job (task (fn () (gitdiff/gitdiff-status path text))))
-        (assoc m :gitdiff-proc job :gitdiff-checking (buffer-rope b)))))
+            path (buffer-file b))
+        (if (nil? path)
+          m ; `ed-gitdiff-stale?` already said it is a file buffer; this says so to the checker
+          (let (text (buffer-text b)
+                job (task (fn () (gitdiff/gitdiff-status path text))))
+            (assoc m :gitdiff-proc job :gitdiff-checking (buffer-rope b)))))))
 
 (sig ed-apply-gitdiff (model any -> model))
 (defn ed-apply-gitdiff (m result)
@@ -448,7 +460,7 @@ Mirrors `ed-apply-diag`."
       (update m1
         :buffers assoc
         idx
-        (editor/buffer/annotate (nth (:buffers m1) idx) :git-line-status (or result {}))))))
+        (editor/buffer/annotate (ed-buf-at m1 idx) :git-line-status (or result {}))))))
 
 (defn ed-layer-modeline-segments (m buf)
   "The status-bar segments `buf`'s active layers contribute via a `:modeline` service — each a
@@ -879,6 +891,7 @@ text (point at end). Stored as the minibuffer's `:edit`."
 (defn mb-text (mb) "The minibuffer's current input text." (get-in mb [:edit :text]))
 (defn mb-point (mb) "The minibuffer cursor index (into its input)." (get-in mb [:edit :point]))
 (defn mb-prompt (mb) "The minibuffer prompt string." (get-in mb [:edit :prompt]))
+(sig mb-sel (any -> int))
 (defn mb-sel (mb) "The selected candidate index (Vertico-style), default 0." (or (:sel mb) 0))
 (defn mb-source? (mb)
   "True if `mb` produces candidates from either a fixed `:rank-source` (fuzzy-ranked,
@@ -1017,10 +1030,20 @@ buffer switching."
 pane→buffer references after the pool changes (e.g. after a kill). Pure."
   (assoc m :layout (pane-map (:layout m) f)))
 
+(sig ed-buffer-index-by-name (model string -> (or nil int)))
 (defn ed-buffer-index-by-name (m nm)
   "The pool index of the buffer named `nm`, or nil if there is none."
   (let (i (seq/index-where (:buffers m) (fn (b) (= (buffer-name b) nm))))
     (if (< i 0) nil i)))
+
+(sig ed-buffer-index-by-name! (model string -> int))
+(defn ed-buffer-index-by-name! (m nm)
+  "The pool index of the buffer named `nm` — which must exist: the `!` spelling (ADR-302)
+for the sites that go straight on to `nth` / `ed-buf-at` / `ed-select` with the answer,
+where an absent buffer is a bug to name, not a `nil` to hand on. `ed-buffer-index-by-name`
+is the honest `nil | int` for a caller that has a plan for absence."
+  (or (ed-buffer-index-by-name m nm)
+    (error (str "no buffer named " (pr-str nm) " in the pool"))))
 
 (defn ed-update-named (m nm f)
   "The model with `f` applied to the pool buffer named `nm`, wherever it sits, and nothing
@@ -1088,7 +1111,7 @@ must not flood the echo area). Returns the model."
         line (ed-ensure-newline s))
     (if (nil? idx)
       (update m :buffers into [(ed-stamp (insert (ed-log-buffer nm) line))])
-      (update m :buffers assoc idx (ed-append-end (nth (:buffers m) idx) line)))))
+      (update m :buffers assoc idx (ed-append-end (ed-buf-at m idx) line)))))
 
 (sig message (model string -> model))
 (defn message (m s)
@@ -1246,6 +1269,7 @@ once per `*auto-save-interval-ms*`. Returns the model with `:auto-saved-at` upda
 ;; ---- scrolling --------------------------------------------------------------
 
 (def *scroll-margin* 4) ; Emacs `scroll-margin`: lines of context kept above/below point
+(sig ed-margin (int -> int))
 (defn ed-margin (textrows)
   "The effective scroll margin for a `textrows`-tall viewport: `*scroll-margin*`, capped
 below half the viewport (so a tall margin in a short pane can't exceed what fits)."

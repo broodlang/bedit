@@ -234,7 +234,7 @@ command was `self`, extend from the existing mark instead of from point — the
 repeat-extends mechanism: each press grows the region by one more unit."
   (let (b (ed-current-buf m)
         extending (and (= (:last-command m) self) (buffer-mark b))
-        from (if extending (buffer-mark b) (buffer-point b))
+        from (or (and extending (buffer-mark b)) (buffer-point b))
         target (buffer-point (move (goto-char b from))))
     (ed-set-buf m (assoc b :mark target))))
 
@@ -278,6 +278,7 @@ a tree-sitter node."
   "The count of leading spaces/tabs on the line starting at offset `bol`."
   (ed-leading-ws* text bol 0))
 
+(sig ed-fallback-indent (string int -> int))
 (defn- ed-fallback-indent (text bol)
   "The simple, mode-less indent for the line at `bol`: the leading-whitespace width
 of the previous non-blank line, or 0 at the top. Tail-recursive over blank lines."
@@ -299,6 +300,7 @@ applied to the line start, else the previous-line fallback."
         svc (ed-mode-service buf :indent))
     (if (nil? svc) (ed-fallback-indent text bol) (svc text bol))))
 
+(sig ed-reindent-line (buffer int -> buffer))
 (defn ed-reindent-line (buf target)
   "Reindent the current line of `buf` to `target` columns of leading spaces,
 preserving point: from inside the old indentation point moves to the first non-blank
@@ -331,6 +333,7 @@ in that next (empty) line."
       (let (rope (buffer-rope buf) [lo hi] bnds)
         [(text/char->line rope lo) (text/char->line rope (math/max lo (dec hi)))]))))
 
+(sig ed-reselect-lines (buffer int int -> buffer))
 (defn- ed-reselect-lines (buf first last)
   "Re-activate the region to fully cover lines `[first, last]` (mark at the first line's
 start, point at the start of the line after the last), so repeated TAB / Shift-TAB keep
@@ -352,6 +355,7 @@ caller decides (TAB re-selects the block; `indent-sexp` restores point)."
 keep acting on the same block."
   (ed-reselect-lines (ed-fold-region-lines buf first last f) first last))
 
+(sig ed-reindent-line-at (buffer int -> buffer))
 (defn ed-reindent-line-at (buf ln)
   "Reindent line `ln` to its mode column (positions point at the line first so the shared
 `ed-reindent-line` acts on it).
@@ -372,12 +376,13 @@ and a bulk reindent declines to put anything on a line with nothing on it."
       (ed-reindent-line b 0)
       (ed-reindent-line b (ed-indent-target b)))))
 
+(sig ed-dedent-line-at (buffer int int -> buffer))
 (defn ed-dedent-line-at (buf ln width)
   "Remove up to `width` leading spaces/tabs from line `ln`; a no-op on a line with none."
   (let (rope (buffer-rope buf)
         bol (text/line->char rope ln)
-        seq/remove (math/min width (ed-leading-ws (buffer-text buf) bol)))
-    (if (= seq/remove 0) buf (replace-region buf bol (+ bol seq/remove) ""))))
+        drop-n (math/min width (ed-leading-ws (buffer-text buf) bol)))
+    (if (= drop-n 0) buf (replace-region buf bol (+ bol drop-n) ""))))
 
 (defcommand cmd-dedent
   (m key)
@@ -503,7 +508,8 @@ line of overlap and point's screen position. (Emacs `scroll-down-command`.)"
 (defn- ed-cycle-pos (m self field)
   "The next position 0/1/2 in a 3-way cycle for a repeated command: advance the stored
 `field` when the previous command was `self` (a quoted command symbol), else restart 0."
-  (if (= (:last-command m) self) (math/mod (inc (or (get m field) 0)) 3) 0))
+  (let (pos (get m field 0))
+    (if (and (= (:last-command m) self) (int? pos)) (math/mod (inc pos) 3) 0)))
 
 (defcommand cmd-recenter
   (m key)
@@ -874,8 +880,9 @@ on: nothing you cycle through is lost."
              (ed-edit m
                (fn (bb)
                  (let ([l h] (editor/buffer/whitespace-run-at bb)
-                       restored (replace-region bb l h (:text orig)))
-                   (goto-char restored (+ l (:offset orig))))))
+                       o (or orig {:text "" :offset 0}) ; set on the first press; never absent here
+                       restored (replace-region bb l h (:text o)))
+                   (goto-char restored (+ l (:offset o))))))
              (ed-collapse-ws m (if (= phase :one-space) " " "")))
       :cycle-spacing stash)))
 (defcommand cmd-delete-horizontal-space
@@ -1169,10 +1176,11 @@ rows (1-based source line numbers, which `cmd-occur-jump` parses back)."
                              (buffer-current-line (ed-current-buf m))))
         src (:occur-source m))
     (cond
-      (or (nil? ln) (nil? src)) (message m "not on a match line")
+      (nil? ln) (message m "not on a match line")
+      (nil? src) (message m "not on a match line")
       (nil? (ed-buffer-index-by-name m src)) (message m (str "source buffer gone: " src))
       else
-        (ed-apply (ed-select m (ed-buffer-index-by-name m src))
+        (ed-apply (ed-select m (ed-buffer-index-by-name! m src))
           (fn (b) (ed-goto-line b ln))))))
 
 ;; ---- reload the user config (M-x reload-config) -----------------------------
@@ -1699,6 +1707,7 @@ then show the first line of its docstring in the echo area."
   (let (target (math/max 0 (math/min (dec n) (dec (buffer-line-count b)))))
     (fold (range target) (beginning-of-buffer b) (fn (bb _) (forward-line bb)))))
 
+(sig ed-goto-line-col (buffer int int -> buffer))
 (defn ed-goto-line-col (b line0 col)
   "Move point to 0-based `line0` / `col` (LSP coordinates), clamped to the buffer. Used by
 imenu/xref jumps, which land on a symbol's start position."
@@ -2147,6 +2156,7 @@ enabled item."
 
 (defn ed-close-menu (m) "Dismiss the context menu." (dissoc m :menu))
 
+(sig ed-menu-move (model int -> model))
 (defn ed-menu-move (m d)
   "Move the selection by `d` among the ENABLED items, wrapping — disabled items and the
 divider are skipped (arrow-key navigation)."
@@ -2266,9 +2276,10 @@ loop."
                       (fn (acc nm)
                         (let ([mm killed] acc
                               i (ed-buffer-index-by-name mm nm))
-                          (if (or (nil? i) (= nm "*Messages*"))
-                            acc
-                            [(ed-kill-at mm i false) (append killed (list nm))])))))
+                          (cond
+                            (nil? i) acc
+                            (= nm "*Messages*") acc
+                            else [(ed-kill-at mm i false) (append killed (list nm))])))))
       (if (empty? also)
         m2
         (message m2 (str label " (with " (string/join also ", ") ")"))))))
@@ -2379,7 +2390,7 @@ matching `display-buffer`'s reuse rule. The reuse seam for generated/refreshable
 (*Process List*, *git-log*, *git-diff*, …)."
   (let (action (:action opts :here)
         m1 (ed-upsert-named m nm text type)
-        idx (ed-buffer-index-by-name m1 nm)
+        idx (ed-buffer-index-by-name! m1 nm) ; `ed-upsert-named` just put it there
         layout (:layout m1))
     (if (= action :here)
       (ed-select m1 idx)
@@ -2820,13 +2831,18 @@ column-aligned). `:depth` is absent (→ 0, no indent) in the flat view."
 observer parity (`observe-opt`)."
   (if (nil? v) "-" (f v)))
 
+(sig ed-reds-rate ((or nil int) (or nil int) (or nil int) (or nil int) -> (or nil int)))
 (defn- ed-reds-rate (prev-reds prev-at reds at)
   "Reductions/second between two `process-info` samples, or nil when it can't be
 computed — no prior sample for this id, missing counters, or no elapsed time. Clamps a
 negative delta (a recycled id) to 0. Mirrors `observe-reds-rate`."
-  (if (or (nil? prev-reds) (nil? prev-at) (nil? reds) (nil? at) (<= (- at prev-at) 0))
-    nil
-    (math/quot (* 1000 (math/max 0 (- reds prev-reds))) (- at prev-at))))
+  (cond
+    (nil? prev-reds) nil
+    (nil? prev-at) nil
+    (nil? reds) nil
+    (nil? at) nil
+    (<= (- at prev-at) 0) nil
+    else (math/quot (* 1000 (math/max 0 (- reds prev-reds))) (- at prev-at))))
 
 (defn- ed-rate-procs (prev-reds prev-at infos at)
   "Tag each `process-info` map in `infos` with `:reds-rate` — its reductions/second
@@ -3517,6 +3533,7 @@ Async — the docs show when they arrive."
           nil
           "hover…")))))
 
+(sig ed-edit-offsets (buffer (record &open :start-line int :start-char int :end-line int :end-char int :text string) -> (record :start int :end int :text string)))
 (defn- ed-edit-offsets (b e)
   "The char-offset form `{:start :end :text}` of normalised LSP edit `e` in buffer `b`
 (offsets computed against the original buffer, clamped to its length)."
@@ -3741,9 +3758,14 @@ the gap to the next word. (`forward-word` alone lands at the word *end*, which i
    :down {:op 'editor/buffer/forward-line :linewise? true}})
 
 (def *vim-digits* {"1" 1 "2" 2 "3" 3 "4" 4 "5" 5 "6" 6 "7" 7 "8" 8 "9" 9}) ; `0` → cmd-vim-zero
+;; The accumulator's shape: two optional counts (`2d3w`), the pending operator, the text
+;; object flavour. Declared once so `ed-vim-count`'s arithmetic reads ints.
+(deftype vim-pending (record &open :count1 (optional int) :count2 (optional int) :operator (optional keyword) :textobj (optional keyword)))
+(sig ed-vim-pending (model -> vim-pending))
 (defn- ed-vim-pending (m) "The Vim command accumulator map, or `{}`." (or (:vim-pending m) {}))
 (defn- ed-vim-clear (m) "Drop the Vim command accumulator." (dissoc m :vim-pending))
 
+(sig ed-vim-count (model -> int))
 (defn- ed-vim-count (m)
   "The effective repeat count: the pre-operator count × the post-operator count (each
 defaulting to 1), so `2d3w` is 6."
@@ -3806,7 +3828,7 @@ insert; yank leaves point at the start without editing. Clears `:vim-pending`."
                (text/char->line rope (math/min s e))
                (text/char->line rope (math/max s e)))
              (assoc buf :point (math/max s e) :mark (math/min s e)))
-        start (math/min (buffer-point rb) (buffer-mark rb))
+        start (math/min (buffer-point rb) (or (buffer-mark rb) (buffer-point rb))) ; both branches set it
         m1 (ed-set-buf (ed-vim-clear m) rb))
     (cond
       (= op :yank)
@@ -3857,6 +3879,7 @@ stops on its last letter and leaves it behind."
           done
           (ed-vim-remember done (vim-motion-change op motion-op linewise? n)))))))
 
+(sig ed-vim-linewise-current (model keyword int -> model))
 (defn- ed-vim-linewise-current (m op n)
   "Operate linewise on `n` whole lines from the current line — the `dd`/`cc`/`yy` form."
   (let (buf (ed-current-buf m)
@@ -3868,13 +3891,16 @@ stops on its last letter and leaves it behind."
         ;; ends the block at the START of the following line, so that range carries
         ;; the newline; a change has to stop one short of it or the next line joins
         ;; onto the one you are about to type into.
+        ;; `ed-reselect-lines` set the mark; `(or … point)` says so where `buffer-mark`'s
+        ;; own contract (`nil | int`) cannot.
+        mark (or (buffer-mark block) (buffer-point block))
         rb (if (and (= op :change)
-                 (> (buffer-point block) (buffer-mark block))
+                 (> (buffer-point block) mark)
                  (= (text/slice (buffer-rope block) (dec (buffer-point block)) (buffer-point block))
                    "\n"))
              (assoc block :point (dec (buffer-point block)))
              block)
-        done (ed-vim-operate (ed-set-buf m rb) op (buffer-mark rb) (buffer-point rb) false))
+        done (ed-vim-operate (ed-set-buf m rb) op mark (buffer-point rb) false))
     (if (= op :yank) done (ed-vim-remember done (vim-linewise-change op n)))))
 
 (defn- ed-vim-word-region (buf around?)
@@ -3896,6 +3922,7 @@ trailing whitespace. Approximate, built on forward-word/backward-word."
         done (ed-vim-operate m op s e false))
     (if (= op :yank) done (ed-vim-remember done (vim-textobj-change op around?)))))
 
+(sig ed-vim-delete-chars (model int -> model))
 (defn- ed-vim-delete-chars (m n)
   "Delete `n` chars at point (`x`), recording it for `.`"
   (let (buf (ed-current-buf m)
@@ -3904,6 +3931,7 @@ trailing whitespace. Approximate, built on forward-word/backward-word."
     (ed-vim-remember (ed-vim-clear (ed-edit (ed-set-buf m rb) delete-region))
       (vim-delete-chars-change (math/max 1 n)))))
 
+(sig ed-vim-add-digit (model int -> model))
 (defn- ed-vim-add-digit (m d)
   "Append count digit `d` to the pre-operator count (`:count1`) or, once an operator is
 pending, the post-operator count (`:count2`)."
@@ -3941,9 +3969,9 @@ current line(s)."
   "Dispatch a Vim motion from `*vim-motions*` (operator-aware via `ed-vim-run-motion`).
 When a text object is pending (after `di`/`da`), interpret the key as the object (`w` →
 word) instead."
-  (let (pend (ed-vim-pending m) tobj (:textobj pend))
-    (if tobj
-      (if (= key "w") (ed-vim-word-object m (:operator pend) (= tobj :around)) (ed-vim-clear m))
+  (let (pend (ed-vim-pending m) tobj (:textobj pend) op (:operator pend))
+    (if (and tobj op)
+      (if (= key "w") (ed-vim-word-object m op (= tobj :around)) (ed-vim-clear m))
       (let (spec (get *vim-motions* key))
         ;; late binding: the table holds a SYMBOL, resolved here, on this keystroke
         (if (nil? spec)
