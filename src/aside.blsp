@@ -1,0 +1,135 @@
+(defmodule aside
+  "The **aside pane** — a named buffer shown BESIDE the page, following what you do in
+the page, that stays closed once you close it.
+
+Three features wanted exactly this and each had grown its own copy of the judgement:
+the tutorial's *Workings* and the playground's *Playground Spy* (both through
+`workings`, which shows the report of the region the cursor is in) and the markdown
+preview (`mdpreview`, which shows the document the cursor is in, rendered). What they
+share is not the CONTENT — a cascade, a rendered page — but the discipline of a pane
+that is a view of another buffer:
+
+  - it is shown with `commands/ed-show-named-aside` (`:display`): split off a lone pane
+    or reuse the next one, selection untouched, and REFRESHED IN PLACE while it is up;
+  - a refresh without `force` only touches a pane already on screen, so an update in the
+    background never opens one behind the reader;
+  - **a pane the reader closed stays closed** — latched — because absence alone cannot
+    tell a pane the reader dismissed from one that has never opened. Only an explicit
+    [[reopen]] (the client's \"show me the pane\" command) clears the latch;
+  - a client that turns a page ([[forget]]) starts over: not shown, not dismissed.
+
+**The spec** each client passes first names where its state lives and what its pane is
+called — `{:key :mdpreview :buffer \"*Markdown Preview*\" :type :markdown-preview}`.
+`:key` is the model sub-map holding the pane's state, so two panes never collide; under it
+`:aside-shown?` (it has been on screen this page) and `:aside-closed?` (the latch) are
+this module's, and the client keeps its own beside them.
+
+**The boundary.** This knows a pane, a name and a text; it never looks at the client's
+buffer or decides what the text should be. `workings` adds the region cache and the
+\"what earns a split\" rule on top; `mdpreview` adds the render and the cursor-follow."
+  (:use model) ; ed-buffer-index-by-name / ed-buf-at / ed-max-top — the pool + scroll clamp
+  (:use commands) ; ed-display-buffer — put it beside the page, selection untouched
+  (:use panes) ; ed-layout-now / ed-pane-top / ed-pane-vrows — find + measure the pane
+  (:use editor/pane)) ; pane-update-path / pane-delete / pane-select-path — scroll + take down the pane
+
+(def *unshown*
+  ;; A pane's VISIBILITY state, forgotten: not on screen, and not dismissed either.
+  {:aside-shown? false :aside-closed? false})
+
+(defn path (spec & rest)
+  "The model path to one of this pane's state slots — `[:mdpreview :aside-closed?]`."
+  (into [(:key spec)] rest))
+
+(sig open? (any model -> bool))
+(defn open? (spec m)
+  "Whether the pane is on screen — its buffer is in the pool (a pane shows every pool
+buffer it names; killing the buffer is how a pane closes)."
+  (not (nil? (ed-buffer-index-by-name m (:buffer spec)))))
+
+(sig closed? (any model -> bool))
+(defn closed? (spec m)
+  "Whether the reader dismissed the pane — either latched already, or shown this page
+and gone now, which is what a dismissal looks like from here."
+  (= true
+    (or (get-in m (path spec :aside-closed?))
+      (and (not (open? spec m)) (get-in m (path spec :aside-shown?))))))
+
+(sig refresh (any model any bool &optional map -> model))
+(defn refresh (spec m content force &optional (opts {}))
+  "Put `content` in the pane — a string, or `{:text :spans}` for rendered text whose faces
+travel as data (`ed-display-buffer` `:spans`). With `force` the pane is opened if it isn't
+there; without, only an already-open pane is refreshed. A pane the reader closed stays
+closed, even against `force` — see the module docstring. `opts` pass through to
+`ed-display-buffer` (`:keep-scroll` for a pane that is re-shown under a reader)."
+  (let (closed? (closed? spec m)
+        m1 (assoc-in m (path spec :aside-closed?) closed?))
+    (if (and (not (open? spec m)) (or (not force) closed?))
+      m1
+      (let (text (if (map? content) (:text content) content)
+            opts (if (map? content) (assoc opts :spans (:spans content)) opts)
+            shown (ed-display-buffer m1 (:buffer spec) text (:type spec) (assoc opts :action :display)))
+        (assoc-in shown (path spec :aside-shown?) true)))))
+
+(sig reopen (any model any &optional map -> model))
+(defn reopen (spec m content &optional (opts {}))
+  "Bring a dismissed pane back showing `content`, clearing the close latch — the only
+thing that does. What a client's \"show me the pane\" command calls."
+  (refresh spec (update m (:key spec) merge *unshown*) content true opts))
+
+(sig forget (any model -> model))
+(defn forget (spec m)
+  "A new page: the pane is neither shown nor dismissed. The client's own state under the
+key is untouched — its resets differ (a cache may well outlive a page), which is why this
+is not `dissoc`."
+  (update m (:key spec) merge *unshown*))
+
+(sig close (any model -> model))
+(defn close (spec m)
+  "Take the pane down and latch it closed — what a client's toggle does on its second
+press. The pane showing the aside is deleted (its sibling fills the space, selection kept
+on the reader's own pane), then its buffer is killed; with no pane on screen only the
+buffer goes. [[reopen]] is the way back."
+  (let (pane (pane-of spec m)
+        layout (:layout m)
+        here (pane-selected-path layout)
+        layout2 (if (or (nil? pane) (= (pane-count layout) 1) (= (:path pane) here))
+                  layout
+                  ;; `pane-delete` works on the selected pane: select the aside's, delete it,
+                  ;; and come back to the reader's — whose path the collapse may have moved,
+                  ;; so it is found again by the buffer it shows
+                  (let (mine (:buffer (pane-payload-at layout here))
+                        pruned (pane-delete (pane-select-path layout (:path pane)))
+                        back (seq/find (pane-leaf-paths pruned)
+                               (fn (p) (= mine (:buffer (pane-payload-at pruned p))))))
+                    (if (nil? back) pruned (pane-select-path pruned back))))
+        m1 (ed-kill-buffer-named (assoc m :layout layout2) (:buffer spec)))
+    (assoc-in m1 (path spec :aside-closed?) true)))
+
+(sig pane-of (any model -> (or nil pane)))
+(defn pane-of (spec m)
+  "The laid-out pane showing this aside (`:path`, `:rect`, `:payload` — `ed-body-layout`'s
+shape), or nil when none does. Reads the layout as last painted (`ed-layout-now`), so it is
+nil headless — for a client that places or fits its view after a refresh."
+  (let (idx (ed-buffer-index-by-name m (:buffer spec))
+        layout (ed-layout-now m))
+    (if (or (nil? idx) (nil? layout))
+      nil
+      (seq/find (:panes layout) (fn (p) (= idx (get-in p [:payload :buffer])))))))
+
+(sig scroll-to-line (any model int -> model))
+(defn scroll-to-line (spec m line)
+  "Keep rendered `line` of the aside in view: leave the pane alone while the line is
+already visible, else scroll so it sits a third of the way down — the follow that makes a
+preview track the cursor without twitching on every key. A no-op with no pane on screen."
+  (let (pane (pane-of spec m))
+    (if (nil? pane)
+      m
+      (let (buf (ed-buf-at m (get-in pane [:payload :buffer]))
+            top (ed-pane-top pane buf)
+            vrows (math/max 1 (ed-pane-vrows pane))
+            visible? (and (>= line top) (< line (+ top vrows)))
+            want (math/max 0 (math/min (- line (math/quot vrows 3)) (ed-max-top buf vrows))))
+        (if visible?
+          m
+          (assoc m
+            :layout (pane-update-path (:layout m) (:path pane) (fn (w) (assoc w :top want)))))))))
