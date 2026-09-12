@@ -596,22 +596,54 @@ only: the scan reads Brood syntax (`;` comments, `\"` strings), which is not Rub
 ;; `insert-pair` / `delete-empty-pair`); this is the policy.
 (def *bracket-pairs* {"(" ")" "[" "]" "{" "}"})
 
+;; Self-closing pairs — a delimiter whose opener and closer are the SAME character, so one
+;; key both opens and (typed again) skips over the close. `"` is the one that earns this in
+;; a Brood editor: it opens a string and lands you inside. `'` is deliberately NOT here —
+;; in Brood `'` is the quote operator (`'foo`) and in prose an apostrophe (`don't`), so
+;; auto-pairing it fights the writer; Emacs inhibits it heuristically for the same reason.
+;; A different mode may bind `'` to `cmd-open-delimiter` where it is a real pair.
+(def *self-pairs* {"\"" "\""})
+
+(sig delim-close (string -> (or nil string)))
+(defn delim-close (key)
+  "The closer for opening delimiter `key` — a bracket (`(`→`)`) or a self-closing quote
+(`\"`→`\"`), or nil for anything that is not an electric opener."
+  (or (get *bracket-pairs* key) (get *self-pairs* key)))
+
 (sig electric-pair? (model -> bool))
 (defn electric-pair? (m)
   "Whether electric-pair-mode is on — the model's `:electric-pair?`, default true."
   (let (on (:electric-pair? m)) (if (nil? on) true (= on true))))
 
+(defn- self-pair-should-open? (b key)
+  "For a self-closing delimiter (`\"`): open a fresh pair only where a quote plausibly
+STARTS one — at the buffer edge, after whitespace, or right after an opening bracket. After
+a word or another quote it self-inserts instead, which is how you close a string you typed
+by hand (`\"hello world|` + `\"` → `\"hello world\"`, not a new empty pair)."
+  (let (before (buffer-char-before b))
+    (or (nil? before)
+      (string/blank? before)
+      (not (nil? (get *bracket-pairs* before))))))
+
 (defcommand cmd-open-delimiter
   (m key)
-  "Type the opening bracket `key` — over an active region, wrap the region in the pair
-(point lands inside the opener); with electric-pair-mode on, type the pair and land
-between; else just the character. Bound to `(` `[` `{` on brood-keymap."
-  (let (close (get *bracket-pairs* key)
-        b (ed-current-buf m))
+  "Type the opening delimiter `key`. Over an active region, wrap the region in the pair
+(point lands inside the opener). For a self-closing quote already at point, step over it
+(one `\"` closes the string rather than typing a second). Otherwise, with
+electric-pair-mode on, type the pair and land between — a quote only where one plausibly
+opens ([[self-pair-should-open?]]); else just the character. Bound to `(` `[` `{` `\"` on
+brood-keymap."
+  (let (close (delim-close key)
+        b (ed-current-buf m)
+        self? (= key close))
     (cond
       (nil? close) (cmd-self-insert m key)
       (buffer-region-bounds b) (ed-edit m (fn (bb) (sexp/wrap-region bb key close)))
-      (electric-pair? m) (ed-edit m (fn (bb) (insert-pair bb key close)))
+      ;; a self-closing quote sitting at point: skip over it instead of doubling it
+      (and self? (= (buffer-char-after b) key))
+        (ed-apply m (fn (bb) (goto-char bb (inc (buffer-point bb)))))
+      (and (electric-pair? m) (or (not self?) (self-pair-should-open? b key)))
+        (ed-edit m (fn (bb) (insert-pair bb key close)))
       else (cmd-self-insert m key))))
 
 (defcommand cmd-electric-backspace
@@ -625,7 +657,7 @@ everywhere else."
         (let (before (buffer-char-before b))
           (if (nil? before)
             (delete-backward-char b)
-            (let (close (get *bracket-pairs* before))
+            (let (close (delim-close before))
               (if (and close (= (buffer-char-after b) close))
                 (delete-empty-pair b before close)
                 (delete-backward-char b)))))))
@@ -639,6 +671,70 @@ that has one meaning either way."
   (let (on (not (electric-pair? m)))
     (message (assoc m :electric-pair? on)
       (if on "Electric pair mode enabled" "Electric pair mode disabled"))))
+
+
+;; ---- rectangles (Emacs C-x r k/M-w/d/y/o/c/t) --------------------------------
+;; The column-block editing ops of `editor/buffer` (`extract`/`delete`/`open`/`clear`/
+;; `string`/`insert-rectangle`), wired to the `C-x r` prefix and a rectangle kill ring on
+;; the model. A rectangle is point↔mark taken as two corners, so every one needs a mark.
+;; The kill ring is ONE saved list of rows (`:rectangle-kill`), not the line kill ring: a
+;; rectangle yank rebuilds the block, so its rows must stay a list, never flattened.
+
+(defn- ed-rect-edit (m f)
+  "Run rectangle op `f` (a `buffer -> buffer`) on the current buffer, or say there is no
+region when no mark is set — every rectangle op needs two corners."
+  (if (nil? (buffer-mark (ed-current-buf m))) (message m *no-region-message*) (ed-edit m f)))
+
+(defcommand cmd-kill-rectangle
+  (m key)
+  "Kill the rectangle (C-x r k): save its rows to the rectangle kill ring and delete the
+block, closing the gap. Yank it back with C-x r y."
+  (if (nil? (buffer-mark (ed-current-buf m)))
+    (message m *no-region-message*)
+    (let (rows (extract-rectangle (ed-current-buf m)))
+      (message (ed-edit (assoc m :rectangle-kill rows) delete-rectangle)
+        (str "killed a " (count rows) "-row rectangle")))))
+
+(defcommand cmd-copy-rectangle-as-kill
+  (m key)
+  "Copy the rectangle to the rectangle kill ring without deleting it (C-x r M-w)."
+  (if (nil? (buffer-mark (ed-current-buf m)))
+    (message m *no-region-message*)
+    (let (rows (extract-rectangle (ed-current-buf m)))
+      (message (assoc m :rectangle-kill rows) (str "copied a " (count rows) "-row rectangle")))))
+
+(defcommand cmd-delete-rectangle
+  (m key)
+  "Delete the rectangle without saving it (C-x r d)."
+  (ed-rect-edit m delete-rectangle))
+
+(defcommand cmd-open-rectangle
+  (m key)
+  "Shift the rectangle's text right, blanking the block with spaces (C-x r o)."
+  (ed-rect-edit m open-rectangle))
+
+(defcommand cmd-clear-rectangle
+  (m key)
+  "Blank the rectangle in place, keeping following columns put (C-x r c)."
+  (ed-rect-edit m clear-rectangle))
+
+(defcommand cmd-yank-rectangle
+  (m key)
+  "Insert the last killed/copied rectangle as a block at point (C-x r y)."
+  (let (rows (:rectangle-kill m))
+    (if (or (nil? rows) (empty? rows))
+      (message m "the rectangle kill ring is empty")
+      (ed-edit m (fn (b) (insert-rectangle b rows))))))
+
+(defcommand cmd-string-rectangle
+  (m key)
+  "Replace each line's block with a string read in the minibuffer (C-x r t)."
+  (if (nil? (buffer-mark (ed-current-buf m)))
+    (message m *no-region-message*)
+    (assoc m
+      :minibuffer
+        {:edit (ed-mb-edit "String rectangle: " "")
+         :on-complete (fn (mm t) (ed-edit mm (fn (b) (string-rectangle b t))))})))
 
 (defcommand cmd-newline (m key) (ed-edit m (fn (b) (insert b "\n"))))
 (defcommand cmd-delete-char (m key) (ed-edit m delete-char))
@@ -2050,6 +2146,57 @@ Repeated, it extends the region by another word; under a negative argument it ma
         start (sexp/point-defun-start text (buffer-point b))
         end (sexp/point-forward text start))
     (ed-mark-region m start end)))
+
+;; ---- narrowing: focus a pane on a region (C-x n n/d/p/w) ----------------------
+;; Emacs narrowing conflates "restrict what's editable" with "hide the rest" and makes it
+;; BUFFER-GLOBAL and modal — every window narrows, and you forget it is on (the classic
+;; "where did my file go?"). bedit already has the editable half — `editor/buffer`'s
+;; `narrow-to`/`read-only?`, the tutorial's prose, the shell prompt — so narrowing here is
+;; the OTHER half, and better: a PER-PANE focus (`:restrict` on the pane, `model/ed-set-restrict`).
+;; One pane focuses a defun while another shows the whole file; the restriction is visible
+;; (the pane draws only the slice) and local, so there is no hidden mode to forget. Point is
+;; confined to it (`model/ed-clamp-restriction`, per key), which is what makes the pane feel
+;; like a small buffer.
+
+(defn- ed-narrow-between (m start end)
+  "Narrow the selected pane to `[start end]`, drop the mark, and put point at the top of the
+region — the shared tail of every narrowing command."
+  (ed-set-buf (ed-set-restrict m start end)
+    (assoc (goto-char (ed-current-buf m) start) :mark nil)))
+
+(defcommand cmd-narrow-to-region
+  (m key)
+  "Focus this pane on the region (C-x n n): only the lines point↔mark covers stay in view
+and point is confined to them. Other panes on the buffer are unaffected. C-x n w widens."
+  (let (rb (buffer-region-bounds (ed-current-buf m)))
+    (if (nil? rb)
+      (message m *no-region-message*)
+      (let ([lo hi] rb) (message (ed-narrow-between m lo hi) "Narrowed to region — C-x n w widens")))))
+
+(defcommand cmd-narrow-to-defun
+  (m key)
+  "Focus this pane on the top-level form around point (C-x n d) — the structural parser's
+defun in brood-mode. C-x n w widens."
+  (let (b (ed-current-buf m)
+        text (buffer-text b)
+        start (sexp/point-defun-start text (buffer-point b))
+        end (sexp/point-forward text start))
+    (message (ed-narrow-between m start end) "Narrowed to defun — C-x n w widens")))
+
+(defcommand cmd-narrow-to-paragraph
+  (m key)
+  "Focus this pane on the paragraph around point (C-x n p). C-x n w widens."
+  (let (b (ed-current-buf m)
+        start (buffer-point (backward-paragraph b))
+        end (buffer-point (forward-paragraph (goto-char b start))))
+    (message (ed-narrow-between m start end) "Narrowed to paragraph — C-x n w widens")))
+
+(defcommand cmd-widen
+  (m key)
+  "Widen the selected pane — undo narrowing, so the whole buffer is in view again (C-x n w)."
+  (if (nil? (ed-selected-restrict m))
+    (message m "not narrowed")
+    (message (ed-clear-restrict m) "Widened")))
 
 ;; ---- shift-select (Shift+arrows / Home / End extend the region) -------------
 (def- ed-shift-motion-for

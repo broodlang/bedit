@@ -1026,6 +1026,52 @@ scrollbar (`ed-scrollbar-wake`)."
   (let (m2 (assoc m :layout (pane-update-selected (:layout m) (fn (w) (assoc w :top n)))))
     (if (= n (ed-current-top m)) m2 (ed-scrollbar-wake m2))))
 
+(sig ed-restrict-lines (buffer any -> (tuple int int)))
+(defn ed-restrict-lines (buf restrict)
+  "The inclusive `[top bottom]` LINE range a `[lo hi]` char restriction covers in `buf`,
+clamped to the buffer — the narrowing translated into what the renderer and scroll clamp
+speak (lines). A restriction is stored as char bounds so it survives edits sensibly; this
+is the per-frame read."
+  (let ([lo hi] restrict
+        rope (buffer-rope buf)
+        last (dec (buffer-line-count buf)))
+    [(math/max 0 (math/min last (text/char->line rope lo)))
+      (math/max 0 (math/min last (text/char->line rope hi)))]))
+
+(sig ed-selected-restrict (model -> any))
+(defn ed-selected-restrict (m)
+  "The selected pane's narrowing — its `[lo hi]` char restriction — or nil when the pane is
+wide. Narrowing is PER PANE (a window property, not the buffer's): one pane may focus a
+region while another on the same buffer shows all of it. That is the whole design — a
+visible, local focus, never a hidden buffer-global mode you forget is on."
+  (get (ed-current-pane m) :restrict))
+
+(sig ed-set-restrict (model int int -> model))
+(defn ed-set-restrict (m lo hi)
+  "Narrow the selected pane to the char range `[lo hi]`: it renders and scrolls only those
+lines, and point is confined to them. Other panes are untouched."
+  (assoc m :layout (pane-update-selected (:layout m) (fn (w) (assoc w :restrict [lo hi])))))
+
+(sig ed-clear-restrict (model -> model))
+(defn ed-clear-restrict (m)
+  "Widen the selected pane — drop its narrowing, so all of the buffer is in view again."
+  (assoc m :layout (pane-update-selected (:layout m) (fn (w) (dissoc w :restrict)))))
+
+(sig ed-clamp-restriction (model -> model))
+(defn ed-clamp-restriction (m)
+  "Keep point inside the selected pane's narrowing — the per-key confinement that makes a
+narrowed pane behave like a small buffer: a motion that would leave the region stops at its
+edge. A no-op in a wide pane, or when point is already inside. Runs after dispatch, before
+the scroll clamp (a confined point is what the viewport then centres on)."
+  (let (restrict (ed-selected-restrict m))
+    (if (nil? restrict)
+      m
+      (let ([lo hi] restrict
+            p (buffer-point (ed-current-buf m)))
+        (if (and (>= p lo) (<= p hi))
+          m
+          (ed-set-buf m (goto-char (ed-current-buf m) (math/max lo (math/min hi p)))))))))
+
 (sig ed-show-index (model int -> model))
 (defn ed-show-index (m i)
   "The model with the selected pane showing pool buffer `i`, scrolled to the top and with its
@@ -1302,17 +1348,25 @@ above and below it within a `textrows`-tall viewport — scrolling only as far a
 (Emacs `scroll-margin` + `scroll-conservatively`: never recenter, just enough). Clamped
 so it never scrolls past end-of-buffer (no blank void below the last line); near the
 edges the margin is whatever the buffer allows. Pure."
-  (let (line (buffer-current-line (ed-current-buf m))
+  (let (buf (ed-current-buf m)
+        line (buffer-current-line buf)
         top (ed-current-top m)
         mgn (ed-margin textrows)
-        maxtop (ed-max-top (ed-current-buf m) textrows)
+        ;; a narrowed pane scrolls only within its restriction — first line `rtop`, and a
+        ;; top no further than shows the last restricted line on the bottom row; a wide pane
+        ;; gets `[0 .. ed-max-top]`, exactly as before (the restriction range is the whole
+        ;; buffer then, so these reduce to the old bounds).
+        restrict (ed-selected-restrict m)
+        [rtop rbot] (if restrict (ed-restrict-lines buf restrict) [0 (dec (buffer-line-count buf))])
+        mintop rtop
+        maxtop (math/max rtop (math/min (ed-max-top buf textrows) (math/max 0 (- (inc rbot) textrows))))
         lo (+ top mgn) ; first comfortable line (margin below top)
-        hi (- (+ top textrows) 1 mgn))
-    ; last comfortable line (margin above bottom)
-    (cond
-      (< line lo) (ed-set-top m (math/min maxtop (math/max 0 (- line mgn))))
-      (> line hi) (ed-set-top m (math/min maxtop (math/max 0 (+ (- line textrows) 1 mgn))))
-      else m)))
+        hi (- (+ top textrows) 1 mgn) ; last comfortable line (margin above bottom)
+        want (cond
+               (< line lo) (- line mgn)
+               (> line hi) (+ (- line textrows) 1 mgn)
+               else top))
+    (ed-set-top m (math/max mintop (math/min maxtop want)))))
 
 ;; ---- horizontal scroll (long lines, no wrap): keep point's column in view ----
 (def *hscroll-margin* 8) ; columns of context kept left/right of point
