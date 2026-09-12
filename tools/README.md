@@ -19,6 +19,7 @@ python3 tools/drive_mspc.py # or one at a time (from anywhere)
 | `drive_progress.py` | Progress survives a session — two editor processes, one throwaway `XDG_CONFIG_HOME`, a solve in the first and the count still there in the second. |
 | `drive_tailcalls.py` | A million TRACED tail calls answer `=> :liftoff`. The lesson teaching O(1) stack is boundary-traced, and a trace wrapper used to cost a frame per level (Brood ADR-207). Model tests can't see it: the headless evaluator instruments nothing, which is exactly the instrumentation that broke. |
 | `drive_mdpreview.py` | `C-c C-p` in a `.md` buffer paints the rendered document beside it — the mode keymap's chord reaching a command whose module was not loaded, the split, and the view painting a buffer's faces from `:face-spans` data rather than a lexer. The needles (`━`, `•`) are what only the render produces. |
+| `drive_windmove.py` | `C-S-<right>` moves the window and `M-<left>` selects the one beside it — from a real terminal, where the frontend has to turn `ESC [ 1 ; 6 C` into `:ctrl-shift-right` (ADR-328). Each command's edge message names the direction, a needle the input cannot produce. |
 | `drive_tutor_readonly.py` | The REAL editor refuses a backspace at a box's edge and says so, while the box stays writable — the tutorial's prose/borders are read-only at the edit primitive (`:read-only-spans`, ADR-219), not a `:post-key` guard a held key could outrun. |
 
 **Three bugs these caught that 1200 model tests could not.** A new tutorial key was added to the
