@@ -918,7 +918,7 @@ enclosing list's close delimiter, so it can't break the parens. Reuses the kill 
 
 (defcommand cmd-duplicate-line
   (m key)
-  "Duplicate the current line below it (C-x d)."
+  "Duplicate the current line below it (M-x duplicate-line — C-x d is dired, as in Emacs)."
   (ed-edit m
     (fn (b)
       (let (lt (buffer-line-at b (buffer-current-line b)))
@@ -1355,7 +1355,69 @@ so it can't be applied with eval-buffer."
     (message m1
       (if (empty? warns) "config reloaded" (str "config reloaded (" (first warns) ")")))))
 
-;; ---- dired (a directory browser, C-x C-d) -----------------------------------
+;; ---- hexl: a binary file as a hex view ---------------------------------------
+;; `find-file` on a file that is not UTF-8 (an ELF, a PNG, a .o) used to fail with
+;; "stream did not contain valid UTF-8" and open nothing. Emacs opens it in
+;; `hexl-mode`; so does this: a read-only `:hexl` buffer of xxd-style rows — offset,
+;; sixteen bytes as hex pairs, the printable ASCII beside — capped at `*hexl-cap*`
+;; bytes with a header saying so, because the rows are built in Brood and a
+;; multi-megabyte object file is not what anyone reads by eye.
+
+(defdyn *hexl-cap* 65536) ; bytes of a binary shown (4096 rows)
+(def- hexl-row-bytes 16)
+
+(defn- hexl-ascii (b)
+  "The ASCII column's character for byte `b`: printable 7-bit as itself, else `.`."
+  (if (and (>= b 32) (< b 127)) (string/codepoints-> (list b)) "."))
+
+(defn hexl-row (b off n)
+  "One xxd row for the `n` bytes of `b` from `off`: `00000010: 7f45 4c46 … |.ELF…|`.
+Pure over the bytes value; the row is padded so the ASCII column lines up on a short
+last row."
+  (letrec (go (fn (j hex asc)
+                (if (>= j hexl-row-bytes)
+                  (str (string/format "%08x: " off) hex "  " (string/trimr asc))
+                  (let (sep (if (and (> j 0) (= 0 (math/rem j 2))) " " "")
+                        in? (< j n)
+                        v (if in? (nth b (+ off j)) 0))
+                    (go (inc j)
+                      (str hex sep (if in? (string/format "%02x" v) "  "))
+                      (str asc (if in? (hexl-ascii v) " ")))))))
+    (go 0 "" "")))
+
+(defn hexl-text (b)
+  "The hex view of bytes `b`: a header line, then a row per sixteen bytes up to
+`*hexl-cap*`."
+  (let (total (count b)
+        shown (math/min total *hexl-cap*)
+        rows (math/quot (+ shown (dec hexl-row-bytes)) hexl-row-bytes)
+        header (if (> total shown)
+                 (str ";; binary file: " total " bytes — the first " shown " shown (read-only)")
+                 (str ";; binary file: " total " bytes (read-only)")))
+    (string/join
+      (cons header
+        (map (range rows)
+          (fn (r)
+            (let (off (* r hexl-row-bytes))
+              (hexl-row b off (math/min hexl-row-bytes (- shown off)))))))
+      "\n")))
+
+(defn- ed-open-binary (m path root)
+  "Open `path` (an existing file that is not UTF-8) as a `:hexl` buffer — Emacs
+`hexl-mode`, read-only. Its `:file` is kept so the mode line names it and `C-x C-j`
+lands in its directory, but there is no saving a hex view."
+  (let (b (file/slurp-bytes path)
+        m1 (ed-show-named m (file-display-name path root) (hexl-text b) :hexl))
+    (message (ed-set-buf m1 (assoc (ed-current-buf m1) :file path :dir (path/dirname path)))
+      (str "opened " path " as hex (binary, " (count b) " bytes)"))))
+
+(defn- utf8-file? (path)
+  "True when the bytes at `path` decode as UTF-8 — a text file `find-file-buffer` can read.
+The decode failing IS the answer (a binary), so the error is the verdict, not a fault."
+  (check-allow :discarded-catch
+    (try (do (string/bytes-> (file/slurp-bytes path)) true) (catch e false))))
+
+;; ---- dired (a directory browser, C-x d / C-x C-j) -----------------------------------
 ;; The same generated-read-only-buffer pattern as occur/process-menu: a listing of a
 ;; directory, navigated and operated by single keys (see modes/dired-keymap). State
 ;; lives on the model — `:dired-dir` (absolute dir), `:dired-names` (entry names in
@@ -1483,7 +1545,7 @@ sized to the listing), a row flagged when its name is in `marks`."
 is named by the absolute directory path, so revisiting reuses it), recording
 `:dired-dir`/`:dired-names`, and put point on (1-based) `line` — default the first entry.
 Marks (`:dired-marks`) persist across a same-dir refresh and reset on a directory change."
-  (let (dir (path/absolute dir)
+  (let (dir (path/normalize (path/absolute dir)) ; no `./` in the listing's title
         marks (if (= dir (:dired-dir m)) (or (:dired-marks m) '()) '())
         entries (ed-dired-list dir)
         names (into [] (map entries :name))
@@ -1639,9 +1701,34 @@ leading mark column) — a no-op on the header line."
   "Move to the previous line and onto its filename (p / C-p / up)."
   (ed-dired-snap (cmd-previous-line m key)))
 
+(defcommand cmd-dired-jump
+  (m key)
+  "Open dired on the current buffer's directory with point on its file (C-x C-j / C-x j —
+Emacs `dired-jump`): no prompt, the listing itself is the selector. A buffer with no file
+(a scratch, a report) jumps to its `:dir` / the working directory, point on the first
+entry; a dired buffer jumps to its parent, point on the directory just left."
+  (let (buf (ed-current-buf m)
+        file (:file buf)
+        here (:dired-dir m)
+        in-dired? (and here (= here (ed-default-dir m)) (= (editor/layers/buffer-type-for buf) :dired))
+        dir (cond
+              in-dired? (path/dirname here)
+              file (path/dirname file)
+              else (ed-default-dir m))
+        target (cond
+                 in-dired? (path/basename here)
+                 file (path/basename file)
+                 else nil)
+        m1 (ed-show-dired m dir)
+        idx (if target (index-of (or (:dired-names m1) []) target) nil))
+    (if (nil? idx)
+      m1
+      (ed-apply m1
+        (fn (b) (ed-dired-move-to-filename (ed-goto-line b (+ ed-dired-header-lines (inc idx)))))))))
+
 (defcommand cmd-dired
   (m key)
-  "Open a directory browser (dired) on a prompted directory (C-x C-d), defaulting to the
+  "Open a directory browser (dired) on a prompted directory (C-x d / C-x C-d), defaulting to the
 current buffer's directory (else the working dir). Uses the **same** path-completing
 prompt as find-file (`ed-path-prompt`): a Plume candidate list, Tab-expand, C-w to walk
 up — opening dired on the chosen directory."
@@ -2729,7 +2816,7 @@ to absolute (`path-absolute`) first, so the prompt can stay short/relative while
 buffer's `:file`, dedup, and project-relative name all key off a canonical path."
   (if (string/blank? path)
     (message m "(no file)")
-    (let (path (path/absolute path)
+    (let (path (path/normalize (path/absolute path)) ; `./` and `..` collapsed: one spelling per file
           _ (when (:recent-files m) (remember-file! path)) ; recentf — live editor only
           ;; The project follows the file you visit (Emacs `default-directory`): resolve
           ;; the visited file's project root (`.git` / `project.blsp`) and make it the
@@ -2754,12 +2841,16 @@ buffer's `:file`, dedup, and project-relative name all key off a canonical path.
         ;; try guards a read error (e.g. a permission denial on an existing file). The
         ;; display name is project-relative inside a project, else the basename
         ;; (`file-display-name`) — `:file` keeps the full path for saving / dedup.
-        (try
-          (let (buf (assoc (find-file-buffer path)
-                      :name (file-display-name path root)))
-            (message (ed-open-buffer m buf)
-              (if (file/exists? path) (str "opened " path) (str "new file " path))))
-          (catch e (message m (str "open failed: " (error-message e)))))))))
+        ;; A file that exists but is not UTF-8 (an ELF, an image) opens as a hex view
+        ;; (`ed-open-binary`, Emacs hexl-mode) instead of failing on the decode.
+        (if (and (file/exists? path) (not (utf8-file? path)))
+          (ed-open-binary m path root)
+          (try
+            (let (buf (assoc (find-file-buffer path)
+                        :name (file-display-name path root)))
+              (message (ed-open-buffer m buf)
+                (if (file/exists? path) (str "opened " path) (str "new file " path))))
+            (catch e (message m (str "open failed: " (error-message e))))))))))
 
 ;; ---- panes (tiled splits, Emacs C-x 2/3/0/1/o) ----------------------------
 ;; Operate on the model's `:layout` pane tree (std/pane). A split shows the
