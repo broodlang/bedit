@@ -1507,10 +1507,11 @@ nlink / owner / group / size fields across `entries`."
      :group-w (widths :group "?")
      :size-w (widths :size "0")}))
 
-(defn- ed-dired-row (marked? st name cols)
+(defn- ed-dired-row (mark st name cols)
   "One `ls -l` row: `<mark><perms> <nlink> <owner> <group> <size> <date> <name>`, each
-field padded to `cols`' widths so the columns line up."
-  (str (if marked? "*" " ")
+field padded to `cols`' widths so the columns line up. `mark` is the mark cell: `*` a
+marked row, `D` one flagged for deletion, a space otherwise."
+  (str mark
     (perms-string st)
     " "
     (string/pad-left (ed-stat-field-str st :nlink "1") (:nlink-w cols))
@@ -1529,14 +1530,22 @@ field padded to `cols`' widths so the columns line up."
   "The header line: the absolute directory path (trailing `:`, `ls`/dired style)."
   (str dir ":"))
 
-(defn ed-dired-text (dir entries marks)
+(defn ed-dired-text (dir entries marks &optional (flags (list)))
   "The dired buffer text: the header line then one `ed-dired-row` per entry (columns
-sized to the listing), a row flagged when its name is in `marks`."
+sized to the listing), a row marked `*` when its name is in `marks`, `D` when it is in
+`flags` (flagged for deletion, Emacs `d`)."
   (let (cols (ed-dired-cols entries))
     (str (ed-dired-header dir entries)
       "\n"
       (string/join (map entries
-                     (fn (e) (ed-dired-row (includes? marks (:name e)) (:stat e) (:name e) cols)))
+                     (fn (e)
+                       (ed-dired-row (cond
+                                       (includes? flags (:name e)) "D"
+                                       (includes? marks (:name e)) "*"
+                                       else " ")
+                         (:stat e)
+                         (:name e)
+                         cols)))
         "\n")
       "\n")))
 
@@ -1547,11 +1556,12 @@ is named by the absolute directory path, so revisiting reuses it), recording
 Marks (`:dired-marks`) persist across a same-dir refresh and reset on a directory change."
   (let (dir (path/normalize (path/absolute dir)) ; no `./` in the listing's title
         marks (if (= dir (:dired-dir m)) (or (:dired-marks m) '()) '())
+        flags (if (= dir (:dired-dir m)) (or (:dired-flags m) '()) '())
         entries (ed-dired-list dir)
         names (into [] (map entries :name))
-        m1 (ed-show-named (assoc m :dired-dir dir :dired-names names :dired-marks marks)
+        m1 (ed-show-named (assoc m :dired-dir dir :dired-names names :dired-marks marks :dired-flags flags)
              dir
-             (ed-dired-text dir entries marks)
+             (ed-dired-text dir entries marks flags)
              :dired)
         ;; the Dired buffer's default-directory IS the dir it lists (every buffer carries
         ;; `:dir`; this is where find-file / C-x p f resolve from when you're in Dired).
@@ -1581,7 +1591,7 @@ blank line (the index is the line offset past the header into `:dired-names`)."
   "True if line `lt` looks like an `ls -l` row — a mark cell (space/`*`), a type char
 (`d`/`l`/`-`), then the first permission bit (`r`/`-`)."
   (and (>= (string/length lt) ed-dired-fields-col)
-    (includes? (list " " "*") (string/substring lt 0 1))
+    (includes? (list " " "*" "D") (string/substring lt 0 1))
     (includes? (list "d" "l" "-") (string/substring lt 1 2))
     (includes? (list "r" "-") (string/substring lt 2 3))))
 
@@ -1631,7 +1641,10 @@ offset `off` (`len` its length): the `*` mark, the perms string, the metadata fi
 the name in its type colour. Ascending + non-overlapping."
   (let ([toks name-start] (ed-dired-fields lt ed-dired-fields-col len 7 '())
         name-face (ed-dired-name-face lt))
-    (append (if (= (string/substring lt 0 1) "*") (list [off (+ off 1) theme/face-dired-mark]) '())
+    (append (cond
+              (= (string/substring lt 0 1) "*") (list [off (+ off 1) theme/face-dired-mark])
+              (= (string/substring lt 0 1) "D") (list [off (+ off 1) theme/face-dired-flag])
+              else '())
       (list [(+ off ed-dired-perms-col)
               (+ off ed-dired-perms-col ed-dired-perms-w)
               theme/face-dired-perms])
@@ -1775,42 +1788,59 @@ up — opening dired on the chosen directory."
   "Kill the dired buffer (q)."
   (cmd-kill-buffer m key))
 
-;; ---- marking (m / u / U / t, acted on by x / D) -----------------------------
+;; ---- marking (m / u / U / t → D) and flagging (d / u → x) ---------------------
 ;; `:dired-marks` is the set (a list, deduped) of marked entry names; a marked row
 ;; renders with a `*` flag (peach, via dired-fontify) and `cmd-dired-delete` operates on
 ;; the whole set. Marks survive a same-dir refresh (ed-show-dired) and reset on cd.
 
-(defn- ed-dired-mark-set (m name on?)
-  "Return `m` with entry `name` marked (`on?` true) or unmarked — marks kept a deduped set."
-  (let (marks (or (:dired-marks m) '()))
+(defn- ed-dired-set-in (m key name on?)
+  "Return `m` with entry `name` added to (`on?`) or removed from the set under `key`
+(`:dired-marks` or `:dired-flags`) — each kept a deduped list."
+  (let (names (or (get m key) '()))
     (assoc m
-      :dired-marks
-        (if on?
-          (if (includes? marks name) marks (cons name marks))
-          (seq/reject marks (fn (x) (= x name)))))))
+      key
+      (if on?
+        (if (includes? names name) names (cons name names))
+        (seq/reject names (fn (x) (= x name)))))))
 
-(defn- ed-dired-remark (m on?)
-  "Mark (`on?`) or unmark the entry under point, then advance to the next line and
-re-render. The `.`/`..` pseudo-entries can't be marked — just advance past them."
+(defn- ed-dired-mark-set (m name on?)
+  "Return `m` with entry `name` marked (`on?` true) or unmarked. Marking clears a
+deletion flag on the same entry (one mark cell per row); unmarking clears both."
+  (ed-dired-set-in (ed-dired-set-in m :dired-flags name false) :dired-marks name on?))
+
+(defn- ed-dired-flag-set (m name)
+  "Return `m` with entry `name` flagged for deletion (its `*` mark, if any, replaced)."
+  (ed-dired-set-in (ed-dired-set-in m :dired-marks name false) :dired-flags name true))
+
+(defn- ed-dired-remark (m change)
+  "Apply `change` (`(m name) -> m`) to the entry under point, then advance to the next
+line and re-render. The `.`/`..` pseudo-entries can't be marked — just advance past them."
   (let (name (ed-dired-name-at m)
         next (+ (buffer-current-line (ed-current-buf m)) 2) ; 1-based line below point
-        m1 (if (or (nil? name) (= name ".") (= name "..")) m (ed-dired-mark-set m name on?)))
+        m1 (if (or (nil? name) (= name ".") (= name "..")) m (change m name)))
     (ed-show-dired m1 (:dired-dir m) next)))
 
 (defcommand cmd-dired-mark
   (m key)
   "Mark the entry under point, then advance (m)."
-  (ed-dired-remark m true))
+  (ed-dired-remark m (fn (mm name) (ed-dired-mark-set mm name true))))
+
+(defcommand cmd-dired-flag
+  (m key)
+  "Flag the entry under point for deletion — a `D` in the mark cell — then advance (d,
+Emacs `dired-flag-file-deletion`). `x` deletes every flagged entry after a confirm;
+`u` unflags."
+  (ed-dired-remark m ed-dired-flag-set))
 
 (defcommand cmd-dired-unmark
   (m key)
-  "Unmark the entry under point, then advance (u)."
-  (ed-dired-remark m false))
+  "Unmark the entry under point — its `*` mark or its `D` flag — then advance (u)."
+  (ed-dired-remark m (fn (mm name) (ed-dired-mark-set mm name false))))
 
 (defcommand cmd-dired-unmark-all
   (m key)
-  "Remove every mark (U)."
-  (ed-show-dired (assoc m :dired-marks '())
+  "Remove every mark and every deletion flag (U)."
+  (ed-show-dired (assoc m :dired-marks '() :dired-flags '())
     (:dired-dir m)
     (inc (buffer-current-line (ed-current-buf m)))))
 
@@ -1888,13 +1918,30 @@ marks and re-render; report the first failure in the echo area."
       (fold names
         nil
         (fn (_ n) (let (p (path/join dir n)) (if (file/dir? p) (file/rmdir p) (file/rm p)))))
-      (ed-show-dired (assoc mm :dired-marks '()) dir))
+      (ed-show-dired (assoc mm :dired-marks '() :dired-flags '()) dir))
     (catch e (message mm (str "delete failed: " (error-message e))))))
+
+(defcommand cmd-dired-do-flagged-delete
+  (m key)
+  "Delete every entry flagged `D` after a y/n confirm (x, Emacs
+`dired-do-flagged-delete`); says so when nothing is flagged."
+  (let (dir (:dired-dir m)
+        flags (or (:dired-flags m) '()))
+    (if (empty? flags)
+      (message m "(no files flagged for deletion)")
+      (ed-read-char m
+        (if (= (count flags) 1)
+          (str "Delete " (first flags) "? (y/n)")
+          (str "Delete " (count flags) " flagged? (y/n)"))
+        (fn (mm k)
+          (if (or (= k "y") (= k "Y"))
+            (ed-dired-delete-targets mm dir flags)
+            (message mm "canceled")))))))
 
 (defcommand cmd-dired-delete
   (m key)
   "Delete the marked entries — or the entry under point when none are marked — after a
-y/n confirm (D / x)."
+y/n confirm (D, Emacs `dired-do-delete`)."
   (let (dir (:dired-dir m)
         marks (or (:dired-marks m) '())
         under (ed-dired-name-at m)
