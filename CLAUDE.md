@@ -141,6 +141,15 @@ src/playground.blsp         M-x brood-playground: a free-text Brood buffer that 
                             type — results as ghost text, *Playground Spy* pane beside it
 src/tutor.blsp              the interactive Brood tutorial (C-h t): playground boxes that
                             eval-on-type in the sandbox — ✓/✗ gutter, ghost results, prose guard
+src/aside.blsp              the ASIDE pane: a named buffer shown beside the page, refreshed in
+                            place, latched closed once the reader closes it, reopened only by
+                            asking — the discipline under every preview pane (workings, mdpreview)
+src/workings.blsp           the "show me how it actually ran" pane over `aside`: the per-region
+                            report cache and the rule for what earns a split — the tutorial's
+                            *Workings* and the playground's *Playground Spy* are its two clients
+src/mdpreview.blsp          C-c C-p in a .md buffer: the document rendered beside it
+                            (std's `markdown-render`, faces as data on the buffer), following
+                            the cursor per key and re-rendering on the idle beat (`:on-idle`)
 src/tutor-workings.blsp     the tutorial's *Workings* pane: the per-box cascade cache, its body
                             text, and its open/follow/close (knows a pane + a box INDEX; the
                             tutorial owns the box parser and passes the index — acyclic)

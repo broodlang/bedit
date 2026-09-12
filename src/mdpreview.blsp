@@ -1,0 +1,109 @@
+(defmodule mdpreview
+  "The **markdown preview** — the document you are writing, rendered, in a pane beside it.
+
+`C-c C-p` (M-x markdown-preview) in a `.md` buffer opens `*Markdown Preview*` to the
+right: the text the markup describes — headings underlined, paragraphs re-flowed to the
+pane's width, bullets, quotes, code — with the faces carried as data, since the markers a
+lexer would read are exactly what is gone (`editor/markdown/markdown-render`, whose
+`:spans` the pane paints through `:face-spans`). The command toggles: run it again and the
+pane goes.
+
+**It follows you, on two clocks.** Every keystroke scrolls the preview to keep the
+rendered line of the cursor's source line in view (`aside/scroll-to-line`; nothing
+re-renders — `:lines` from the last render answers where a source line landed). The
+RENDER runs on the idle beat (`:on-idle`), once typing settles, and only when the text or
+the pane's width changed since the last one: a whole-document render on every key would
+be the jitter the highlighter's per-key band already cost once.
+
+**The pane is an `aside`**: shown beside the page, refreshed in place keeping its scroll
+(`:keep-scroll` — the follow places it), latched closed when you close it, brought back
+only by the command. Killing the markdown buffer takes the preview with it
+(`:on-close`), because a preview of nothing is a corpse on screen.
+
+**State**, under the model's `:mdpreview` map: `aside`'s `:aside-shown?`/`:aside-closed?`,
+plus `:rope` (the text last rendered — O(1) to compare, so \"did it change?\" is free),
+`:width` (the columns it was rendered to) and `:render` (the last `markdown-render`
+result, for `:lines`)."
+  (:use model) ; ed-current-buf / message
+  (:use commands) ; the command registry's home; ed-* pool ops
+  (:use interactive) ; defcommand
+  (:use aside) ; the pane discipline: refresh / reopen / scroll-to-line / pane-of
+  (:use editor/buffer) ; buffer-rope / buffer-text / buffer-current-line
+  (:use editor/layers) ; request-close — take the pane with the buffer
+  (:use editor/markdown)) ; markdown-render / markdown-rendered-line
+
+(def *buffer-name* "*Markdown Preview*")
+
+(def *spec* {:key :mdpreview :buffer mdpreview/*buffer-name* :type :markdown-preview})
+
+(sig pane-width (model -> int))
+(defn pane-width (m)
+  "The columns the preview should render to: the pane's width less its scrollbar column,
+or 72 (a comfortable reading width) with no pane to measure — headless, where the pane is
+never laid out. The command opens the pane BEFORE the first render so it is measured."
+  (let (pane (aside/pane-of *spec* m))
+    (if (nil? pane)
+      72
+      (let ([_ _ w _] (:rect pane)) (math/max 10 (- w 2))))))
+
+(sig fresh? (model buffer -> bool))
+(defn fresh? (m buf)
+  "Whether the last render is of `buf`'s text at the pane's current width — nothing to do."
+  (and (= (get-in m [:mdpreview :rope]) (buffer-rope buf))
+    (= (get-in m [:mdpreview :width]) (pane-width m))))
+
+(sig render (model buffer bool -> model))
+(defn render (m buf force)
+  "Render `buf` into the pane (opening it with `force`, else only refreshing one already
+up) and remember what was rendered, then keep the cursor's line in view."
+  (let (width (pane-width m)
+        r (markdown-render (buffer-text buf) width)
+        m1 (assoc m :mdpreview (merge (:mdpreview m) {:rope (buffer-rope buf) :width width :render r}))
+        m2 (aside/refresh *spec* m1 r force {:keep-scroll true}))
+    (follow m2 buf)))
+
+(sig follow (model buffer -> model))
+(defn follow (m buf)
+  "Scroll the preview so the rendered line of `buf`'s cursor line is in view — from the
+last render's `:lines`, no re-render. A no-op when the pane is not up or the render is of
+some other text (the idle beat will replace it, and follow then)."
+  (let (r (get-in m [:mdpreview :render]))
+    (if (or (nil? r)
+          (not (aside/open? *spec* m))
+          (not (= (get-in m [:mdpreview :rope]) (buffer-rope buf))))
+      m
+      (aside/scroll-to-line *spec* m (markdown-rendered-line r (buffer-current-line buf))))))
+
+;; ---- the hooks on markdown-mode -------------------------------------------------
+
+(defn markdown-post-key (m-before m key)
+  "markdown-mode's `:post-key`: keep the preview following the cursor. Follows only;
+the render is the idle beat's."
+  (follow m (ed-current-buf m)))
+
+(defn markdown-on-idle (m)
+  "markdown-mode's `:on-idle`: re-render an open preview once typing settles, if the
+text or the pane's width moved since the last render. Never opens one."
+  (let (buf (ed-current-buf m))
+    (if (or (not (aside/open? *spec* m)) (fresh? m buf)) m (render m buf false))))
+
+(defn markdown-on-close (buf)
+  "markdown-mode's `:on-close`: killing the buffer takes its preview with it. The hook is
+handed only its buffer, so it NAMES the pane (`request-close`) and the app closes it."
+  (request-close buf *buffer-name*))
+
+;; ---- the command ----------------------------------------------------------------
+
+(defcommand cmd-markdown-preview
+  (m key)
+  "Toggle the markdown preview (C-c C-p, M-x markdown-preview): open `*Markdown Preview*`
+beside this buffer, rendered and following the cursor — or, when it is up, close it.
+Opening clears the latch a closed pane leaves, because this is you asking."
+  (if (aside/open? *spec* m)
+    (message (aside/close *spec* m) "markdown preview closed")
+    ;; open first, render second: the pane has to exist to be measured, and a render at a
+    ;; guessed width would be redone by the next idle beat anyway
+    (let (m1 (aside/reopen *spec* m "")
+          m2 (aside/scroll-to-line *spec* m1 0))
+      (message (render m2 (ed-current-buf m2) false)
+        "markdown preview — follows the cursor; C-c C-p closes it"))))

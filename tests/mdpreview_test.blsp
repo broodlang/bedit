@@ -1,0 +1,163 @@
+;; tests/mdpreview_test.blsp — the markdown preview pane (src/mdpreview.blsp) and the
+;; `aside` pane discipline under it (src/aside.blsp).
+;;
+;; Pure model tests: a `.md` buffer, the command, keys through `ed-update` (so the mode's
+;; `:post-key` follow and the `:idle-recompute` beat's `:on-idle` re-render run the way
+;; they do live), and assertions on what the preview pane holds and where it is scrolled.
+
+(defmodule mdpreview-test
+  (:use test)
+  (:use model)
+  (:use input)
+  (:use editor/buffer)
+  (:use editor/pane) ; pane-count / pane-leaf-paths / pane-payload-at — the layout
+  (:use-internals mdpreview)
+  (:use-internals aside))
+
+(defn md-of (text)
+  (ed-init (make-buffer text "notes.md" "notes.md")))
+(defn press (m keys) (fold keys m (fn (acc k) (ed-update acc k 80 24))))
+(defn beat (m) (ed-update m [:timer :idle-recompute] 80 24))
+(defn open (m) (press m [:ctrl-c :ctrl-p]))
+(defn preview-buf (m)
+  (let (i (ed-buffer-index-by-name m mdpreview/*buffer-name*)) (if (nil? i) nil (ed-buf-at m i))))
+(defn preview-text (m) (let (b (preview-buf m)) (if (nil? b) nil (buffer-text b))))
+(defn preview-pane (m) (aside/pane-of mdpreview/*spec* m))
+(defn preview-top (m)
+  (let (p (preview-pane m)) (if (nil? p) nil (or (get-in p [:payload :top]) 0))))
+
+(def *doc* "# Title\n\nSome **bold** words here.\n\n- one\n- two\n")
+
+(describe "markdown-preview: the pane"
+  (test "C-c C-p in a .md buffer opens *Markdown Preview* beside it, rendered, selection kept"
+    (let (m (open (md-of *doc*)))
+      (assert= (pane-count (:layout m)) 2)
+      (assert= (buffer-name (ed-current-buf m)) "notes.md") ; still on the source
+      (assert= (preview-text m) "Title\n━━━━━\n\nSome bold words here.\n\n• one\n• two")
+      ;; rendered to the pane it opened in (39 columns on an 80-column window), not a guess
+      (assert= (get-in m [:mdpreview :width]) 37)
+      (is (includes? (:echo m) "markdown preview"))))
+
+  (test "the rendered faces travel as data on the buffer, not from a lexer"
+    (let (b (preview-buf (open (md-of *doc*)))
+          spans (:face-spans b)
+          bold (seq/find spans (fn (s) (= (nth s 2) {:bold true}))))
+      (is (not (nil? bold)))
+      (assert= (string/substring (buffer-text b) (nth bold 0) (nth bold 1)) "bold")))
+
+  (test "the preview buffer is a read-only special buffer without line numbers"
+    (let (b (preview-buf (open (md-of *doc*))))
+      (is (read-only? b))
+      (is (editor/layers/layer-collect b :no-line-numbers))))
+
+  (test "C-c C-p again takes the pane and its buffer down, and says so"
+    (let (m (press (open (md-of *doc*)) [:ctrl-c :ctrl-p]))
+      (assert= (pane-count (:layout m)) 1)
+      (is (nil? (preview-buf m)))
+      (assert= (buffer-name (ed-current-buf m)) "notes.md")
+      (is (includes? (:echo m) "closed"))))
+
+  (test "M-x markdown-preview is the same command, known before the module ever loaded"
+    (is (not (nil? (interactive/command-sym "markdown-preview")))))
+
+  (test "in a buffer that is not markdown, C-c C-p is not bound"
+    (let (m (press (ed-init (make-buffer "plain" "notes.txt" "notes.txt")) [:ctrl-c :ctrl-p]))
+      (is (nil? (preview-buf m))))))
+
+(describe "markdown-preview: following the text"
+  (test "typing does not re-render on the key; the idle beat does"
+    (let (m (open (md-of "# A\n\nb"))
+          typed (press m ["!"])) ; point is at 0: "!# A" — no longer a heading
+      (assert= (preview-text typed) "A\n━\n\nb") ; the key left the render alone
+      (assert= (preview-text (beat typed)) "!# A\n\nb"))) ; the beat re-rendered
+
+  (test "the beat re-renders only when the text changed"
+    (let (m (beat (open (md-of "# A")))
+          r1 (get-in m [:mdpreview :render])
+          m2 (beat (press m [:ctrl-f])))
+      (is (= r1 (get-in m2 [:mdpreview :render])))
+      (is (= (get-in m [:mdpreview :rope]) (get-in m2 [:mdpreview :rope])))))
+
+  (test "the beat opens nothing: no preview, no render"
+    (let (m (beat (press (md-of *doc*) ["x"])))
+      (is (nil? (preview-buf m)))
+      (is (nil? (get-in m [:mdpreview :render])))))
+
+  (test "the cursor's source line keeps its rendered line in view (scrolls when out of view)"
+    ;; 60 headings: the preview (a 24-row window, ~22 rows of pane) cannot show them all
+    (let (long (string/join (map (range 60) (fn (i) (str "# H" i "\n\ntext " i "\n"))) "")
+          m (open (md-of long))
+          ;; jump the source cursor to the last line: the preview must scroll to it
+          at-end (press m [(keyword "alt->")]))
+      (assert= (preview-top m) 0)
+      (is (> (preview-top at-end) 0))
+      ;; back to the top: scrolls back
+      (assert= (preview-top (press at-end [(keyword "alt-<")])) 0)))
+
+  (test "a move that stays in view leaves the preview's scroll alone"
+    (let (m (open (md-of *doc*))
+          moved (press m [:ctrl-n :ctrl-n]))
+      (assert= (preview-top moved) 0))))
+
+(describe "markdown-preview: the buffer's life"
+  (test "killing the markdown buffer takes the preview with it"
+    (let (m (open (md-of *doc*))
+          killed (commands/cmd-kill-buffer m :none))
+      (is (nil? (preview-buf killed)))))
+
+  (test "closing the pane latches: the beat will not bring it back, the command will"
+    (let (m (beat (open (md-of "# A")))
+          ;; the reader kills the preview from its own pane
+          gone (commands/cmd-kill-buffer (commands/cmd-other-pane m :none) :none)
+          typed (beat (press (commands/cmd-other-pane gone :none) ["x"])))
+      (is (nil? (preview-buf gone)))
+      (is (aside/closed? mdpreview/*spec* typed))
+      (is (nil? (preview-buf typed)))
+      (is (not (nil? (preview-buf (open typed))))))))
+
+(describe "aside: the pane discipline on its own"
+  (def spec {:key :t :buffer "*T*" :type :markdown-preview})
+  (defn shown? (m) (aside/open? spec m))
+
+  (test "refresh without force only touches a pane already up; with force it opens one"
+    (let (m (ed-init (make-buffer "x")))
+      (is (not (shown? (aside/refresh spec m "hi" false))))
+      (let (up (aside/refresh spec m "hi" true))
+        (is (shown? up))
+        (is (get-in up [:t :aside-shown?]))
+        (assert= (buffer-text (ed-buf-at up (ed-buffer-index-by-name! up "*T*"))) "hi")
+        (assert= (buffer-text (ed-buf-at (aside/refresh spec up "there" false)
+                                (ed-buffer-index-by-name! up "*T*")))
+          "there"))))
+
+  (test "rendered content carries its spans onto the buffer"
+    (let (up (aside/refresh spec (ed-init (make-buffer "x")) {:text "ab" :spans (list [0 1 {:bold true}])} true))
+      (assert= (:face-spans (ed-buf-at up (ed-buffer-index-by-name! up "*T*"))) (list [0 1 {:bold true}]))))
+
+  (test "a pane shown and then gone is closed: latched against force; reopen clears it"
+    (let (up (aside/refresh spec (ed-init (make-buffer "x")) "hi" true)
+          gone (assoc up :buffers (into [] (filter (:buffers up) (fn (b) (not (= (buffer-name b) "*T*")))))
+                         :layout (pane-delete-others (:layout up)))
+          latched (aside/refresh spec gone "hi" true))
+      (is (aside/closed? spec gone))
+      (is (not (shown? latched)))
+      (is (get-in latched [:t :aside-closed?]))
+      (is (shown? (aside/reopen spec latched "back")))
+      (is (not (get-in (aside/reopen spec latched "back") [:t :aside-closed?])))))
+
+  (test "close takes the pane down, keeps the reader's pane selected, and latches"
+    (let (m (ed-init (make-buffer "x"))
+          up (ed-update (aside/refresh spec m "hi" true) :ctrl-f 80 24) ; a frame, so the layout is known
+          closed (aside/close spec up))
+      (assert= (pane-count (:layout up)) 2)
+      (assert= (pane-count (:layout closed)) 1)
+      (is (not (shown? closed)))
+      (assert= (buffer-text (ed-current-buf closed)) "x")
+      (is (aside/closed? spec closed))))
+
+  (test "forget is a new page: neither shown nor closed, the client's own state kept"
+    (let (m (assoc-in (aside/close spec (aside/refresh spec (ed-init (make-buffer "x")) "hi" true)) [:t :mine] 1)
+          fresh (aside/forget spec m))
+      (is (not (get-in fresh [:t :aside-closed?])))
+      (is (not (get-in fresh [:t :aside-shown?])))
+      (assert= (get-in fresh [:t :mine]) 1))))
