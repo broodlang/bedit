@@ -129,6 +129,10 @@ src/apprun.blsp             run the project (C-c r): nest run in a subprocess wi
 src/hosted.blsp             THE FLIP: every pool buffer backed by its own process (hosted-reconcile)
 src/procstream.blsp         the shared streaming-subprocess worker (testrun's :testrun and
                             apprun's :apprun ride it): line-buffered stdout -> handler fns
+src/wrap.blsp              visual-line-mode: the pure break rule (a line → `[from to]` row
+                            segments, word-wrapped at the pane width) that the row↔line owner
+                            (panes), the view and the scroll clamp all read — markdown wraps
+                            by default (a `:visual-line` mode facet); M-x visual-line-mode toggles
 src/isearch.blsp            incremental search + query-replace (C-s/C-r/M-%) modal mini-loops
 src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
 src/sandbox.blsp            the persistent eval sandbox: one `nest run` child on std's

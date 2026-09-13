@@ -10,6 +10,61 @@ Language-level changes live in the Brood repo's `docs/devlog.md` + `docs/decisio
 
 ---
 
+## 2026-09-13
+
+### where we lack against Emacs, measured — and the seven fixes, language first
+
+The question was "where are we lacking, and can the UI be crisper and faster?" Measured
+rather than guessed (`tools/profile-turn.blsp`, `BROOD_UI_TRACE=1`, `BROOD_GUI_TRACE=1`,
+`BROOD_GUI_DUMP`): a keystroke was already ~2 ms fold + ~1.5 ms view + 0.3 ms paint. Three
+real defects fell out, and an Emacs-parity tail. Brood first (prime directive), then bedit.
+
+**Brood (worktree branch `display-tabs-motion-scrollblit`, ADR-342 / ADR-343 there):**
+
+- **Tabs were zero-width.** `a\tb` painted as `ab`; every tab-indented file sat flush
+  left; the caret and the click agreed with each other and with nothing on screen. The
+  stop rule now lives in `text_width` with a running column: `string/display-width` and
+  `string/width->index` take `start-col` + `tab-width`, `string/expand-tabs` is the string
+  a frontend is handed, and the GUI paints a raw tab to the screen stop. bedit's view
+  expands each chunk at its LINE column, `ed-visual-column-from` measures from the line
+  start, `ed-buf-offset-at` maps a click by the same rule (`tests/tabs_test.blsp`).
+- **A scroll re-rasterised the whole pane.** 7–10 ms at 1080p, 4× that on 4K. The scroll
+  blit (`paint.rs strip_blits`) copies a dirty strip from the old canvas when its ops are
+  an exact pixel translation of an old band (or a solid fill covering both). A one-line
+  scroll at 1920×1045: **10.1 ms → 2.3 ms** (83 rows drawn, 946 copied), pixel-for-pixel
+  identical to a full raster by test, `BROOD_GUI_BLIT=0` to opt out.
+- **Every pointer move was a full turn** (95 of ~110 turns in a 12 s idle run).
+  `ui-coalesce-motion` collapses a `:move` flood like a `:drag` one.
+- **`:close-is-input?`** — an app can claim the window's X button and ask about unsaved
+  work first; and `std/editor/buffer` stamps a file's mtime at read/save
+  (`buffer-file-changed?`), the knowledge auto-revert needs.
+
+**bedit:**
+
+- **The view was O(all diagnostics) per frame.** A 282k-line file with 2,547 checker
+  findings: `ed-view` 135 ms with them, 2.6 ms without — on every cursor blink. They are
+  indexed by line once when they land (`model/ed-set-diagnostics`, the ONE setter) and
+  every reader asks only about the visible lines: **135 ms → 4.4 ms**.
+- **Quit asked nothing.** `C-x C-c` and the window's ✕ dropped unsaved work. Now Emacs's
+  `save-buffers-kill-terminal` flow (`Save file …? (y, n, !, q)`, then `Modified buffers
+  exist; exit anyway?`), `C-x k` asks too, `C-x C-s` onto a file another writer changed asks,
+  and the idle beat auto-reverts a clean buffer whose file changed (a dirty one is warned
+  once). `M-x revert-buffer` shares `ed-revert-at` with it.
+- **No word wrap.** `src/wrap.blsp` is the pure break rule; `panes/ed-pane-rows` the row
+  table every row↔line question reads (click, drag, hover, cursor, hl-line, region bands,
+  notes, links, remote carets); `ed-scroll`/`ed-max-top` count rows. Markdown wraps by
+  default (a `:visual-line` mode facet); `M-x visual-line-mode` toggles; `↩ Wrap` on the
+  mode line. `C-n`/`C-p` still move by logical line.
+- **The everyday tail:** `C-x C-b` (*Buffer List*, RET visits), `M-/` dabbrev-expand
+  (cycling; redo moved to `C-?`, Emacs's `undo-redo`), `M-!` / `M-|` (`C-u M-|` replaces
+  the region), `C-x C-o`, `sort-lines`, `delete-trailing-whitespace`, `M-=`, `C-x i`. And
+  which-key lays its continuations out in columns, since `C-x` now has more than one
+  column's worth.
+
+Not done from the list, deliberately: multiple frames (needs a window id on input events,
+ADR-059) and the GPU glyph atlas — both Brood work of a different size.
+
+
 ## 2026-08-31
 
 ### two suite failures reproduce ON DEMAND under `taskset -c 0,1` — the CPU count was the missing variable

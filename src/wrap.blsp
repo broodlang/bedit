@@ -1,0 +1,108 @@
+;; wrap.blsp — visual lines: where a buffer line breaks into screen rows.
+;;
+;; `visual-line-mode` (Emacs): a long line is shown on as many rows as it needs, broken at
+;; word boundaries, instead of scrolling sideways. Everything that maps a screen row to a
+;; buffer position — the view painting a row, the cursor's row, a click, the scroll clamp
+;; — has to agree on WHERE the breaks fall, so the break rule lives here, once, as a pure
+;; function of the line's text and the width, and the row↔line owner (`panes`) and the
+;; scroll (`model`) both ask it. Measured in display cells (`string/display-width`, so a
+;; tab or a wide glyph counts what it paints), with tab stops the LINE's (ADR-342).
+;;
+;; A segment is `[from to]` — char offsets into the line, `to` exclusive, the newline
+;; never included — and a line is a list of them: one when it fits, `'([0 0])` when empty.
+(defmodule wrap
+  "Visual-line wrapping: the pure break rule that turns a buffer line into `[from to]`
+row segments at most `w` cells wide, breaking after the last space that fits (else
+mid-word). The one place the breaks are decided, so the view, the cursor, the mouse and
+the scroll agree."
+  (:use editor/buffer)) ; buffer-line-at — a line's text for `line-segments`
+
+(sig break-at (string int int int -> int))
+(defn- break-at (text from col w)
+  "The char offset (absolute in `text`) where the row starting at `from` (display column
+`col` of the line) ends: after the last space among the chars that fit in `w` cells,
+else at the last char that fits (a word longer than the row breaks mid-word), and at
+least one char on, so a glyph wider than the row still advances."
+  (let (rest (string/substring text from (string/length text))
+        ;; `width->index` from the line's column: a tab in the row spans to the LINE's stop
+        hard (+ from (string/width->index rest w col))
+        hard (if (<= hard from) (inc from) hard)
+        ;; the last space in [from, hard) (-1 when none) — the row keeps it, the next starts clean
+        fit (string/substring text from hard)
+        space (string/last-index-of fit " "))
+    (if (or (< space 0) (>= hard (string/length text))) ; -1: no space in the row
+      hard
+      (+ from space 1))))
+
+(sig segments-step (string int int int int list -> list))
+(defn- segments-step (text len from col w acc)
+  "Tail-recursive: the segments of `text` from char `from` (display column `col`) on,
+consed onto `acc` newest first."
+  (if (>= from len)
+    (reverse acc)
+    (let (rest (string/substring text from len))
+      (if (<= (string/display-width rest col) w)
+        (reverse (cons [from len] acc))
+        (let (to (break-at text from col w))
+          (segments-step text len to
+            (+ col (string/display-width (string/substring text from to) col))
+            w
+            (cons [from to] acc)))))))
+
+(sig segments (string int -> list))
+(defn segments (text w)
+  "The `[from to]` row segments of `text` (one line, no newline) at most `w` cells wide:
+`'([0 len])` when it fits (or `w` is 0 — no width, no wrapping), `'([0 0])` for an empty
+line. A row is what `break-at` says."
+  (let (len (string/length text))
+    (if (or (<= w 0) (<= (string/display-width text) w))
+      (list [0 len])
+      (segments-step text len 0 0 w '()))))
+
+(sig line-segments (buffer int int -> list))
+(defn line-segments (buf line w)
+  "`segments` of buffer line `line` (its text without the newline), `w` cells wide."
+  (let (lt (buffer-line-at buf line)
+        text (if (string/ends-with? lt "\n") (string/substring lt 0 (dec (string/length lt))) lt))
+    (segments text w)))
+
+(sig rows-step (buffer int int int int vector -> vector))
+(defn- rows-step (buf n line w limit acc)
+  "Tail-recursive: `acc` plus the rows of `line` and the lines after it, up to `limit`."
+  (if (or (>= line n) (>= (count acc) limit))
+    acc
+    (rows-step buf n (inc line) w limit
+      (fold (line-segments buf line w) acc
+        (fn (a seg)
+          (if (>= (count a) limit) a (conj a [line (first seg) (second seg)])))))))
+
+(sig rows-from (buffer int int int -> vector))
+(defn rows-from (buf top w limit)
+  "The first `limit` screen rows from buffer line `top` down, each `[line from to]` — a
+line's segments in order, then the next line's — stopping at the buffer's end. What a
+`w`-wide, `limit`-tall pane shows; the row↔line owner's table."
+  (rows-step buf (buffer-line-count buf) (math/max 0 top) w limit []))
+
+(sig row-of-step (list int int -> int))
+(defn- row-of-step (segs col i)
+  "Tail-recursive: the index of the segment holding `col`, from `i` on; the last one
+when none does."
+  (cond
+    (>= i (dec (count segs))) (dec (count segs))
+    (< col (second (nth segs i))) i
+    else (row-of-step segs col (inc i))))
+
+(sig row-of (list int -> int))
+(defn row-of (segs col)
+  "Which of a line's `segs` holds char column `col`: the segment whose `[from to)` spans
+it, or the last one for a column at the end (point after the last char sits on the last
+row, and an empty line's point on its one row)."
+  (if (empty? segs) 0 (row-of-step segs col 0)))
+
+(sig row-count (buffer int int int -> int))
+(defn row-count (buf from-line to-line w)
+  "How many screen rows the lines `[from-line, to-line)` take at width `w` — what the
+scroll clamp asks to keep point on screen through wrapped lines above it."
+  (fold (range (math/max 0 from-line) (math/max 0 to-line))
+    0
+    (fn (acc line) (+ acc (count (line-segments buf line w))))))

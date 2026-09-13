@@ -9,7 +9,8 @@ over it, so screen coordinates line up. Pure (data→data)."
   (:use model) ; ed-buf-at — the pool lookup ed-scroll-pane needs
   (:use editor/buffer) ; buffer-line-count (scroll clamp)
   (:use editor/highlight) ; shift-spans — re-base windowed fontify spans to absolute coords
-  (:use editor/pane)) ; pane-layout / divider-at / pane-select-at / pane-set-ratio / pane-* ops
+  (:use editor/pane) ; pane-layout / divider-at / pane-select-at / pane-set-ratio / pane-* ops
+  (:use wrap)) ; rows-from / row-of — the visual-line break rule the row table is built on
 ;; ---- pane layout (shared geometry: view & hit-testing agree) ----------------
 
 (sig ed-body-layout (map int int -> map))
@@ -115,17 +116,102 @@ line than this one). Clamped like `ed-pane-top`."
 not its laid-out rect (M-r)."
   (ed-pane-view-top {:payload payload} buf))
 
+;; ---- visual lines (wrapping): the pane's row table ---------------------------------
+;; With `visual-line-mode` on a buffer (`:visual-line`), a line takes as many rows as it
+;; needs (`wrap/segments`), so "row k shows line top + k" stops being true. The pane's ROW
+;; TABLE — `[line from to]` per text row, from `wrap/rows-from` — is what every row↔line
+;; question reads then; a row's `from` is its horizontal scroll (the chars before it are
+;; on the rows above), so the column geometry (`ed-buf-offset-at`, the caret) is unchanged.
+
+(sig ed-pane-text-cols (pane buffer -> int))
+(defn ed-pane-text-cols (pane buf)
+  "The text width of `pane` in cells: its rect width less the gutter and the scrollbar
+column, divided by the font scale — the width the view lays lines into and a wrapped line
+breaks at (`ed-selected-text-cols` is this for the selected pane). At least 1."
+  (let ([x y w h] (:rect pane)
+        gw (ed-gutter-width buf (ed-gutter-shown? buf pane))
+        s (ed-pane-scale pane))
+    (math/max 1 (- (math/quot (dec w) s) gw))))
+
+(sig ed-pane-rows (pane buffer -> (or nil vector)))
+(defn ed-pane-rows (pane buf)
+  "The pane's row table when `buf` wraps — `[line from to]` for each text row from the
+pane's top, one more than the pane shows so a smooth-scroll step has its extra row —
+else nil (an unwrapped pane's rows are `top + k`, the arithmetic in `ed-pane-line-at`).
+Recomputed per call from the visible lines' text (O(rows) segmentations)."
+  (if (ed-wrap? buf)
+    (wrap/rows-from buf (ed-pane-top pane buf) (ed-pane-text-cols pane buf) (inc (ed-pane-vrows pane)))
+    nil))
+
+(sig ed-pane-row-index (pane int -> int))
+(defn- ed-pane-row-index (pane row)
+  "Screen row `row` as an index into the pane's text rows (0 = the first), by the font scale."
+  (let ([px py pw ph] (:rect pane))
+    (math/quot (math/max 0 (- row py)) (math/max 1 (ed-pane-scale pane)))))
+
+(sig ed-pane-line-at (pane buffer int -> (or nil int)))
 (defn ed-pane-line-at (pane buf row)
   "The buffer line screen row `row` (absolute) of `pane` shows — `ed-pane-view-top` plus
-the row's offset into the pane's text area divided by the font scale — or nil for a
-row below the buffer's last line (a hover there is over nothing; a CLICK there wants
-the last line, which is `ed-pane-line-at-clamped`). The one row→line mapping; the
-inverse of the view's pane geometry."
-  (let ([px py pw ph] (:rect pane)
-        s (ed-pane-scale pane)
-        line (+ (ed-pane-view-top pane buf) (math/quot (math/max 0 (- row py)) (math/max 1 s))))
-    (if (< line (buffer-line-count buf)) line nil)))
-(sig ed-pane-line-at (pane buffer int -> (or nil int)))
+the row's offset into the pane's text area divided by the font scale, or the row table's
+entry when the buffer wraps — or nil for a row below the buffer's last line (a hover
+there is over nothing; a CLICK there wants the last line, which is
+`ed-pane-line-at-clamped`). The one row→line mapping; the inverse of the view's pane
+geometry."
+  (let (k (ed-pane-row-index pane row)
+        rows (ed-pane-rows pane buf))
+    (if (nil? rows)
+      (let (line (+ (ed-pane-view-top pane buf) k))
+        (if (< line (buffer-line-count buf)) line nil))
+      (if (< k (count rows)) (first (nth rows k)) nil))))
+
+(sig ed-pane-row-hscroll (pane buffer int -> int))
+(defn ed-pane-row-hscroll (pane buf row)
+  "The chars of its line that sit LEFT of screen row `row`'s first cell: the pane's
+horizontal scroll for an unwrapped buffer, the row's segment start for a wrapped one —
+what `ed-buf-offset-at` takes as `hscroll`, so a click on a continuation row maps into
+that row's slice of the line."
+  (let (rows (ed-pane-rows pane buf))
+    (if (nil? rows)
+      (ed-pane-hscroll pane)
+      (let (k (ed-pane-row-index pane row))
+        (if (< k (count rows)) (second (nth rows k)) 0)))))
+
+(sig ed-rows-line-rows ((or nil vector) int int int -> list))
+(defn ed-rows-line-rows (rows top line hscroll)
+  "The pane text rows buffer `line` occupies, each `[k from to]` (row index from 0, the
+line's chars on it — `to` nil for an unwrapped pane, where the row runs to the pane's
+edge): `'([(- line top) hscroll nil])` when `rows` is nil (unwrapped: one row per line,
+the caller range-checks `k`), else the table's rows for the line in order — `'()` when
+none is on screen. The line half of the geometry for anything painted AT a line: the
+hl-line band, a region's end-of-line fill, a ghost note, a link zone."
+  (if (nil? rows)
+    (list [(- line top) hscroll nil])
+    (reverse (fold (range (count rows)) '()
+               (fn (acc k)
+                 (let (r (nth rows k))
+                   (if (= (first r) line) (cons [k (second r) (nth r 2)] acc) acc)))))))
+
+(sig ed-rows-offset-row ((or nil vector) int int int int int -> (or nil (tuple int int))))
+(defn ed-rows-offset-row (rows top line col hscroll vrows)
+  "`[k from]` — the pane text row (0-based) char column `col` of buffer `line` sits on
+and that row's first char column — when it is among the `vrows` rows shown, else nil.
+Unwrapped (`rows` nil) `k` is `line - top` and `from` the pane's `hscroll`; wrapped, the
+line's rows decide (`wrap/row-of` picks the segment holding the column, the last one for
+a column at the line's end). The cursor, a remote caret and the hl-line band ask here,
+so they land on the row the text was painted on."
+  (let (mine (ed-rows-line-rows rows top line hscroll))
+    (if (empty? mine)
+      nil
+      (let ([k from _] (if (nil? rows)
+                         (first mine)
+                         (nth mine (wrap/row-of (map mine (fn ([k f t]) [f t])) col))))
+        (if (and (>= k 0) (< k vrows)) [k from] nil)))))
+
+(sig ed-pane-point-row (pane buffer int -> (or nil (tuple int int))))
+(defn ed-pane-point-row (pane buf vrows)
+  "`ed-rows-offset-row` for `buf`'s point in `pane`: the row the cursor is on."
+  (ed-rows-offset-row (ed-pane-rows pane buf) (ed-pane-top pane buf)
+    (buffer-current-line buf) (buffer-column buf) (ed-pane-hscroll pane) vrows))
 
 (defn ed-pane-line-at-clamped (pane buf row)
   "`ed-pane-line-at`, with a row below the text answering the LAST line — where a click
@@ -447,12 +533,13 @@ same predicate `view/ed-scrollbar-ops` draws under)."
       (< row (+ py vh))
       (> (buffer-line-count buf) vh))))
 
-(sig ed-scrollbar-top-for (buffer int int int -> int))
-(defn ed-scrollbar-top-for (buf vh row sy)
+(sig ed-scrollbar-top-for (buffer int int int &optional (or nil int) -> int))
+(defn ed-scrollbar-top-for (buf vh row sy &optional (w nil))
   "The pane `:top` for a scrollbar click/drag at screen `row`, on a track of `vh` rows
 starting at `sy`: a proportional map — the track top scrolls to 0, the bottom to
-`ed-max-top` — clamped into `[0, max-top]`."
-  (let (maxtop (ed-max-top buf (math/max 1 vh))
+`ed-max-top` (row-counted for a wrapped buffer given its text width `w`) — clamped into
+`[0, max-top]`."
+  (let (maxtop (ed-max-top buf (math/max 1 vh) w)
         rr (math/max 0 (math/min (dec vh) (- row sy))))
     (if (<= maxtop 0)
       0
@@ -477,8 +564,12 @@ lands at its end, never the next line."
         bol (text/line->char rope line)
         lt (buffer-line-at buf line)
         llen (if (string/ends-with? lt "\n") (dec (string/length lt)) (string/length lt))
-        from (+ bol (math/min hscroll llen)))
-    (+ from (string/width->index (text/slice rope from (+ bol llen)) cell))))
+        h (math/min hscroll llen)
+        from (+ bol h)
+        ;; the slice is laid out from the display column its first character sits at, so a
+        ;; tab in it spans to the LINE's stop, as the view painted it (ADR-342)
+        h-col (if (= h 0) 0 (string/display-width (text/slice rope bol from))))
+    (+ from (string/width->index (text/slice rope from (+ bol llen)) cell h-col))))
 
 (sig ed-mouse-begin-select (map pane buffer int int -> any))
 (defn ed-mouse-begin-select (m pane buf row col)
@@ -516,7 +607,9 @@ With no such service the click falls through to the old clamped point move."
         (try
           (gutter-svc m line)
           (catch e (message m (str "gutter: " (error-message e))))))
-      (let (off (ed-buf-offset-at buf (ed-pane-line-at-clamped pane buf row) hscroll gw s px col))
+      ;; the row's own hscroll: a wrapped continuation row starts mid-line (`ed-pane-row-hscroll`)
+      (let (off (ed-buf-offset-at buf (ed-pane-line-at-clamped pane buf row)
+                  (ed-pane-row-hscroll pane buf row) gw s px col))
         (assoc (ed-set-buf m (clear-mark (goto-char buf off)))
           :text-drag
             {:buf (get-in pane [:payload :buffer])
@@ -559,7 +652,8 @@ drag is in progress."
             ;; the selected pane's live payload under the press-time rect
             live {:rect (:rect td) :payload (ed-current-pane m)}
             hscroll (ed-current-hscroll m)
-            off0 (ed-buf-offset-at buf (ed-pane-line-at-clamped live buf row) hscroll (:gw td) s px col)
+            off0 (ed-buf-offset-at buf (ed-pane-line-at-clamped live buf row)
+                   (ed-pane-row-hscroll live buf row) (:gw td) s px col)
             ;; Edge auto-scroll (the horizontal analogue of dragging past the bottom to
             ;; scroll down): a pane's right edge IS the window edge, so the pointer can't
             ;; go beyond it to map to off-screen columns. Instead, when the drag is against
@@ -600,11 +694,12 @@ and arm a text-selection drag (`ed-mouse-begin-select`)."
                                        (:path pane)
                                        (fn (w)
                                          (assoc w
-                                           :top (ed-scrollbar-top-for buf vh row py))))
+                                           :top (ed-scrollbar-top-for buf vh row py (ed-pane-text-cols pane buf)))))
                                    :sb-drag
                                      {:path (:path pane)
                                       :sy py
                                       :vh vh
+                                      :w (ed-pane-text-cols pane buf)
                                       :buf (get-in pane [:payload :buffer])}))
             (< row (+ py vh)) (ed-mouse-begin-select selected pane buf row col)
             else selected)))))
@@ -621,7 +716,7 @@ follow the pointer (`ed-scrollbar-top-for`). A no-op if not dragging one."
             (:path sb)
             (fn (w)
               (assoc w
-                :top (ed-scrollbar-top-for (ed-buf-at m (:buf sb)) (:vh sb) row (:sy sb)))))))))
+                :top (ed-scrollbar-top-for (ed-buf-at m (:buf sb)) (:vh sb) row (:sy sb) (:w sb)))))))))
 
 (defn ed-mouse-drag (m row col)
   "While dragging a divider, set its split's ratio so the boundary follows the
@@ -676,7 +771,7 @@ any accumulated sub-line fractional offset)."
   (let (buf (ed-pane-buf m pane)
         top (or (get-in pane [:payload :top]) 0)
         [px py pw ph] (or (:rect pane) [0 0 80 24])
-        maxtop (ed-max-top buf (math/max 1 (dec ph)))
+        maxtop (ed-max-top buf (math/max 1 (dec ph)) (ed-pane-text-cols pane buf))
         new-top (math/max 0 (math/min maxtop (+ top delta)))
         m2 (assoc m
              :layout
@@ -698,7 +793,7 @@ value crosses a whole line, advance `:top` and keep the remainder. `:scroll-frac
         new-frac-raw (+ frac dy-frac)
         lines (math/floor new-frac-raw)
         remainder (- new-frac-raw lines)
-        maxtop (ed-max-top buf (math/max 1 (dec ph)))
+        maxtop (ed-max-top buf (math/max 1 (dec ph)) (ed-pane-text-cols pane buf))
         ideal-top (+ top lines)
         new-top (math/max 0 (math/min maxtop ideal-top))
         ;; Zero the fraction at hard boundaries so the view doesn't oscillate.

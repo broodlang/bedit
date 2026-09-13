@@ -39,7 +39,8 @@ pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
   ;; that RETURNS the string. Referring the writer bare here would shadow the op.
   (:use io :exclude [inspect]) ; fn-port — the editor-targeting log sink (buffer-log-event)
   (:use keymaps) ; profile-layers — seed the model-scope keybinding profile (emacs default)
-  (:use task)) ; task — run the advisory diagnostics check off the loop (async recheck)
+  (:use task) ; task — run the advisory diagnostics check off the loop (async recheck)
+  (:use wrap)) ; line-segments / row-of / row-count — a wrapped buffer's rows, for the scroll clamp
 ;; editor/lineedit (minibuffer core), gitdiff (diff-hl annotate) and json (runner event
 ;; decode) are referenced qualified below — each `mod/name` auto-loads its module.
 
@@ -137,6 +138,7 @@ carries a `:dir`; a fileless one inherits it where it's opened (see `ed-open-buf
     ;; read is typed at its one producer rather than guessed at every consumer
     :cycle-spacing (optional (record &open :orig (optional (record &open :text string :offset int))))
     :diagnostics (optional (or nil (list (record &open :line (optional int) :col (optional int)))))
+    :diag-by-line (optional map) ; `ed-diag-index` of `:diagnostics` — set with it, read per visible line
     :query-replace (optional (record &open :match (or nil int) :from string :to string :count int))
     :completion (optional (record &open :items list :index int))
     :compile-errors (optional (or nil (list (record &open :file string :line int))))))
@@ -165,6 +167,10 @@ minibuffer/prefix."
    ;; and dribble in over seconds after the run finished. Inert in pure `ed-update` tests
    ;; (it only affects the live loop).
    :coalesce-input? true
+   ;; the window's X button reaches `ed-update` as `:close` instead of quitting the loop
+   ;; outright (std/editor/ui.blsp) — it runs `cmd-quit`, which asks about unsaved work
+   ;; first, exactly as C-x C-c does.
+   :close-is-input? true
    :blink-on? true
    :timers {:cursor-blink {:every *blink-ms* :idle? true}}})
 
@@ -309,6 +315,29 @@ the previous newline (0 at the first line). Tail-recursive."
 ;; back to a synchronous check. The check is the buffer mode's `:diagnostics` service
 ;; (brood-mode → the in-process type checker); buffers whose mode offers none never pay.
 
+(defn ed-diag-index (diags)
+  "`diags` (`{:line :col :message}`, 1-based lines) as `{0-based line -> (the diagnostics
+on it, in order)}` — the shape the view reads. Built ONCE, when a check's result lands
+(`ed-set-diagnostics`), because every reader is per frame and per VISIBLE line: the token
+underlines, the ⚠ end-of-line notes, the echo row's message. Read as a list per frame, a
+large file's checker output made the view O(all diagnostics) on every cursor blink —
+2,547 findings cost 135 ms a frame where the same frame without them cost 2.6. A
+diagnostic with no `:line` cannot be placed and is left out (the count still sees it)."
+  (fold diags {}
+    (fn (acc d)
+      (let (ln (:line d))
+        (if (nil? ln)
+          acc
+          (assoc acc (dec ln) (append (get acc (dec ln) '()) (list d))))))))
+
+(sig ed-set-diagnostics (model any any -> model))
+(defn ed-set-diagnostics (m diags rope)
+  "The model with `diags` as its diagnostics cache, computed for `rope` (`:diag-rope`, the
+staleness key) — and indexed by line (`:diag-by-line`, `ed-diag-index`). The ONE setter,
+so the list and its index cannot disagree: both check paths (`ed-refresh-diagnostics`,
+`ed-apply-diag`) land here."
+  (assoc m :diagnostics diags :diag-rope rope :diag-by-line (ed-diag-index diags)))
+
 (defn ed-refresh-diagnostics (m)
   "The model with `:diagnostics` (a list of `{:line :col :message}`) + `:diag-rope`
 refreshed iff the current buffer has a `:diagnostics` service and its rope changed since
@@ -319,7 +348,7 @@ tests share."
         rope (buffer-rope buf))
     (if (or (nil? svc) (= rope (:diag-rope m)))
       m
-      (assoc m :diagnostics (svc (buffer-text buf)) :diag-rope rope))))
+      (ed-set-diagnostics m (svc (buffer-text buf)) rope))))
 
 (defn- ed-buffer-dir (buf)
   "The directory `buf` lives in — its `:dir`, else its file's folder, else the working
@@ -464,9 +493,7 @@ the buffer moved on while it ran, `ed-tree-warm-stale?` fires again on the next 
 errored / timed out) into the model: store it against the rope it was computed for
 (`:diag-checking` → `:diag-rope`) and clear the in-flight handle. `ed-diag-stale?` then
 re-fires iff the buffer moved on while the check ran, so the next idle tick relaunches."
-  (assoc m
-    :diagnostics (or result '())
-    :diag-rope (:diag-checking m)
+  (assoc (ed-set-diagnostics m (or result '()) (:diag-checking m))
     :diag-proc nil
     :diag-checking nil))
 
@@ -1518,6 +1545,66 @@ once per `*auto-save-interval-ms*`. Returns the model with `:auto-saved-at` upda
                 (catch e (log/warn (str "auto-save of " path " failed: " (error-message e))))))))
         (assoc m :auto-saved-at now-ms)))))
 
+(sig ed-revert-at (model int -> model))
+(defn ed-revert-at (m i)
+  "Re-read pool buffer `i` from its file, discarding its unsaved changes: the buffer
+keeps its name, mode (`:layers`) and dir, every pane on it keeps its point (clamped to
+the new length), undo history resets. The shared core of `M-x revert-buffer` (the
+current buffer) and the idle beat's auto-revert (any buffer another writer changed).
+Raises if the file cannot be read — the callers report."
+  (let (b (ed-buf-at m i)
+        f (buffer-file b)
+        fresh (find-file-buffer f)
+        len (buffer-length fresh)
+        ;; Carry the original buffer's MODE (`:layers`) + dir onto the reverted buffer.
+        ;; The line-number / diff-hl gutter, highlighting and eldoc are all `:layers`
+        ;; mode services — a bare `find-file-buffer` has none (they're seeded lazily on
+        ;; the next dispatch), so without this the gutter vanishes until the next
+        ;; keystroke re-inits them. diff-hl re-arms on its own (fresh has no
+        ;; `:git-status-rope`, so it recomputes against the new content on the idle beat).
+        reverted (goto-char (assoc fresh :name (buffer-name b) :layers (:layers b) :dir (:dir b))
+                   (math/min (buffer-point b) len)))
+    (ed-map-panes (assoc m :buffers (assoc (:buffers m) i reverted))
+      (fn (w)
+        (if (and (= (:buffer w) i) (not (nil? (:point w))))
+          (assoc w :point (math/min (:point w) len) :mark nil)
+          w)))))
+;; ---- files that change under the editor ------------------------------------
+;; Another writer — a formatter, `git checkout`, a build step, a colleague's editor —
+;; rewrites a file this editor has open. Emacs's answer is two-fold: `auto-revert` reloads
+;; a buffer with no unsaved changes, and a buffer WITH changes is protected: the save
+;; asks before overwriting the other writer's work. The knowledge of "changed since we
+;; last agreed" lives in `std/editor/buffer` (`:file-mtime`, `buffer-file-changed?`);
+;; this is the policy over it, run on the idle beat so it costs a keystroke nothing.
+
+(sig ed-revert-changed-files (model -> model))
+(defn ed-revert-changed-files (m)
+  "For every file buffer whose file was written since it last agreed with the buffer
+(`buffer-file-changed?`): a buffer with NO unsaved changes is reverted in place (Emacs
+`global-auto-revert-mode`) with a note in the echo area; one WITH unsaved changes is left
+alone and warned about once per on-disk version (`:disk-warned` remembers the mtime told
+about), since `cmd-save` will ask before overwriting. A revert that fails (the file
+unreadable now) is logged and skipped. Runs on the idle beat."
+  (fold (range (count (:buffers m)))
+    m
+    (fn (acc i)
+      (let (b (ed-buf-at acc i))
+        (if (not (buffer-file-changed? b))
+          acc
+          (let (f (buffer-file b)
+                now (file/mtime f))
+            (cond
+              (not (:modified b))
+                (try
+                  (message (ed-revert-at acc i) (str "reverted " f " (changed on disk)"))
+                  (catch e
+                    (do (log/warn (str "auto-revert of " f " failed: " (error-message e)))
+                      acc)))
+              (= (:disk-warned b) now) acc
+              else
+                (message (assoc acc :buffers (assoc (:buffers acc) i (assoc b :disk-warned now)))
+                  (str f " changed on disk — save will ask; M-x revert-buffer to reload")))))))))
+
 ;; ---- scrolling --------------------------------------------------------------
 
 (def *scroll-margin* 4) ; Emacs `scroll-margin`: lines of context kept above/below point
@@ -1527,12 +1614,44 @@ once per `*auto-save-interval-ms*`. Returns the model with `:auto-saved-at` upda
 below half the viewport (so a tall margin in a short pane can't exceed what fits)."
   (math/max 0 (math/min *scroll-margin* (math/quot (dec textrows) 2))))
 
-(sig ed-max-top (buffer int -> int))
-(defn ed-max-top (buf textrows)
+(sig ed-max-top (buffer int &optional (or nil int) -> int))
+(defn ed-max-top (buf textrows &optional (w nil))
   "The largest scroll offset that still fills a `textrows`-tall viewport — the last
 line sits on the bottom row. Beyond this there'd be blank space past end-of-buffer, so
-scrolling clamps here (and the bottom margin relaxes near EOF, as in Emacs)."
-  (math/max 0 (- (buffer-line-count buf) textrows)))
+scrolling clamps here (and the bottom margin relaxes near EOF, as in Emacs). For a
+wrapped buffer (`ed-wrap?`) given its text width `w`, the last line's LAST row sits on
+the bottom row — a wrapped line takes several, so the top can be higher than the line
+count says; without `w` the line arithmetic stands (a caller with no width to measure at)."
+  (if (and w (> w 0) (ed-wrap? buf))
+    (let (last (dec (buffer-line-count buf))
+          segs (wrap/line-segments buf last w))
+      (ed-wrap-top-for buf last (dec (count segs)) w textrows 0))
+    (math/max 0 (- (buffer-line-count buf) textrows))))
+
+(sig ed-wrap? (buffer -> bool))
+(defn ed-wrap? (buf)
+  "Whether `buf` wraps long lines visually (`visual-line-mode`, M-x visual-line-mode):
+a long line takes as many screen rows as it needs instead of scrolling sideways. Per
+buffer, as in Emacs: the buffer's own `:visual-line` when it has been toggled, else the
+mode's `:visual-line` facet (markdown wraps by default). The break rule is
+`wrap/segments`."
+  (let (own (:visual-line buf))
+    (if (nil? own) (= true (ed-mode-service buf :visual-line)) (= true own))))
+
+(sig ed-wrap-top-for (buffer int int int int int -> int))
+(defn- ed-wrap-top-for (buf line seg-row w budget floor)
+  "The highest scroll top that still shows point's row of a wrapped buffer within
+`budget` rows from the top: from `line` (whose rows through point's, `seg-row + 1`, are
+already spent) walk up a line at a time while the line above fits — never above
+`floor`. Tail-recursive over the lines above."
+  (let (step (fn (t used)
+               (if (<= t floor)
+                 t
+                 (let (above (count (wrap/line-segments buf (dec t) w)))
+                   (if (> (+ used above) budget)
+                     t
+                     (step (dec t) (+ used above)))))))
+    (step line (inc seg-row))))
 
 (sig ed-scroll (model int -> model))
 (defn ed-scroll (m textrows)
@@ -1540,7 +1659,9 @@ scrolling clamps here (and the bottom margin relaxes near EOF, as in Emacs)."
 above and below it within a `textrows`-tall viewport — scrolling only as far as needed
 (Emacs `scroll-margin` + `scroll-conservatively`: never recenter, just enough). Clamped
 so it never scrolls past end-of-buffer (no blank void below the last line); near the
-edges the margin is whatever the buffer allows. Pure."
+edges the margin is whatever the buffer allows. A wrapped buffer (`ed-wrap?`) counts
+ROWS below the top, not lines — a long line above point takes several — against the
+text width the loop last stored (`:view-cols`); the margin above stays in lines. Pure."
   (let (buf (ed-current-buf m)
         line (buffer-current-line buf)
         top (ed-current-top m)
@@ -1552,14 +1673,26 @@ edges the margin is whatever the buffer allows. Pure."
         restrict (ed-selected-restrict m)
         [rtop rbot] (if restrict (ed-restrict-lines buf restrict) [0 (dec (buffer-line-count buf))])
         mintop rtop
+        w (or (:view-cols m) 0)
+        wrap? (and (ed-wrap? buf) (> w 0))
+        ;; wrapped: the top that puts the last (restricted) line's last row on the bottom row
         maxtop (math/max rtop
-                 (math/min (ed-max-top buf textrows) (math/max 0 (- (inc rbot) textrows))))
+                 (if wrap?
+                   (ed-wrap-top-for buf rbot (dec (count (wrap/line-segments buf rbot w))) w textrows rtop)
+                   (math/min (ed-max-top buf textrows) (math/max 0 (- (inc rbot) textrows)))))
         lo (+ top mgn) ; first comfortable line (margin below top)
         hi (- (+ top textrows) 1 mgn) ; last comfortable line (margin above bottom)
         want (cond
                (< line lo) (- line mgn)
-               (> line hi) (+ (- line textrows) 1 mgn)
-               else top))
+               (not wrap?) (if (> line hi) (+ (- line textrows) 1 mgn) top)
+               else
+                 ;; point's row below the top: the rows of the lines above it plus its
+                 ;; own segment; past the comfortable last row, raise the top just enough
+                 (let (seg-row (wrap/row-of (wrap/line-segments buf line w) (buffer-column buf))
+                       r (+ (wrap/row-count buf top line w) seg-row))
+                   (if (> r (- textrows 1 mgn))
+                     (math/max top (ed-wrap-top-for buf line seg-row w (- textrows mgn) mintop))
+                     top))))
     (ed-set-top m (math/max mintop (math/min maxtop want)))))
 
 ;; ---- horizontal scroll (long lines, no wrap): keep point's column in view ----
@@ -1580,12 +1713,15 @@ edges the margin is whatever the buffer allows. Pure."
 text area, keeping `*hscroll-margin*` columns of slack — the horizontal analogue of
 `ed-scroll`, so a long line scrolls sideways to follow point instead of clipping. Char-
 column based (exact for ASCII; a line of wide glyphs is approximate, as elsewhere)."
-  (let (col (buffer-column (ed-current-buf m))
+  (let (buf (ed-current-buf m)
+        col (buffer-column buf)
         hs (ed-current-hscroll m)
         mgn (math/max 0 (math/min *hscroll-margin* (math/quot (dec cols) 2)))
         lo (+ hs mgn)
         hi (- (+ hs cols) 1 mgn))
     (cond
+      ;; a wrapped buffer never scrolls sideways: its long lines take more rows instead
+      (ed-wrap? buf) (if (= hs 0) m (ed-set-hscroll m 0))
       (< col lo) (ed-set-hscroll m (math/max 0 (- col mgn)))
       (> col hi) (ed-set-hscroll m (math/max 0 (+ (- col cols) 1 mgn)))
       else m)))

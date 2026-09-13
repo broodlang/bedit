@@ -327,6 +327,16 @@ A batch of everyday Emacs commands + discoverability, all on existing primitives
   driven highlighting for other languages comes with §C. Plus **markdown-mode**,
   **env-mode** (`.env`), and **docker-mode** (`Dockerfile`) — fontify-only layers over
   `std/editor/{markdown,dotenv,dockerfile}`.
+- ✅ **visual-line-mode** (2026-09-13) — `src/wrap.blsp` + the pane row table; markdown
+  wraps by default, `M-x visual-line-mode` toggles. Tabs paint on their stops (Brood
+  ADR-342). `C-n`/`C-p` still move by logical line (Emacs moves visually — deferred).
+- ✅ **Quit / kill / save safety + auto-revert** (2026-09-13) — `save-buffers-kill-terminal`
+  on `C-x C-c` and the window's ✕ (Brood `:close-is-input?`), `C-x k` asks, a save onto a
+  file changed on disk asks, a clean buffer auto-reverts on the idle beat (Brood
+  `buffer-file-changed?`).
+- ✅ **The everyday tail** (2026-09-13) — `C-x C-b`, `M-/` dabbrev (redo → `C-?`), `M-!` /
+  `M-|`, `C-x C-o`, `sort-lines`, `delete-trailing-whitespace`, `M-=`, `C-x i`; which-key in
+  columns.
 - ⬜ **Browsable `*Kill Ring*`** view. (which-key ✅ — see §A.2.)
 - ⬜ **regex** ranges `[a-z]` / captures / `{m,n}` (`regex`, brood repo).
 - ⬜ **layers** extras (brood repo): `:commands` manifest, per-binding `when`-guards,

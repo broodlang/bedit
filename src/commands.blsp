@@ -1122,18 +1122,9 @@ A hex view is refused: its text renders the binary, it is not the binary."
     (if (nil? f)
       (message m "no file to revert")
       (try
-        (let (fresh (find-file-buffer f)
-              p (math/min (buffer-point b) (buffer-length fresh))
-              ;; Carry the original buffer's MODE (`:layers`) + dir onto the reverted buffer.
-              ;; The line-number / diff-hl gutter, highlighting and eldoc are all `:layers`
-              ;; mode services — a bare `find-file-buffer` has none (they're seeded lazily on
-              ;; the next dispatch), so without this the gutter vanishes until the next
-              ;; keystroke re-inits them. diff-hl re-arms on its own (fresh has no
-              ;; `:git-status-rope`, so it recomputes against the new content on the idle beat).
-              reverted (assoc fresh :name (buffer-name b) :layers (:layers b) :dir (:dir b)))
-          (message (ed-set-buf m (goto-char reverted p))
-            (str "reverted " f)))
+        (message (ed-revert-at m (ed-current-index m)) (str "reverted " f))
         (catch e (message m (str "revert failed: " (error-message e))))))))
+
 
 ;; ---- keyboard macros (C-x ( / C-x ) / C-x e) --------------------------------
 ;; Recording captures raw input events into `:macro-recording` (the capture happens in
@@ -2663,7 +2654,8 @@ loop."
 
 (defcommand cmd-kill-buffer
   (m key)
-  "Kill the current buffer (C-x k). Refuses to kill `*Messages*`; if it would leave
+  "Kill the current buffer (C-x k) — asking first when it holds unsaved changes to a
+file. Refuses to kill `*Messages*`; if it would leave
 no editable buffer, opens a fresh `*scratch*`. Panes showing the killed buffer are
 re-pointed; indices above it shift down. A hosted slot is unhosted first — its
 process stopped when locally owned, presence withdrawn when shared — and the
@@ -2673,9 +2665,16 @@ async-cleanup seam where a mode kills a worker it owns (the tutorial's eval
 sandbox; a natural home for bshell's shell process too) — and any companion buffers
 that mode asked to take with it (`layers/request-close`) are killed as well."
   (let (buf (ed-current-buf m))
-    (if (= (buffer-name buf) "*Messages*")
-      (message m "cannot kill *Messages*")
-      (ed-kill-at m (ed-current-index m) true))))
+    (cond
+      (= (buffer-name buf) "*Messages*") (message m "cannot kill *Messages*")
+      ;; unsaved changes to a file: ask, as Emacs does, rather than drop them silently
+      (and (:modified buf) (buffer-file buf))
+        (ed-read-char m (str "Buffer " (buffer-name buf) " modified; kill anyway? (y or n)")
+          (fn (mm k)
+            (if (or (= k "y") (= k "Y"))
+              (ed-kill-at mm (ed-current-index mm) true)
+              (message mm "kill canceled"))))
+      else (ed-kill-at m (ed-current-index m) true))))
 
 (sig ed-kill-buffer-named (model string -> model))
 (defn ed-kill-buffer-named (m nm)
@@ -3083,6 +3082,19 @@ split's panes exchange places, sizes kept."
   "Toggle the left line-number gutter on the selected pane (C-x l). Pane-local, so
 one pane can show numbers while another doesn't."
   (ed-toggle-line-numbers m))
+
+(defcommand cmd-visual-line-mode
+  (m key)
+  "Toggle visual-line-mode on the current buffer (M-x visual-line-mode): a long line
+shows on as many rows as it needs, broken after words (`wrap/segments`), instead of
+scrolling sideways — Emacs's `visual-line-mode`, per buffer. The horizontal scroll is
+reset when it turns on (a wrapped buffer never scrolls sideways) and the mode line says
+`Wrap`. `C-n`/`C-p` still move by logical line."
+  (let (buf (ed-current-buf m)
+        on? (not (ed-wrap? buf))
+        m2 (ed-set-buf m (assoc buf :visual-line on?)))
+    (message (if on? (ed-set-hscroll m2 0) m2)
+      (if on? "visual-line-mode on: long lines wrap" "visual-line-mode off: long lines scroll"))))
 
 ;; ---- buffer/file prompts (open a minibuffer; see input/minibuffer-handle) ---
 
@@ -3598,18 +3610,83 @@ isn't on a process row, or the process is already gone."
 
 ;; ---- files + quit -----------------------------------------------------------
 
+(sig ed-modified-file-indices (model -> list))
+(defn ed-modified-file-indices (m)
+  "The pool indices of the buffers with unsaved changes to a FILE, in pool order — what a
+quit must ask about. A modified scratch or generated buffer has nowhere to be saved and is
+not asked about (Emacs asks only for file-visiting buffers)."
+  (seq/filter (range (count (:buffers m)))
+    (fn (i) (let (b (ed-buf-at m i)) (and (:modified b) (not (nil? (buffer-file b))))))))
+
+(defn- ed-quit-ask (m pending save-all?)
+  "Emacs `save-buffers-kill-terminal`: for each modified file buffer in `pending` ask
+`Save file …? (y, n, !, q)` — `y` saves it, `n` skips it, `!` saves it and every one
+after without asking, `q` stops asking — then, if anything is still modified, `Modified
+buffers exist; exit anyway? (y or n)`. `C-g` / Esc at any prompt cancels the quit. Each
+answer is a `ed-read-char` continuation, so the loop stays live between questions."
+  (cond
+    (empty? pending)
+      (if (empty? (ed-modified-file-indices m))
+        (assoc m :done true)
+        (ed-read-char m "Modified buffers exist; exit anyway? (y or n)"
+          (fn (mm k)
+            (if (or (= k "y") (= k "Y"))
+              (assoc mm :done true)
+              (message mm "quit canceled")))))
+    save-all? (ed-quit-ask (ed-save-buf-at m (first pending)) (rest pending) true)
+    else
+      (let (i (first pending))
+        (ed-read-char m (str "Save file " (buffer-file (ed-buf-at m i)) "? (y, n, !, q)")
+          (fn (mm k)
+            (cond
+              (or (= k "y") (= k "Y")) (ed-quit-ask (ed-save-buf-at mm i) (rest pending) false)
+              (= k "n") (ed-quit-ask mm (rest pending) false)
+              (= k "!") (ed-quit-ask mm pending true)
+              (= k "q") (ed-quit-ask mm '() false)
+              else (message mm "quit canceled")))))))
+
 (defcommand cmd-quit
   (m key)
-  "Quit the editor (C-x C-c). The window's X button also quits, delivered as `:close`
-and handled by `ui-run` itself — not bound here. ESC is *not* quit (it's
-`keyboard-escape-quit`; see `modes`)."
-  (assoc m :done true))
+  "Quit the editor (C-x C-c, and the window's X button, delivered as `:close` — the
+model claims it with `:close-is-input?` so it lands here rather than quitting the loop
+outright). With unsaved changes to a file it asks first, buffer by buffer, the way Emacs's
+`save-buffers-kill-terminal` does (`ed-quit-ask`); with none it quits at once. ESC is
+*not* quit (it's `keyboard-escape-quit`; see `modes`)."
+  (ed-quit-ask m (ed-modified-file-indices m) false))
+
+(sig ed-save-buf-at (model int -> model))
+(defn ed-save-buf-at (m i)
+  "Write pool buffer `i` to its file: the plain save every path shares — `C-x C-s` on the
+current buffer, and `save-some-buffers` on any other at quit. Clears the buffer's
+`:modified` flag in the pool and deletes its `#filename#` auto-save sidecar on success;
+reports the outcome in the echo area either way. The diff-hl gutter is NOT recomputed
+here: a save writes the working tree but touches neither the buffer text nor HEAD, so
+the buffer-vs-HEAD diff is unchanged (and any prior edit already refreshed it via the
+rope-keyed idle recompute). Leaving the cached `:git-line-status` in place keeps the bars
+steady — dropping it made them blink off and back on each save."
+  (let (buf (ed-buf-at m i))
+    (try
+      ;; `save-buffer` answers the buffer stamped with the file's new mtime, so the idle
+      ;; beat's change check (`ed-revert-changed-files`) knows text and file agree again
+      (let (saved (dissoc (save-buffer buf) :modified :disk-warned)
+            f (buffer-file buf)
+            as-path (ed-auto-save-path f)
+            m2 (dissoc (assoc m :buffers (assoc (:buffers m) i saved)) :status))
+        (do
+          (when (file/exists? as-path)
+            (try
+              (file/rm as-path)
+              (catch e
+                (log/warn (str "could not remove auto-save " as-path ": " (error-message e))))))
+          (message m2 (str "saved " f))))
+      (catch e (message m (str "save failed: " (error-message e)))))))
 
 (defcommand cmd-save
   (m key)
   "Write the current buffer to its file (C-x C-s); report the outcome in the echo
 area. Clears the buffer's `:modified` flag and deletes the `#filename#` auto-save
-sidecar on success. A no-op-with-message if the buffer has no backing file."
+sidecar on success (`ed-save-buf-at`). A no-op-with-message if the buffer has no
+backing file."
   (let (buf (ed-current-buf m)
         ;; format-on-save, when the user asked for it and this buffer's language has a
         ;; formatter. It does the save itself (the formatter works on the FILE, so the
@@ -3624,26 +3701,16 @@ sidecar on success. A no-op-with-message if the buffer has no backing file."
         (message m "a hex view is not saved (it renders the binary; edit the file itself)")
       (nil? (buffer-file buf))
         (message m "no file to save (C-x C-f to open one, or run: nest run -- <path>)")
-      else
-        (try
-          ;; The diff-hl gutter is NOT recomputed here: a save writes the working tree but
-          ;; touches neither the buffer text nor HEAD, so the buffer-vs-HEAD diff is unchanged
-          ;; (and any prior edit already refreshed it via the rope-keyed idle recompute). Leaving
-          ;; the cached `:git-line-status` in place keeps the bars steady — dropping it made them
-          ;; blink off and back on each save.
-          (do
-            (save-buffer buf)
-            (let (f (buffer-file buf)
-                  as-path (ed-auto-save-path f)
-                  saved (dissoc buf :modified)
-                  m2 (dissoc (ed-set-buf m saved) :status))
-              (when (file/exists? as-path)
-                (try
-                  (file/rm as-path)
-                  (catch e
-                    (log/warn (str "could not remove auto-save " as-path ": " (error-message e))))))
-              (message m2 (str "saved " f))))
-          (catch e (message m (str "save failed: " (error-message e))))))))
+      ;; another writer changed the file since this buffer last agreed with it: saving
+      ;; would overwrite their work, so ask (Emacs: \"has changed since visited or saved\")
+      (buffer-file-changed? buf)
+        (ed-read-char m
+          (str (buffer-file buf) " has changed since visited or saved. Save anyway? (y or n)")
+          (fn (mm k)
+            (if (or (= k "y") (= k "Y"))
+              (ed-save-buf-at mm (ed-current-index mm))
+              (message mm "save canceled (M-x revert-buffer to reload the disk version)"))))
+      else (ed-save-buf-at m (ed-current-index m)))))
 
 ;; ---- eval-in-buffer (the C-x C-e family, via std/eval-command) --------------
 ;; Thin `(model key) -> model` wrappers over `std/eval-command.blsp`, which does
@@ -4818,3 +4885,282 @@ who you're following (M-x collab-status; a quick sanity probe when testing sessi
             " · here: "
             (if (empty? who) "just you" (string/join who ", "))
             (if f (str " · following " (:name f)) "")))))))
+
+;; ---- the everyday Emacs tail: buffer list, dabbrev, shell commands, line utilities --
+;; The commands a user reaches for in the first hour that were not here: `C-x C-b`,
+;; `M-/`, `M-!` / `M-|`, `C-x C-o`, `M-x sort-lines`, `M-x delete-trailing-whitespace`,
+;; `M-=`, `C-x i`. Each is a `(model key) -> model` over the buffer primitives; the two
+;; that run a program go through `%os-cmd` in the buffer's `default-directory`.
+
+(defn- ed-buffer-list-text (m)
+  "The `*Buffer List*` rows: one per pool buffer — `*` when modified, `%` when read-only,
+then name, size, mode and file (Emacs `list-buffers`, minus the columns nobody reads)."
+  (let (rows (map (:buffers m)
+               (fn (b)
+                 (str "  "
+                   (if (:modified b) "*" " ")
+                   (if (read-only? b) "%" " ")
+                   " "
+                   (string/pad-right (buffer-name b) 24)
+                   " "
+                   (string/pad-left (str (buffer-length b)) 8)
+                   "  "
+                   (string/pad-right (ed-buf-mode-name b) 12)
+                   " "
+                   (or (buffer-file b) "")))))
+    (str "  MR Buffer                       Size  Mode         File\n"
+      (string/join rows "\n")
+      "\n")))
+
+(defn- ed-buffer-list-name-at (m)
+  "The buffer named on the current `*Buffer List*` row: the name column, matched back
+against the pool (a name can hold spaces, so the row is matched by prefix, longest first)."
+  (let (line (buffer-line-at (ed-current-buf m) (buffer-current-line (ed-current-buf m)))
+        body (if (>= (string/length line) 5) (string/substring line 5 (string/length line)) "")
+        names (sort (map (:buffers m) buffer-name) (fn (a b) (> (string/length a) (string/length b)))))
+    (seq/find names (fn (nm) (string/starts-with? body nm)))))
+
+(defcommand cmd-list-buffers
+  (m key)
+  "List every open buffer in a read-only `*Buffer List*` (C-x C-b, Emacs `list-buffers`):
+modified/read-only flags, name, size, mode and file. `RET` visits the buffer on the row,
+`g` refreshes, `q` quits — the `:buffer-menu` mode's keys."
+  (ed-show-named m "*Buffer List*" (ed-buffer-list-text m) :buffer-menu))
+
+(defcommand cmd-buffer-menu-select
+  (m key)
+  "RET in `*Buffer List*`: switch to the buffer named on this row."
+  (let (nm (ed-buffer-list-name-at m))
+    (if (nil? nm) (message m "not on a buffer row") (ed-switch-to-named m nm))))
+
+(defcommand cmd-buffer-menu-refresh
+  (m key)
+  "g in `*Buffer List*`: rebuild the listing."
+  (cmd-list-buffers m key))
+
+;; dabbrev-expand (M-/): complete the word before point from the words in the buffer,
+;; nearest-before-point first, then after; a repeated M-/ tries the next candidate in
+;; place of the last one — Emacs `dabbrev-expand`, without the other-buffer search.
+(defn- ed-dabbrev-candidates (text prefix at)
+  "The distinct words of `text` that start with `prefix` (and are longer than it), ordered
+by distance from offset `at`: the nearest before point first, then the ones after."
+  (let (words (ed-word-spans text) ; `[start end]` per word, in order
+        before (reverse (seq/filter words (fn ([s e]) (< e at))))
+        after (seq/filter words (fn ([s e]) (> s at)))
+        pick (fn (spans)
+               (seq/keep spans
+                 (fn ([s e])
+                   (let (w (string/substring text s e))
+                     (when (and (> (string/length w) (string/length prefix))
+                             (string/starts-with? w prefix))
+                       w))))))
+    (seq/distinct (append (pick before) (pick after)))))
+
+(defn- ed-word-spans (text)
+  "`[start end]` of every run of word characters in `text` (`complete-word-char?`)."
+  (let (n (string/length text)
+        step (fn (i start acc)
+               (cond
+                 (>= i n) (reverse (if start (cons [start n] acc) acc))
+                 (complete-word-char? (string/char-at text i))
+                   (step (inc i) (or start i) acc)
+                 start (step (inc i) nil (cons [start i] acc))
+                 else (step (inc i) nil acc))))
+    (step 0 nil '())))
+
+(defcommand cmd-dabbrev-expand
+  (m key)
+  "Expand the word before point to a word in the buffer that starts with it (M-/, Emacs
+`dabbrev-expand`): the nearest one before point, then the ones after. Pressing M-/ again
+right away replaces the expansion with the next candidate; anything else ends the cycle.
+The state rides `:dabbrev` (`{:start :prefix :candidates :index}`) and is honoured only
+while `:last-command` is this one."
+  (let (buf (ed-current-buf m)
+        p (buffer-point buf)
+        st (:dabbrev m)
+        again? (and st (= (:last-command m) 'commands/cmd-dabbrev-expand))
+        text (buffer-text buf)
+        start (if again? (:start st) (let (s (ed-word-start text p)) s))
+        prefix (if again? (:prefix st) (string/substring text start p))
+        cands (if again? (:candidates st) (ed-dabbrev-candidates text prefix start))
+        index (if again? (inc (:index st)) 0))
+    (cond
+      (= prefix "") (message m "no word before point to expand")
+      (empty? cands) (message m (str "no expansion for `" prefix "`"))
+      (>= index (count cands))
+        ;; the cycle is over: back to the prefix, as Emacs does, and start again next time
+        (message (assoc (ed-edit m (fn (b) (replace-region b start p prefix))) :dabbrev nil)
+          (str "no further expansions for `" prefix "`"))
+      else
+        (let (w (nth cands index))
+          (assoc (ed-edit m (fn (b) (replace-region b start p w)))
+            :dabbrev {:start start :prefix prefix :candidates cands :index index})))))
+
+(defn- ed-word-start (text p)
+  "The start of the run of word characters ending at `p` in `text` (`p` itself when the
+char before it is not a word char)."
+  (let (step (fn (i) (if (and (> i 0) (complete-word-char? (string/char-at text (dec i)))) (step (dec i)) i)))
+    (step p)))
+
+;; shell commands: `M-!` runs one and shows its output; `M-|` pipes the region through
+;; one. Synchronous (`%os-cmd`, the buffer's directory), so a long-running command is
+;; what `C-c r` / the bshell are for — these are for `ls`, `date`, `sort -u`.
+(defn- ed-shell-run (m cmd stdin)
+  "`{:exit :stdout :stderr}` of `sh -c cmd` in the buffer's default directory, with
+`stdin` (nil for none)."
+  (let (dir (ed-default-dir m))
+    (if (nil? stdin)
+      (%os-cmd "sh" ["-c" cmd] dir)
+      (%os-cmd-stdin "sh" ["-c" cmd] stdin dir))))
+
+(defn- ed-shell-show (m cmd r)
+  "Show a shell command's result the Emacs way: one output line in the echo area, more in
+`*Shell Command Output*` beside the buffer; a failure's stderr joins the output."
+  (let (out (str (:stdout r) (if (= (:stderr r) "") "" (:stderr r)))
+        trimmed (string/trim out)
+        lines (string/split trimmed "\n"))
+    (cond
+      (= trimmed "") (message m (str "(shell command " (if (= (:exit r) 0) "succeeded" (str "failed: " (:exit r))) " with no output)"))
+      (= (count lines) 1) (message m trimmed)
+      else (ed-show-named-aside m "*Shell Command Output*" out :special))))
+
+(defcommand cmd-shell-command
+  (m key)
+  "Run a shell command and show its output (M-!, Emacs `shell-command`): one line of
+output goes to the echo area, more to `*Shell Command Output*` in a side pane. Runs
+`sh -c` in the buffer's directory, synchronously."
+  (assoc m
+    :minibuffer
+      {:edit (ed-mb-edit "Shell command: " "")
+       :on-complete (fn (mm t)
+                      (if (= (string/trim t) "")
+                        (message mm "no command")
+                        (ed-shell-show mm t (ed-shell-run mm t nil))))}))
+
+(defcommand cmd-shell-command-on-region
+  (m key)
+  "Pipe the region through a shell command (M-|, Emacs `shell-command-on-region`): the
+region is the command's stdin; the output is shown like `M-!` — or, with a prefix
+argument (`C-u M-|`), REPLACES the region (the `sort`/`fmt`/`jq .` idiom)."
+  (let (buf (ed-current-buf m)
+        rb (buffer-region-bounds buf)
+        replace? (not (nil? (current-prefix-arg m))))
+    (if (nil? rb)
+      (message m "no region (set the mark first)")
+      (let ([lo hi] rb
+            input (text/slice (buffer-rope buf) lo hi))
+        (assoc m
+          :minibuffer
+            {:edit (ed-mb-edit (if replace? "Shell command on region (replace): " "Shell command on region: ") "")
+             :on-complete (fn (mm t)
+                            (if (= (string/trim t) "")
+                              (message mm "no command")
+                              (let (r (ed-shell-run mm t input))
+                                (if (and replace? (= (:exit r) 0))
+                                  (message (ed-edit mm (fn (b) (replace-region b lo hi (:stdout r))))
+                                    (str "region replaced by `" t "`"))
+                                  (ed-shell-show mm t r)))))})))))
+(register-prefix-consuming 'commands/cmd-shell-command-on-region)
+
+;; line utilities
+(defn- ed-blank-line? (buf line)
+  "Whether buffer `line` holds only whitespace."
+  (= "" (string/trim (buffer-line-at buf line))))
+
+(defn- ed-blank-run (buf line dir)
+  "The last line of the run of blank lines from `line` in direction `dir` (+1 down, -1
+up), `line` itself when it is not blank or the run ends there."
+  (let (n (buffer-line-count buf)
+        step (fn (l)
+               (let (next (+ l dir))
+                 (if (and (>= next 0) (< next n) (ed-blank-line? buf next)) (step next) l))))
+    (if (ed-blank-line? buf line) (step line) line)))
+
+(defn- ed-delete-lines (buf from to)
+  "Delete buffer lines `[from, to]` inclusive, with their newlines."
+  (let (rope (buffer-rope buf)
+        n (buffer-line-count buf)
+        lo (text/line->char rope from)
+        hi (if (< (inc to) n) (text/line->char rope (inc to)) (buffer-length buf)))
+    (replace-region buf lo hi "")))
+
+(defcommand cmd-delete-blank-lines
+  (m key)
+  "On a blank line, delete all surrounding blank lines, leaving just one; on an isolated
+blank line, delete it; on a non-blank line, delete every blank line that follows it
+(C-x C-o, Emacs `delete-blank-lines`)."
+  (ed-edit m
+    (fn (b)
+      (let (line (buffer-current-line b))
+        (if (ed-blank-line? b line)
+          (let (first (ed-blank-run b line -1)
+                last (ed-blank-run b line 1))
+            (if (= first last)
+              (ed-delete-lines b line line) ; isolated: gone
+              ;; a run: keep one (the first), delete the rest, point on the survivor
+              (goto-char (ed-delete-lines b (inc first) last)
+                (text/line->char (buffer-rope b) first))))
+          (let (n (buffer-line-count b)
+                next (inc line))
+            (if (and (< next n) (ed-blank-line? b next))
+              (let (last (ed-blank-run b next 1)
+                    p (buffer-point b))
+                (goto-char (ed-delete-lines b next last) p))
+              b)))))))
+
+(defcommand cmd-sort-lines
+  (m key)
+  "Sort the lines of the region (or the current line's paragraph of one line — the
+whole buffer when there is no region) alphabetically, in place (M-x sort-lines)."
+  (ed-edit m
+    (fn (b)
+      (let (rope (buffer-rope b)
+            rb (buffer-region-bounds b)
+            [sl el] (if rb (region-line-range b) [0 (dec (buffer-line-count b))])
+            lo (text/line->char rope sl)
+            hi (if (< (inc el) (buffer-line-count b)) (text/line->char rope (inc el)) (buffer-length b))
+            block (text/slice rope lo hi)
+            trailing-nl (string/ends-with? block "\n")
+            body (if trailing-nl (string/substring block 0 (dec (string/length block))) block)
+            sorted (string/join (sort (string/split body "\n")) "\n"))
+        (goto-char (replace-region b lo hi (if trailing-nl (str sorted "\n") sorted)) lo)))))
+
+(defcommand cmd-delete-trailing-whitespace
+  (m key)
+  "Delete the spaces and tabs at the end of every line of the buffer (M-x
+delete-trailing-whitespace)."
+  (let (before (buffer-text (ed-current-buf m))
+        after (string/join (map (string/split before "\n") string/trimr) "\n"))
+    (if (= before after)
+      (message m "no trailing whitespace")
+      (message (ed-edit m (fn (b) (goto-char (replace-region b 0 (buffer-length b) after)
+                                    (math/min (buffer-point b) (string/length after)))))
+        "trailing whitespace deleted"))))
+
+(defcommand cmd-count-words
+  (m key)
+  "Report the lines, words and characters of the region, or of the whole buffer when there
+is none (M-=, Emacs `count-words`)."
+  (let (buf (ed-current-buf m)
+        rb (buffer-region-bounds buf)
+        text (if rb (text/slice (buffer-rope buf) (first rb) (second rb)) (buffer-text buf))
+        lines (count (seq/filter (string/split text "\n") (fn (l) (not (= l "")))))
+        words (count (ed-word-spans text)))
+    (message m (str (if rb "Region" "Buffer") " has " lines " lines, " words " words, and "
+                 (string/length text) " characters"))))
+
+(defcommand cmd-insert-file
+  (m key)
+  "Insert a file's contents at point (C-x i, Emacs `insert-file`), leaving point before the
+text and the mark after it, so the inserted text is the region."
+  (assoc m
+    :minibuffer
+      (ed-path-prompt "Insert file: " (str (ed-default-dir m) "/") []
+        (fn (mm t)
+          (if (or (not (file/exists? t)) (file/dir? t))
+            (message mm (str "no such file: " t))
+            (let (content (file/slurp t)
+                  p (buffer-point (ed-current-buf mm)))
+              ;; `insert` leaves point after the text: mark there, point back at the start
+              (message (ed-edit mm (fn (b) (goto-char (set-mark (insert b content)) p)))
+                (str "inserted " t))))))))

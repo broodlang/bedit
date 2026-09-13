@@ -1,0 +1,99 @@
+;; visual-line-mode: a long line shows on as many rows as it needs (src/wrap.blsp — the
+;; break rule; panes — the row table every row↔line question reads; view — the rows
+;; painted, the cursor and bands on them; model — the scroll clamp counting rows).
+(defmodule wrap-test
+  (:use model)
+  (:use input)
+  (:use view)
+  (:use panes)
+  (:use commands)
+  (:use wrap)
+  (:use editor/buffer)
+  (:use test))
+
+(defn m-of (text) (ed-init (make-buffer text)))
+(defn cur (m) (ed-current-buf m))
+(defn press (m keys) (fold keys m (fn (acc k) (ed-update acc k 80 24))))
+(defn wrapped (text)
+  "A model on `text` with visual-line-mode on."
+  (cmd-visual-line-mode (m-of text) nil))
+(defn line-texts (ops)
+  (map (seq/filter ops (fn (op) (and (vector? op) (= (first op) :text)))) (fn (op) (nth op 3))))
+
+(describe "wrap/segments — the break rule"
+  (test "a line that fits is one segment; an empty line one empty segment"
+    (assert= (segments "fits" 10) (list [0 4]))
+    (assert= (segments "" 10) (list [0 0]))
+    (assert= (segments "no width, no wrapping" 0) (list [0 21])))
+  (test "breaks fall after the last space that fits, the row keeping the space"
+    (assert= (segments "the quick brown fox jumps over the lazy dog" 10)
+      (list [0 10] [10 20] [20 26] [26 35] [35 43])))
+  (test "a word longer than the row breaks mid-word, never stalling"
+    (assert= (segments "abcdefghijklmnop" 5) (list [0 5] [5 10] [10 15] [15 16])))
+  (test "widths are display cells: a tab spans to the line's stop, a wide glyph two"
+    (assert= (segments "a\tbcd" 9) (list [0 3] [3 5])) ; a + 7-cell tab = 8, b fits (9), cd wrap
+    (assert= (segments "😀😀😀" 4) (list [0 2] [2 3])))
+  (test "row-of finds the segment holding a column; the end sits on the last row"
+    (let (segs (segments "the quick brown fox" 10))
+      (assert= (row-of segs 0) 0)
+      (assert= (row-of segs 9) 0)
+      (assert= (row-of segs 10) 1)
+      (assert= (row-of segs 19) 1)
+      (assert= (row-of (list [0 0]) 0) 0)))
+  (test "rows-from lays lines out row by row, stopping at the limit"
+    (let (buf (make-buffer "short\nthe quick brown fox\nx\n"))
+      (assert= (rows-from buf 0 10 10)
+        [[0 0 5] [1 0 10] [1 10 19] [2 0 1] [3 0 0]])
+      (assert= (rows-from buf 1 10 2) [[1 0 10] [1 10 19]])
+      (assert= (row-count buf 0 3 10) 4))))
+
+(describe "a wrapped pane paints, places the cursor, and maps a click by the same rows"
+  (def long-line "the quick brown fox jumps over the lazy dog")
+  (test "visual-line-mode toggles per buffer and shows on the mode line"
+    (let (m (wrapped "x"))
+      (is (ed-wrap? (cur m)))
+      (is (includes? (:echo m) "wrap"))
+      (is (not (ed-wrap? (cur (cmd-visual-line-mode m nil)))))))
+  (test "the view paints one row per segment, the gutter number only on the first"
+    ;; 30 cols: gutter 6 (min for a non-file buffer) → 23 text cells
+    (let (m (wrapped (str long-line "\nnext"))
+          ops (ed-view m 30 6)
+          texts (line-texts ops))
+      (is (any? texts (fn (t) (= t "the quick brown fox "))))
+      (is (any? texts (fn (t) (= t "jumps over the lazy dog"))))
+      (is (any? texts (fn (t) (= t "next"))))
+      ;; line numbers: 1 on the first row, 2 on the third — nothing on the continuation
+      (let (rows (seq/filter ops (fn (op) (and (vector? op) (= (first op) :text) (includes? (nth op 3) "  2")))))
+        (assert= (nth (first rows) 1) 2))))
+  (test "the cursor sits on the continuation row, at the column within that row"
+    (let (m (wrapped long-line)
+          m2 (ed-set-buf m (goto-char (cur m) 25)) ; "j" of jumps: row 1, col 5
+          ops (ed-view (assoc m2 :blink-on? true) 30 6)
+          c (seq/find ops (fn (op) (and (vector? op) (= (first op) :cursor)))))
+      (assert= (nth c 1) 1) ; row 1
+      (assert= (nth c 2) (+ 6 5)))) ; gutter + 5
+  (test "a click on a continuation row lands in that row's slice of the line"
+    (let (m (wrapped long-line)
+          pane (first (:panes (ed-body-layout m 30 6))))
+      (assert= (ed-pane-line-at pane (cur m) 1) 0) ; row 1 is still line 0
+      (assert= (ed-pane-row-hscroll pane (cur m) 1) 20) ; …its second segment
+      (assert= (ed-pane-line-at pane (cur m) 2) nil) ; nothing below the one line
+      ;; the press: row 1, screen col 6+5 → offset 25
+      (let (m2 (ed-update m [:mouse :press :left 1 11 [] 1] 30 6))
+        (assert= (buffer-point (cur m2)) 25))))
+  (test "no sideways scroll while wrapping: point at the line's end keeps hscroll 0"
+    (let (m (press (wrapped long-line) [:alt->]))
+      (assert= (ed-current-hscroll m) 0))))
+
+(describe "the scroll clamp counts rows for a wrapped buffer"
+  (test "moving point onto a line whose rows overflow the pane raises the top enough"
+    ;; 4 text rows (rows=6: 4 text + mode line + echo); three long lines of 2 rows each
+    (let (ll "the quick brown fox jumps over the lazy dog"
+          m (wrapped (str ll "\n" ll "\n" ll "\nend"))
+          at-end (ed-update m :alt-> 30 6)) ; M->: end of buffer, then the clamp
+      ;; unwrapped arithmetic would leave top at 0 (4 lines fit in 4 rows); wrapped, line
+      ;; 3 is row 6 — the top must move so it is on screen
+      (is (> (ed-current-top at-end) 0))
+      (let (pane (first (:panes (ed-body-layout at-end 30 6)))
+            rows (ed-pane-rows pane (cur at-end)))
+        (is (any? rows (fn ([line f t]) (= line 3))))))))

@@ -228,3 +228,122 @@
     ;; fires, kills the eval, and reports the timeout (received via eval-result).
     (let (m (eval-result (ed-eval-async (m-of "x") "(receive (after 100000 nil))" 50)))
       (is (includes? (:echo m) "timed out")))))
+
+;; Quitting with unsaved work asks first — Emacs `save-buffers-kill-terminal`. C-x C-c
+;; (and the window's X button, which reaches `ed-update` as `:close`) used to set `:done`
+;; outright, dropping every unsaved edit on the floor.
+(describe "quit asks about unsaved file buffers"
+  (defn file-model (text)
+    "A model on a file-backed buffer holding `text` on disk, then edited (so it is modified)."
+    (let (path (str (temp-dir "bedit-quit-") ".txt")
+          _ (file/spit path text)
+          m (ed-find-file (m-of "x") path))
+      (type-str m "!")))
+  (test "a clean model quits at once"
+    (let (m (ed-update (m-of "hi") :close 80 24))
+      (is (:done (press (m-of "hi") [:ctrl-x :ctrl-c])))
+      (is (:done m))))
+  (test "a modified scratch buffer has no file to save, so it is not asked about"
+    (is (:done (press (type-str (m-of "hi") "x") [:ctrl-x :ctrl-c]))))
+  (test "y saves the file and quits; the echo shows what was asked"
+    (let (m (press (file-model "on disk\n") [:ctrl-x :ctrl-c])
+          path (buffer-file (cur m)))
+      (is (not (:done m)))
+      (is (string/starts-with? (:echo m) (str "Save file " path "?")))
+      (let (done (ed-update m "y" 80 24))
+        (is (:done done))
+        (assert= (file/slurp path) "!on disk\n"))))
+  (test "n skips the save, then the exit-anyway question guards the loss"
+    (let (m (ed-update (press (file-model "on disk\n") [:ctrl-x :ctrl-c]) "n" 80 24)
+          path (buffer-file (cur m)))
+      (is (not (:done m)))
+      (is (string/starts-with? (:echo m) "Modified buffers exist; exit anyway?"))
+      (assert= (file/slurp path) "on disk\n")
+      (is (not (:done (ed-update m "n" 80 24)))) ; n: stay
+      (is (:done (ed-update m "y" 80 24))))) ; y: go, unsaved
+  (test "C-g at a prompt cancels the quit"
+    (let (m (ed-update (press (file-model "on disk\n") [:ctrl-x :ctrl-c]) :ctrl-g 80 24))
+      (is (not (:done m)))
+      (is (:modified (cur m)))))
+  (test "the window's X button (:close) takes the same road as C-x C-c"
+    (let (m (ed-update (file-model "on disk\n") :close 80 24))
+      (is (not (:done m)))
+      (is (string/starts-with? (:echo m) "Save file"))
+      (is (:done (ed-update m "y" 80 24)))))
+  (test "! saves every remaining buffer without asking again"
+    (let (m1 (file-model "one\n")
+          path2 (str (temp-dir "bedit-quit2-") ".txt")
+          _ (file/spit path2 "two\n")
+          m2 (type-str (ed-find-file m1 path2) "!")
+          asked (press m2 [:ctrl-x :ctrl-c])
+          done (ed-update asked "!" 80 24))
+      (is (:done done))
+      (assert= (file/slurp path2) "!two\n")
+      (is (every? (:buffers done) (fn (b) (not (:modified b))))))))
+
+(describe "kill-buffer asks about unsaved file changes"
+  (test "a modified file buffer is kept on n and killed on y"
+    (let (path (str (temp-dir "bedit-kill-") ".txt")
+          _ (file/spit path "keep me\n")
+          m (type-str (ed-find-file (m-of "x") path) "!")
+          asked (press m [:ctrl-x "k"]))
+      (is (string/starts-with? (:echo asked) "Buffer "))
+      (assert= (buffer-file (cur (ed-update asked "n" 80 24))) path)
+      (is (not (= (buffer-file (cur (ed-update asked "y" 80 24))) path)))))
+  (test "a clean buffer is killed without a question"
+    (let (path (str (temp-dir "bedit-kill2-") ".txt")
+          _ (file/spit path "clean\n")
+          m (ed-find-file (m-of "x") path))
+      (is (not (= (buffer-file (cur (press m [:ctrl-x "k"]))) path))))))
+
+;; Files that change under the editor (another writer: a formatter, `git checkout`).
+;; `std/editor/buffer` stamps the file's mtime at the read and the save
+;; (`buffer-file-changed?`); the idle beat reverts a clean buffer and warns on a dirty
+;; one, and a save onto a changed file asks first.
+(describe "a file changed on disk"
+  (defn on-disk (text)
+    (let (path (str (temp-dir "bedit-disk-") ".txt"))
+      (do (file/spit path text) [path (ed-find-file (m-of "x") path)])))
+  (defn changed-behind (m)
+    "`m` with its current buffer stamped as if the file had been written since."
+    (ed-set-buf m (assoc (cur m) :file-mtime (dec (:file-mtime (cur m))))))
+  (test "a clean buffer is reverted on the idle beat, point kept, mode kept"
+    (let ([path m0] (on-disk "old text\n")
+          m1 (press m0 [:ctrl-f :ctrl-f]) ; point at 2
+          _ (file/spit path "new text on disk\n")
+          m2 (ed-revert-changed-files (changed-behind m1)))
+      (assert= (buffer-text (cur m2)) "new text on disk\n")
+      (assert= (buffer-point (cur m2)) 2)
+      (assert= (:layers (cur m2)) (:layers (cur m1)))
+      (is (includes? (:echo m2) "reverted"))
+      ;; agreed again: a second beat does nothing
+      (assert= (cur (ed-revert-changed-files m2)) (cur m2))))
+  (test "a revert clamps a point past the new end"
+    (let ([path m0] (on-disk "a long line of text\n")
+          m1 (press m0 [:alt->]) ; end of buffer
+          _ (file/spit path "ab\n")
+          m2 (ed-revert-changed-files (changed-behind m1)))
+      (assert= (buffer-point (cur m2)) 3)))
+  (test "a modified buffer is kept and warned about once per on-disk version"
+    (let ([path m0] (on-disk "old text\n")
+          m1 (type-str m0 "!")
+          _ (file/spit path "new text on disk\n")
+          m2 (ed-revert-changed-files (changed-behind m1)))
+      (assert= (buffer-text (cur m2)) "!old text\n")
+      (is (includes? (:echo m2) "changed on disk"))
+      ;; the next beat is quiet about the same version
+      (assert= (:echo (message (ed-revert-changed-files m2) "quiet")) "quiet")))
+  (test "saving onto a changed file asks; n keeps the disk version, y overwrites"
+    (let ([path m0] (on-disk "old text\n")
+          m1 (changed-behind (type-str m0 "!"))
+          _ (file/spit path "theirs\n")
+          asked (press m1 [:ctrl-x :ctrl-s]))
+      (is (includes? (:echo asked) "Save anyway?"))
+      (assert= (file/slurp path) "theirs\n")
+      (ed-update asked "n" 80 24)
+      (assert= (file/slurp path) "theirs\n")
+      (let (saved (ed-update asked "y" 80 24))
+        (assert= (file/slurp path) "!old text\n")
+        (is (not (:modified (cur saved))))
+        ;; the save re-stamped: the file and the buffer agree, no revert follows
+        (is (not (buffer-file-changed? (cur saved))))))))
