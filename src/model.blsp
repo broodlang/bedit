@@ -680,6 +680,36 @@ input, then the idle `:cursor-blink` timer takes over once you stop."
     else true))
 
 (sig ed-sync-timers (model -> model))
+
+;; ---- scroll settling: a glide ends on a whole line --------------------------
+;; A trackpad step or a wheel notch's kinetic glide (the runtime's fractional deltas)
+;; leaves a pane resting between lines — `:scroll-frac` ≠ 0 — which is fine while it
+;; moves and wrong once it stops: the click→line mapping reads `top`, the cursor sits
+;; half a cell off, and a screen row shows most of the line BELOW the one point is on.
+;; Emacs's pixel scrolling snaps to the nearest line when the gesture ends; so does this,
+;; on the `:scroll-settle` idle one-shot armed whenever a pane holds a fraction.
+
+(def *scroll-settle-ms* 140) ; quiet time after the last scroll delta before the snap
+
+(defn ed-any-pane-fractional? (m)
+  "True when some pane rests between lines (`:scroll-frac` ≠ 0)."
+  (any? (pane-leaf-paths (:layout m))
+    (fn (path) (> (or (:scroll-frac (pane-payload-at (:layout m) path)) 0.0) 0.001))))
+
+(defn ed-settle-scroll (m)
+  "Every pane snapped onto a whole line: a fraction of half a line or more advances `top`\n(clamped to the buffer), less falls back; `:scroll-frac` is 0 everywhere after."
+  (ed-map-panes m
+    (fn (w)
+      (let (frac (or (:scroll-frac w) 0.0))
+        (if (<= frac 0.001)
+          w
+          (let (buf (ed-buf-at m (:buffer w))
+                top (or (:top w) 0)
+                snapped (if (>= frac 0.5) (inc top) top))
+            (assoc w
+              :top (if buf (math/min snapped (math/max top (ed-max-top buf 1))) snapped)
+              :scroll-frac 0.0)))))))
+
 (defn ed-sync-timers (m)
   "Reconcile `:timers` (ADR-102) with the model after each event — the declarative
 replacement for the old arm-the-tick cascade. `:cursor-blink` is always present; the
@@ -713,6 +743,8 @@ flag once no prefix is pending (what `ed-which-key-arm` used to do)."
                             (bound? 'playground/ed-playground-stale?)
                             ((reflect/eval 'playground/ed-playground-stale?) m))
         idle (merge (if recompute? {:idle-recompute {:after *diag-debounce-ms* :idle? true}} {})
+               ;; a pane resting between lines snaps once the scroll deltas stop
+               (if (ed-any-pane-fractional? m) {:scroll-settle {:after *scroll-settle-ms* :idle? true}} {})
                (if tutor-stale? {:tutor-eval {:after *tutor-eval-debounce-ms* :idle? true}} {})
                (if playground-stale?
                  {:playground-eval {:after *tutor-eval-debounce-ms* :idle? true}}
@@ -727,7 +759,7 @@ flag once no prefix is pending (what `ed-which-key-arm` used to do)."
                      {}))))
         managed (merge {:cursor-blink {:every *blink-ms* :idle? true}} idle)
         kept (dissoc (or (:timers m) {})
-               :cursor-blink :idle-recompute :which-key :undo-pause :tutor-eval :playground-eval))
+               :cursor-blink :idle-recompute :which-key :undo-pause :tutor-eval :playground-eval :scroll-settle))
     (assoc m :timers (merge kept managed))))
 
 ;; ---- overlay scrollbar fade (macOS-style auto-hide) -------------------------
@@ -925,6 +957,35 @@ the flag. Leaves `:last-command` untouched, so kill coalescing / yank-pop are un
 Public (called cross-module from `input/ed-timer-fire`)."
   (if (:pending m) (assoc m :which-key true) (dissoc m :which-key)))
 
+;; ---- buffer recency (Emacs `buffer-list` order) ------------------------------
+;; `:buffer-mru` is the names of the buffers in most-recently-selected-first order —
+;; what Emacs keeps as the order of `(buffer-list)` and reads for `switch-to-buffer`'s
+;; default (`other-buffer`: the one before this) and its candidate order. Names, not
+;; indices: the pool reorders when a buffer is killed. Read through `ed-recent-buffers`,
+;; which drops names no longer in the pool, so a kill needs no bookkeeping here.
+
+(defn ed-note-buffer-recency (m)
+  "The model with the current buffer's name at the head of `:buffer-mru` (deduplicated);
+`m` unchanged when it already is."
+  (let (name (buffer-name (ed-current-buf m))
+        mru (or (:buffer-mru m) '()))
+    (if (= name (first mru))
+      m
+      (assoc m :buffer-mru (cons name (seq/reject mru (fn (n) (= n name))))))))
+
+(defn ed-recent-buffers (m)
+  "The open buffers' names, most recently selected first: the recency list, pruned to
+the pool, then any pool buffer never selected in this session (in pool order)."
+  (let (live (map (:buffers m) buffer-name)
+        mru (seq/filter (or (:buffer-mru m) '()) (fn (n) (includes? live n))))
+    (append mru (seq/reject live (fn (n) (includes? mru n))))))
+
+(defn ed-other-buffer (m)
+  "The buffer to switch back to — the most recently selected one that is not the current
+(Emacs `other-buffer`): `switch-to-buffer`'s default. Nil when there is no other."
+  (let (cur (buffer-name (ed-current-buf m)))
+    (seq/find (ed-recent-buffers m) (fn (n) (not (= n cur))))))
+
 (defn ed-post-step (m input)
   "The post-event step run after `input/ed-update` folds an event in. The eldoc hint and
 the advisory type-check are **debounced onto idle timers** (ADR-102; Emacs's idle-timer
@@ -944,6 +1005,10 @@ blinks at rest. Finally refreshes the open minibuffer's memoized candidate list
         m0 (if real (assoc m :blink-on? true) m)
         m1 (if (and real (:server m)) (assoc m0 :web-dirty true) m0)
         m2 (ed-sync-timers m1)
+        ;; buffer recency (Emacs's `buffer-list` order): whatever buffer is current after
+        ;; this event moves to the head — the one place every path that switches a
+        ;; buffer (C-x b, RET in dired, a results jump, a pane click) passes through
+        m2 (ed-note-buffer-recency m2)
         ;; the live-evaluating buffers' notes follow the text on the edit itself (the
         ;; debounce only EVALUATES) — the same deferred-module guard as their stale? probes
         ;; above, and both are O(1) until their own buffer's notes go stale
