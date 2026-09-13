@@ -89,6 +89,47 @@ boundary, > 0 = content is shifted up by `frac × cell_h` pixels (from trackpad 
   (let (f (or (get-in pane [:payload :scroll-frac]) 0.0))
     (if (and (>= f 0.0) (< f 1.0)) f 0.0)))
 
+;; ---- screen row → buffer line: ONE owner ----------------------------------------
+;; Every hit-test (a click, a drag, a hover, a gutter press) must agree with what the
+;; view painted on that row. The view paints line `top + k` on the pane's row `k`
+;; (scaled by the pane's font scale), shifted up by the smooth-scroll fraction — so
+;; once that fraction passes half a cell, row `k` shows MOST of line `top + k + 1`. The
+;; mapping used to be spelled inline at five sites, each `top + (row - py) / s` and
+;; each unaware of the fraction; a glide that came to rest between lines put every
+;; click one line above what it clicked on. These two functions are the only place the
+;; arithmetic lives now; a consumer that needs the line under a row asks here.
+
+(defn ed-pane-view-top (pane buf)
+  "The buffer line the pane's FIRST text row mostly shows: `ed-pane-top`, plus one
+while the smooth-scroll fraction is half a cell or more (the row is then more the next
+line than this one). Clamped like `ed-pane-top`."
+  (let (top (ed-pane-top pane buf))
+    (if (>= (ed-pane-scroll-frac pane) 0.5)
+      (math/min (inc top) (math/max top (dec (buffer-line-count buf))))
+      top)))
+
+(defn ed-payload-view-top (payload buf)
+  "`ed-pane-view-top` for a bare pane PAYLOAD (`{:top :scroll-frac …}`, what
+`model/ed-current-pane` answers) — for a command that has the selected pane's state but
+not its laid-out rect (M-r)."
+  (ed-pane-view-top {:payload payload} buf))
+
+(defn ed-pane-line-at (pane buf row)
+  "The buffer line screen row `row` (absolute) of `pane` shows — `ed-pane-view-top` plus
+the row's offset into the pane's text area divided by the font scale — or nil for a
+row below the buffer's last line (a hover there is over nothing; a CLICK there wants
+the last line, which is `ed-pane-line-at-clamped`). The one row→line mapping; the
+inverse of the view's pane geometry."
+  (let ([px py pw ph] (:rect pane)
+        s (ed-pane-scale pane)
+        line (+ (ed-pane-view-top pane buf) (math/quot (math/max 0 (- row py)) (math/max 1 s))))
+    (if (< line (buffer-line-count buf)) line nil)))
+
+(defn ed-pane-line-at-clamped (pane buf row)
+  "`ed-pane-line-at`, with a row below the text answering the LAST line — where a click
+below the end of a short buffer lands, as in Emacs."
+  (or (ed-pane-line-at pane buf row) (math/max 0 (dec (buffer-line-count buf)))))
+
 (sig ed-selected-text-cols (map int int -> int))
 (defn ed-selected-text-cols (m cols rows)
   "The text width (in columns) of the *selected* pane — its rect width less the gutter
@@ -414,15 +455,15 @@ starting at `sy`: a proportional map — the track top scrolls to 0, the bottom 
       0
       (math/max 0 (math/min maxtop (math/quot (* maxtop rr) (math/max 1 (dec vh))))))))
 
-(sig ed-buf-offset-at (buffer int int int int int int int int -> int))
-(defn ed-buf-offset-at (buf top hscroll gw s px py row col)
-  "The buffer offset under screen cell `[row col]` for a pane at origin `(px, py)`, left
-gutter `gw` columns wide, font scale `s`, scrolled to `top` rows / `hscroll` columns — the
-inverse of the view's pane geometry (`view/ed-pane-ops` / `ed-cursor`). Line = `top +
-(row-py)/s`; column = `hscroll + (col-px)/s - gw`, both clamped (a click past a short
-line's end lands at its end, never the next line)."
-  (let (line (math/min (math/max 0 (dec (buffer-line-count buf)))
-               (+ top (math/quot (math/max 0 (- row py)) (math/max 1 s))))
+(sig ed-buf-offset-at (buffer int int int int int int -> int))
+(defn ed-buf-offset-at (buf line hscroll gw s px col)
+  "The buffer offset under screen column `col` on buffer `line` for a pane at left edge
+`px`, left gutter `gw` columns wide, font scale `s`, scrolled `hscroll` columns — the
+column half of the view's pane geometry (`view/ed-pane-ops` / `ed-cursor`); the LINE
+is the caller's, from `ed-pane-line-at-clamped`, the one row→line owner. Column =
+`hscroll + (col-px)/s - gw`, clamped (a click past a short line's end lands at its
+end, never the next line)."
+  (let (line (math/min (math/max 0 (dec (buffer-line-count buf))) line)
         vcol (math/quot (math/max 0 (- col px)) (math/max 1 s))
         bufcol (math/max 0 (+ (- vcol gw) hscroll))
         bol (text/line->char (buffer-rope buf) line)
@@ -444,10 +485,7 @@ point move: it routes to the mode's `:gutter-click` service — `(m line) -> m`,
 late like every service — the margin-click seam (a breakpoint toggle in brood-mode).
 With no such service the click falls through to the old clamped point move."
   (let ([px py pw ph] (:rect pane)
-        ;; a pane resting between lines (a glide not yet settled) shows most of the NEXT
-        ;; line in each row once the fraction passes half a cell — the row maps to that
-        top (let (t (or (get-in pane [:payload :top]) 0))
-              (if (>= (ed-pane-scroll-frac pane) 0.5) (inc t) t))
+        top (or (get-in pane [:payload :top]) 0) ; recorded for the drag; the line is `ed-pane-line-at-clamped`'s
         hscroll (ed-pane-hscroll pane)
         s (ed-pane-scale pane)
         gw (ed-gutter-width buf (ed-gutter-shown? buf pane))
@@ -465,12 +503,11 @@ With no such service the click falls through to the old clamped point move."
                            (log/warn (str "gutter-click service unavailable: " (error-message e)))
                            nil)))))
     (if gutter-svc
-      (let (line (math/min (math/max 0 (dec (buffer-line-count buf)))
-                   (+ top (math/quot (math/max 0 (- row py)) (math/max 1 s)))))
+      (let (line (ed-pane-line-at-clamped pane buf row))
         (try
           (gutter-svc m line)
           (catch e (message m (str "gutter: " (error-message e))))))
-      (let (off (ed-buf-offset-at buf top hscroll gw s px py row col))
+      (let (off (ed-buf-offset-at buf (ed-pane-line-at-clamped pane buf row) hscroll gw s px col))
         (assoc (ed-set-buf m (clear-mark (goto-char buf off)))
           :text-drag
             {:buf (get-in pane [:payload :buffer])
@@ -509,9 +546,11 @@ drag is in progress."
             ;; the press-time top — so as a drag past the edge scrolls (ed-ev-mouse's
             ;; clamp), the pointer keeps mapping to the newly-revealed lines and the
             ;; region keeps growing instead of sticking at the press-time viewport.
-            top (ed-current-top m)
+            ;; the row→line mapping is the pane's (`ed-pane-line-at-clamped`, the one owner):
+            ;; the selected pane's live payload under the press-time rect
+            live {:rect (:rect td) :payload (ed-current-pane m)}
             hscroll (ed-current-hscroll m)
-            off0 (ed-buf-offset-at buf top hscroll (:gw td) s px py row col)
+            off0 (ed-buf-offset-at buf (ed-pane-line-at-clamped live buf row) hscroll (:gw td) s px col)
             ;; Edge auto-scroll (the horizontal analogue of dragging past the bottom to
             ;; scroll down): a pane's right edge IS the window edge, so the pointer can't
             ;; go beyond it to map to off-screen columns. Instead, when the drag is against
