@@ -127,6 +127,10 @@ src/testrun.blsp            native test runs (C-c t): a dedicated nest subproces
 src/apprun.blsp             run the project (C-c r): nest run in a subprocess with debug taps —
                             app output + spy/trace traffic into *Run*; live stats on a statusbar chip
 src/hosted.blsp             THE FLIP: every pool buffer backed by its own process (hosted-reconcile)
+src/frames.blsp             frames (C-x 5 2 / o / 0): a second OS window is a PROCESS with its own
+                            ui-run whose pool slots link to the same buffer processes, named by
+                            std/editor/buffer-registry — a buffer opened, edited or killed in one
+                            frame is in every frame (docs/frames-plan.md)
 src/procstream.blsp         the shared streaming-subprocess worker (testrun's :testrun and
                             apprun's :apprun ride it): line-buffered stdout -> handler fns
 src/wrap.blsp              visual-line-mode: the pure break rule (a line → `[from to]` row

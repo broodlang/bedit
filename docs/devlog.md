@@ -61,8 +61,37 @@ real defects fell out, and an Emacs-parity tail. Brood first (prime directive), 
   which-key lays its continuations out in columns, since `C-x` now has more than one
   column's worth.
 
-Not done from the list, deliberately: multiple frames (needs a window id on input events,
-ADR-059) and the GPU glyph atlas — both Brood work of a different size.
+Not done from the list at first: multiple frames and the GPU glyph atlas — frames followed
+the same day (below); the atlas stays.
+
+### frames — a second window on the same buffers (option 2, as decided)
+
+`docs/frames-plan.md`. Two ways to a second window: stamp a window id on input and drive
+both from one process, or make a frame a *process* that links its slots to the same
+buffer processes. The first is not sound as a tag alone (the loop's catch-all poll arm
+for async replies would swallow the other window's keys; the sound form is a per-window
+mailbox), and the second is the collab session with no network — so Brood got
+`std/editor/buffer-registry` (ADR-345: the one process for a buffer NAME, share-on-first-ask
+serialised in the registry, enumeration, `:added`/`:removed` notifications, liveness
+checked at share so a re-share can never be handed a dead pid) and bedit got
+`src/frames.blsp`: `hosted-share-slot` hosts every live slot through the registry
+(`:buffer-reg`, started in `main` beside the flip), `frames-adopt` folds another frame's
+buffers into this pool as linked slots (the seed push fills the text), a kill removes the
+buffer from the registry and every frame drops it (`:drop-local-only` keeps the echo from
+removing twice), a died process is re-shared by the first frame to notice and the rest
+relink. `C-x 5 2` spawns the frame process (its own `gui-display` + `ui-run`, the primary's
+live flags inherited), `C-x 5 0` / the frame's ✕ / `C-x C-c` in a frame closes just the
+frame, `C-x 5 o` raises the next. The primary's quit takes the frames with it. Tests:
+`tests/frames_test.blsp` — two models, one registry, no window; the one harness subtlety is
+that both models fold in one process, so the frame's links are re-identified (`ft-as-other`)
+or the primary's pushes read as its own echoes.
+
+### lisp-mode
+
+`.lisp` / `.cl` / `.lsp` / `.asd` get `lisp-mode` (`deflisp`, the same argument as elisp: the
+structural keys and the lexer are Brood's; what is Common Lisp is `lisp-special-forms` and
+Emacs's `lisp-mode` indent rule — `lisp-indent-with`, the elisp rule over the dialect's set).
+
 
 
 ## 2026-08-31

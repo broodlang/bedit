@@ -1,0 +1,197 @@
+(defmodule frames
+  "Frames — a second OS window over the same buffers (Emacs `C-x 5 2` / `C-x 5 o` / `C-x
+5 0`), `docs/frames-plan.md`. A frame is a PROCESS with its own window and its own
+`ui-run` (layout, minibuffer, mode line all its own) whose pool slots are linked to the
+same buffer processes as every other frame's: the hosted flip (`hosted.blsp`) already
+backs every buffer with a process, and `std/editor/buffer-registry` names them — the one
+process for `*scratch*`, shared by whichever frame asks. A buffer opened in one frame
+appears in the others (`[:registry-added …]`), a kill removes it everywhere
+(`[:registry-removed …]`), an edit lands in every frame through its process — the collab
+session with no network. The primary (the window `main` opened, the `:editor` process)
+keeps the frame list and the services; a frame that closes just leaves its loop."
+  (:use model) ; ed-init / ed-buf-at / ed-stamp / message — the model a frame runs
+  (:use hosted) ; ed-host-slot / ed-unhost-slot / hosted-share-slot — linking a slot to a process
+  (:use interactive) ; defcommand
+  (:use editor/buffer) ; make-buffer / buffer-name
+  (:use editor/layers) ; set-buffer-type — a joining frame types its copy from the entry's meta
+  (:use editor/ui) ; gui-display / ui-run — a frame's own window and loop
+  (:use editor/buffer-registry)) ; registry-start / -watch / -entries — buffers global by name
+
+;; ---- the registry on the model ------------------------------------------------
+
+(sig frames-registry-start (model -> model))
+(defn frames-registry-start (m)
+  "Start the buffer registry for this editor and watch it: `:buffer-reg` on the model,
+which `hosted-share-slot` then hosts every slot through, and `[:registry-…]` events for
+this process. `main` calls it beside the hosted flip; a frame inherits the pid."
+  (let (reg (registry-start))
+    (registry-watch reg (self))
+    ;; a well-known name, like `:editor`: a tool, a mirror or a probe finds the editor's
+    ;; buffers here without going through a frame
+    (proc/register :buffer-registry reg)
+    (assoc m :buffer-reg reg)))
+
+;; ---- registry events: buffers appearing and vanishing in other frames ----------
+
+(defn- frames-slot-from-entry (name proc meta dir)
+  "A pool buffer for another frame's `name`: empty, typed and placed from the registry
+`meta` (its `:file` / `:type` / `:dir`, else `dir`), stamped for the pool (`ed-stamp`).
+The seed push fills the text once the slot is linked to `proc`."
+  (let (raw (make-buffer "" name (:file meta))
+        typed (if (nil? (:type meta)) raw (set-buffer-type raw (:type meta)))
+        stamped (ed-stamp typed))
+    (if (nil? (:dir stamped)) (assoc stamped :dir (or (:dir meta) dir)) stamped)))
+
+(sig frames-adopt (model string pid map -> model))
+(defn frames-adopt (m name proc meta)
+  "Fold a registry entry into this frame's pool: a buffer this frame does not have is
+appended as a slot linked to `proc` (the seed push fills it); one it has but whose link
+points elsewhere — its process died and another frame re-shared first, or this frame is
+not yet linked — is relinked to `proc`; one already on `proc` is left alone (our own
+share echoing back). The layout is untouched: a buffer opened in another frame does not
+steal this one's pane."
+  (let (idx (ed-buffer-index-by-name m name))
+    (cond
+      (nil? idx)
+        (let (bufs (into (:buffers m) [(frames-slot-from-entry name proc meta (:dir (ed-current-buf m)))])
+              i (dec (count bufs)))
+          (update-in (ed-host-slot (assoc m :buffers bufs) i proc)
+            [:hosted i] (fn (l) (assoc l :shared? true :registry? true))))
+      (= (get-in m [:hosted idx :proc]) proc) m
+      else
+        (update-in (ed-host-slot (ed-unhost-slot m idx false) idx proc)
+          [:hosted idx] (fn (l) (assoc l :shared? true :registry? true))))))
+
+(defn ed-ev-registry-added (m input textrows cols rows)
+  "`[:registry-added name proc meta]`: another frame (or this one, echoing) shared a
+buffer — adopt it (`frames-adopt`)."
+  (let ([_ name proc meta] input)
+    (frames-adopt m name proc meta)))
+
+(defn ed-ev-registry-removed (m input textrows cols rows)
+  "`[:registry-removed name reason]`: a buffer was killed in another frame (`:killed`) —
+drop this frame's slot without asking the registry again (`:drop-local-only`, read by
+`hosted-drop-slot`), through the full kill path (`commands/ed-kill-buffer-named`: the
+mode's `:on-close`, the pane re-point). A `:died` needs nothing here: this frame's own
+monitor `[:down]` re-shares from its cache (`hosted-rehost`)."
+  (let ([_ name reason] input)
+    (if (or (not (= reason :killed)) (nil? (ed-buffer-index-by-name m name)))
+      m
+      ((reflect/eval 'commands/ed-kill-buffer-named) (assoc m :drop-local-only true) name))))
+
+;; ---- a frame: its process, window and model -------------------------------------
+
+(sig frames-seed-model (pid string map -> model))
+(defn frames-seed-model (reg show live)
+  "A fresh frame's model: `ed-init` on a scratch, every registry entry adopted as a linked
+slot, `show` (the buffer the frame was opened on) selected, the live flags `live` merged
+(the primary's `:gui` / `:os-clipboard` / `:recent-files` / `:project-root` / `:hl-line` …),
+the registry watched, and `:frame? true` — a frame's quit is a frame quit."
+  (let (m0 (merge (ed-init (make-buffer "" "*scratch*")) live)
+        m1 (assoc m0 :buffer-reg reg :host-buffers? true :frame? true)
+        entries (registry-entries reg)
+        m2 (fold (if (vector? entries) entries []) m1
+             (fn (acc e) (frames-adopt acc (:name e) (:proc e) (or (:meta e) {}))))
+        idx (ed-buffer-index-by-name m2 show))
+    (registry-watch reg (self))
+    (if (nil? idx) m2 (assoc (ed-show-index m2 idx) :status (str "editing " show)))))
+
+(def *frame-live-keys*
+  ;; the primary's model keys a frame inherits — the live-editor flags `main` sets, not
+  ;; its buffers, layout or transient state
+  [:gui :os-clipboard :recent-files :project-root :hl-line :cursor :profile :theme])
+
+(defn- frames-main (reg show live opts)
+  "The body of a frame process: open its window (this process polls it — the runtime
+routes a window's input to the process that opened it), run `ui-run` on the seed model
+with the editor's own view and update, and leave. Everything the frame links to
+(`:hosted`) is unsubscribed when the loop ends; the buffer processes live on."
+  (let (disp (gui-display opts))
+    (try
+      (let (m (assoc (frames-seed-model reg show live) :window (:window disp)))
+        (log/info (str "frame " (:window disp) " opened on " show " with " (count (:buffers m)) " buffers"))
+        (ui-run m
+          (reflect/eval 'view/ed-view)
+          (reflect/eval 'input/ed-update)
+          disp)
+        ;; the loop is over: drop every link, so the processes stop pushing to a dead mailbox
+        (doseq (kv (%map-pairs (or (:hosted m) {}))) (unsubscribe-buffer (:proc (second kv)))))
+      ;; a frame that dies says why on stderr — a spawned process's crash is otherwise silent
+      (catch e (do (log/warn (str "frame failed: " (error-message e))) ((get disp :leave)) (throw e))))))
+
+(sig frames-spawn (model map -> model))
+(defn frames-spawn (m opts)
+  "Open a new frame on the current buffer: spawn its process (`frames-main`), monitor it
+and record it in `:frames` (`{pid → window title}`), so the primary can raise, list and
+close it. `opts` are the window options (`:app-id` / `:title`)."
+  (let (reg (:buffer-reg m)
+        show (buffer-name (ed-current-buf m))
+        live (fold *frame-live-keys* {} (fn (acc k) (if (nil? (get m k)) acc (assoc acc k (get m k)))))
+        pid (spawn (frames-main reg show live opts)))
+    (monitor pid)
+    (message (assoc m :frames (conj (or (:frames m) []) pid))
+      (str "frame opened on " show))))
+
+(sig frames-forget (model pid -> model))
+(defn frames-forget (m pid)
+  "A frame process ended (`[:down …]` for a pid in `:frames`): drop it from the list."
+  (assoc m :frames (into [] (seq/reject (or (:frames m) []) (fn (p) (= p pid))))))
+
+(sig frames-frame-pid? (model pid -> bool))
+(defn frames-frame-pid? (m pid)
+  "Whether `pid` is one of this primary's frames."
+  (includes? (or (:frames m) []) pid))
+
+(sig frames-close-all (model -> model))
+(defn frames-close-all (m)
+  "End every frame process (their windows close with them) — the primary's quit."
+  (do
+    (doseq (p (or (:frames m) [])) (exit p :kill))
+    (assoc m :frames [])))
+
+;; ---- the commands (C-x 5 …) --------------------------------------------------------
+
+(defcommand cmd-make-frame
+  (m key)
+  "Open a second window on the current buffer (C-x 5 2, Emacs `make-frame`): a new frame
+process with its own layout, sharing every buffer with this one through the buffer
+registry. Only the primary opens frames (a frame asks the primary); without a registry —
+a headless or test model — it says so."
+  (cond
+    (nil? (:buffer-reg m)) (message m "frames need the live editor (no buffer registry)")
+    (:frame? m) (do (send (proc/whereis :editor) [:make-frame]) (message m "asked the primary for a frame"))
+    else (frames-spawn m {:app-id config/*app-id* :title *app-name*})))
+
+(defcommand cmd-delete-frame
+  (m key)
+  "Close this frame (C-x 5 0, Emacs `delete-frame`): a frame just leaves its loop — the
+buffers live on in the registry, the other frames keep them. On the primary, with no other
+frame open, this is `C-x C-c`; with frames open the primary cannot be deleted (close the
+others first, or quit)."
+  (cond
+    (:frame? m) (assoc m :done true)
+    (empty? (or (:frames m) [])) ((reflect/eval 'commands/cmd-quit) m key)
+    else (message m (str (count (:frames m)) " other frame(s) open — close them first, or C-x C-c to quit all"))))
+
+(defcommand cmd-other-frame
+  (m key)
+  "Raise the next frame's window (C-x 5 o, Emacs `other-frame`). The primary raises its
+first frame; a frame asks the primary to raise the one after it (or the primary itself)."
+  (cond
+    (:frame? m) (do (send (proc/whereis :editor) [:other-frame (self)]) m)
+    (empty? (or (:frames m) [])) (message m "no other frame")
+    else (do (send (first (:frames m)) :focus) m)))
+
+(defn ed-ev-make-frame (m input textrows cols rows)
+  "`[:make-frame]` from a frame: the primary opens one."
+  (cmd-make-frame m nil))
+
+(defn ed-ev-other-frame (m input textrows cols rows)
+  "`[:other-frame from]` from frame `from`: raise the frame after it, the primary itself
+after the last."
+  (let (frames (or (:frames m) [])
+        i (index-of frames (nth input 1))
+        next (if (and (>= i 0) (< (inc i) (count frames))) (nth frames (inc i)) nil))
+    (do
+      (if (nil? next) (send (self) :focus) (send next :focus))
+      m)))

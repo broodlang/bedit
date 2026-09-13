@@ -24,7 +24,8 @@ Presence (cursors, name tags, follow) is the collab module's layer on top; this
 module is content only."
   (:use editor/buffer) ; spawn-buffer / subscribe / replace-region / ed-stamp deps
   (:use editor/buffer-client) ; link-init / link-propagate / link-fold / view-parts
-  (:use model)) ; ed-buf-at / ed-stamp
+  (:use model) ; ed-buf-at / ed-stamp
+  (:use editor/buffer-registry)) ; registry-share / registry-remove — buffers global by name across frames
 (defn- hosted-proj (b)
   "The subscription projection: `[text markers participants]` — the document, every
 marker (pid → offset; presence cursors ride these), and the pid → name registry.
@@ -70,6 +71,33 @@ slot isn't hosted."
         (when stop? (stop-buffer proc))
         (assoc m :hosted (dissoc (:hosted m) i))))))
 
+;; ---- the buffer registry: buffers global by name across frames -----------------
+;; With a `:buffer-reg` on the model (`std/editor/buffer-registry`, started by `main`
+;; beside the flip), a slot is hosted THROUGH the registry: the one process for the
+;; buffer's name, spawned by whichever frame asks first and handed to every frame after.
+;; That is what a second frame (`src/frames.blsp`) shares the buffers by. A registry link
+;; is `:shared?` — the registry owns the process; a kill removes it there (global, as in
+;; Emacs) and the other frames learn of it as `[:registry-removed …]`.
+
+(defn hosted-meta (b)
+  "What another frame needs to build its own copy of `b` before the seed push fills the
+text: `{:file :type :dir}` — the registry entry's `:meta`."
+  {:file (buffer-file b) :type (editor/layers/buffer-type-for b) :dir (:dir b)})
+
+(defn hosted-share-slot (m i)
+  "Host pool slot `i` — through the model's `:buffer-reg` when it has one (the registry's
+process for the buffer's name, shared with every other frame), else locally
+(`ed-host-slot`). A registry that does not answer falls back to a local host, so the
+editor never wedges on it."
+  (let (reg (:buffer-reg m)
+        b (ed-buf-at m i))
+    (if (nil? reg)
+      (ed-host-slot m i)
+      (let (bp (registry-share reg (buffer-name b) (buffer-text b) (hosted-meta b)))
+        (if (pid? bp)
+          (update-in (ed-host-slot m i bp) [:hosted i] (fn (l) (assoc l :shared? true :registry? true)))
+          (ed-host-slot m i))))))
+
 (defn hosted-propagate (before after &optional skip-i)
   "Ship each event's text changes to their slots' processes: for every hosted slot
 whose text differs between `before` and `after`, `link-propagate` (std
@@ -113,20 +141,28 @@ actually grew the pool."
     m
     (fold (range (count (:buffers m)))
       m
-      (fn (acc i) (if (get-in acc [:hosted i]) acc (ed-host-slot acc i))))))
+      (fn (acc i) (if (get-in acc [:hosted i]) acc (hosted-share-slot acc i))))))
 
 (defn hosted-drop-slot (m killed)
   "Unhost pool slot `killed` ahead of its REMOVAL from the pool (kill-buffer):
 stop the process too when it is locally owned (not `:shared?` — a shared host
 outlives its subscribers), then shift the `:hosted` keys above `killed` down one,
 mirroring the pool shift, so every surviving link still points at its slot.
+A registry-hosted slot is removed from the `:buffer-reg` instead (the registry stops
+the process; a kill is global, every frame drops it) — unless the model is folding
+another frame's removal (`:drop-local-only`, set by `frames/ed-ev-registry-removed`),
+in which case only this frame's link goes.
 Also stamps `:pool-shifted` — pool indices no longer name the same documents
 across this event, so `hosted-step` must NOT diff before/after by index (it would
 ship splice(other-document → this-one) to every surviving process above the kill).
 Returns the model; safe on an unhosted slot (still remaps + stamps)."
   (let (sh (get-in m [:hosted killed])
+        reg (:buffer-reg m)
+        name (if (< killed (count (:buffers m))) (buffer-name (ed-buf-at m killed)) nil)
         m1 (if (nil? sh) m (ed-unhost-slot m killed (not (:shared? sh))))
-        m1 (assoc m1 :pool-shifted true)
+        _ (when (and sh reg name (:registry? sh) (not (:drop-local-only m)))
+            (registry-remove reg name))
+        m1 (assoc (dissoc m1 :drop-local-only) :pool-shifted true)
         hosted (:hosted m1))
     (if (nil? hosted)
       m1
@@ -163,7 +199,7 @@ the in-flight splices — resubscribe, and reset the link. The per-buffer fault
 boundary: one crashed buffer process never takes the editor (or another buffer)
 with it. Echoes the casualty by name."
   (let (name (buffer-name (ed-buf-at m i)))
-    (message (ed-host-slot (assoc m :hosted (dissoc (:hosted m) i)) i)
+    (message (hosted-share-slot (assoc m :hosted (dissoc (:hosted m) i)) i)
       (str "buffer process for " name " restarted"))))
 
 (defn- hosted-propagate-shifted (before after)

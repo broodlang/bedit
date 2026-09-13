@@ -337,6 +337,9 @@ A batch of everyday Emacs commands + discoverability, all on existing primitives
 - ✅ **The everyday tail** (2026-09-13) — `C-x C-b`, `M-/` dabbrev (redo → `C-?`), `M-!` /
   `M-|`, `C-x C-o`, `sort-lines`, `delete-trailing-whitespace`, `M-=`, `C-x i`; which-key in
   columns.
+- ✅ **Frames** (2026-09-13) — `C-x 5 2` / `o` / `0`: a second OS window is a process on the same
+  buffers, through Brood's `editor/buffer-registry` (ADR-345); `docs/frames-plan.md`.
+- ✅ **lisp-mode** (2026-09-13) — `.lisp`/`.cl`/`.asd`, via `deflisp`, Emacs's lisp-mode indent.
 - ⬜ **Browsable `*Kill Ring*`** view. (which-key ✅ — see §A.2.)
 - ⬜ **regex** ranges `[a-z]` / captures / `{m,n}` (`regex`, brood repo).
 - ⬜ **layers** extras (brood repo): `:commands` manifest, per-binding `when`-guards,

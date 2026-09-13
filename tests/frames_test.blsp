@@ -1,0 +1,141 @@
+;; Frames (src/frames.blsp, docs/frames-plan.md): two models — the primary and a frame —
+;; one buffer registry, no window. Both models fold in THIS process, so every push and
+;; registry notification lands in one mailbox and is fed to both (`ft-feed`); a real frame
+;; is its own process, but the folds are the same. Barriers, not sleeps: a registry call
+;; and a `buffer-query` are synchronous round-trips, so everything they caused is queued
+;; by the time they answer.
+(defmodule frames-test
+  (:use frames)
+  (:use hosted)
+  (:use model)
+  (:use input)
+  (:use commands) ; ed-open-buffer / cmd-kill-buffer / cmd-quit
+  (:use editor/buffer)
+  (:use editor/buffer-registry)
+  (:use test))
+
+(defn ft-text (m) (buffer-text (ed-current-buf m)))
+(defn ft-press (m keys) (fold keys m (fn (acc k) (ed-update acc k 80 24))))
+(defn ft-names (m) (map (:buffers m) buffer-name))
+
+(defn- ft-queued (acc)
+  "Every push / registry notification already in the mailbox, oldest first."
+  (receive
+    ([:buffer-updated p v view o] (ft-queued (cons [:buffer-updated p v view o] acc)))
+    ([:registry-added n p meta] (ft-queued (cons [:registry-added n p meta] acc)))
+    ([:registry-removed n why] (ft-queued (cons [:registry-removed n why] acc)))
+    (after 0 (reverse acc))))
+
+(def *other* (spawn (fn () (receive (_ nil)))))
+;; A real frame is its own process, so its links carry its own pid as `:me` and a push
+;; tagged by the primary is foreign to it. Both models fold HERE, in one process, so the
+;; frame's links are re-identified as `*other*` — else it would take the primary's pushes
+;; for its own echoes (`link-fold`'s echo suppression) and never apply them.
+(defn ft-as-other (m)
+  (assoc m :hosted (fold (%map-pairs (or (:hosted m) {})) {}
+                     (fn (acc [i l]) (assoc acc i (assoc l :me *other*))))))
+
+(defn ft-feed (models)
+  "Fold everything queued into each of `models` (`[primary frame]`), after a barrier on
+every process the models are linked to."
+  (doseq (m models)
+    (doseq (kv (%map-pairs (or (:hosted m) {})))
+      ;; a process a kill or a crash just ended answers nothing — barrier on the live ones
+      (when (proc/info (:proc (second kv))) (buffer-query (:proc (second kv)) buffer-text))))
+  (let (models [(first models) (ft-as-other (second models))])
+    (fold (ft-queued '()) models
+      (fn ([a b] msg) [(ed-update a msg 80 24) (ft-as-other (ed-update b msg 80 24))]))))
+
+(defn ft-primary (reg text file)
+  "A primary on `text`/`file`, hosting through `reg`, after one event (the flip hosted it)."
+  (ft-press (assoc (ed-init (make-buffer text file file)) :host-buffers? true :buffer-reg reg) [:right]))
+
+(describe "frames — a second model over the same buffer processes"
+  :isolated (test "a frame seeds from the registry: every buffer, linked, the current one shown"
+    (let (reg (registry-start)
+          _ (registry-watch reg (self))
+          a (ft-primary reg "hello" "a.txt")
+          b (frames-seed-model reg "a.txt" {:gui true})
+          [a2 b2] (ft-feed [a b]))
+      ;; every buffer of the primary (the frame keeps its own *scratch* until one is shared)
+      (is (every? (ft-names a2) (fn (n) (includes? (ft-names b2) n))))
+      (is (:frame? b2))
+      (is (:gui b2))
+      (assert= (buffer-name (ed-current-buf b2)) "a.txt")
+      (assert= (ft-text b2) "hello") ; the seed push filled the copy
+      ;; the same process on both sides
+      (assert= (get-in b2 [:hosted (ed-buffer-index-by-name b2 "a.txt") :proc])
+        (get-in a2 [:hosted 0 :proc]))
+      (registry-stop reg)))
+  :isolated (test "an edit in one frame lands in the other through the buffer process"
+    (let (reg (registry-start)
+          _ (registry-watch reg (self))
+          a (ft-primary reg "hello" "a.txt")
+          [a1 b1] (ft-feed [a (frames-seed-model reg "a.txt" {})])
+          a2 (ft-press a1 ["!"]) ; point at 1 after :right
+          [a3 b3] (ft-feed [a2 b1]))
+      (assert= (ft-text a3) "h!ello")
+      (assert= (ft-text b3) "h!ello")
+      ;; and back the other way
+      (let (b4 (ft-press (ed-set-buf b3 (goto-char (ed-current-buf b3) 0)) ["?"])
+            [a5 b5] (ft-feed [a3 b4]))
+        (assert= (ft-text b5) "?h!ello")
+        (assert= (ft-text a5) "?h!ello"))
+      (registry-stop reg)))
+  :isolated (test "a buffer opened in one frame appears in the other; a kill removes it everywhere"
+    (let (reg (registry-start)
+          _ (registry-watch reg (self))
+          a (ft-primary reg "hello" "a.txt")
+          [a1 b1] (ft-feed [a (frames-seed-model reg "a.txt" {})])
+          a2 (ft-press (ed-open-buffer a1 (make-buffer "ccc" "c.txt" "c.txt")) [:right])
+          [a3 b3] (ft-feed [a2 b1]))
+      (is (includes? (ft-names b3) "c.txt"))
+      (assert= (buffer-name (ed-current-buf b3)) "a.txt") ; b's pane did not move
+      (assert= (buffer-text (ed-buf-at b3 (ed-buffer-index-by-name b3 "c.txt"))) "ccc")
+      ;; kill it in A (A is on c.txt): gone from the registry and from B
+      (let (a4 (cmd-kill-buffer a3 nil)
+            [a5 b5] (ft-feed [a4 b3]))
+        (is (not (includes? (ft-names a5) "c.txt")))
+        (is (not (includes? (ft-names b5) "c.txt")))
+        (is (not (includes? (map (registry-entries reg) :name) "c.txt")))
+        ;; B's surviving links still point at their slots
+        (assert= (buffer-query (get-in b5 [:hosted (ed-buffer-index-by-name b5 "a.txt") :proc]) buffer-text)
+          "hello"))
+      (registry-stop reg)))
+  :isolated (test "a died buffer process is re-shared by the first frame to notice; the other relinks"
+    (let (reg (registry-start)
+          _ (registry-watch reg (self))
+          a (ft-primary reg "hello" "a.txt")
+          [a1 b1] (ft-feed [a (frames-seed-model reg "a.txt" {})])
+          old (get-in a1 [:hosted 0 :proc])
+          _ (exit old :kill)
+          down (receive ([:down r p rsn] (if (= p old) [:down r p rsn] nil)) (after 2000 :none)))
+      (is (vector? down))
+      ;; A folds its [:down]: rehost through the registry → a fresh process under the name
+      (let (a2 (ed-update a1 down 80 24)
+            fresh (get-in a2 [:hosted 0 :proc]))
+        (is (not (= fresh old)))
+        (assert= (buffer-query fresh buffer-text) "hello")
+        ;; B gets the registry's :removed :died and :added — and relinks to the fresh one
+        (let ([a3 b3] (ft-feed [a2 b1]))
+          (assert= (get-in b3 [:hosted (ed-buffer-index-by-name b3 "a.txt") :proc]) fresh)))
+      (registry-stop reg)))
+  :isolated (test "a frame's quit is a frame quit; the primary's takes the frames with it"
+    (let (reg (registry-start)
+          a (ft-primary reg "x" "a.txt")
+          b (frames-seed-model reg "a.txt" {})
+          bq (cmd-quit b nil))
+      (is (:done bq))
+      (is (not (:done a)))
+      ;; delete-frame on the primary with no frames is quit; with a frame recorded it refuses
+      (is (:done (cmd-delete-frame a nil)))
+      (let (fake (spawn (fn () (receive (_ nil))))
+            a2 (assoc a :frames [fake]))
+        (is (not (:done (cmd-delete-frame a2 nil))))
+        (is (includes? (:echo (cmd-delete-frame a2 nil)) "other frame"))
+        ;; the primary's quit closes them
+        (let (mref (monitor fake)
+              done (cmd-quit a2 nil))
+          (is (:done done))
+          (assert= (receive ([:down ^mref _ _] :closed) (after 2000 :alive)) :closed)))
+      (registry-stop reg))))
