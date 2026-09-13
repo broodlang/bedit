@@ -433,3 +433,14 @@ commits (`git log --since=2026-06-16 --until=2026-07-10`) have the detail:
   tutor,web}.blsp`, `tests/{apprun,testrun,tutor}_test.blsp`. `nest check` reports zero
   "catch discards" warnings; the suite is red from the in-flight data-first argument-order
   migration (`empty?: expected collection, got fn`), not from these edits.
+
+### more modes: the other Lisps and the configuration formats
+
+Clojure/EDN, Scheme/Racket and Fennel are `deflisp` declarations (a head set each; Scheme
+shares the elisp/Common Lisp indent rule via `lisp-indent-with`). JSON, YAML, TOML,
+Makefile, INI/git config and `COMMIT_EDITMSG` are fontify-only layers over brood's new
+`editor/configs` tables (ADR-346 — a lexical mode is a table over `editor/lexer`), with
+`:comment-syntax` so `M-;` works. Measured: the regex capture engine behind every
+table-driven mode costs ~1.4 ms per matched line (brood's devlog has the profile and the
+30% that was recoverable in Brood); a large YAML band is slow to re-lex until the engine
+changes — a design decision recorded there, not hidden here.

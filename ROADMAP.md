@@ -340,6 +340,10 @@ A batch of everyday Emacs commands + discoverability, all on existing primitives
 - ✅ **Frames** (2026-09-13) — `C-x 5 2` / `o` / `0`: a second OS window is a process on the same
   buffers, through Brood's `editor/buffer-registry` (ADR-345); `docs/frames-plan.md`.
 - ✅ **lisp-mode** (2026-09-13) — `.lisp`/`.cl`/`.asd`, via `deflisp`, Emacs's lisp-mode indent.
+- ✅ **More modes** (2026-09-13) — Clojure/EDN, Scheme/Racket, Fennel (`deflisp`); JSON, YAML, TOML,
+  Makefile, INI/gitconfig, commit messages as tables over brood's `editor/lexer` (ADR-346).
+  Known: the pure-Brood regex capture engine costs ~1.4 ms per matched line, so a large
+  YAML/TOML band re-lexes slowly — measured in brood's devlog; a faster engine is a decision.
 - ⬜ **Browsable `*Kill Ring*`** view. (which-key ✅ — see §A.2.)
 - ⬜ **regex** ranges `[a-z]` / captures / `{m,n}` (`regex`, brood repo).
 - ⬜ **layers** extras (brood repo): `:commands` manifest, per-binding `when`-guards,
