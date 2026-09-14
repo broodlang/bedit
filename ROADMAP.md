@@ -420,6 +420,40 @@ ranges and `layers` extras (§D).)
 
 ---
 
+## I. Next — the 2026-09-13 session's open ends
+
+The day's measured pass (`docs/devlog.md` 2026-09-13) shipped tabs, the scroll blit,
+visual-line-mode, quit/revert safety, frames, lisp-mode, the Lisps and the configuration
+formats. What it leaves, in the order to take it up:
+
+1. ⬜ **Decide the regex engine** (brood `ROADMAP.md`, "Findings from bedit 2026-09-13").
+   Every table-driven mode — JSON, YAML, TOML, Makefile, INI, commit messages, and
+   `shell-mode` all along — re-lexes a ~100-line band in ~150 ms per keystroke, because
+   `regex/find-all` costs ~1.4 ms per matched line. Nothing to do in bedit; the fix is a
+   Brood design choice (a DFA scan, a native path, or a JIT of the NFA). Until then the
+   modes are correct but not crisp on long files.
+2. ⬜ **The tree-sitter batch: TypeScript/JavaScript, Rust, Go, C** — and the way to get a
+   grammar: `deflanguage` gains `:grammar` (a git URL or a directory — "where it lives"),
+   `M-x grammar-install <lang>` runs brood's `editor/treesit/grammar-install` off the loop
+   (a `procstream` task into `*Grammars*`) then `grammar-reload`, and opening a file whose
+   mode declares a grammar that is not loaded says so with the command. The std half
+   (`grammar-fetch` / `grammar-build` / `grammar-install`) is in. Each language is a face
+   table + an indent spec, like python's; keywords come free from the anonymous tokens.
+3. ⬜ **Org-mode** — parked by decision on 2026-09-13; a `std/editor/org` lexer (headings,
+   TODO keywords, lists, links, `#+BEGIN_SRC` blocks) plus TAB visibility cycling and
+   `C-c C-t`, on markdown-mode's shape. The one thing an Emacs person asks about first.
+4. ⬜ **`C-n`/`C-p` by visual line** in `visual-line-mode` (Emacs moves visually; we move by
+   logical line — the row table in `panes/ed-pane-rows` has what the motion needs).
+5. ⬜ **The wheel and the cursor** — scrolling leaves point where it was, so the cursor
+   vanishes once point is off-screen (it looks like blinking stopped). Emacs's
+   `mwheel-scroll` drags point along. Small: clamp point into the viewport in
+   `panes/ed-scroll-pane`, drop `ed-point-into-view`. Waiting on a preference.
+6. ⬜ **Kill ring across frames** — per frame today (the OS clipboard makes yank cross
+   anyway); registers and bookmarks likewise.
+7. ⬜ Two pre-existing red tests (`gitdiff_async_test`, `strict_ratchet_test` — the latter
+   tracks the other session's checker work) and a new advisory finding in `tutor.blsp:1447`
+   from brood's newer checker.
+
 ## Loose ends / caveats
 
 - **Key encodings are best-guesses.** The `C-M-*`, `M-o`/`M-O`, `M-^`, `M-DEL`
