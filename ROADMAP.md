@@ -10,6 +10,9 @@ design-of-record in the brood repo: `docs/layers.md`).
 
 Legend: ✅ done · 🟡 in progress · ⬜ not started
 
+**Picking this up cold:** read [`docs/handoff.md`](docs/handoff.md) first — the current state,
+the traps, and the work queue in order (replaced each session).
+
 **Strategic direction — competing with Neovim/Emacs/VSCode:** the honest standing
 vs the big three and the three tracks that would make someone *choose* bedit over
 them are in **`docs/competitive-tracks.md`**. The flagship (Track 1 — remote &
