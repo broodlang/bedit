@@ -5,17 +5,23 @@ in [`../ROADMAP.md`](../ROADMAP.md) (§the open ends) and in brood's `docs/devlo
 decisions in brood's `docs/decisions.md` (ADR-352 is this session's). Read this to pick the
 work back up cold.
 
-## State when written — 2026-09-15, 14:10
+## State when written — 2026-09-15, 14:40
 
 - **bedit** `main` = `07700563` (`release: 0.4.3`), tag `v0.4.3`, pushed, tree clean.
   `project.blsp` says `:brood ">= 0.28.0"` — an older `nest` refuses the project outright
   (that is what "files: 0" from the suite means), so install brood first.
-- **brood** `main` = `916c505a` (the other session's `ci: BEDIT_REF -> 07700563` on top of
-  `aa5f2a15` = `chore(release): v0.28.0`, on top of `2a750c08`, the regex change). Tag
-  `v0.28.0` pushed; the Release workflow **succeeded** — tarballs for every target are on
-  the GitHub release. CI on `main` for `916c505a` was still running when this was written
-  (`gh run list -R broodlang/brood`); the run for `aa5f2a15` itself was cancelled by that
-  later push, so this newer run is the one that judges both commits.
+- **brood** `main` = `c247c996` (`fix(check): the ADR-352 scan loops pass the strict gate over
+  std`) on `916c505a` (the other session's `ci: BEDIT_REF -> 07700563`) on `aa5f2a15` =
+  `chore(release): v0.28.0` on `2a750c08`, the regex change. Tag `v0.28.0` pushed; the
+  Release workflow **succeeded** — tarballs for every target are on the GitHub release.
+  **CI on `main` was red for `916c505a`** on two jobs: the strict gate over `std/` (12
+  findings, all in the new scan loops — mine, fixed by `c247c996`: `check-allow
+  :type-mismatch` on the three loops whose `(count codes)` bound is one to three calls up,
+  plus sigs; 0 locally now) and the `differential (tree-walker)` job (observer, mcp,
+  sequence and highlight tests under `BROOD_VM=0`) — that job was already red on the run
+  before the release (`34955268473`, 09:57) and is the "faces-nil" hunt the other session's
+  `ci(differential)` commit names; not this work. Check `gh run list -R broodlang/brood` for
+  `c247c996`'s run.
 - **Installed:** `~/.local/bin/nest` 0.28.0 (`aa5f2a15`, GUI build from this session's
   worktree), `~/.local/bin/bedit` 0.4.3 on it. Verified on that pair: 51/51 test files,
   `nest check` clean, `nest check --strict` = 58 (the ratchet's ceiling), `make check-modes`
