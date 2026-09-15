@@ -342,8 +342,8 @@ A batch of everyday Emacs commands + discoverability, all on existing primitives
 - ✅ **lisp-mode** (2026-09-13) — `.lisp`/`.cl`/`.asd`, via `deflisp`, Emacs's lisp-mode indent.
 - ✅ **More modes** (2026-09-13) — Clojure/EDN, Scheme/Racket, Fennel (`deflisp`); JSON, YAML, TOML,
   Makefile, INI/gitconfig, commit messages as tables over brood's `editor/lexer` (ADR-346).
-  Known: the pure-Brood regex capture engine costs ~1.4 ms per matched line, so a large
-  YAML/TOML band re-lexes slowly — measured in brood's devlog; a faster engine is a decision.
+  The pure-Brood regex capture engine cost ~1.4 ms per matched line until 2026-09-15, when
+  the lexers moved onto the bitset DFA (brood ADR-352, `regex/tokens`); see §the open ends.
 - ⬜ **Browsable `*Kill Ring*`** view. (which-key ✅ — see §A.2.)
 - ⬜ **regex** ranges `[a-z]` / captures / `{m,n}` (`regex`, brood repo).
 - ⬜ **layers** extras (brood repo): `:commands` manifest, per-binding `when`-guards,
@@ -426,12 +426,21 @@ The day's measured pass (`docs/devlog.md` 2026-09-13) shipped tabs, the scroll b
 visual-line-mode, quit/revert safety, frames, lisp-mode, the Lisps and the configuration
 formats. What it leaves, in the order to take it up:
 
-1. ⬜ **Decide the regex engine** (brood `ROADMAP.md`, "Findings from bedit 2026-09-13").
-   Every table-driven mode — JSON, YAML, TOML, Makefile, INI, commit messages, and
-   `shell-mode` all along — re-lexes a ~100-line band in ~150 ms per keystroke, because
-   `regex/find-all` costs ~1.4 ms per matched line. Nothing to do in bedit; the fix is a
-   Brood design choice (a DFA scan, a native path, or a JIT of the NFA). Until then the
-   modes are correct but not crisp on long files.
+1. ✅ **The regex engine, decided** (2026-09-15, brood ADR-352): a DFA scan. `regex/tokens`
+   scans a rule table on the bitset engine (a token's identity is its rule, never a group),
+   `regex/paint` does a line rule's one grouped question on it, and `find` enters the capture
+   VM only where the DFA found a start. `editor/lexer` and `editor/shell` are one scan per
+   line. Here: the nine line-oriented modes declare `editor/highlight/line-restart`, so the
+   200-line backscan is cut and a keystroke lexes the band alone. `.bashrc`: 430 ms per
+   keystroke → see the 2026-09-15 numbers in brood's devlog.
+   Two things it taught, both kept: a mode service is a SYMBOL resolved at render time, so it
+   names a module `modes` always loads (`editor/highlight`, not `editor/lexer` — the released
+   binary from `$HOME` painted `render error` on every frame while every test passed;
+   `make check-modes` now opens one file per mode in the installed editor), and the loop-tail
+   span refresh is guarded on its own — a throwing lexer used to discard the whole event,
+   the window's close request included. Open: `nest check --strict` reads 58 findings under
+   brood 0.28.0's checker (the ratchet's ceiling and comment name the classes) — a
+   contract sweep, its own commit.
 2. ⬜ **The tree-sitter batch: TypeScript/JavaScript, Rust, Go, C** — and the way to get a
    grammar: `deflanguage` gains `:grammar` (a git URL or a directory — "where it lives"),
    `M-x grammar-install <lang>` runs brood's `editor/treesit/grammar-install` off the loop

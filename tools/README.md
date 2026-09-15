@@ -23,6 +23,7 @@ python3 tools/drive_mspc.py # or one at a time (from anywhere)
 | `drive_contract.py` | `M-x` shows each command's declared `model -> model` contract in the margin (with its key and doc) — the marginalia the model tests build but cannot paint. |
 | `drive_narrow.py` | `C-x n n` paints ONLY the focused region and the mode line shows `⊸ Narrowed`; `C-x n w` brings the rest back. The model tests confine point; only a frame shows the render slice + indicator. |
 | `drive_tutor_readonly.py` | The REAL editor refuses a backspace at a box's edge and says so, while the box stays writable — the tutorial's prose/borders are read-only at the edit primitive (`:read-only-spans`, ADR-219), not a `:post-key` guard a held key could outrun. |
+| `check-modes.sh` | The RELEASED binary, opened from `$HOME` on one file per lexical mode, prints no view error. A mode names its services by symbol, resolved at render time; the model tests load every module, so only the installed editor with no project around it can show a service whose module nothing loads (`editor/lexer/line-restart`, 2026-09-15). `make check-modes`. |
 
 **Three bugs these caught that 1200 model tests could not.** A new tutorial key was added to the
 help-text vocabulary but never `keymap-bind`-ed, so it rendered as a blank hole in the prose

@@ -31,7 +31,7 @@ DATADIR ?= $(PREFIX)/share
 APPSDIR ?= $(DATADIR)/applications
 ICONDIR ?= $(DATADIR)/icons/hicolor/scalable/apps
 
-.PHONY: all build install install-bin install-desktop uninstall test drive check clean
+.PHONY: all build install install-bin install-desktop uninstall test drive check check-modes clean
 
 all: build
 
@@ -93,3 +93,8 @@ check:
 
 clean:
 	rm -f $(NAME)
+
+# Open one file of every lexical mode in the INSTALLED bedit from $HOME and fail on any
+# view error printed — the symbol-resolved mode service the model tests cannot see (tools/check-modes.sh).
+check-modes:
+	tools/check-modes.sh
