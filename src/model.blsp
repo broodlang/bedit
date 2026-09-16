@@ -32,7 +32,7 @@ pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
   (:use editor/layers) ; init-buffer-layers (stamp a buffer's mode) + active-layers (mode line)
   (:use editor/keymap) ; keymap-where-is — command → the key actually bound to it (help text)
   (:use editor/pane) ; the pane-tree layout: pane-single / selected payload / update / map
-  (:use completion) ; completion-rank-incremental — the minibuffer's narrowable fuzzy rank
+  (:use completion) ; completion-rank — the minibuffer's fuzzy rank, capped to what it shows
   ;; `:exclude [error]` — log's `error` would shadow the prelude's `error`.
   (:use log :exclude [error]) ; backend — the log-routing backends (one per buffer)
   ;; `:exclude [inspect]` — `io/inspect` WRITES; the root `inspect` is the ability op
@@ -1091,22 +1091,22 @@ text (point at end). Stored as the minibuffer's `:edit`."
 narrowable) or a `:candidates-fn` (computed each keystroke)."
   (or (:rank-source mb) (:candidates-fn mb)))
 
-(defn- mb-rank (mb text prev-for prev-ranked)
-  "`[ranked cands]` for minibuffer `mb` at input `text`. For a `:rank-source` prompt,
-fuzzy-rank the source — narrowing from `prev-ranked` when `text` extends `prev-for`
-(`completion/completion-rank-incremental`) — and cap to `:rank-cap` for display; `ranked`
-(the full, untruncated ranking) is cached so the *next* keystroke can narrow from it. For a
-`:candidates-fn` prompt there's nothing to narrow: `ranked` is nil and `cands` is the fn's
-result. `[nil ()]` when the prompt has neither source."
+(defn- mb-rank (mb text)
+  "The candidate list for minibuffer `mb` at input `text`: a `:rank-source` prompt is
+fuzzy-ranked to its `:rank-cap` (`completion/completion-rank`, which only ever does the
+work the cap needs — see there), a `:candidates-fn` prompt computes its own, and a prompt
+with neither has none.
+
+There is no narrowing cache here. There used to be: each keystroke ranked the *previous*
+result rather than the whole source, which is exact (a longer query can only drop matches)
+but only helps when the previous result is small — and a short query over a project matches
+nearly every path, so it saved nothing on the one source where it mattered. Ranking to a
+cap made it worthless AND wrong: the cached ranking would be the capped twenty, and
+narrowing from those would drop matches that belong in the next twenty."
   (cond
-    (:rank-source mb)
-      (let (ranked (completion-rank-incremental text
-                     prev-for
-                     prev-ranked
-                     (:rank-source mb)))
-        [ranked (take ranked (or (:rank-cap mb) 20))])
-    (:candidates-fn mb) [nil ((:candidates-fn mb) text)]
-    :else [nil ()]))
+    (:rank-source mb) (completion-rank text (:rank-source mb) (or (:rank-cap mb) 20))
+    (:candidates-fn mb) ((:candidates-fn mb) text)
+    :else ()))
 
 (def ed-minibuffer-max 10) ; most list rows the echo area grows to (Emacs vertico-count)
 (defn ed-which-key-count (m)
@@ -1142,9 +1142,8 @@ or its `:candidates-fn` applied to the typed text, or `()` with neither.
 each event): the view reads this every frame and input reads it on every selection move,
 so without the memo a large candidate set (e.g. a whole project's files) would be
 re-ranked several times per keystroke and again on every idle tick. The shared seam the
-view (the vertical list) and input (selection + accept) both read. A cache miss computes
-fresh (no narrowing — that needs the previous ranking, which `ed-cache-mb-candidates`
-threads in)."
+view (the vertical list) and input (selection + accept) both read. A cache miss ranks
+fresh."
   (let (cache (:cand-cache mb))
     (cond
       ;; a fresh hit (the cache is for the current text) — the common case
@@ -1154,7 +1153,7 @@ threads in)."
       (and cache (mb-debounce? mb)) (:cands cache)
       ;; otherwise (small source, or no cache yet) recompute now — instant, and what the
       ;; per-keystroke and direct-text-set paths rely on
-      :else (second (mb-rank mb (mb-text mb) (:for cache) (:ranked cache))))))
+      :else (mb-rank mb (mb-text mb)))))
 
 (defn- mb-debounce? (mb)
   "Whether minibuffer `mb`'s candidate ranking should be debounced — a fixed `:rank-source`
@@ -1172,20 +1171,15 @@ source; a small source is kept current synchronously, so it's never stale here."
       (not (= (get-in mb [:cand-cache :for]) (mb-text mb))))))
 
 (defn ed-cache-mb-candidates (m)
-  "Refresh the open minibuffer's `:cand-cache` (`{:for <text> :ranked <full> :cands …}`)
-when its input text changed since the last computation — so `mb-candidates` returns a
-memoized list rather than re-ranking the full candidate set per frame / selection move /
-tick. For a `:rank-source` prompt it also **narrows incrementally**: each keystroke ranks
-the previous result (`:ranked`) instead of the whole source when the query grew (see
-`mb-rank`). Run once per event by `ed-post-step`; a no-op with no minibuffer, no candidate
-source, or unchanged text."
+  "Refresh the open minibuffer's `:cand-cache` (`{:for <text> :cands …}`) when its input
+text changed since the last computation — so `mb-candidates` returns a memoized list rather
+than re-ranking the candidate set per frame / selection move / tick. Run once per event by
+`ed-post-step`; a no-op with no minibuffer, no candidate source, or unchanged text."
   (let (mb (:minibuffer m))
     (if (or (nil? mb) (not (mb-source? mb)) (= (get-in mb [:cand-cache :for]) (mb-text mb)))
       m
-      (let (cache (:cand-cache mb)
-            [ranked cands] (mb-rank mb (mb-text mb) (:for cache) (:ranked cache)))
-        (assoc m
-          :minibuffer (assoc mb :cand-cache {:for (mb-text mb) :ranked ranked :cands cands}))))))
+      (assoc m
+        :minibuffer (assoc mb :cand-cache {:for (mb-text mb) :cands (mb-rank mb (mb-text mb))})))))
 
 (sig ed-set-buf (model buffer -> model))
 (defn ed-set-buf (m buf)
