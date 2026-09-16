@@ -91,6 +91,14 @@ named; the tutor's dead `nil?` guard gone.
 ## Work queue — in the order to take it up
 
 ### 1 — The strict ratchet: 58 → 0 under brood 0.28.0's checker
+**2026-09-16, brood `de575508` (on main):** the count reads **48**
+against a nest built from it — `apply` binds a callee's type variable (KI-140: the four
+`ordered` into `pad-left`), a `let`-bound lambda's parameters are derived from its callers
+and a `sig` over the required positions seeds a `defn` with undeclared `&optional`s
+(ADR-355: `ed-visible-lines`'s `row-op`, `(+ y k)`). The ceiling is 48. What remains is bedit's: `nil | x` reads (~25), `number` from a genuinely
+unknown operand (an `&optional` never declared, a private helper whose callers pass a
+computed `number`), the six `ed-pane-line-at` nils.
+
 `nest check --strict 2>&1 | grep warning:` — the classes, with counts as of `07700563`:
 - **`number` into an `int` parameter** (~15: `view.blsp` `(+ y k)`, `(- pos bol)`,
   `(math/max 0 n)` in `statusbar.blsp`, `model.blsp:1650`, `wrap_test`/`view_scroll_test`):
@@ -112,7 +120,15 @@ named; the tutor's dead `nil?` guard gone.
 Each fix is its own small commit; lower the number in `tests/strict_ratchet_test.blsp` as
 you go — it may only shrink.
 
-### 2 — Why `editor/lexer/line-restart` did not auto-load in the released binary
+### 2 — Why `editor/lexer/line-restart` did not auto-load in the released binary — ANSWERED 2026-09-15
+It never existed there. `line-restart` was born in `editor/highlight` in the ADR-352 commit
+(`2a750c08`) and `editor/lexer` only ever *mentioned* `editor/highlight/line-restart` in a
+comment; `(reflect/eval 'editor/lexer/line-restart)` loads `editor/lexer` and then finds no
+such binding, which is the `unbound symbol` the frame painted. Verified on brood's tree with
+both `nest run` and `brood`: `editor/highlight/line-restart` and `editor/lexer/lexer-spans`
+resolve to `:fn`, the misspelling raises. So trap 1 is policy, not a bug, and the auto-load
+mechanism is fine. The original notes follow for the record.
+
 `reflect/eval` of a qualified symbol loads its module on first use (verified:
 `(reflect/eval 'editor/lexer/lexer-spans)` resolves in a fresh `nest run` with nothing
 loaded), yet the 10:08 `bedit` binary painted `unbound symbol: editor/lexer/line-restart`
