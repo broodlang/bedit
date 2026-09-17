@@ -2,15 +2,16 @@
   "The window's type setup — family, size, line height — and **named presets** over it
 (`M-x preset-select` / `preset-save` / `preset-delete`).
 
-Two things share one vocabulary here. Ctrl+mouse-wheel steps the SIZE, finely; a preset
-names a whole setup you can switch to in one command. The second is what you want when a
+Two things live here. A ZOOM is per buffer — Ctrl+mouse-wheel, `C-x C-=`/`C-x C--`/`C-x C-0`,
+Emacs's `text-scale-adjust` — and never touches the window's font. A PRESET names a whole
+window setup you can switch to in one command. The second is what you want when a
 call starts: `M-x preset-select` → `Presenting`, and the person on the other end of the
 screen share can read your code. Then back to `Default` after.
 
 Why a module and not two knobs. The window has no getter for what it is showing, so
-something has to hold it — the model's `:appearance`. Once that exists, zooming is a step
-on it, a preset is a saved value of it, and `preset-save` is just naming what you are
-looking at. Themes set it too (a theme carries a font), so `themes/themes-apply` records
+something has to hold it — the model's `:appearance`. Once that exists, a preset is a saved
+value of it, `preset-save` is just naming what you are looking at, and a buffer's zoom is a
+size relative to it. Themes set it too (a theme carries a font), so `themes/themes-apply` records
 what it applied and a preset saved afterwards records the truth.
 
 A preset is a plain map, like a theme: `{:name :family :height :line-height}`. The
@@ -44,8 +45,9 @@ name, so redefining `Presenting` is just saving one with that name."
 
 The record is the point: `gui/font` and `gui/line-height` are writes with no read, so the
 model is the only place that knows what is on screen. Every path that changes type goes
-through here — startup, a theme, a preset, a zoom step — so none of them can leave the
-model describing something the window is not."
+through here — startup, a theme, a preset — so none of them can leave the model describing
+something the window is not. A per-buffer zoom does NOT come through here (it is not a
+window change); it is measured against this, so a size change re-measures every zoom."
   (let (was (current m)
         a (merge was appearance) ; over what is showing, not the default: a partial
         h (clamp-height (:height a)) ; apply must not silently reset the fields it omits
@@ -57,19 +59,26 @@ model describing something the window is not."
         lh? (not (= (:line-height a) (:line-height was))))
     (when font? (theme/gui-only gui/font {:family (:family a) :height h}))
     (when lh? (theme/gui-only gui/line-height (:line-height a)))
-    (assoc m :appearance (assoc a :height h))))
+    (let (m2 (assoc m :appearance (assoc a :height h)))
+      (if font? (zoom-remeasure m2) m2))))
 
-;; ---- the size step (Ctrl+mouse-wheel) ---------------------------------------
-;; The old Ctrl+wheel moved the hovered pane's INTEGER `:scale`, one level per event. Two
-;; things made that unusable. A level is a whole multiple — 1 → 2 doubles the text, so the
-;; smallest possible step was +100%. And the runtime turns one notch into a kinetic impulse
-;; that decays over ~half a second (see `ed-smooth-scroll-pane`), so a single notch arrived
-;; as a burst of events and took the scale from 1 to its cap before you let go of the wheel.
+;; ---- the per-buffer zoom (Ctrl+mouse-wheel, C-x C-= / C-x C-- / C-x C-0) ----------
+;; A zoom is Emacs's `text-scale-adjust`: THIS buffer, bigger; the rest of the window as it
+;; was. It used to be a change to the window's font — the grid shrank, every pane was
+;; re-laid, the status bar jumped, and a wheel's kinetic stream re-rasterised the whole
+;; window per event. Five pacing fixes each moved the jank somewhere else, because the model
+;; was wrong, not the pacing: a size belongs to a buffer, not to the window.
 ;;
-;; So zoom moves the font SIZE, which is continuous (a step is ~7% at 15 px, not 100%), and
-;; it accumulates the same float delta the scroll path reads, stepping only when a whole
-;; notch's worth has arrived. The per-pane block zoom is still there — `panes/ed-zoom-pane`,
-;; on Ctrl+SHIFT+wheel — because "make this one pane huge" is a different thing to want.
+;; So a zoomed buffer carries `:zoom {:px :ratio}` — the size, and the size of one of its
+;; cells relative to the window's (`[rw rh]`, physical px over physical px). The view paints
+;; such a buffer's pane inside a `cell-region` (brood ADR-363): a block laid out for the rows
+;; and columns that fit at `px`, positioned in its own cell space, the mode line and every
+;; other pane untouched. The window's font never changes on a zoom; `apply!` is for presets.
+;;
+;; The ratio is MEASURED, not derived: a cell is whatever shaping the reference glyph gives,
+;; rounded to whole pixels, so 16/15 is not 1.0667 of a cell — `gui/cell-size` asks the
+;; window. Headless there is no window; the size ratio stands in, which keeps the geometry
+;; honest in tests and in a `*term-display*` session (where a region is skipped anyway).
 
 (defdyn *zoom-step-lines* 3.0)
 ;; How much accumulated wheel delta buys one pixel of size — and the units matter, because
@@ -86,6 +95,52 @@ model describing something the window is not."
 ;; streak the runtime boosts (capped), so more lines arrive per notch and the size moves in
 ;; bigger steps. Raise this for a slower zoom, lower it for a faster one.
 
+(defn zoom-of (buf)
+  "`buf`'s zoom — `{:px :ratio}` — or nil at the window's own size."
+  (:zoom buf))
+
+(defn zoom-px (m buf)
+  "The font size `buf` shows at: its own zoom, else the window's."
+  (or (:px (zoom-of buf)) (:height (current m))))
+
+(defn- cell-ratio (m px)
+  "`[rw rh]` — a cell at `px` over the window's cell, both in physical pixels, measured by
+the window (`gui/cell-size`) when there is one, else the size ratio. The measurement is what
+makes a zoomed pane's rows and columns exact: the region is painted with the cell the
+renderer shapes, and this is that cell, not an estimate of it."
+  (let (base (:height (current m))
+        win (:window m)
+        ;; the error IS the answer here: no window, a headless build, a window closed under
+        ;; us — every one means "measure nothing, use the ratio", so it is not read
+        measured (when (and win (gui/available?))
+                   (check-allow :discarded-catch
+                     (try
+                       [(gui/cell-size win) (gui/cell-size win px)]
+                       (catch e nil))))
+        [[cw ch] [zw zh]] (or measured [[base base] [px px]]))
+    [(/ zw (math/max 1 cw)) (/ zh (math/max 1 ch))]))
+
+(defn zoom-buffer (m buf px)
+  "`buf` zoomed to `px` — carrying the size and its measured cell ratio — or back to plain
+when `px` is the window's own size, so an unzoomed buffer has no zoom rather than a zoom of
+one. The accumulator is kept: it is the wheel's leftover, not part of the size."
+  (let (px (clamp-height px))
+    (if (= px (:height (current m)))
+      (dissoc buf :zoom)
+      (assoc buf :zoom {:px px :ratio (cell-ratio m px)}))))
+
+(defn zoom-buffer-at (m idx px)
+  "The model with pool buffer `idx` zoomed to `px` (`zoom-buffer`), the size it landed on
+echo'd — the clamped one, so the readout never claims a size past the bounds.
+
+Only in the GUI (`:gui`, what `main` sets under a window). A terminal cell has one size,
+and the frontend-agnostic path a `*term-display*` or `--attach` session renders through
+SKIPS a `cell-region` — a zoom there would blank the pane. It says so instead."
+  (if (not (:gui m))
+    (message m "zoom needs the window: a terminal cell has one size")
+    (let (px (clamp-height px))
+      (assoc (ed-set-buf-at m idx (zoom-buffer m (ed-buf-at m idx) px)) :echo (str "size " px " px")))))
+
 (defn- whole-steps (acc step)
   "How many whole `step`s fit in `acc`, counted TOWARD ZERO. Deliberately not a floor:
 floor(-0.6) is -1, so shrinking would step on a nudge while growing waited for a full
@@ -93,62 +148,68 @@ notch, and a zoom that is easier to shrink than to grow feels broken rather than
   (let (n (math/floor (/ (math/abs acc) step)))
     (if (< acc 0) (- 0 n) n)))
 
-(defn zoom-step (m dy)
-  "Fold a Ctrl+wheel delta of `dy` line units into the PENDING window size, stepping by
-whole pixels once a notch's worth has accumulated. Returns the model — with the leftover
-kept, so a slow scroll is not rounded away to nothing.
+(defn zoom-step (m pane dy)
+  "Fold a Ctrl+wheel delta of `dy` line units into the zoom of the buffer `pane` shows,
+stepping the size by whole pixels once a notch's worth has accumulated. Returns the model —
+with the leftover kept on the buffer (`:zoom-accum`), so a slow scroll is not rounded away
+to nothing.
 
-This does not touch the window. It records the target and lets `zoom-flush` apply it on the
-`:zoom-apply` throttle, because applying it here made the resize janky in two ways. The
-runtime delivers one wheel notch as a burst of kinetic events, and every `gui/font` call
-clears the glyph cache and invalidates the retained frame — so a spin re-rasterised the
-whole window several times per frame, and the grid's rows changed under the mode line each
-time. And it used to `message`, which appends to `*Messages*`: a zoom from 15 to 30 wrote
-fifteen lines into a buffer. The size goes to the echo area only, where a transient status
-belongs."
-  (let (acc (+ (or (:zoom-accum m) 0.0) dy)
+Nothing here touches the window. A step is a model change; the view paints that one pane's
+region at the new size and the rest of the frame is what it was — which is why this needs
+no throttle, no timer and no clock: there is no grid to resize and no whole-window raster to
+pace. The size goes to the echo area only, where a transient status belongs (a zoom from 15
+to 30 used to write fifteen lines into `*Messages*`)."
+  (let (idx (get-in pane [:payload :buffer])
+        buf (ed-buf-at m idx)
+        acc (+ (or (:zoom-accum buf) 0.0) dy)
         steps (whole-steps acc *zoom-step-lines*))
     (if (= steps 0)
-      (assoc m :zoom-accum acc)
-      (let (target (clamp-height (+ (or (:zoom-to m) (:height (current m))) steps))
-            stepped (assoc m
-                      :zoom-accum (- acc (* steps *zoom-step-lines*))
-                      :zoom-to target
-                      :echo (str "size " target " px")))
-        ;; LEADING edge: the first step of a gesture goes to the window immediately and
-        ;; starts a cooldown; everything during that cooldown only accumulates, and the
-        ;; `:zoom-apply` timer applies it when the cooldown ends. A purely trailing throttle
-        ;; put its whole interval between the wheel moving and the text moving, which does
-        ;; not read as smooth — it reads as slow.
-        (if (:zoom-cooling m) stepped (zoom-flush stepped))))))
+      (ed-set-buf-at m idx (assoc buf :zoom-accum acc))
+      (zoom-buffer-at (ed-set-buf-at m idx (assoc buf :zoom-accum (- acc (* steps *zoom-step-lines*))))
+        idx
+        (+ (zoom-px m buf) steps)))))
 
-(defn zoom-notch (m dir)
+(defn zoom-notch (m pane dir)
   "One whole notch of zoom in direction `dir` (+1 bigger, -1 smaller) — for a wheel event
 that carries no delta at all: a terminal, or a test written before the runtime reported one.
 `dir` alone cannot say how far, and one notch is the honest reading of one event."
-  (zoom-step m (* dir *zoom-step-lines*)))
+  (zoom-step m pane (* dir *zoom-step-lines*)))
 
-(defn zoom-pending? (m)
-  "Whether a zoom target is waiting to be pushed to the window."
-  (let (to (:zoom-to m))
-    (and (not (nil? to)) (not (= to (:height (current m)))))))
+(defn zoom-adjust (m delta)
+  "The selected buffer's size stepped by `delta` px — the keyboard's zoom (`C-x C-=` /
+`C-x C--`), one pixel a press, like a notch."
+  (let (idx (ed-current-index m))
+    (zoom-buffer-at m idx (+ (zoom-px m (ed-buf-at m idx)) delta))))
 
-(defn zoom-active? (m)
-  "Whether the `:zoom-apply` timer should be armed: a target waiting, OR a cooldown still
-running. The cooldown needs a tick of its own to end, or the gesture after it would find the
-flag set and defer its first step for nothing."
-  (or (zoom-pending? m) (= true (:zoom-cooling m))))
+(defn zoom-reset (m)
+  "The selected buffer back at the window's size (`C-x C-0`)."
+  (zoom-buffer-at m (ed-current-index m) (:height (current m))))
 
-(defn zoom-flush (m)
-  "Apply the pending zoom target to the window, once — and carry the cooldown. The
-`:zoom-apply` timer's work, and the leading edge's.
+(defn zoom-remeasure (m)
+  "Every zoomed buffer's ratio measured again — for after the WINDOW's size changed under
+it (a preset): a buffer's px stays what it was, but the cell it is relative to moved, and
+one that now sits at the window's size is simply unzoomed."
+  (assoc m
+    :buffers
+      (into []
+        (map (:buffers m)
+          (fn (b) (if (nil? (zoom-of b)) b (zoom-buffer m b (:px (zoom-of b)))))))))
 
-With a target: apply it and keep cooling, so the next tick paces the step after. With none:
-the cooldown has run out with nothing waiting, so it ends and the next notch is immediate
-again."
-  (if (nil? (:zoom-to m))
-    (dissoc m :zoom-cooling)
-    (assoc (dissoc (apply! m {:height (:zoom-to m)}) :zoom-to) :zoom-cooling true)))
+(defcommand cmd-text-scale-increase
+  (m key)
+  "Zoom the current buffer one pixel bigger (`C-x C-=`, `M-x text-scale-increase`) — this
+buffer only, as Emacs's `text-scale-adjust`; Ctrl+wheel is the same step under the pointer."
+  (zoom-adjust m 1))
+
+(defcommand cmd-text-scale-decrease
+  (m key)
+  "Zoom the current buffer one pixel smaller (`C-x C--`, `M-x text-scale-decrease`)."
+  (zoom-adjust m -1))
+
+(defcommand cmd-text-scale-reset
+  (m key)
+  "Show the current buffer at the window's size again (`C-x C-0`, `M-x text-scale-reset`)."
+  (zoom-reset m))
 
 ;; ---- the presets ------------------------------------------------------------
 

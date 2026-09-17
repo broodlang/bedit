@@ -10,6 +10,49 @@ Language-level changes live in the Brood repo's `docs/devlog.md` + `docs/decisio
 
 ---
 
+## 2026-09-17
+
+### the zoom is per buffer, and it is a render op — not a font change
+
+**What shipped.** Ctrl+wheel (and `C-x C-=` / `C-x C--` / `C-x C-0`, `M-x text-scale-*`) zooms
+the buffer under the pointer a pixel a notch — that buffer only, Emacs's `text-scale-adjust`.
+The window's font never moves: the pane is painted inside a `cell-region` at the buffer's
+size, the mode line, the other panes and the echo row where they were.
+
+**Why.** The morning's five zoom fixes each moved the jank somewhere else — a throttle, a
+leading edge, a clock — because a zoom was a change to the WINDOW's font: the grid shrank,
+every pane was re-laid, the status bar jumped, a kinetic wheel stream re-rasterised the whole
+window per event, and `ui-loop` only fired a timer when its poll timed out. The model was
+wrong, not the pacing. What a user means by zoom is *this buffer, bigger*, and the runtime
+could not draw that: the grid had one cell size, and the `:scale` face attr was a whole
+multiple. Prime directive: the capability was missing from the language.
+
+**Brood first (ADR-363, brood `f8827ab1`).** `[:cell-region x y w h px ops]` — a block whose
+ops are painted with the cell metrics of font size `px`, inside a rect given in the parent's
+cells, positioned in the region's own cell space; scoped and self-restoring like
+`scroll-region`, nesting, clipped to its rect, one leaf in the damage bands. `gui/cell-size`
+measures the cell a size produces (13×29 px at 21 px over 9×21 at 15 — not the 1.4 the ratio
+says, which is why it is measured). The cluster cache is keyed by px, so two sizes coexist.
+
+**bedit.** A zoomed buffer carries `:zoom {:px :ratio}` (`appearance/zoom-buffer`); every
+piece of pane geometry divides by the ratio (`panes/ed-zoom-ratio`, `ed-pane-cols`,
+`ed-pane-vrows`, `ed-pane-row-index`, `ed-buf-offset-at`) so the rows and columns that fit,
+the cell a click landed in and the scroll clamp are all in the buffer's cells; the view lays
+the body out at origin 0,0 in those cells and wraps it (`view/ed-pane-ops`). The old integer
+`:scale`, `ed-scale-op` and the `s` parameter threaded through seven view helpers are gone;
+so are the window-zoom throttle, its timer and its three model fields. A zoom outside the
+GUI (`*term-display*`, `--attach`) is refused with a message — a terminal cell has one size.
+Presets (`M-x preset-select`) still set the window's font, and re-measure every zoom.
+
+**Known gap.** The runtime collects `cursor-zone`s from a frame's TOP-LEVEL ops only, so the
+pointer-hand over a results buffer's links is lost inside a zoomed pane (as it already was
+inside a `scroll-region` mid-glide); a zone inside a region would also need its cells mapped.
+A brood fix — harvest zones through regions, in window px — is the right one when it matters.
+
+**Verified.** 1697 model tests, strict 0, `make drive` green — and a real window
+(`BROOD_GUI_DUMP`): one wheel notch + five `C-x C-=` = 21 px, region `[0 0 92 24 21]`,
+seventeen zoomed rows over an unzoomed mode line.
+
 ## 2026-09-13
 
 ### where we lack against Emacs, measured — and the seven fixes, language first

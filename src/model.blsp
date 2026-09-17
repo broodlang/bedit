@@ -114,9 +114,9 @@ carries a `:dir`; a fileless one inherits it where it's opened (see `ed-open-buf
         b))))
 
 (defn ed-pane (idx)
-  "A pane payload showing pool buffer `idx`, scrolled to the top, at font scale 1
-(`:scale` is the per-pane zoom level Ctrl+wheel changes — see `ed-zoom`)."
-  {:buffer idx :top 0 :scale 1})
+  "A pane payload showing pool buffer `idx`, scrolled to the top. (A zoom is the BUFFER's —
+`appearance/zoom-of` — not the pane's, so it does not live here.)"
+  {:buffer idx :top 0})
 
 ;; The model's shape, named once (ADR-326). What every command reads is declared; the
 ;; long tail of per-feature keys (`:dired-dir`, `:lsp`, `:sb-drag`, …) rides on the open
@@ -149,21 +149,14 @@ carries a `:dir`; a fileless one inherits it where it's opened (see `ed-open-buf
     ;; keys; `:cursors` is `pid -> char offset`, read back with arithmetic by the view
     :hosted (optional (map int (record &open :cursors (optional (map any int)))))
     ;; a text-selection drag in progress (`panes/ed-drag-text`): the press-time pane
-    ;; geometry, read back as a pane's rect and scale — the buffer index is what every
+    ;; geometry, read back as a pane's rect and cell ratio — the buffer index is what every
     ;; reader needs (a release copies the region), the geometry what the drag itself does
-    :text-drag (optional (record &open :buf int :rect (optional rect) :scale (optional int)))
+    :text-drag (optional (record &open :buf int :rect (optional rect) :ratio (optional vector)))
     ;; the window's current type setup (`appearance`): the family, its size in px and the
     ;; line height. The window has no getter for these, so the model is where "what am I
     ;; showing right now" lives — Ctrl+wheel reads it to step, and `preset-save` reads it to
     ;; name what you are looking at.
-    :appearance (optional (record &open :family keyword :height int :line-height number))
-    ;; a Ctrl+wheel zoom in flight: the target size not yet pushed to the window, and the
-    ;; sub-notch wheel delta still accumulating toward the next pixel
-    :zoom-to (optional int)
-    :zoom-accum (optional number)
-    ;; the leading-edge cooldown: set when a step is pushed to the window, cleared by the
-    ;; `:zoom-apply` tick that finds nothing waiting
-    :zoom-cooling (optional bool)))
+    :appearance (optional (record &open :family keyword :height int :line-height number))))
 
 (sig ed-init (buffer -> model))
 (defn ed-init (buf)
@@ -739,24 +732,6 @@ input, then the idle `:cursor-blink` timer takes over once you stop."
 ;; on the `:scroll-settle` idle one-shot armed whenever a pane holds a fraction.
 
 (def *scroll-settle-ms* 140) ; quiet time after the last scroll delta before the snap
-(defdyn *zoom-apply-ms* 110)
-;; How often a Ctrl+wheel zoom in progress is pushed to the window — a THROTTLE, not a
-;; debounce (no `:idle?`, which would hold the resize until the wheel stopped and then jump).
-;; `appearance/zoom-step` records the target; `appearance/zoom-flush` applies it.
-;;
-;; This number is the whole smoothness trade-off, so it is worth knowing what it buys. A
-;; size change is NOT cheap: `gui/font` clears the glyph cache, re-shapes the cell, and
-;; changes the grid's row and column count — so every apply re-rasterises the whole window
-;; and re-lays-out the panes (measured here: ~9 ms of model+view, on top of the raster).
-;; Applying per kinetic event was hundreds of those a second, which is what made the status
-;; bar flicker. At 110 ms a spin resizes ~9 times a second: each step lands with slack
-;; around it, so the motion reads as a ramp rather than a stutter.
-;;
-;; It is a `defdyn` because the right value depends on the machine and the taste. Lower it
-;; for a more continuous zoom on a fast box; raise it past a few hundred ms and the zoom
-;; effectively becomes "apply once when I stop scrolling", which is the smoothest of all if
-;; you do not want to watch the text grow. `(binding (*zoom-apply-ms* 300) …)`, or a
-;; `C-x C-e` on a `def` to try one live.
 (defn ed-any-pane-fractional? (m)
   "True when some pane rests between lines (`:scroll-frac` ≠ 0)."
   (any? (pane-leaf-paths (:layout m))
@@ -813,12 +788,6 @@ flag once no prefix is pending (what `ed-which-key-arm` used to do)."
                (if (ed-any-pane-fractional? m)
                  {:scroll-settle {:after *scroll-settle-ms* :idle? true}}
                  {})
-               ;; a zoom in progress pushes its target to the window on a THROTTLE — no
-               ;; `:idle?`, which would hold the resize until the wheel stopped and then
-               ;; jump. Deferred-loaded like the tutor/playground probes above.
-               (if (and (bound? 'appearance/zoom-active?) ((reflect/eval 'appearance/zoom-active?) m))
-                 {:zoom-apply {:after *zoom-apply-ms*}}
-                 {})
                (if tutor-stale? {:tutor-eval {:after *tutor-eval-debounce-ms* :idle? true}} {})
                (if playground-stale?
                  {:playground-eval {:after *tutor-eval-debounce-ms* :idle? true}}
@@ -834,11 +803,11 @@ flag once no prefix is pending (what `ed-which-key-arm` used to do)."
         managed (merge {:cursor-blink {:every *blink-ms* :idle? true}} idle)
         ;; Every managed one-shot is dropped here and re-added by `managed` while its work
         ;; is pending — that drop is what RE-ARMS it. A one-shot the loop has already fired
-        ;; is dead until its entry is recreated, so leaving `:zoom-apply` in this map made
-        ;; the first notch apply and every one after it record a target nothing pushed.
+        ;; is dead until its entry is recreated, so a managed timer missing from this list
+        ;; fires once and never again.
         kept (dissoc (or (:timers m) {})
                :cursor-blink :idle-recompute :which-key :undo-pause :tutor-eval :playground-eval
-               :scroll-settle :zoom-apply))
+               :scroll-settle))
     (assoc m :timers (merge kept managed))))
 
 ;; ---- overlay scrollbar fade (macOS-style auto-hide) -------------------------
@@ -1221,13 +1190,20 @@ than re-ranking the candidate set per frame / selection move / tick. Run once pe
       (assoc m
         :minibuffer (assoc mb :cand-cache {:for (mb-text mb) :cands (mb-rank mb (mb-text mb))})))))
 
+(sig ed-set-buf-at (model int buffer -> model))
+(defn ed-set-buf-at (m i buf)
+  "The model with `buf` in pool slot `i` — the plain write every pane on that buffer sees.
+No pane bookkeeping: a caller changing the CURRENT buffer's content wants `ed-set-buf`,
+which also caches its point on the pane; this is for a buffer's own properties (its zoom, a
+reload, a save-stamp), or a slot that is not the selected pane's."
+  (assoc m :buffers (assoc (:buffers m) i buf)))
+
 (sig ed-set-buf (model buffer -> model))
 (defn ed-set-buf (m buf)
   "The model with `buf` written back to the selected pane's POOL slot (so every view sees a
 content edit) **and** `buf`'s point/mark cached as the selected pane's **window-local** cursor
 — so other panes on the same buffer keep their own. Scroll (per-pane) is untouched."
-  (assoc m
-    :buffers (assoc (:buffers m) (ed-current-index m) buf)
+  (assoc (ed-set-buf-at m (ed-current-index m) buf)
     :layout
       (pane-update-selected (:layout m)
         (fn (w) (assoc w :point (:point buf) :mark (:mark buf))))))
@@ -1604,7 +1580,7 @@ Raises if the file cannot be read — the callers report."
         ;; `:git-status-rope`, so it recomputes against the new content on the idle beat).
         reverted (goto-char (assoc fresh :name (buffer-name b) :layers (:layers b) :dir (:dir b))
                    (math/min (buffer-point b) len)))
-    (ed-map-panes (assoc m :buffers (assoc (:buffers m) i reverted))
+    (ed-map-panes (ed-set-buf-at m i reverted)
       (fn (w)
         (if (and (= (:buffer w) i) (not (nil? (:point w))))
           (assoc w :point (math/min (:point w) len) :mark nil)

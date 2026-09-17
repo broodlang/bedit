@@ -54,14 +54,11 @@ the body fills the pane)."
 
 (defn ed-selected-text-rows (m cols rows)
   "The text height of the *selected* pane in BUFFER lines — its rect height less the
-mode-line row, divided by the pane's font scale (a zoomed pane shows fewer lines).
-What scrolling and paging use, so they're correct inside a split and when zoomed.
-At least 1."
+mode-line row, in the buffer's own cells (a zoomed buffer shows fewer lines). What
+scrolling and paging use, so they're correct inside a split and when zoomed. At least 1."
   (let (panes (:panes (ed-body-layout m cols rows))
-        sel (ed-selected-pane panes)
-        cells (dec (nth (:rect sel) 3)) ; rect = [x y w h]; h-1 for the mode line
-        s (ed-pane-scale sel))
-    (math/max 1 (math/quot cells s))))
+        sel (ed-selected-pane panes))
+    (math/max 1 (ed-pane-vrows sel (ed-pane-buf m sel)))))
 
 (sig ed-pane-top (pane buffer -> int))
 (defn ed-pane-top (pane buf)
@@ -120,14 +117,36 @@ not its laid-out rect (M-r)."
 ;; question reads then; a row's `from` is its horizontal scroll (the chars before it are
 ;; on the rows above), so the column geometry (`ed-buf-offset-at`, the caret) is unchanged.
 
+;; ---- the buffer's cell: every dimension below is in the ZOOMED buffer's cells ------
+;; A zoomed buffer (`appearance/zoom-of`) is painted inside a `cell-region` (brood ADR-363)
+;; at its own font size, so its pane holds fewer, bigger cells than the window's rect says.
+;; `ed-zoom-ratio` is the size of one of its cells over the window's, `[rw rh]`; a rect in window
+;; cells divided by it is the rect in the buffer's cells. Unzoomed the ratio is `[1 1]` and
+;; every formula here reads as it always did.
+
+(sig ed-zoom-ratio (buffer -> vector))
+(defn ed-zoom-ratio (buf)
+  "`[rw rh]` — `buf`'s cell over the window's (`[1 1]` unzoomed): what every piece of pane
+geometry divides by — the columns and rows that fit, the cell a click landed in, the rect a
+region is laid out into. `appearance/zoom-buffer` writes it (measured by the window); this
+is the one read, here rather than there because `appearance` is deferred and the geometry
+must not load the preset registry to answer for a buffer with no zoom."
+  (or (:ratio (:zoom buf)) [1 1]))
+
+(sig ed-pane-cols (pane buffer -> int))
+(defn ed-pane-cols (pane buf)
+  "The columns `pane`'s BODY holds in `buf`'s cells: its rect width less the scrollbar
+column, divided by the cell ratio — the width of the region the body is painted into (the
+gutter is inside it). At least 1."
+  (let ([x y w h] (or (:rect pane) [0 0 80 24])
+        [rw rh] (ed-zoom-ratio buf))
+    (math/max 1 (math/floor (/ (dec w) rw)))))
+
 (defn ed-pane-text-cols (pane buf)
-  "The text width of `pane` in cells: its rect width less the gutter and the scrollbar
-column, divided by the font scale — the width the view lays lines into and a wrapped line
-breaks at (`ed-selected-text-cols` is this for the selected pane). At least 1."
-  (let ([x y w h] (:rect pane)
-        gw (ed-gutter-width buf (ed-gutter-shown? buf pane))
-        s (ed-pane-scale pane))
-    (math/max 1 (- (math/quot (dec w) s) gw))))
+  "The text width of `pane` in `buf`'s cells: the body's columns (`ed-pane-cols`) less the
+gutter — the width the view lays lines into and a wrapped line breaks at
+(`ed-selected-text-cols` is this for the selected pane). At least 1."
+  (math/max 1 (- (ed-pane-cols pane buf) (ed-gutter-width buf (ed-gutter-shown? buf pane)))))
 
 (sig ed-pane-rows (pane buffer -> (or nil vector)))
 (defn ed-pane-rows (pane buf)
@@ -139,14 +158,17 @@ Recomputed per call from the visible lines' text (O(rows) segmentations)."
     (wrap/rows-from buf
       (ed-pane-top pane buf)
       (ed-pane-text-cols pane buf)
-      (inc (ed-pane-vrows pane)))
+      (inc (ed-pane-vrows pane buf)))
     nil))
 
-(sig ed-pane-row-index (pane int -> int))
-(defn- ed-pane-row-index (pane row)
-  "Screen row `row` as an index into the pane's text rows (0 = the first), by the font scale."
-  (let ([px py pw ph] (:rect pane))
-    (math/quot (math/max 0 (- row py)) (math/max 1 (ed-pane-scale pane)))))
+(sig ed-pane-row-index (pane buffer int -> int))
+(defn- ed-pane-row-index (pane buf row)
+  "Screen row `row` as an index into the pane's text rows (0 = the first) in `buf`'s cells:
+the offset into the pane divided by the cell ratio, so a zoomed buffer's taller rows count
+as one each."
+  (let ([px py pw ph] (:rect pane)
+        [rw rh] (ed-zoom-ratio buf))
+    (math/floor (/ (math/max 0 (- row py)) rh))))
 
 (sig ed-pane-line-at (pane buffer int -> (or nil int)))
 (defn ed-pane-line-at (pane buf row)
@@ -156,7 +178,7 @@ entry when the buffer wraps — or nil for a row below the buffer's last line (a
 there is over nothing; a CLICK there wants the last line, which is
 `ed-pane-line-at-clamped`). The one row→line mapping; the inverse of the view's pane
 geometry."
-  (let (k (ed-pane-row-index pane row)
+  (let (k (ed-pane-row-index pane buf row)
         rows (ed-pane-rows pane buf))
     (if (nil? rows)
       (let (line (+ (ed-pane-view-top pane buf) k))
@@ -172,7 +194,7 @@ that row's slice of the line."
   (let (rows (ed-pane-rows pane buf))
     (if (nil? rows)
       (ed-pane-hscroll pane)
-      (let (k (ed-pane-row-index pane row))
+      (let (k (ed-pane-row-index pane buf row))
         (if (< k (count rows)) (second (nth rows k)) 0)))))
 
 (sig ed-rows-line-rows ((or nil vector) int int int -> (list (tuple int int (or nil int)))))
@@ -222,26 +244,22 @@ below the end of a short buffer lands, as in Emacs."
   (or (ed-pane-line-at pane buf row) (math/max 0 (dec (buffer-line-count buf)))))
 
 (defn ed-selected-text-cols (m cols rows)
-  "The text width (in columns) of the *selected* pane — its rect width less the gutter
-and the 1-col scrollbar, divided by the font scale. What horizontal scrolling keeps point
-within (matches the width `view/ed-pane-ops` paints the lines into). At least 1."
+  "The text width (in columns) of the *selected* pane — `ed-pane-text-cols` for it. What
+horizontal scrolling keeps point within (matches the width `view/ed-pane-ops` paints the
+lines into). At least 1."
   (let (panes (:panes (ed-body-layout m cols rows))
-        sel (ed-selected-pane panes)
-        buf (ed-pane-buf m sel)
-        [x y w h] (:rect sel)
-        gw (ed-gutter-width buf (ed-gutter-shown? buf sel))
-        s (ed-pane-scale sel))
-    (math/max 1 (- (math/quot (dec w) s) gw))))
+        sel (ed-selected-pane panes))
+    (ed-pane-text-cols sel (ed-pane-buf m sel))))
 
-(defn ed-pane-vrows (pane)
-  "The number of BUFFER lines `pane`'s text area shows: its rect height less the
-mode-line row, divided by the pane's font scale (a zoomed pane shows fewer lines). The
+(sig ed-pane-vrows (pane buffer -> int))
+(defn ed-pane-vrows (pane buf)
+  "The number of BUFFER lines `pane`'s text area shows in `buf`'s cells: its rect height
+less the mode-line row, divided by the cell ratio (a zoomed buffer shows fewer lines). The
 single source of the viewport height the fontify window and its cache key are built on
 — `view/ed-pane-ops` reads it too, so the cached band always matches what's painted."
-  (let ([x y w h] (:rect pane)
-        s (ed-pane-scale pane)
-        text-h (math/max 0 (dec h)))
-    (if (= s 1) text-h (math/max 1 (math/quot text-h s)))))
+  (let ([x y w h] (or (:rect pane) [0 0 80 24])
+        [rw rh] (ed-zoom-ratio buf))
+    (math/max 0 (math/floor (/ (math/max 0 (dec h)) rh)))))
 
 ;; ---- windowed fontification + a cross-frame span cache ----------------------
 ;; The view paints syntax colour from the `[start end face]` spans a buffer mode's
@@ -369,11 +387,8 @@ both dimensions, so `ed-update` doesn't pay for two independent layout traversal
   (let (panes (:panes (ed-body-layout m cols rows))
         sel (ed-selected-pane panes)
         buf (ed-pane-buf m sel)
-        [x y w h] (:rect sel)
-        gw (ed-gutter-width buf (ed-gutter-shown? buf sel))
-        s (ed-pane-scale sel))
-    [(math/max 1 (math/quot (dec h) s))
-      (math/max 1 (- (math/quot (dec w) s) gw))]))
+        buf (ed-pane-buf m sel))
+    [(math/max 1 (ed-pane-vrows sel buf)) (ed-pane-text-cols sel buf)]))
 
 ;; ---- the gutter-cell cache (same discipline as the span cache) ---------------
 ;; The line-number gutter rebuilds every visible cell each frame — per line a mode
@@ -469,7 +484,7 @@ pure `view` just reads the result; also caches the layout as `:_lc`."
                          sc2 (if (nil? fontify)
                                sc
                                (let (top (ed-pane-top pane buf)
-                                     vrows (ed-pane-vrows pane)
+                                     vrows (ed-pane-vrows pane buf)
                                      restart (ed-mode-service buf :fontify-restart)
                                      entry (get old key))
                                  (assoc sc
@@ -482,7 +497,7 @@ pure `view` just reads the result; also caches the layout as `:_lc`."
                          gc2 (if (or (<= gw 0) (nil? cell))
                                gc
                                (let (top (ed-pane-top pane buf)
-                                     vh (ed-pane-vrows pane)
+                                     vh (ed-pane-vrows pane buf)
                                      gkey (ed-gutter-key buf gw)
                                      gentry (get oldg key)
                                      same? (and gentry (= (:key gentry) gkey)))
@@ -516,11 +531,6 @@ than a cursor shared across every view of the buffer."
   (let (pl (:payload pane))
     (ed-with-window-point (ed-buf-at m (:buffer pl)) (:point pl) (:mark pl))))
 
-(sig ed-pane-scale (pane -> int))
-(defn ed-pane-scale (pane)
-  "The pane's integer zoom factor (its payload's `:scale`, at least 1)."
-  (math/max 1 (or (get-in pane [:payload :scale]) 1)))
-
 (defn ed-scrollbar-hit? (pane buf row col)
   "True if `[row col]` lands on `pane`'s scrollbar: its rightmost column, on a text row
 (above the mode line), with the bar shown — `buf` doesn't fit the `vh` text rows (the
@@ -530,34 +540,38 @@ same predicate `view/ed-scrollbar-ops` draws under)."
     (and (= col (+ px (dec pw)))
       (>= row py)
       (< row (+ py vh))
-      (> (buffer-line-count buf) vh))))
+      (> (buffer-line-count buf) (math/max 1 (ed-pane-vrows pane buf))))))
 
-(sig ed-scrollbar-top-for (buffer int int int &optional (or nil int) -> int))
-(defn ed-scrollbar-top-for (buf vh row sy &optional (w nil))
-  "The pane `:top` for a scrollbar click/drag at screen `row`, on a track of `vh` rows
-starting at `sy`: a proportional map — the track top scrolls to 0, the bottom to
-`ed-max-top` (row-counted for a wrapped buffer given its text width `w`) — clamped into
-`[0, max-top]`."
+(sig ed-scrollbar-top-for (buffer int int int &optional (or nil int) (or nil int) -> int))
+(defn ed-scrollbar-top-for (buf vh row sy &optional (w nil) (track nil))
+  "The pane `:top` for a scrollbar click/drag at screen `row`, on a track of `track` rows
+(the pane's window rows; `vh` when not given) starting at `sy`, with `vh` buffer lines in
+view: a proportional map — the track top scrolls to 0, the bottom to `ed-max-top`
+(row-counted for a wrapped buffer given its text width `w`) — clamped into `[0, max-top]`.
+The two heights differ for a zoomed buffer: its track is the pane's rows, its page fewer,
+bigger lines."
   (let (maxtop (ed-max-top buf (math/max 1 vh) w)
+        vh (or track vh)
         rr (math/max 0 (math/min (dec vh) (- row sy))))
     (if (<= maxtop 0)
       0
       (math/max 0 (math/min maxtop (math/quot (* maxtop rr) (math/max 1 (dec vh))))))))
 
-(sig ed-buf-offset-at (buffer int int int int int int -> int))
-(defn ed-buf-offset-at (buf line hscroll gw s px col)
+(sig ed-buf-offset-at (buffer int int int number int int -> int))
+(defn ed-buf-offset-at (buf line hscroll gw rw px col)
   "The buffer offset under screen column `col` on buffer `line` for a pane at left edge
-`px`, left gutter `gw` columns wide, font scale `s`, scrolled `hscroll` columns — the
-column half of the view's pane geometry (`view/ed-pane-ops` / `ed-cursor`); the LINE
-is the caller's, from `ed-pane-line-at-clamped`, the one row→line owner. The cell is
-`(col-px)/s - gw` right of the first shown character (`hscroll` chars in, as
+`px`, left gutter `gw` columns wide, a cell `rw` window cells wide (`ed-zoom-ratio`; 1
+unzoomed), scrolled `hscroll` columns — the column half of the view's pane geometry
+(`view/ed-pane-ops` / `ed-cursor`); the LINE is the caller's, from
+`ed-pane-line-at-clamped`, the one row→line owner. The cell is `(col-px)/rw - gw` right
+of the first shown character (`hscroll` chars in, as
 `view/ed-visual-column-from` counts it), and `string/width->index` turns that cell back
 into a character by the SAME measure the view lays the line out with (`display-width`:
 an emoji or CJK glyph is two cells, a combining mark none) — a click on a wide glyph
 lands before it, never a character past it. Clamped: a click past a short line's end
 lands at its end, never the next line."
   (let (line (math/min (math/max 0 (dec (buffer-line-count buf))) line)
-        vcol (math/quot (math/max 0 (- col px)) (math/max 1 s))
+        vcol (math/floor (/ (math/max 0 (- col px)) rw))
         cell (math/max 0 (- vcol gw))
         rope (buffer-rope buf)
         bol (text/line->char rope line)
@@ -586,9 +600,9 @@ With no such service the click falls through to the old clamped point move."
   (let ([px py pw ph] (:rect pane)
         top (or (get-in pane [:payload :top]) 0) ; recorded for the drag; the line is `ed-pane-line-at-clamped`'s
         hscroll (ed-pane-hscroll pane)
-        s (ed-pane-scale pane)
+        [rw rh] (ed-zoom-ratio buf)
         gw (ed-gutter-width buf (ed-gutter-shown? buf pane))
-        vcol (math/quot (math/max 0 (- col px)) (math/max 1 s))
+        vcol (math/floor (/ (math/max 0 (- col px)) rw))
         ;; a click in the gutter columns routes to the mode's `:gutter-click`, but
         ;; ONLY when the mode defines one — otherwise it falls through to a normal
         ;; text click (a gutterless-service buffer must still select from column 0).
@@ -611,7 +625,7 @@ With no such service the click falls through to the old clamped point move."
                   (ed-pane-line-at-clamped pane buf row)
                   (ed-pane-row-hscroll pane buf row)
                   gw
-                  s
+                  rw
                   px
                   col))
         (assoc (ed-set-buf m (clear-mark (goto-char buf off)))
@@ -621,7 +635,7 @@ With no such service the click falls through to the old clamped point move."
              :top top
              :hscroll hscroll
              :gw gw
-             :scale s
+             :ratio [rw rh]
              :anchor off})))))
 
 (sig ed-drag-edge-advance (buffer int int -> int))
@@ -648,7 +662,7 @@ drag is in progress."
       m
       (let (buf (ed-buf-at m (:buf td))
             [px py pw ph] (:rect td)
-            s (math/max 1 (or (:scale td) 1))
+            [rw rh] (or (:ratio td) [1 1])
             ;; read the pane's CURRENT scroll (the dragged pane is the selected one), not
             ;; the press-time top — so as a drag past the edge scrolls (ed-ev-mouse's
             ;; clamp), the pointer keeps mapping to the newly-revealed lines and the
@@ -662,7 +676,7 @@ drag is in progress."
                    (ed-pane-line-at-clamped live buf row)
                    (ed-pane-row-hscroll live buf row)
                    (:gw td)
-                   s
+                   rw
                    px
                    col)
             ;; Edge auto-scroll (the horizontal analogue of dragging past the bottom to
@@ -671,8 +685,8 @@ drag is in progress."
             ;; the right/left text edge, push point a step further along the line so
             ;; `ed-scroll-horizontal` reveals more of it. `ed-drag-edge-advance` clamps to
             ;; the line, so a short line (nothing to reveal) is untouched.
-            right-edge (- (+ px pw) s)
-            left-edge (+ px (* (:gw td) s))
+            right-edge (- (+ px pw) (math/ceil rw))
+            left-edge (+ px (math/floor (* (:gw td) rw)))
             off (cond
                   (>= col right-edge) (ed-drag-edge-advance buf off0 8)
                   (< col left-edge) (ed-drag-edge-advance buf off0 -8)
@@ -707,14 +721,16 @@ and arm a text-selection drag (`ed-mouse-begin-select`)."
                                          (assoc w
                                            :top
                                              (ed-scrollbar-top-for buf
-                                               vh
+                                               (math/max 1 (ed-pane-vrows pane buf))
                                                row
                                                py
-                                               (ed-pane-text-cols pane buf)))))
+                                               (ed-pane-text-cols pane buf)
+                                               vh))))
                                    :sb-drag
                                      {:path (:path pane)
                                       :sy py
-                                      :vh vh
+                                      :vh (math/max 1 (ed-pane-vrows pane buf))
+                                      :track vh
                                       :w (ed-pane-text-cols pane buf)
                                       :buf (get-in pane [:payload :buffer])}))
             (< row (+ py vh)) (ed-mouse-begin-select selected pane buf row col)
@@ -732,7 +748,7 @@ follow the pointer (`ed-scrollbar-top-for`). A no-op if not dragging one."
             (:path sb)
             (fn (w)
               (assoc w
-                :top (ed-scrollbar-top-for (ed-buf-at m (:buf sb)) (:vh sb) row (:sy sb) (:w sb)))))))))
+                :top (ed-scrollbar-top-for (ed-buf-at m (:buf sb)) (:vh sb) row (:sy sb) (:w sb) (:track sb)))))))))
 
 (defn ed-mouse-drag (m row col)
   "While dragging a divider, set its split's ratio so the boundary follows the
@@ -743,11 +759,11 @@ pointer (clamped by `pane-set-ratio` so no pane vanishes). A no-op if not draggi
       (assoc m
         :layout (pane-set-ratio (:layout m) (:path d) (pane-ratio-for d [row col]))))))
 
-(def *max-zoom* 6) ; integer font-scale cap (1 = base; the GUI :scale matches the kernel's gui/font cap)
 (defdyn *wheel-lines* 3) ; lines a plain wheel notch scrolls
 ;; ---- mouse wheel acts on the pane UNDER THE POINTER (not the active one) -----
 ;; A wheel notch zooms / scrolls the pane the cursor is over, like every editor —
-;; so it never disturbs which pane is selected. `pane-at` resolves the hovered
+;; so it never disturbs which pane is selected. (A zoom is then the BUFFER's, as Emacs's
+;; `text-scale-adjust` is: every pane on it follows.) `pane-at` resolves the hovered
 ;; pane (carrying its `:path`); `pane-update-path` edits exactly that pane's
 ;; payload. (Divider drag-resize is already hover-targeted in `ed-mouse-press`.)
 
@@ -764,17 +780,6 @@ click can make its pane current without the point-move a full press does."
       m
       (assoc m :layout (pane-select-at (:layout m) layout [row col])))))
 
-(defn ed-zoom-pane (m pane delta)
-  "Ctrl+mouse-wheel: change the font scale of `pane` (the one under the pointer) by
-`delta` levels, clamped to 1..*max-zoom*. Per-pane `:scale` (the view renders it via
-the kernel's per-op `:scale` face attr, ADR-079) — only the hovered pane resizes;
-selection and every other pane are untouched. The *decision* to zoom on Ctrl+wheel
-is editor policy; the kernel supplies only the mechanism (ADR-006)."
-  (let (cur (ed-pane-scale pane)
-        s (math/max 1 (math/min *max-zoom* (+ cur delta))))
-    (assoc m
-      :layout (pane-update-path (:layout m) (:path pane) (fn (w) (assoc w :scale s))))))
-
 (sig ed-scroll-pane (model pane int -> model))
 (defn ed-scroll-pane (m pane delta)
   "Plain mouse-wheel: scroll the *hovered* `pane`'s viewport by `delta` buffer lines,
@@ -787,7 +792,7 @@ any accumulated sub-line fractional offset)."
   (let (buf (ed-pane-buf m pane)
         top (or (get-in pane [:payload :top]) 0)
         [px py pw ph] (or (:rect pane) [0 0 80 24])
-        maxtop (ed-max-top buf (math/max 1 (dec ph)) (ed-pane-text-cols pane buf))
+        maxtop (ed-max-top buf (math/max 1 (ed-pane-vrows pane buf)) (ed-pane-text-cols pane buf))
         new-top (math/max 0 (math/min maxtop (+ top delta)))
         m2 (assoc m
              :layout
@@ -809,7 +814,7 @@ value crosses a whole line, advance `:top` and keep the remainder. `:scroll-frac
         new-frac-raw (+ frac dy-frac)
         lines (math/floor new-frac-raw)
         remainder (- new-frac-raw lines)
-        maxtop (ed-max-top buf (math/max 1 (dec ph)) (ed-pane-text-cols pane buf))
+        maxtop (ed-max-top buf (math/max 1 (ed-pane-vrows pane buf)) (ed-pane-text-cols pane buf))
         ideal-top (+ top lines)
         new-top (math/max 0 (math/min maxtop ideal-top))
         ;; Zero the fraction at hard boundaries so the view doesn't oscillate.
@@ -861,8 +866,7 @@ selects a pane and moves point to the click (starting a text selection), begins 
 drag, or grabs a scrollbar; `:drag` extends the text selection (`:text-drag`), resizes the
 dragged divider, or scrolls the grabbed scrollbar; `:release` ends any drag; **Ctrl+wheel
 zooms** and a **plain wheel scrolls** the pane
-**under the pointer** (`ed-zoom-pane` / `ed-scroll-pane`, one notch each), never the
-active pane. Fields are read positionally (`nth`), not by a fixed-length vector
+**under the pointer** (`appearance/zoom-step` / `ed-scroll-pane`), never the active pane. Fields are read positionally (`nth`), not by a fixed-length vector
 pattern, so the trailing `mods` element (and any future addition) can't silently
 break the match. A wheel notch off every pane is ignored."
   (let (action (nth input 1)
@@ -889,21 +893,14 @@ break the match. A wheel notch off every pane is ignored."
           (:text-drag m) (ed-text-drag m row col)
           else (ed-mouse-drag m row col))
       (= action :release) (dissoc m :dragging :sb-drag :text-drag)
-      ;; Ctrl alone steps the window's font SIZE, finely: a level of `:scale` is a whole
-      ;; multiple (1 → 2 doubles the text) and one notch arrives as a burst of kinetic
-      ;; events, so this used to cross the whole zoom range before you let go of the wheel.
-      ;; `appearance/zoom-step` accumulates the same float delta the scroll path below reads
-      ;; and moves one pixel per notch. Deferred-loaded, the keymap idiom, so this core file
-      ;; does not link the preset registry.
-      ;;
-      ;; ABOVE the hovered-pane guard on purpose. The size is the WINDOW's, so it needs no
-      ;; pane — and gating it on one killed the gesture mid-zoom: growing the font shrinks
-      ;; the grid, the pointer's last reported CELL (the runtime keeps it until the mouse
-      ;; moves) then falls outside it, `pane-at` answers nil, and every remaining event of
-      ;; the glide was dropped. It moved for a split second and stopped.
-      (and (or (= action :scroll-up) (= action :scroll-down))
-        (includes? mods :ctrl)
-        (not (includes? mods :shift))) ; Ctrl+Shift is the per-pane zoom, below
+      (nil? hovered) m
+      ;; Ctrl+wheel zooms the BUFFER under the pointer, a pixel per notch — this buffer only,
+      ;; Emacs's `text-scale-adjust`; the window's font is untouched, so the grid never
+      ;; changes under the gesture and nothing else on screen moves. `appearance/zoom-step`
+      ;; accumulates the same float delta the scroll path below reads and steps once a
+      ;; notch's worth has arrived. Deferred-loaded, the keymap idiom, so this core file
+      ;; does not link the preset registry. Shift is ignored: there is one zoom now.
+      (and (or (= action :scroll-up) (= action :scroll-down)) (includes? mods :ctrl))
         ;; The 7th element is the kinetic delta in LINE units. A notch is not one event and
         ;; not one line — the runtime spreads it over a decaying stream summing to ~3 lines
         ;; — so the conversion to pixels lives in `appearance`, which knows that ratio. An
@@ -912,13 +909,8 @@ break the match. A wheel notch off every pane is ignored."
               dir (if (= action :scroll-up) 1 -1))
           (cond
             (not (bound? 'appearance/zoom-step)) m
-            (nil? dy) ((reflect/eval 'appearance/zoom-notch) m dir)
-            :else ((reflect/eval 'appearance/zoom-step) m (* dir dy))))
-      (nil? hovered) m
-      ;; Ctrl+SHIFT keeps the per-pane block zoom (whole multiples, this pane only) — and
-      ;; that one really does need a pane under the pointer, so it sits below the guard.
-      (and (= action :scroll-up) (includes? mods :ctrl)) (ed-zoom-pane m hovered 1)
-      (and (= action :scroll-down) (includes? mods :ctrl)) (ed-zoom-pane m hovered -1)
+            (nil? dy) ((reflect/eval 'appearance/zoom-notch) m hovered dir)
+            :else ((reflect/eval 'appearance/zoom-step) m hovered (* dir dy))))
       ;; 7th element: scroll delta in line units (float, from the Brood runtime) — a
       ;; trackpad step, or one tick of a wheel notch's kinetic glide (the runtime turns a
       ;; notch into an impulse that decays over ~half a second, so the wheel scrolls as

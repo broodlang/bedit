@@ -2,11 +2,11 @@
 ;; model tests: `apply!`'s window calls are `gui-only`, so headless they are no-ops and what
 ;; is left is exactly the state the model records.
 ;;
-;; The behaviour under test is a complaint: Ctrl+wheel zoom was "VERY sensitive". Two causes,
-;; both pinned below. A `:scale` level is a whole multiple, so the smallest step was +100%;
-;; and the runtime turns one notch into a kinetic burst of events, so a single notch crossed
-;; the entire range. Stepping the font SIZE, and only once a notch's worth of delta has
-;; accumulated, is what makes it incremental.
+;; The behaviour under test is a complaint, twice: Ctrl+wheel zoom was "VERY sensitive"
+;; (a `:scale` level was a whole multiple, and one notch is a kinetic burst of events), and
+;; then, as a step on the WINDOW's font, it was janky however it was paced. Stepping a
+;; BUFFER's size a pixel at a time, once a notch's worth of delta has accumulated, and
+;; painting that buffer in a cell region, is what makes it incremental and smooth.
 
 (defmodule appearance-test
   (:use test)
@@ -14,10 +14,8 @@
   (:use editor/buffer)
   (:use appearance))
 
-(defn m0 () (ed-init (make-buffer "hello")))
-(defn pane-scale-of (m)
-  (let (p (first (:panes (panes/ed-body-layout m 80 24))))
-    (math/max 1 (or (:scale (:payload p)) 1))))
+;; `:gui` as `main` sets it under a window: a zoom is a GUI thing (a terminal cell has one size)
+(defn m0 () (assoc (ed-init (make-buffer "hello")) :gui true))
 
 (describe "the window's type setup"
   (test "a fresh model reports the default, and apply! records what it set"
@@ -47,66 +45,34 @@
         total (math/sum raw))
     (map raw (fn (v) (* dir (* *zoom-step-lines* (/ v total)))))))
 
+(defn pane0 (m) (first (:panes (panes/ed-body-layout m 80 24))))
 (defn notches (m dir n)
-  ;; `n` physical notches, each as its own kinetic stream
-  (fold (range n) m (fn (acc _) (fold (notch-stream dir) acc (fn (a dy) (zoom-step a dy))))))
+  ;; `n` physical notches, each as its own kinetic stream, over the pointer's pane
+  (fold (range n) m (fn (acc _) (fold (notch-stream dir) acc (fn (a dy) (zoom-step a (pane0 a) dy))))))
+(defn px-of (m) (zoom-px m (ed-current-buf m)))
 
-(describe "Ctrl+wheel steps the size incrementally"
-  (defn stepped (m) (or (:zoom-to m) (:height (current m))))
-  (defn applied (m) (:height (current (zoom-flush m))))
-
+(describe "Ctrl+wheel steps the buffer's size incrementally"
   ;; The complaint, twice over: one notch must be ONE pixel. At a divisor of 1.0 a notch
   ;; stepped three (its glide sums to ~3 lines), which read as "too sensitive", and the
   ;; accumulated target then lurched a whole spin's worth per throttle tick.
   (test "one physical notch is one pixel"
-    (assert= (applied (notches (m0) 1 1)) 16)
-    (assert= (applied (notches (m0) -1 1)) 14))
+    (assert= (px-of (notches (m0) 1 1)) 16)
+    (assert= (px-of (notches (m0) -1 1)) 14))
   (test "three notches are three pixels — the response is linear in the hand"
-    (assert= (applied (notches (m0) 1 3)) 18))
+    (assert= (px-of (notches (m0) 1 3)) 18))
   (test "a fraction of a notch does not step at all"
-    (let (m (fold (take (notch-stream 1) 4) (m0) (fn (a dy) (zoom-step a dy))))
-      (assert= (stepped m) 15)))
+    (let (m (fold (take (notch-stream 1) 4) (m0) (fn (a dy) (zoom-step a (pane0 a) dy))))
+      (assert= (px-of m) 15)
+      (is (nil? (zoom-of (ed-current-buf m)))))) ; and an unzoomed buffer carries no zoom
   (test "and its leftover is kept, so the rest of the notch still gets there"
-    (assert= (applied (notches (m0) 1 1)) 16))
+    (assert= (px-of (notches (m0) 1 1)) 16))
   (test "shrinking needs the same push as growing (no floor asymmetry)"
-    (let (half (fold (take (notch-stream -1) 6) (m0) (fn (a dy) (zoom-step a dy))))
-      (assert= (stepped half) 15))
-    (assert= (applied (notches (m0) -1 1)) 14))
+    (let (half (fold (take (notch-stream -1) 6) (m0) (fn (a dy) (zoom-step a (pane0 a) dy))))
+      (assert= (px-of half) 15))
+    (assert= (px-of (notches (m0) -1 1)) 14))
   (test "zoom stops at the readable bounds"
-    (assert= (applied (notches (m0) 1 200)) *max-height*)
-    (assert= (applied (notches (m0) -1 200)) *min-height*)))
-
-;; ---- the resize has to be smooth, which is a statement about how OFTEN it happens ----
-;; Applying the size per wheel event was janky: every `gui/font` clears the glyph cache and
-;; re-rasters the window, and the grid's row count changes under the mode line each time —
-;; so the status bar jumped and flickered. The step is bookkeeping now; the window is
-;; written on a throttle.
-
-(describe "a zoom in flight: the first step lands, the rest are paced"
-  ;; A leading edge, not a plain throttle: waiting the whole interval before ANYTHING moves
-  ;; reads as slow, and applying every event re-rasters the window dozens of times a second.
-  ;; So the first step of a gesture goes straight to the window and starts a cooldown; steps
-  ;; during that cooldown accumulate, and the `:zoom-apply` tick applies them.
-  (test "the first notch moves the window immediately"
-    (let (m (notches (m0) 1 1))
-      (assert= (:height (current m)) 16) ; applied, not merely recorded
-      (is (nil? (:zoom-to m)))
-      (is (:zoom-cooling m)))) ; …and the pacing has started
-  (test "notches during the cooldown accumulate instead of re-rastering"
-    (let (m (notches (notches (m0) 1 1) 1 3)) ; one immediate, three more inside the cooldown
-      (assert= (:height (current m)) 16) ; the window has not moved again
-      (assert= (:zoom-to m) 19) ; but the target has
-      (is (zoom-pending? m))))
-  (test "the tick applies what accumulated, and keeps pacing"
-    (let (m (zoom-flush (notches (notches (m0) 1 1) 1 3)))
-      (assert= (:height (current m)) 19)
-      (is (nil? (:zoom-to m)))
-      (is (:zoom-cooling m))))
-  (test "a tick with nothing waiting ends the cooldown, so the next gesture is immediate"
-    (let (settled (zoom-flush (zoom-flush (notches (m0) 1 1))))
-      (is (nil? (:zoom-cooling settled)))
-      (is (not (zoom-active? settled)))
-      (assert= (:height (current (notches settled 1 1))) 17))) ; immediate again
+    (assert= (px-of (notches (m0) 1 200)) *max-height*)
+    (assert= (px-of (notches (m0) -1 200)) *min-height*))
   (test "the size shows in the echo area and NOT in *Messages*"
     ;; a zoom from 15 to 30 used to append fifteen lines to the buffer
     ;; a fresh model always has *Messages* in the pool (`ed-init` seeds it), so this indexes
@@ -115,46 +81,77 @@
       (buffer-line-count (nth (:buffers mm)
                            (seq/index-where (:buffers mm) (fn (b) (= (buffer-name b) "*Messages*"))))))
     (let (before (msg-lines (m0))
-          m (fold (range 15) (m0) (fn (acc _) (zoom-flush (notches acc 1 1))))
+          m (notches (m0) 1 15)
           after (msg-lines m))
-      (assert= (:height (current m)) 30)
+      (assert= (px-of m) 30)
       (is (includes? (:echo m) "30 px"))
-      (assert= after before)))
-  (test "nothing pending means no timer work"
-    (is (not (zoom-active? (m0))))
-    (assert= (:height (current (zoom-flush (m0)))) 15)))
+      (assert= after before))))
 
-;; ---- the timer has to RE-arm, which is the bug every test above missed ---------------
-;; Every assertion above calls `zoom-flush` by hand, so all of them passed while the live
-;; editor zoomed exactly once and then stopped. `ed-sync-timers` drops each managed one-shot
-;; and re-adds it while its work is pending — the drop is what re-arms it — and `:zoom-apply`
-;; was missing from that list, so the loop saw an entry it had already fired and never fired
-;; it again. These drive the wheel through `ed-update` and let the TIMER do the applying.
+;; ---- the zoom is the BUFFER's, and the window's font never moves --------------------
+;; This is the model that made the jank go away. A zoom used to change the window's font:
+;; the grid shrank, every pane was re-laid, the status bar jumped, and pacing it was a
+;; fight with the wheel's kinetic stream. A size that belongs to a buffer changes one
+;; pane's ops and nothing else.
+(describe "a zoom belongs to the buffer"
+  (test "the window's size is untouched by any number of notches"
+    (assert= (:height (current (notches (m0) 1 10))) 15))
+  (test "it is recorded on the buffer with its cell ratio — measured against the window"
+    (let (z (zoom-of (ed-current-buf (notches (m0) 1 3))))
+      (assert= (:px z) 18)
+      ;; headless there is no window to measure, so the ratio is the size ratio
+      (assert= (:ratio z) [(/ 18 15) (/ 18 15)])))
+  (test "back at the window's size the buffer is simply unzoomed, not zoomed to 1"
+    (is (nil? (zoom-of (ed-current-buf (notches (notches (m0) 1 2) -1 2))))))
+  (test "another buffer in the pool is not affected"
+    (let (m (notches (m0) 1 4)
+          other (seq/find (:buffers m) (fn (b) (= (buffer-name b) "*Messages*"))))
+      (is (nil? (zoom-of other)))))
+  (test "the keyboard steps the current buffer the same pixel: C-x C-= / C-x C-- / C-x C-0"
+    (let (up (zoom-adjust (zoom-adjust (m0) 1) 1)
+          down (zoom-adjust up -1)
+          reset (zoom-reset up))
+      (assert= (px-of up) 17)
+      (assert= (px-of down) 16)
+      (assert= (px-of reset) 15)
+      (is (nil? (zoom-of (ed-current-buf reset))))))
+  (test "a preset changes the window under a zoomed buffer: its px stays, its ratio moves"
+    (let (m (preset-apply (notches (m0) 1 3) "Pairing")) ; the window to 19 px
+      (assert= (px-of m) 18)
+      (assert= (:ratio (zoom-of (ed-current-buf m))) [(/ 18 19) (/ 18 19)])))
+  (test "and a buffer the preset lands exactly on is unzoomed by it"
+    (let (m (preset-apply (notches (m0) 1 4) "Pairing")) ; zoomed to 19, window to 19
+      (is (nil? (zoom-of (ed-current-buf m)))))))
 
-(defn one-notch (m dir)
-  ;; a notch through the real event path, then the timer fire the loop would do
-  (let (after (fold (notch-stream dir)
-                m
-                (fn (a dy) (input/ed-update a [:mouse :scroll-up nil 5 5 [:ctrl] dy] 80 24))))
-    (if (get (:timers after) :zoom-apply)
-      (input/ed-update after [:timer :zoom-apply] 80 24)
-      after)))
-
-(describe "the zoom timer re-arms for every notch"
-  (test "six notches in a row each move one pixel"
+;; ---- through the event path: the wheel over a pane, the frame it paints ----------------
+(describe "Ctrl+wheel through ed-update zooms the pane under the pointer"
+  (defn wheel (m dir col)
+    (fold (notch-stream dir)
+      m
+      (fn (a dy) (input/ed-update a [:mouse :scroll-up nil 5 col [:ctrl] dy] 80 24))))
+  (test "six notches in a row each move one pixel — no timer to re-arm, nothing to pace"
     (let (sizes (second (fold (range 6)
                           [(m0) []]
                           (fn ([m acc] _)
-                            (let (m1 (one-notch m 1)) [m1 (conj acc (:height (current m1)))])))))
+                            (let (m1 (wheel m 1 5)) [m1 (conj acc (px-of m1))])))))
       (assert= sizes [16 17 18 19 20 21])))
-  (test "and the timer is armed while pending, gone once it has applied"
-    (let (mid (fold (notch-stream 1)
-                (m0)
-                (fn (a dy) (input/ed-update a [:mouse :scroll-up nil 5 5 [:ctrl] dy] 80 24)))
-          done (input/ed-update mid [:timer :zoom-apply] 80 24))
-      (is (not (nil? (get (:timers mid) :zoom-apply)))) ; armed: work outstanding
-      (is (nil? (get (:timers done) :zoom-apply)))))) ; dropped: so the next notch re-arms it
-
+  (test "Shift makes no difference: there is one zoom"
+    (let (m (fold (notch-stream 1)
+              (m0)
+              (fn (a dy) (input/ed-update a [:mouse :scroll-up nil 5 5 [:ctrl :shift] dy] 80 24))))
+      (assert= (px-of m) 16)))
+  (test "a notch off every pane does nothing"
+    (let (m (wheel (m0) 1 400))
+      (assert= (px-of m) 15)))
+  (test "a zoomed buffer's pane is painted inside a cell-region at its size; unzoomed, flat"
+    (let (flat (view/ed-view (m0) 80 24)
+          zoomed (view/ed-view (notches (m0) 1 3) 80 24)
+          region (seq/find (rest zoomed) (fn (op) (= (first op) :cell-region))))
+      (is (nil? (seq/find (rest flat) (fn (op) (= (first op) :cell-region)))))
+      (is (not (nil? region)))
+      ;; [:cell-region x y w h px ops]: the pane's rect less the scrollbar column and the
+      ;; mode line row, at the buffer's size, with the text inside laid out from 0,0
+      (assert= (into [] (take (rest region) 5)) [0 0 79 22 18])
+      (is (any? (nth region 6) (fn (op) (and (= (first op) :text) (includes? (nth op 3) "hello"))))))))
 
 (describe "presets"
   (test "the built-ins are there and apply live"
@@ -219,17 +216,11 @@
       (assert= (count (saved-in f)) 0)
       (is (includes? (map ok (fn (p) (:name p))) "Default")))))
 
-;; The zoom must survive the grid shrinking under it. Growing the font means fewer cells, so
-;; the pointer's last reported CELL (the runtime keeps it until the mouse moves) can fall
-;; outside the new grid — and the wheel branch used to sit behind the hovered-pane guard, so
-;; every remaining event of the glide was dropped. It moved for a split second and stopped.
-(describe "the font zoom does not need a pane under the pointer"
-  (test "a notch with the pointer outside the grid still zooms"
-    (let (outside (fold (notch-stream 1)
-                    (m0)
-                    (fn (a dy) (input/ed-update a [:mouse :scroll-up nil 400 400 [:ctrl] dy] 80 24))))
-      ;; the first step of a gesture applies straight away, so read the size, not the target
-      (assert= (:height (current outside)) 16)))
-  (test "but the per-pane block zoom still requires one (Ctrl+Shift)"
-    (let (outside (input/ed-update (m0) [:mouse :scroll-up nil 400 400 [:ctrl :shift]] 80 24))
-      (assert= (pane-scale-of outside) 1))))
+
+;; A terminal cell has one size, and the frontend-agnostic path (a `*term-display*` harness,
+;; an `--attach` client) skips a `cell-region` — so a zoom there would blank the pane.
+(describe "a zoom is a GUI thing"
+  (test "without a window it is refused, and says why"
+    (let (m (zoom-adjust (ed-init (make-buffer "hello")) 1))
+      (assert= (zoom-px m (ed-current-buf m)) 15)
+      (is (includes? (:echo m) "zoom needs the window")))))
