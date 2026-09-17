@@ -46,10 +46,17 @@ The record is the point: `gui/font` and `gui/line-height` are writes with no rea
 model is the only place that knows what is on screen. Every path that changes type goes
 through here — startup, a theme, a preset, a zoom step — so none of them can leave the
 model describing something the window is not."
-  (let (a (merge (current m) appearance) ; over what is showing, not the default: a partial
-        h (clamp-height (:height a))) ; apply must not silently reset the fields it omits
-    (theme/gui-only gui/font {:family (:family a) :height h})
-    (theme/gui-only gui/line-height (:line-height a))
+  (let (was (current m)
+        a (merge was appearance) ; over what is showing, not the default: a partial
+        h (clamp-height (:height a)) ; apply must not silently reset the fields it omits
+        ;; Write only what CHANGED. Each of these costs a full re-raster — the window
+        ;; clears its glyph cache and re-shapes the cell on any `gui/font` or
+        ;; `gui/line-height`, whether or not the value differs — so writing both on every
+        ;; zoom step paid that price twice per pixel, for a line height that never moved.
+        font? (or (not (= (:family a) (:family was))) (not (= h (:height was))))
+        lh? (not (= (:line-height a) (:line-height was))))
+    (when font? (theme/gui-only gui/font {:family (:family a) :height h}))
+    (when lh? (theme/gui-only gui/line-height (:line-height a)))
     (assoc m :appearance (assoc a :height h))))
 
 ;; ---- the size step (Ctrl+mouse-wheel) ---------------------------------------
@@ -103,11 +110,17 @@ belongs."
         steps (whole-steps acc *zoom-step-lines*))
     (if (= steps 0)
       (assoc m :zoom-accum acc)
-      (let (target (clamp-height (+ (or (:zoom-to m) (:height (current m))) steps)))
-        (assoc m
-          :zoom-accum (- acc (* steps *zoom-step-lines*))
-          :zoom-to target
-          :echo (str "size " target " px"))))))
+      (let (target (clamp-height (+ (or (:zoom-to m) (:height (current m))) steps))
+            stepped (assoc m
+                      :zoom-accum (- acc (* steps *zoom-step-lines*))
+                      :zoom-to target
+                      :echo (str "size " target " px")))
+        ;; LEADING edge: the first step of a gesture goes to the window immediately and
+        ;; starts a cooldown; everything during that cooldown only accumulates, and the
+        ;; `:zoom-apply` timer applies it when the cooldown ends. A purely trailing throttle
+        ;; put its whole interval between the wheel moving and the text moving, which does
+        ;; not read as smooth — it reads as slow.
+        (if (:zoom-cooling m) stepped (zoom-flush stepped))))))
 
 (defn zoom-notch (m dir)
   "One whole notch of zoom in direction `dir` (+1 bigger, -1 smaller) — for a wheel event
@@ -116,15 +129,26 @@ that carries no delta at all: a terminal, or a test written before the runtime r
   (zoom-step m (* dir *zoom-step-lines*)))
 
 (defn zoom-pending? (m)
-  "Whether a zoom target is waiting to be pushed to the window — what arms `:zoom-apply`."
+  "Whether a zoom target is waiting to be pushed to the window."
   (let (to (:zoom-to m))
     (and (not (nil? to)) (not (= to (:height (current m)))))))
 
+(defn zoom-active? (m)
+  "Whether the `:zoom-apply` timer should be armed: a target waiting, OR a cooldown still
+running. The cooldown needs a tick of its own to end, or the gesture after it would find the
+flag set and defer its first step for nothing."
+  (or (zoom-pending? m) (= true (:zoom-cooling m))))
+
 (defn zoom-flush (m)
-  "Apply the pending zoom target to the window, once. The `:zoom-apply` timer's work."
+  "Apply the pending zoom target to the window, once — and carry the cooldown. The
+`:zoom-apply` timer's work, and the leading edge's.
+
+With a target: apply it and keep cooling, so the next tick paces the step after. With none:
+the cooldown has run out with nothing waiting, so it ends and the next notch is immediate
+again."
   (if (nil? (:zoom-to m))
-    m
-    (dissoc (apply! m {:height (:zoom-to m)}) :zoom-to)))
+    (dissoc m :zoom-cooling)
+    (assoc (dissoc (apply! m {:height (:zoom-to m)}) :zoom-to) :zoom-cooling true)))
 
 ;; ---- the presets ------------------------------------------------------------
 
