@@ -446,7 +446,23 @@ segment is clickable/hoverable exactly where it's drawn."
                  (seg :pos pos {:sep "  "}))
                (if narrow? (list (seg :narrow "⊸ Narrowed" {:sep "  —  "})) '())
                ;; a wrapping buffer says so too (visual-line-mode is per buffer)
-               (if (ed-wrap? buf) (list (seg :wrap "↩ Wrap" {:sep "  "})) '()))
+               (if (ed-wrap? buf) (list (seg :wrap "↩ Wrap" {:sep "  "})) '())
+               ;; a zoomed pane shows its size as a chip, and the chip is the way back: one
+               ;; click and the pane is at the window's size again (`C-x C-0` from the keys).
+               ;; On the pane itself — a zoom is per pane, like the narrowing above — so a
+               ;; split reads which side is zoomed, and the click lands on that side
+               (let (zoom (get-in pane [:payload :zoom]))
+                 (if (nil? zoom)
+                   '()
+                   (list (seg :zoom
+                           (str "⌕ " (:px zoom) "px")
+                           {:sep "  —  "
+                            :face {:fg *peach*}
+                            :on-click 'appearance/cmd-text-scale-reset
+                            :cursor :pointer
+                            :tooltip (fn (mm)
+                                       [(str "zoomed to " (:px zoom) " px — this pane only")
+                                         "click for 100% (C-x C-0) · Ctrl+wheel / C-x C-= C-- to step"])})))))
         ;; the non-interactive extras reuse the existing label helpers (which bake their own
         ;; leading separator), so they need no `:sep`; empty ones are dropped.
         extras (seq/filter
@@ -502,14 +518,19 @@ segment is clickable/hoverable exactly where it's drawn."
 its **segments** (`ed-statusbar-segments`) by `statusbar/statusbar-layout` — buffer name ·
 mode · scroll% · line:col, plus the selected pane's status / diagnostics / git. The selected
 pane's bar is `face-modeline` (a raised surface), an unselected pane's the dimmer
-`face-modeline-inactive`; on the selected pane the segment under the pointer (`:hover`) gets a
-subtle hover pill. Thin **top + bottom hairlines** (`face-border`, GUI only) rule the bar off
+`face-modeline-inactive`; the segment under the pointer (`:hover`, on whichever pane's bar
+holds it) gets a subtle hover pill. Thin **top + bottom hairlines** (`face-border`, GUI only) rule the bar off
 as a distinct band — dark-UI chrome is anchored by a 1px border, not a shadow (docs/ui-chrome.md)."
   (let ([x y w h] (:rect pane)
         sel (:selected pane)
         row (+ y (dec h))
         base (if sel face-modeline face-modeline-inactive)
-        hovered-id (if sel (get-in m [:hover :id]) nil)
+        ;; the hover pill on THIS bar only when the pointer is on it: the hover names its cell,
+        ;; and a chip id (`:zoom`) repeats across a split's bars
+        hover (:hover m)
+        hovered-id (if (and hover (= (:row hover) row) (>= (:col hover) x) (< (:col hover) (+ x w)))
+                     (:id hover)
+                     nil)
         segments (ed-statusbar-segments m pane buf)
         ;; the memo's deps are the segments WITHOUT their closures (a `:tooltip` fn, an
         ;; `:on-click` fn are fresh objects every turn and never `=`): what the LAYOUT
@@ -542,19 +563,26 @@ as a distinct band — dark-UI chrome is anchored by a 1px border, not a shadow 
 ;; drew — and hit-tests the pointer against its zones, exactly as `ed-menu-hit` recomputes the
 ;; menu card's rect. So a segment is hoverable / clickable precisely where its glyphs are.
 
+(defn ed-modeline-pane-at (m cols rows col row)
+  "The pane whose MODE LINE holds screen cell `[col row]`, or nil. Every pane's bar is live,
+not just the selected one's: the per-pane chips (a zoom, a narrowing) sit on the pane they
+describe, so their click must land there."
+  (seq/find (:panes (ed-body-layout m cols rows))
+    (fn (p)
+      (let ([x y w ph] (:rect p))
+        (and (= row (+ y (dec ph))) (>= col x) (< col (+ x w)))))))
+
 (defn ed-modeline-segment-at (m cols rows col row)
-  "The status-bar segment under screen cell `[col row]` on the **selected** pane's mode line,
-or nil (a different row, or a gap between segments). What hover (`:move`) and click hit-test
-against — the caller reads the returned segment's `:on-click` / `:tooltip`."
-  (let (panes (:panes (ed-body-layout m cols rows))
-        pane (ed-selected-pane panes)
-        [x y w ph] (:rect pane)
-        mrow (+ y (dec ph)))
-    (if (not (= row mrow))
+  "The status-bar segment under screen cell `[col row]` on whichever pane's mode line holds
+it, or nil (no mode line there, or a gap between segments). What hover (`:move`) and click
+hit-test against — the caller reads the returned segment's `:on-click` / `:tooltip`."
+  (let (pane (ed-modeline-pane-at m cols rows col row))
+    (if (nil? pane)
       nil
-      (let (buf (ed-pane-buf m pane)
+      (let ([x y w ph] (:rect pane)
+            buf (ed-pane-buf m pane)
             segs (ed-statusbar-segments m pane buf)
-            laid (statusbar-layout segs x mrow w face-modeline nil (:gui m))
+            laid (statusbar-layout segs x (+ y (dec ph)) w face-modeline nil (:gui m))
             z (zone-at (:zones laid) col row))
         (if (nil? z) nil (seg-by-id segs (:id z)))))))
 
@@ -562,10 +590,14 @@ against — the caller reads the returned segment's `:on-click` / `:tooltip`."
   "If a status-bar segment with an `:on-click` command sits under press `[col row]`, run that
 command (resolved late via `reflect/eval`, like a keymap binding — `(m key) -> m`) and return the new
 model; else nil. The mouse handler tries this before its normal left-press handling, so a
-click on the branch / git indicator opens `*git-status*` instead of moving point."
+click on the branch / git indicator opens `*git-status*` instead of moving point. The pane
+under the click is SELECTED first, so a command that acts on the current pane (the zoom
+chip's `text-scale-reset`) acts on the one whose bar was clicked."
   (let (s (ed-modeline-segment-at m cols rows col row))
     (if (and s (:on-click s))
-      ((reflect/eval (:on-click s)) (dissoc m :hover) :mouse) ; dismiss the tooltip as the click fires
+      ((reflect/eval (:on-click s))
+        (dissoc (ed-select-pane-at m cols rows row col) :hover) ; dismiss the tooltip as the click fires
+        :mouse)
       nil)))
 
 (defn ed-modeline-hover (m cols rows col row)
@@ -625,8 +657,9 @@ floated just above the selected pane's mode line at the hover column. Reads `:ho
   (let (hover (:hover m))
     (if (nil? hover)
       '()
-      (let (panes (:panes (ed-body-layout m cols rows))
-            pane (ed-selected-pane panes)
+      ;; the hovered pane's bar (the hover names its own cell), the selected one's failing that
+      (let (pane (or (ed-modeline-pane-at m cols rows (:col hover) (:row hover))
+                   (ed-selected-pane (:panes (ed-body-layout m cols rows))))
             [x y w ph] (:rect pane)
             mrow (+ y (dec ph))
             buf (ed-pane-buf m pane)

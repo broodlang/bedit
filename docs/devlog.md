@@ -21,7 +21,9 @@ and the echo row where they were. It landed first as a BUFFER's zoom (Emacs's bu
 `text-scale-adjust`), and a split showing the same buffer twice zoomed both sides — which
 reads as "all the buffers zoom". The thing under the pointer is what should grow, so the
 zoom moved to the pane's payload (`:zoom {:px :ratio}`, beside its line numbers), and a
-pane keeps it across buffer switches.
+pane keeps it across buffer switches. A zoomed pane's mode line carries a chip with its size (`⌕ 20px`); one
+click is `text-scale-reset` for THAT pane — the mode-line hit-test now finds the pane whose
+bar holds the cell (and selects it), where it used to answer for the selected pane only.
 
 **Why.** The morning's five zoom fixes each moved the jank somewhere else — a throttle, a
 leading edge, a clock — because a zoom was a change to the WINDOW's font: the grid shrank,
