@@ -12,12 +12,16 @@ Language-level changes live in the Brood repo's `docs/devlog.md` + `docs/decisio
 
 ## 2026-09-17
 
-### the zoom is per buffer, and it is a render op — not a font change
+### the zoom is per pane, and it is a render op — not a font change
 
 **What shipped.** Ctrl+wheel (and `C-x C-=` / `C-x C--` / `C-x C-0`, `M-x text-scale-*`) zooms
-the buffer under the pointer a pixel a notch — that buffer only, Emacs's `text-scale-adjust`.
-The window's font never moves: the pane is painted inside a `cell-region` at the buffer's
-size, the mode line, the other panes and the echo row where they were.
+the pane under the pointer a pixel a notch — that pane only. The window's font never moves:
+the pane is painted inside a `cell-region` at its own size, the mode line, the other panes
+and the echo row where they were. It landed first as a BUFFER's zoom (Emacs's buffer-local
+`text-scale-adjust`), and a split showing the same buffer twice zoomed both sides — which
+reads as "all the buffers zoom". The thing under the pointer is what should grow, so the
+zoom moved to the pane's payload (`:zoom {:px :ratio}`, beside its line numbers), and a
+pane keeps it across buffer switches.
 
 **Why.** The morning's five zoom fixes each moved the jank somewhere else — a throttle, a
 leading edge, a clock — because a zoom was a change to the WINDOW's font: the grid shrank,
@@ -34,10 +38,10 @@ cells, positioned in the region's own cell space; scoped and self-restoring like
 measures the cell a size produces (13×29 px at 21 px over 9×21 at 15 — not the 1.4 the ratio
 says, which is why it is measured). The cluster cache is keyed by px, so two sizes coexist.
 
-**bedit.** A zoomed buffer carries `:zoom {:px :ratio}` (`appearance/zoom-buffer`); every
+**bedit.** A zoomed pane carries `:zoom {:px :ratio}` (`appearance/zoom-payload`); every
 piece of pane geometry divides by the ratio (`panes/ed-zoom-ratio`, `ed-pane-cols`,
 `ed-pane-vrows`, `ed-pane-row-index`, `ed-buf-offset-at`) so the rows and columns that fit,
-the cell a click landed in and the scroll clamp are all in the buffer's cells; the view lays
+the cell a click landed in and the scroll clamp are all in the pane's cells; the view lays
 the body out at origin 0,0 in those cells and wraps it (`view/ed-pane-ops`). The old integer
 `:scale`, `ed-scale-op` and the `s` parameter threaded through seven view helpers are gone;
 so are the window-zoom throttle, its timer and its three model fields. A zoom outside the

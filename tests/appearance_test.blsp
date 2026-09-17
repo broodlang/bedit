@@ -49,9 +49,9 @@
 (defn notches (m dir n)
   ;; `n` physical notches, each as its own kinetic stream, over the pointer's pane
   (fold (range n) m (fn (acc _) (fold (notch-stream dir) acc (fn (a dy) (zoom-step a (pane0 a) dy))))))
-(defn px-of (m) (zoom-px m (ed-current-buf m)))
+(defn px-of (m) (zoom-px m (pane0 m)))
 
-(describe "Ctrl+wheel steps the buffer's size incrementally"
+(describe "Ctrl+wheel steps the pane's size incrementally"
   ;; The complaint, twice over: one notch must be ONE pixel. At a divisor of 1.0 a notch
   ;; stepped three (its glide sums to ~3 lines), which read as "too sensitive", and the
   ;; accumulated target then lurched a whole spin's worth per throttle tick.
@@ -63,7 +63,7 @@
   (test "a fraction of a notch does not step at all"
     (let (m (fold (take (notch-stream 1) 4) (m0) (fn (a dy) (zoom-step a (pane0 a) dy))))
       (assert= (px-of m) 15)
-      (is (nil? (zoom-of (ed-current-buf m)))))) ; and an unzoomed buffer carries no zoom
+      (is (nil? (zoom-of (pane0 m)))))) ; and an unzoomed pane carries no zoom
   (test "and its leftover is kept, so the rest of the notch still gets there"
     (assert= (px-of (notches (m0) 1 1)) 16))
   (test "shrinking needs the same push as growing (no floor asymmetry)"
@@ -87,40 +87,51 @@
       (is (includes? (:echo m) "30 px"))
       (assert= after before))))
 
-;; ---- the zoom is the BUFFER's, and the window's font never moves --------------------
+;; ---- the zoom is the PANE's, and the window's font never moves ----------------------
 ;; This is the model that made the jank go away. A zoom used to change the window's font:
 ;; the grid shrank, every pane was re-laid, the status bar jumped, and pacing it was a
-;; fight with the wheel's kinetic stream. A size that belongs to a buffer changes one
-;; pane's ops and nothing else.
-(describe "a zoom belongs to the buffer"
+;; fight with the wheel's kinetic stream. A size that belongs to one pane changes that
+;; pane's ops and nothing else — not the window, and not the other pane on the same
+;; buffer (a split copies the buffer; zooming one side must not zoom the other, which is
+;; what "all the buffers zoom" looked like when the size lived on the buffer).
+(describe "a zoom belongs to the pane"
   (test "the window's size is untouched by any number of notches"
     (assert= (:height (current (notches (m0) 1 10))) 15))
-  (test "it is recorded on the buffer with its cell ratio — measured against the window"
-    (let (z (zoom-of (ed-current-buf (notches (m0) 1 3))))
+  (test "it is recorded on the pane with its cell ratio — measured against the window"
+    (let (z (zoom-of (pane0 (notches (m0) 1 3))))
       (assert= (:px z) 18)
       ;; headless there is no window to measure, so the ratio is the size ratio
       (assert= (:ratio z) [(/ 18 15) (/ 18 15)])))
-  (test "back at the window's size the buffer is simply unzoomed, not zoomed to 1"
-    (is (nil? (zoom-of (ed-current-buf (notches (notches (m0) 1 2) -1 2))))))
-  (test "another buffer in the pool is not affected"
-    (let (m (notches (m0) 1 4)
-          other (seq/find (:buffers m) (fn (b) (= (buffer-name b) "*Messages*"))))
-      (is (nil? (zoom-of other)))))
-  (test "the keyboard steps the current buffer the same pixel: C-x C-= / C-x C-- / C-x C-0"
+  (test "back at the window's size the pane is simply unzoomed, not zoomed to 1"
+    (is (nil? (zoom-of (pane0 (notches (notches (m0) 1 2) -1 2))))))
+  (test "the buffer itself carries nothing — a zoom is not a property of the text"
+    (let (m (notches (m0) 1 4))
+      (is (every? (:buffers m) (fn (b) (nil? (:zoom b)))))))
+  (test "a split shows the same buffer twice: zooming one side leaves the other alone"
+    (let (split (input/ed-update (input/ed-update (m0) :ctrl-x 80 24) "3" 80 24)
+          panes (fn (m) (:panes (panes/ed-body-layout m 80 24)))
+          right (second (panes split))
+          zoomed (fold (notch-stream 1) split (fn (a dy) (zoom-step a right dy)))
+          [l r] (into [] (panes zoomed)))
+      (assert= (get-in l [:payload :buffer]) (get-in r [:payload :buffer])) ; same buffer
+      (assert= (zoom-px zoomed r) 16)
+      (assert= (zoom-px zoomed l) 15)
+      (is (nil? (zoom-of l)))))
+  (test "the keyboard steps the current pane the same pixel: C-x C-= / C-x C-- / C-x C-0"
     (let (up (zoom-adjust (zoom-adjust (m0) 1) 1)
           down (zoom-adjust up -1)
           reset (zoom-reset up))
       (assert= (px-of up) 17)
       (assert= (px-of down) 16)
       (assert= (px-of reset) 15)
-      (is (nil? (zoom-of (ed-current-buf reset))))))
-  (test "a preset changes the window under a zoomed buffer: its px stays, its ratio moves"
+      (is (nil? (zoom-of (pane0 reset))))))
+  (test "a preset changes the window under a zoomed pane: its px stays, its ratio moves"
     (let (m (preset-apply (notches (m0) 1 3) "Pairing")) ; the window to 19 px
       (assert= (px-of m) 18)
-      (assert= (:ratio (zoom-of (ed-current-buf m))) [(/ 18 19) (/ 18 19)])))
-  (test "and a buffer the preset lands exactly on is unzoomed by it"
+      (assert= (:ratio (zoom-of (pane0 m))) [(/ 18 19) (/ 18 19)])))
+  (test "and a pane the preset lands exactly on is unzoomed by it"
     (let (m (preset-apply (notches (m0) 1 4) "Pairing")) ; zoomed to 19, window to 19
-      (is (nil? (zoom-of (ed-current-buf m)))))))
+      (is (nil? (zoom-of (pane0 m)))))))
 
 ;; ---- through the event path: the wheel over a pane, the frame it paints ----------------
 (describe "Ctrl+wheel through ed-update zooms the pane under the pointer"
@@ -142,14 +153,14 @@
   (test "a notch off every pane does nothing"
     (let (m (wheel (m0) 1 400))
       (assert= (px-of m) 15)))
-  (test "a zoomed buffer's pane is painted inside a cell-region at its size; unzoomed, flat"
+  (test "a zoomed pane is painted inside a cell-region at its size; unzoomed, flat"
     (let (flat (view/ed-view (m0) 80 24)
           zoomed (view/ed-view (notches (m0) 1 3) 80 24)
           region (seq/find (rest zoomed) (fn (op) (= (first op) :cell-region))))
       (is (nil? (seq/find (rest flat) (fn (op) (= (first op) :cell-region)))))
       (is (not (nil? region)))
       ;; [:cell-region x y w h px ops]: the pane's rect less the scrollbar column and the
-      ;; mode line row, at the buffer's size, with the text inside laid out from 0,0
+      ;; mode line row, at the pane's size, with the text inside laid out from 0,0
       (assert= (into [] (take (rest region) 5)) [0 0 79 22 18])
       (is (any? (nth region 6) (fn (op) (and (= (first op) :text) (includes? (nth op 3) "hello"))))))))
 
@@ -222,5 +233,5 @@
 (describe "a zoom is a GUI thing"
   (test "without a window it is refused, and says why"
     (let (m (zoom-adjust (ed-init (make-buffer "hello")) 1))
-      (assert= (zoom-px m (ed-current-buf m)) 15)
+      (assert= (zoom-px m (pane0 m)) 15)
       (is (includes? (:echo m) "zoom needs the window")))))

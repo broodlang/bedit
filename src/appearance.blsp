@@ -2,15 +2,15 @@
   "The window's type setup — family, size, line height — and **named presets** over it
 (`M-x preset-select` / `preset-save` / `preset-delete`).
 
-Two things live here. A ZOOM is per buffer — Ctrl+mouse-wheel, `C-x C-=`/`C-x C--`/`C-x C-0`,
-Emacs's `text-scale-adjust` — and never touches the window's font. A PRESET names a whole
+Two things live here. A ZOOM is per PANE — Ctrl+mouse-wheel, `C-x C-=`/`C-x C--`/`C-x C-0`:
+the pane under the pointer, bigger; nothing else — and never touches the window's font. A PRESET names a whole
 window setup you can switch to in one command. The second is what you want when a
 call starts: `M-x preset-select` → `Presenting`, and the person on the other end of the
 screen share can read your code. Then back to `Default` after.
 
 Why a module and not two knobs. The window has no getter for what it is showing, so
 something has to hold it — the model's `:appearance`. Once that exists, a preset is a saved
-value of it, `preset-save` is just naming what you are looking at, and a buffer's zoom is a
+value of it, `preset-save` is just naming what you are looking at, and a pane's zoom is a
 size relative to it. Themes set it too (a theme carries a font), so `themes/themes-apply` records
 what it applied and a preset saved afterwards records the truth.
 
@@ -20,7 +20,8 @@ name, so redefining `Presenting` is just saving one with that name."
   (:use interactive) ; defcommand — register the preset commands for M-x
   (:use commands) ; ed-name-prompt — the Vertico selection prompt
   (:use projects) ; persist-read / persist-write! / editor-state-dir — the shared cache layer
-  (:use model)) ; message — the echo-area status
+  (:use model) ; message — the echo-area status; ed-current-pane / ed-map-panes — the zoomed pane
+  (:use editor/pane)) ; pane-update-path / pane-update-selected — writing a pane's zoom
 
 ;; ---- what the window is showing ---------------------------------------------
 
@@ -46,8 +47,8 @@ name, so redefining `Presenting` is just saving one with that name."
 The record is the point: `gui/font` and `gui/line-height` are writes with no read, so the
 model is the only place that knows what is on screen. Every path that changes type goes
 through here — startup, a theme, a preset — so none of them can leave the model describing
-something the window is not. A per-buffer zoom does NOT come through here (it is not a
-window change); it is measured against this, so a size change re-measures every zoom."
+something the window is not. A pane's zoom does NOT come through here (it is not a window
+change); it is measured against this, so a size change re-measures every zoom."
   (let (was (current m)
         a (merge was appearance) ; over what is showing, not the default: a partial
         h (clamp-height (:height a)) ; apply must not silently reset the fields it omits
@@ -62,18 +63,22 @@ window change); it is measured against this, so a size change re-measures every 
     (let (m2 (assoc m :appearance (assoc a :height h)))
       (if font? (zoom-remeasure m2) m2))))
 
-;; ---- the per-buffer zoom (Ctrl+mouse-wheel, C-x C-= / C-x C-- / C-x C-0) ----------
-;; A zoom is Emacs's `text-scale-adjust`: THIS buffer, bigger; the rest of the window as it
-;; was. It used to be a change to the window's font — the grid shrank, every pane was
-;; re-laid, the status bar jumped, and a wheel's kinetic stream re-rasterised the whole
-;; window per event. Five pacing fixes each moved the jank somewhere else, because the model
-;; was wrong, not the pacing: a size belongs to a buffer, not to the window.
+;; ---- the per-pane zoom (Ctrl+mouse-wheel, C-x C-= / C-x C-- / C-x C-0) ------------
+;; A zoom is THIS pane, bigger; the rest of the window as it was. It used to be a change to
+;; the window's font — the grid shrank, every pane was re-laid, the status bar jumped, and
+;; a wheel's kinetic stream re-rasterised the whole window per event. Five pacing fixes each
+;; moved the jank somewhere else, because the model was wrong, not the pacing: a size
+;; belongs to the pane you point at, not to the window.
 ;;
-;; So a zoomed buffer carries `:zoom {:px :ratio}` — the size, and the size of one of its
-;; cells relative to the window's (`[rw rh]`, physical px over physical px). The view paints
-;; such a buffer's pane inside a `cell-region` (brood ADR-363): a block laid out for the rows
-;; and columns that fit at `px`, positioned in its own cell space, the mode line and every
-;; other pane untouched. The window's font never changes on a zoom; `apply!` is for presets.
+;; The PANE, not the buffer — deliberately not Emacs's buffer-local `text-scale-adjust`. A
+;; split shows the same buffer twice, and zooming one side must not zoom the other: the
+;; thing under the pointer is what grows. So a pane's payload carries `:zoom {:px :ratio}` —
+;; the size, and the size of one of its cells relative to the window's (`[rw rh]`, physical
+;; px over physical px); switching buffers in the pane keeps it, like its line numbers. The
+;; view paints such a pane inside a `cell-region` (brood ADR-363): a block laid out for the
+;; rows and columns that fit at `px`, positioned in its own cell space, the mode line and
+;; every other pane untouched. The window's font never changes on a zoom; `apply!` is for
+;; presets.
 ;;
 ;; The ratio is MEASURED, not derived: a cell is whatever shaping the reference glyph gives,
 ;; rounded to whole pixels, so 16/15 is not 1.0667 of a cell — `gui/cell-size` asks the
@@ -95,13 +100,15 @@ window change); it is measured against this, so a size change re-measures every 
 ;; streak the runtime boosts (capped), so more lines arrive per notch and the size moves in
 ;; bigger steps. Raise this for a slower zoom, lower it for a faster one.
 
-(defn zoom-of (buf)
-  "`buf`'s zoom — `{:px :ratio}` — or nil at the window's own size."
-  (:zoom buf))
+(defn zoom-of (pane)
+  "`pane`'s zoom — `{:px :ratio}` on its payload — or nil at the window's own size. Takes a
+laid-out pane (`{:payload …}`) or a bare payload, so a command with only
+`model/ed-current-pane` in hand can ask too."
+  (:zoom (or (:payload pane) pane)))
 
-(defn zoom-px (m buf)
-  "The font size `buf` shows at: its own zoom, else the window's."
-  (or (:px (zoom-of buf)) (:height (current m))))
+(defn zoom-px (m pane)
+  "The font size `pane` shows at: its own zoom, else the window's."
+  (or (:px (zoom-of pane)) (:height (current m))))
 
 (defn- cell-ratio (m px)
   "`[rw rh]` — a cell at `px` over the window's cell, both in physical pixels, measured by
@@ -120,17 +127,18 @@ renderer shapes, and this is that cell, not an estimate of it."
         [[cw ch] [zw zh]] (or measured [[base base] [px px]]))
     [(/ zw (math/max 1 cw)) (/ zh (math/max 1 ch))]))
 
-(defn zoom-buffer (m buf px)
-  "`buf` zoomed to `px` — carrying the size and its measured cell ratio — or back to plain
-when `px` is the window's own size, so an unzoomed buffer has no zoom rather than a zoom of
-one. The accumulator is kept: it is the wheel's leftover, not part of the size."
+(defn zoom-payload (m payload px)
+  "Pane `payload` zoomed to `px` — carrying the size and its measured cell ratio — or back
+to plain when `px` is the window's own size, so an unzoomed pane has no zoom rather than a
+zoom of one. The accumulator is kept: it is the wheel's leftover, not part of the size."
   (let (px (clamp-height px))
     (if (= px (:height (current m)))
-      (dissoc buf :zoom)
-      (assoc buf :zoom {:px px :ratio (cell-ratio m px)}))))
+      (dissoc payload :zoom)
+      (assoc payload :zoom {:px px :ratio (cell-ratio m px)}))))
 
-(defn zoom-buffer-at (m idx px)
-  "The model with pool buffer `idx` zoomed to `px` (`zoom-buffer`), the size it landed on
+(defn- zoom-pane-with (m update px)
+  "The model with `update` (a `(layout-update-fn) -> layout`, i.e. `pane-update-path` or
+`pane-update-selected` partially applied) zooming its pane to `px`, the size it landed on
 echo'd — the clamped one, so the readout never claims a size past the bounds.
 
 Only in the GUI (`:gui`, what `main` sets under a window). A terminal cell has one size,
@@ -139,7 +147,13 @@ SKIPS a `cell-region` — a zoom there would blank the pane. It says so instead.
   (if (not (:gui m))
     (message m "zoom needs the window: a terminal cell has one size")
     (let (px (clamp-height px))
-      (assoc (ed-set-buf-at m idx (zoom-buffer m (ed-buf-at m idx) px)) :echo (str "size " px " px")))))
+      (assoc m
+        :layout (update (fn (w) (zoom-payload m w px)))
+        :echo (str "size " px " px")))))
+
+(defn zoom-pane (m pane px)
+  "The model with the laid-out `pane` (it carries its `:path`) zoomed to `px`."
+  (zoom-pane-with m (fn (f) (pane-update-path (:layout m) (:path pane) f)) px))
 
 (defn- whole-steps (acc step)
   "How many whole `step`s fit in `acc`, counted TOWARD ZERO. Deliberately not a floor:
@@ -149,25 +163,25 @@ notch, and a zoom that is easier to shrink than to grow feels broken rather than
     (if (< acc 0) (- 0 n) n)))
 
 (defn zoom-step (m pane dy)
-  "Fold a Ctrl+wheel delta of `dy` line units into the zoom of the buffer `pane` shows,
-stepping the size by whole pixels once a notch's worth has accumulated. Returns the model —
-with the leftover kept on the buffer (`:zoom-accum`), so a slow scroll is not rounded away
-to nothing.
+  "Fold a Ctrl+wheel delta of `dy` line units into `pane`'s zoom, stepping the size by whole
+pixels once a notch's worth has accumulated. Returns the model — with the leftover kept on
+the pane (`:zoom-accum`), so a slow scroll is not rounded away to nothing.
 
 Nothing here touches the window. A step is a model change; the view paints that one pane's
 region at the new size and the rest of the frame is what it was — which is why this needs
 no throttle, no timer and no clock: there is no grid to resize and no whole-window raster to
 pace. The size goes to the echo area only, where a transient status belongs (a zoom from 15
 to 30 used to write fifteen lines into `*Messages*`)."
-  (let (idx (get-in pane [:payload :buffer])
-        buf (ed-buf-at m idx)
-        acc (+ (or (:zoom-accum buf) 0.0) dy)
-        steps (whole-steps acc *zoom-step-lines*))
-    (if (= steps 0)
-      (ed-set-buf-at m idx (assoc buf :zoom-accum acc))
-      (zoom-buffer-at (ed-set-buf-at m idx (assoc buf :zoom-accum (- acc (* steps *zoom-step-lines*))))
-        idx
-        (+ (zoom-px m buf) steps)))))
+  ;; the LIVE payload, not the one `pane` was laid out with: a wheel stream is many events,
+  ;; and a caller holding the pane from one layout would otherwise feed a stale accumulator
+  (let (live (or (pane-payload-at (:layout m) (:path pane)) (:payload pane))
+        acc (+ (or (:zoom-accum live) 0.0) dy)
+        steps (whole-steps acc *zoom-step-lines*)
+        left (if (= steps 0) acc (- acc (* steps *zoom-step-lines*)))
+        m2 (assoc m
+             :layout
+               (pane-update-path (:layout m) (:path pane) (fn (w) (assoc w :zoom-accum left)))))
+    (if (= steps 0) m2 (zoom-pane m2 pane (+ (zoom-px m live) steps)))))
 
 (defn zoom-notch (m pane dir)
   "One whole notch of zoom in direction `dir` (+1 bigger, -1 smaller) — for a wheel event
@@ -175,40 +189,39 @@ that carries no delta at all: a terminal, or a test written before the runtime r
 `dir` alone cannot say how far, and one notch is the honest reading of one event."
   (zoom-step m pane (* dir *zoom-step-lines*)))
 
+(defn- zoom-selected (m px)
+  "The selected pane zoomed to `px` — the keyboard's target."
+  (zoom-pane-with m (fn (f) (pane-update-selected (:layout m) f)) px))
+
 (defn zoom-adjust (m delta)
-  "The selected buffer's size stepped by `delta` px — the keyboard's zoom (`C-x C-=` /
+  "The selected pane's size stepped by `delta` px — the keyboard's zoom (`C-x C-=` /
 `C-x C--`), one pixel a press, like a notch."
-  (let (idx (ed-current-index m))
-    (zoom-buffer-at m idx (+ (zoom-px m (ed-buf-at m idx)) delta))))
+  (zoom-selected m (+ (zoom-px m (ed-current-pane m)) delta)))
 
 (defn zoom-reset (m)
-  "The selected buffer back at the window's size (`C-x C-0`)."
-  (zoom-buffer-at m (ed-current-index m) (:height (current m))))
+  "The selected pane back at the window's size (`C-x C-0`)."
+  (zoom-selected m (:height (current m))))
 
 (defn zoom-remeasure (m)
-  "Every zoomed buffer's ratio measured again — for after the WINDOW's size changed under
-it (a preset): a buffer's px stays what it was, but the cell it is relative to moved, and
-one that now sits at the window's size is simply unzoomed."
-  (assoc m
-    :buffers
-      (into []
-        (map (:buffers m)
-          (fn (b) (if (nil? (zoom-of b)) b (zoom-buffer m b (:px (zoom-of b)))))))))
+  "Every zoomed pane's ratio measured again — for after the WINDOW's size changed under it
+(a preset): a pane's px stays what it was, but the cell it is relative to moved, and one
+that now sits at the window's size is simply unzoomed."
+  (ed-map-panes m (fn (w) (if (nil? (:zoom w)) w (zoom-payload m w (:px (:zoom w)))))))
 
 (defcommand cmd-text-scale-increase
   (m key)
-  "Zoom the current buffer one pixel bigger (`C-x C-=`, `M-x text-scale-increase`) — this
-buffer only, as Emacs's `text-scale-adjust`; Ctrl+wheel is the same step under the pointer."
+  "Zoom the current pane one pixel bigger (`C-x C-=`, `M-x text-scale-increase`) — this
+pane only; Ctrl+wheel is the same step on the pane under the pointer."
   (zoom-adjust m 1))
 
 (defcommand cmd-text-scale-decrease
   (m key)
-  "Zoom the current buffer one pixel smaller (`C-x C--`, `M-x text-scale-decrease`)."
+  "Zoom the current pane one pixel smaller (`C-x C--`, `M-x text-scale-decrease`)."
   (zoom-adjust m -1))
 
 (defcommand cmd-text-scale-reset
   (m key)
-  "Show the current buffer at the window's size again (`C-x C-0`, `M-x text-scale-reset`)."
+  "Show the current pane at the window's size again (`C-x C-0`, `M-x text-scale-reset`)."
   (zoom-reset m))
 
 ;; ---- the presets ------------------------------------------------------------
