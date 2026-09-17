@@ -1,173 +1,156 @@
 # Handoff — what to do next, and the traps
 
 **Replaced each session; this is the *current* picture, not history.** The narrative lives
-in [`../ROADMAP.md`](../ROADMAP.md) (§the open ends) and in brood's `docs/devlog.md`; the
-decisions in brood's `docs/decisions.md` (ADR-352 is this session's). Read this to pick the
-work back up cold.
+in [`devlog.md`](devlog.md) (newest entry: the per-pane zoom) and brood's `docs/devlog.md`;
+the decisions in brood's `docs/decisions.md` (**ADR-363**, `cell-region`, is this
+session's). Read this to pick the work back up cold.
 
-## State when written — 2026-09-15, 14:40
+## State when written — 2026-09-17, 17:00
 
-- **bedit** `main` = `07700563` (`release: 0.4.3`), tag `v0.4.3`, pushed, tree clean.
-  `project.blsp` says `:brood ">= 0.28.0"` — an older `nest` refuses the project outright
-  (that is what "files: 0" from the suite means), so install brood first.
-- **brood** `main` = `c247c996` (`fix(check): the ADR-352 scan loops pass the strict gate over
-  std`) on `916c505a` (the other session's `ci: BEDIT_REF -> 07700563`) on `aa5f2a15` =
-  `chore(release): v0.28.0` on `2a750c08`, the regex change. Tag `v0.28.0` pushed; the
-  Release workflow **succeeded** — tarballs for every target are on the GitHub release.
-  **CI on `main` was red for `916c505a`** on two jobs: the strict gate over `std/` (12
-  findings, all in the new scan loops — mine, fixed by `c247c996`: `check-allow
-  :type-mismatch` on the three loops whose `(count codes)` bound is one to three calls up,
-  plus sigs; 0 locally now) and the `differential (tree-walker)` job (observer, mcp,
-  sequence and highlight tests under `BROOD_VM=0`) — that job was already red on the run
-  before the release (`34955268473`, 09:57) and is the "faces-nil" hunt the other session's
-  `ci(differential)` commit names; not this work. Check `gh run list -R broodlang/brood` for
-  `c247c996`'s run.
-- **Installed:** `~/.local/bin/nest` 0.28.0 (`aa5f2a15`, GUI build from this session's
-  worktree), `~/.local/bin/bedit` 0.4.3 on it. Verified on that pair: 51/51 test files,
-  `nest check` clean, `nest check --strict` = 58 (the ratchet's ceiling), `make check-modes`
-  green for all eleven modes, a keystroke in a 173-line `.bashrc` **14.6 ms** (was 430).
-- **Your primary brood checkout** (`~/src/broodlang/brood`) has `main` behind origin:
-  `git pull` there. This session's worktree (`regex-dfa-tokens`, merged) lives under
-  `/tmp/claude-1000/…/scratchpad/brood-wt` and disappears on reboot — `git worktree prune`
-  afterwards. Its `target/` is a symlink to `~/.cache/brood-wt-target` (4.8 GB, on disk):
-  keep it, the next worktree gets a warm release-fast build from it.
-- Restart any `bedit` window opened before 12:36 — it is a pre-0.4.3 binary.
+- **bedit** `main` = `ad446851` (`chore(strict): the ratchet reads 0 under brood's
+  trusted-sig lint`), on `23fc57f4` = `release: 0.4.9`, **tag `v0.4.9` pushed**, tree clean.
+  `~/.local/bin/bedit` is 0.4.9 (built 13:30 UTC) and passes `make check-modes` on all
+  eleven modes. `project.blsp` still says `:brood ">= 0.30.0"` — read the comment above it:
+  0.4.9 needs `gui/cell-size` + `cell-region`, which are on brood **main** and in **no brood
+  release yet**. A released 0.30.x opens 0.4.9 fine and raises `unbound symbol:
+  gui/cell-size` on the first Ctrl+wheel. The floor moves the day brood ships.
+- **bedit is NOT published** to the registry: `nest search bedit` says 0.4.2 (0.4.3–0.4.9
+  were tagged, never published). Publish only after the brood release, floor bumped —
+  a registry package whose zoom fails on every released runtime is worse than 0.4.2.
+- **brood** `origin/main` = `03e955c6` (`ci: BEDIT_REF -> ad446851`) on `989af614`. This
+  session's commits: `f8827ab1` (cell-region, ADR-363), `b312370e` (wasm stub + doc
+  examples), `03e955c6`. **CI on main is red** on the OTHER brood session's checker work,
+  not on the cell-region work — see queue item 1. The primary checkout
+  `~/src/broodlang/brood` is that session's: `main` at `989af614` (behind origin) with
+  uncommitted `types/*.rs` edits and a fresh build at 16:48; **do not edit there**.
+- **Installed `nest`** = `0.30.1 (cd87c8c1-dirty)` — the other session's install from its
+  uncommitted tree. It carries cell-region (`cd87c8c1` is after `b312370e`) and the new
+  checker lints; it is the runtime baked into bedit 0.4.9 (`nest release` embeds the
+  installed nest's runtime). Not a released brood.
+- **Disk:** `/` was at 100% during this session (brood's `target/debug` had grown to 195 GB
+  of `cargo test` binaries in one day); `target/debug` and `target/tmp` were deleted under
+  the build lock, `/` is 67% now. `~/.cache/brood-wt-target` (8.7 GB, on disk) is the warm
+  `release-fast` for worktree installs — keep it. All stale worktrees pruned; brood has
+  one checkout again.
+- **`~/.claude-hst/settings.json` now has the build-lock + no-full-suite hooks.** A session
+  started under that config dir had none, ran a bare `cargo test -p brood --features gui`
+  in the terminal's own cgroup, and systemd-oomd killed the whole tab (28 GB peak) — that
+  was the "you crashed AGAIN". The hooks are the fix; the scripts stay in `~/.claude/hooks`.
 
-## What landed this session (bedit 0.4.2 → 0.4.3, brood 0.27.2 → 0.28.0)
+## What landed this session (bedit 0.4.8 → 0.4.9; brood main, unreleased)
 
-**The bug.** `bedit ~/.bashrc` was "pretty much unresponsive" and the X button did nothing.
-Not a hang: `editor/shell` ran `regex/find-all` twice per line over the whole file on every
-keystroke — 430 ms each on brood's pure-Brood capture engine (~40 µs per character; the
-bitset `match?` is 0.19 µs, a 200× gap measured on the file's own lines). Held keys queued
-seconds of work; `:close` waited behind it. Then, once shipped, a second failure: the mode's
-`:fontify-restart` named a symbol in a module nothing loads for a shell buffer, and a
-throwing refresh made the loop drop every event — the close request included.
+**The zoom is per pane, and it is a render op — not a font change.** Ctrl+wheel zooms the
+pane under the pointer a pixel a notch; `C-x C-=` / `C-x C--` / `C-x C-0` (`M-x
+text-scale-*`) the selected pane; the window's font never moves. A zoomed pane's mode line
+carries a chip (`⌕ 20px`) whose click is 100% again. Full story in `devlog.md`; the short
+version: five pacing fixes to a whole-window font change each moved the jank elsewhere
+because the model was wrong, so the capability went into the language — brood's
+`[:cell-region x y w h px ops]` paints a block at another font size inside a rect given in
+the parent's cells, and `gui/cell-size` measures the cell a size produces (13×29 px at 21 px
+over 9×21 at 15 — not the ratio, which is why it is measured). bedit stores `:zoom {:px
+:ratio}` on the pane payload; every geometry read (`panes/ed-zoom-ratio`, `ed-pane-cols`,
+`ed-pane-vrows`, `ed-pane-row-index`, `ed-buf-offset-at`) divides by the ratio; the view
+lays the body out at origin 0,0 and wraps it. The integer `:scale`, `ed-scale-op`, the `s`
+parameter through seven view helpers and the window-zoom throttle/timer are gone. It began
+as a per-BUFFER zoom (Emacs's `text-scale-adjust`) and a split showing one buffer twice
+zoomed both sides — the user's "all the buffers zoom" — so it moved to the pane.
 
-**brood (ADR-352):** `regex/tokens` scans a rule table on the anchored DFA (earliest
-position, first rule in table order, longest match; `\b` only at a rule's edges);
-`regex/tokenizer` is the pure-data handle a `def` holds (the compiled plan, with its table
-handles, lives in the module's cache — a table cannot be imaged); `regex/paint` answers a
-line rule's one grouped question as prefix / paint / suffix, three DFA runs; `find`/`find-all`
-enter the VM only at a start the DFA found (`(find "$" "abc")` is now the empty match at 3);
-`editor/lexer` and `editor/shell` are one scan per line with the word rule as the table's
-last row; `editor/highlight/line-restart` beside `safe-restart`. Numbers: `shell-spans`
-whole-file 303 → 12 ms, a 36-char line 2.0 → 0.11 ms, 40 YAML lines 17.8 → 5.6 ms.
+**The status bar hit-test answers for the pane whose bar holds the cell** (it answered for
+the selected pane only), selects that pane before a segment's command runs, anchors the
+tooltip on the hovered bar, and lights the hover pill only there — what a per-pane chip
+needed.
 
-**bedit:** the nine line-oriented modes declare `editor/highlight/line-restart` (a keystroke
-lexes the band, never the 200-line backscan); `input/ed-refresh-spans-guarded` — the loop
-tail's span refresh may not veto the event (error echoed, `:done` kept; two tests in
-`modes_test`); `tools/check-modes.sh` / `make check-modes`; the tests that pin checker
-output moved with brood's checker; `strict_ratchet_test` ceilinged at 58 with the classes
-named; the tutor's dead `nil?` guard gone.
+**bedit is strict-clean under brood's new trusted-sig lint** (A5 in
+`docs/type-system-status.md`): `declared return type T is trusted, not verified` fires when
+a `sig`'s return cannot be verified because the body's result is the unknown. 26 sites in
+bedit — a pane payload (`any` in `std/editor/pane`), a command resolved late through
+`reflect/eval`, an annotation's value, an open map — each acknowledged with `(check-allow
+:trusted (defn …))` and a comment naming which; two test helpers' sigs fixed at the leaf
+(`any` → the real parameter type). If the lint ever learns the pane payload's shape, the
+acknowledgements come off.
 
 ## Traps — each cost a round of confusion this session
 
-1. **A mode service is a SYMBOL, resolved at render time** (`ed-mode-service` →
-   `reflect/eval`). Name only a module `modes` always loads (`editor/highlight`,
-   `editor/treesit`, the mode's own `-spans` module). The test image loads everything, so
-   this class is invisible to `nest test`; only the released binary from `$HOME` on a file
-   of that mode shows it — that is what `make check-modes` is for. Run it before calling
-   any mode change done.
-2. **Every `nest`/`cargo`/`make`/`git` command waits on `~/.cache/brood/build.lock`**
-   (`~/.claude/hooks/with-build-lock.sh`), held by whichever session builds; a plain
-   `git commit` can sit for 20 minutes. Check `build.lock.holder` before debugging a "hang".
-   `nest test` bare is blocked; run the suite per file:
-   `ls tests/*_test.blsp | xargs -I{} sh -c 'nest test {} 2>&1 | grep "tests," | sed "s|^|{}: |"' | grep -v " 0 failed"`.
-   A `for x in …` in a command trips the hook's env pre-check — use `xargs`/explicit lists.
-3. **In a brood worktree the binary embeds `std/`** — every std edit needs a rebuild before
-   `require` sees it (the "baked-in std/ is OLDER" warning means exactly that); the std
-   image cache is keyed by commit + binary, not content; `make install` from a worktree
-   needs `<worktree>/target` to be a symlink to the on-disk cache (`BROOD_EMBED_RUNTIME`
-   is `$(CURDIR)/target/release-fast/brood`).
-4. **Installing a nest from a newer brood moves bedit's checker-dependent tests** — type
-   strings in `playground_test`, the strict ratchet, a diagnostic count in
-   `gitdiff_async_test`. Classify against that before blaming the change under test.
-5. **The harness kills idle background watchers "for memory"** even with 30 GB free —
-   poll `gh run list` by hand rather than arming an hour-long loop.
-6. `web_fuzz_session_test` renders the repo's own working-tree diff: a comment containing
-   the literal phrase `render error` read as a failure once; the predicate now looks for
-   the error FRAME (a column-0 `render error:` text on the echo row).
+1. **Which `~/.claude` a session runs under decides its hooks AND where its transcript
+   lives.** A `CLAUDE_CONFIG_DIR=~/.claude-hst` session's transcript is under
+   `~/.claude-hst/projects/…`; a "lost" session is usually in the other dir. Both dirs now
+   carry the hooks — check `settings.json` before trusting a session is capped.
+2. **A `try … (catch e nil)` in a probe/harness `receive` is not the trap — the mailbox
+   is.** `(receive (_ nil) (after 400 nil))` returns at once, because the window posts
+   resize/focus events to the process; wait with a pattern nothing sends
+   (`(receive ([:probe-never] nil) (after 400 nil))`). `BROOD_GUI_DUMP=x.ppm` writes the
+   LAST paint, so draw the frame you want to see last; `ffmpeg -i x.ppm x.png` to look.
+   The recipe is in `tools/`-less form in the devlog; `zoom-probe.blsp` lived in the
+   session scratchpad and is gone — 40 lines, easy to rewrite from the memory note.
+3. **A test that hands `zoom-step` a laid-out pane feeds it a stale accumulator** — the
+   wheel is many events, and the pane's payload changes under each. `zoom-step` reads the
+   LIVE payload (`pane-payload-at` by the pane's `:path`); anything else that folds a
+   stream over a pane must too.
+4. **`ed-modeline-click`'s command runs on the SELECTED pane** (`(m key) -> m`), so a
+   per-pane segment must select its pane first — done in `ed-modeline-click`; a new
+   per-pane segment gets it for free, a new *entry point* to segment commands must repeat it.
+5. **A brood ADR number is a race between sessions.** ADR-362 was taken while this one
+   rebased; the cell-region ADR is 363. Renumber before pushing, not after.
+6. **Every `nest`/`cargo`/`make` command waits on the build lock**; bare `nest test` is
+   blocked — the per-file loop is in "How to verify". A `$b`-style one-letter shell
+   variable in a Bash tool command trips the hook's env pre-check and empties it (it
+   truncated a test file once); use longer names or a script file.
+7. **The runtime collects `cursor-zone`s from a frame's top-level ops only** — inside a
+   `cell-region` (and a `scroll-region`, which was already so) a zone is never hit-tested,
+   so the pointer-hand over a results buffer's links is lost in a zoomed pane. Queue item 3.
 
 ## Work queue — in the order to take it up
 
-### 1 — The strict ratchet: 58 → 0 under brood 0.28.0's checker
-**2026-09-16, brood `de575508` (on main):** the count reads **48**
-against a nest built from it — `apply` binds a callee's type variable (KI-140: the four
-`ordered` into `pad-left`), a `let`-bound lambda's parameters are derived from its callers
-and a `sig` over the required positions seeds a `defn` with undeclared `&optional`s
-(ADR-355: `ed-visible-lines`'s `row-op`, `(+ y k)`). The ceiling is 48. What remains is bedit's: `nil | x` reads (~25), `number` from a genuinely
-unknown operand (an `&optional` never declared, a private helper whose callers pass a
-computed `number`), the six `ed-pane-line-at` nils.
+### 1 — Brood green → release → bedit floor → `nest publish`
+Brood main is red on the other session's checker work (`3cbeb090`…`989af614`):
+- `test` and `differential (tree-walker)`: two nest differential tests **TIMEOUT at 120 s**
+  — `nest::check_order_differential a_files_verdict_depends_on_neither_the_list_order_nor_the_process`
+  and `nest::derivation_cache_differential the_site_walk_cache_changes_no_verdict_and_no_inferred_signature`
+  (their B8 work; that session has `types/tests.rs` open).
+- `downstream smoke (bedit @ BEDIT_REF)`: was the trusted-sig lint at the old ref; fixed
+  by `ad446851` + `03e955c6` — expect green on the next run.
+When `gh run list -R broodlang/brood` shows main green: in a worktree (`git worktree add
+-b release-0.31 …/brood-wt origin/main`; `ln -s ~/.cache/brood-wt-target target`; copy
+`config.mk`), bump `Cargo.toml`, `project.blsp`, `std/system.blsp`'s example, move
+CHANGELOG's `## Unreleased` under `## v0.31.0 — …` (cell-region is a feature → minor),
+commit `chore(release): v0.31.0`, tag `v0.31.0`, `git push origin HEAD:main --tags` — the
+Release workflow builds the tarballs (`gh release view v0.31.0`). Then `make install`
+there; in bedit set `:brood ">= 0.31.0"` (and drop the comment), `release: 0.4.10`, tag,
+push, `make install`, `make check-modes`, then `nest publish`. The ecosystem script
+(`brood scripts/release-ecosystem.blsp`, `PUBLISH=1`) publishes the themes after bedit.
 
-`nest check --strict 2>&1 | grep warning:` — the classes, with counts as of `07700563`:
-- **`number` into an `int` parameter** (~15: `view.blsp` `(+ y k)`, `(- pos bol)`,
-  `(math/max 0 n)` in `statusbar.blsp`, `model.blsp:1650`, `wrap_test`/`view_scroll_test`):
-  int arithmetic answering `number`. Check first whether this is the checker's interval
-  arithmetic widening on a bound it cannot prove — if so it is a brood precision item
-  (ADR-350's "checked operations that widen on overflow"), not 15 casts in bedit.
-- **`nil | x` where the context has ruled nil out** (~25: `(nth bols 2)` in `modes_test`
-  1355–1359, `bol-of` call-arg/body, `(proc/whereis :editor)` into `send` in `frames.blsp`
-  162/181, `ed-buffer-index-by-name` in `frames_test`, `file/slurp`/`file/mtime`/
-  `find-file-buffer` on a `nil | string` path in `model.blsp` 1557/1595): declare or guard,
-  the ADR-350 way (`(int 0 _)`, `(len …)`), or bind-and-check like the tutor used to.
-- **`ordered` into `string/pad-left`/`pad-right`** (4): what `count` or `sort` answers
-  there — likely a brood curated-table row.
-- **six `ed-pane-line-at: expects pane, got nil | {…}`** (`wrap_test.blsp:78` and kin) and
-  `panes/ed-selected-pane` declaring `pane` but yielding `nil | …` (`panes.blsp:28`): the
-  selected pane is `nil` only before a layout exists; declare that or narrow at the callers.
-- Singles: `hosted.blsp:309` `assoc` on `countable (link)`, `commands.blsp:4644`
-  `ed-vim-add-digit` over `(get *vim-digits* …)`.
-Each fix is its own small commit; lower the number in `tests/strict_ratchet_test.blsp` as
-you go — it may only shrink.
+### 2 — The trusted-sig lint: 26 acknowledgements that want to be one type
+Every `(check-allow :trusted …)` in `panes`/`model` says the same thing: the pane payload
+is `any` in `std/editor/pane` (`(deftype pane (record &open :path list :payload any …))`).
+The language fix (prime directive) is a payload type parameter or bedit declaring its
+payload record and std's `pane-*` functions carrying it through; then `(:top payload)` is
+`nil | int` and nine acknowledgements come off. The `reflect/eval` ones stay — a late-bound
+command's result is unknown by design.
 
-### 2 — Why `editor/lexer/line-restart` did not auto-load in the released binary — ANSWERED 2026-09-15
-It never existed there. `line-restart` was born in `editor/highlight` in the ADR-352 commit
-(`2a750c08`) and `editor/lexer` only ever *mentioned* `editor/highlight/line-restart` in a
-comment; `(reflect/eval 'editor/lexer/line-restart)` loads `editor/lexer` and then finds no
-such binding, which is the `unbound symbol` the frame painted. Verified on brood's tree with
-both `nest run` and `brood`: `editor/highlight/line-restart` and `editor/lexer/lexer-spans`
-resolve to `:fn`, the misspelling raises. So trap 1 is policy, not a bug, and the auto-load
-mechanism is fine. The original notes follow for the record.
+### 3 — Cursor zones through regions (brood)
+`crates/lisp/src/host/gui/backend.rs`, `UserEvent::Draw`: `w.zones` is
+`ops.iter().filter_map(CursorZone)` — top level only, cells. Recurse into `ScrollRegion`
+(same cells, the scroll offset applies) and `CellRegion` (the region's cells: a zone at
+region `(x, y, w, h)` is at parent px `(rx*cw + x*cw', ry*ch + y*ch', w*cw', h*ch')`, from
+`renderer.metrics_at(px)`), and store zones as **pixel** rects so the hover test compares
+the pointer's pixel position (it has it before `px_to_cell`). A Rust test per shape. Then
+bedit's `ed-pane-link-ops` zones (inside the scrollable block, inside the region) work
+unchanged.
 
-`reflect/eval` of a qualified symbol loads its module on first use (verified:
-`(reflect/eval 'editor/lexer/lexer-spans)` resolves in a fresh `nest run` with nothing
-loaded), yet the 10:08 `bedit` binary painted `unbound symbol: editor/lexer/line-restart`
-on every frame from `$HOME`, while `'editor/shell/shell-spans` on the same layer resolved.
-The move to `editor/highlight` fixed the symptom; the mechanism is unexplained. Repro
-recipe: build a bedit with `:fontify-restart 'editor/lexer/line-restart` on shell-mode, run
-it from `$HOME` on a `.sh` file with stdout captured, grep `render error`. Suspects: the
-release bundle's std image (is `editor/lexer` a section that is present but not loaded, so
-the miss path never fires?), and whether the auto-load runs inside the view's `try`. A
-brood known-issue once understood; it decides whether trap 1 is policy or a bug.
-
-### 3 — Residual lexer cost is interpreter overhead per token
-Profiles after ADR-352: ~7 µs per token (the result map, the substring, the vector append)
-and ~2.5 µs per character on a long line, against 0.2 µs for the DFA step. Levers, if a
-large YAML/TOML/shell file ever feels slow: tokens as `[start end tag]` vectors with `:text`
-on demand (the word pass is the only consumer that needs it), the `into acc [m]` append
-(O(n²) in tokens per line, fine below ~50), and `shell-line-spans`'s per-token cond.
-Measure with `scratchpad`-style `rxbench`/`lexbench` scripts (the shape is in brood's
-devlog entry for 2026-09-15) — the discipline that paid all day: a number before a change.
-
-### 4 — `regex/tokens` housekeeping in brood
-`regex-tokens-cache` is keyed by the rule table's printed form, so a table built per call
-grows it without bound (hold a `tokenizer` in a `def`, as the std lexers do — document that
-in the module doc if it bites). `paint` detects laziness textually (`*?` `+?` `??` anywhere
-in the paint pattern). `\b` inside a rule errors at first scan, not at grammar definition.
-Every `find` pattern now compiles two machines (DFA + capture), so first-call cost and memo
-memory per pattern roughly doubled — fine, but the memo tables are unbounded as before.
-
-### 5 — Everything else is in `ROADMAP.md` §the open ends
-The tree-sitter batch with grammars by location, org-mode, visual-line motion, the wheel
-and the cursor — unchanged by this session, in the order written there.
+### 4 — Everything else is in `ROADMAP.md` §the open ends
+The tree-sitter batch, org-mode, visual-line motion — unchanged by this session.
 
 ## How to verify a change here (the loop that caught every bug this session)
-1. `nest check` clean; the suite per file (trap 2); `nest test --failed` for the loop.
-2. `make check-modes` after any mode/service change (trap 1).
-3. `nest run tools/profile-turn.blsp -- <file> 210 48` for a keystroke's cost — the
-   "unresponsive" report was a 430 ms `update "x"` there, and it is 14.6 ms now.
-4. A live run with `BROOD_UI_TRACE=1 bedit <file>` from `$HOME`, stdout captured: `view=`
-   and `update=` per turn, and any `render error` line.
-5. After a brood change: `make install` (GUI) from the brood tree, then `make install`
-   here, then all of the above against the installed binaries — `nest test` runs under the
-   installed `nest`, and a stale one is the trap that cost three sessions before this one.
+1. `nest check` clean; the suite per file:
+   `ls tests/*_test.blsp | xargs -I{} sh -c 'nest test {} 2>&1 | grep "tests," | sed "s|^|{}: |"' | grep -v " 0 failed"`
+   (1,701 tests, ~3 s each file); `nest test --failed` for the loop; `nest check --strict`
+   must read 0 (`tests/strict_ratchet_test.blsp` is the gate).
+2. `make check-modes` after any mode/service change — it opens a window per mode.
+3. `make drive` — the pty drivers (the real editor over `*term-display*`).
+4. A real paint: a probe script over `gui-display` + `ed-update` + `ed-view` +
+   `(:draw disp)` under `BROOD_GUI_DUMP` (trap 2), sandbox off — it opens a window on the
+   desktop, so not while someone is working on it.
+5. After a brood change: `make install` (GUI) from a brood **worktree** with the `target`
+   symlink, then `make install` here, then all of the above — `nest test` runs under the
+   installed `nest`. Check `nest --version` first: `-dirty` means someone's uncommitted
+   tree is your runtime.
