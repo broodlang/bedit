@@ -29,49 +29,68 @@
     (let (m (apply! (apply! (m0) {:family :hack :height 20 :line-height 1.3}) {:height 21}))
       (assert= (:line-height (current m)) 1.3))))
 
+;; ---- what a NOTCH is, and why the unit is the whole point --------------------
+;; A wheel notch is not one event. The runtime gives it an impulse and a kinetic ticker
+;; delivers a decaying stream of events whose deltas sum to ~3 lines (brood's
+;; `a_single_notch_glides_about_three_lines`). These helpers deliver a notch the way the
+;; runtime does — as that stream — so the tests measure what a hand on the wheel gets.
+
+(defn notch-stream (dir)
+  ;; A decaying impulse summing to EXACTLY `*zoom-step-lines*`, like the runtime's glide
+  ;; (0.45 per tick decaying at 0.85 — brood's `WHEEL_IMPULSE`/`WHEEL_DECAY`). Normalised by
+  ;; its own sum, so "one notch is one pixel" is an exact claim and fifteen notches are
+  ;; fifteen pixels rather than fifteen-ish.
+  (let (raw (fold (range 20) [] (fn (acc i) (conj acc (* 0.45 (math/pow 0.85 i)))))
+        total (math/sum raw))
+    (map raw (fn (v) (* dir (* *zoom-step-lines* (/ v total)))))))
+
+(defn notches (m dir n)
+  ;; `n` physical notches, each as its own kinetic stream
+  (fold (range n) m (fn (acc _) (fold (notch-stream dir) acc (fn (a dy) (zoom-step a dy))))))
+
 (describe "Ctrl+wheel steps the size incrementally"
-  ;; `zoom-step` records a TARGET; `zoom-flush` (the `:zoom-apply` throttle) pushes it to the
-  ;; window. `stepped` is what the wheel asked for, `applied` what the window ends up with.
   (defn stepped (m) (or (:zoom-to m) (:height (current m))))
   (defn applied (m) (:height (current (zoom-flush m))))
 
-  ;; The complaint, as a test: one notch must move one pixel, not the whole range.
-  (test "a notch is one pixel, not a doubling"
-    (assert= (applied (zoom-step (m0) 1.0)) 16))
-  (test "a burst of kinetic events smaller than a notch does not step at all"
-    ;; the runtime decays one notch into many small deltas; they must accumulate
-    (let (m (fold (range 3) (m0) (fn (acc _) (zoom-step acc 0.2))))
-      (assert= (stepped m) 15))) ; 0.6 of a notch — nothing yet
-  (test "and the leftover is kept, so slow scrolling still gets there"
-    (let (m (fold (range 5) (m0) (fn (acc _) (zoom-step acc 0.2))))
-      (assert= (applied m) 16))) ; 1.0 accumulated — exactly one step
+  ;; The complaint, twice over: one notch must be ONE pixel. At a divisor of 1.0 a notch
+  ;; stepped three (its glide sums to ~3 lines), which read as "too sensitive", and the
+  ;; accumulated target then lurched a whole spin's worth per throttle tick.
+  (test "one physical notch is one pixel"
+    (assert= (applied (notches (m0) 1 1)) 16)
+    (assert= (applied (notches (m0) -1 1)) 14))
+  (test "three notches are three pixels — the response is linear in the hand"
+    (assert= (applied (notches (m0) 1 3)) 18))
+  (test "a fraction of a notch does not step at all"
+    (let (m (fold (take (notch-stream 1) 4) (m0) (fn (a dy) (zoom-step a dy))))
+      (assert= (stepped m) 15)))
+  (test "and its leftover is kept, so the rest of the notch still gets there"
+    (assert= (applied (notches (m0) 1 1)) 16))
   (test "shrinking needs the same push as growing (no floor asymmetry)"
-    (assert= (stepped (zoom-step (m0) -0.6)) 15)
-    (assert= (applied (zoom-step (m0) -1.0)) 14))
-  (test "a spun wheel that reports several notches at once moves several pixels"
-    (assert= (applied (zoom-step (m0) 3.0)) 18))
+    (let (half (fold (take (notch-stream -1) 6) (m0) (fn (a dy) (zoom-step a dy))))
+      (assert= (stepped half) 15))
+    (assert= (applied (notches (m0) -1 1)) 14))
   (test "zoom stops at the readable bounds"
-    (assert= (applied (zoom-step (m0) 500.0)) *max-height*)
-    (assert= (applied (zoom-step (m0) -500.0)) *min-height*)))
+    (assert= (applied (notches (m0) 1 200)) *max-height*)
+    (assert= (applied (notches (m0) -1 200)) *min-height*)))
 
 ;; ---- the resize has to be smooth, which is a statement about how OFTEN it happens ----
-;; Applying the size per wheel event was janky: the runtime delivers one notch as a burst,
-;; every `gui/font` clears the glyph cache and re-rasters the window, and the grid's row
-;; count changes under the mode line each time — so the status bar jumped and flickered.
-;; The step is now bookkeeping and the window is written on a throttle.
+;; Applying the size per wheel event was janky: every `gui/font` clears the glyph cache and
+;; re-rasters the window, and the grid's row count changes under the mode line each time —
+;; so the status bar jumped and flickered. The step is bookkeeping now; the window is
+;; written on a throttle.
 
 (describe "a zoom in flight is applied once, not once per event"
   (test "stepping does not touch the window — it records a target"
-    (let (m (zoom-step (m0) 4.0))
+    (let (m (notches (m0) 1 4))
       (assert= (:height (current m)) 15) ; unchanged: nothing was pushed
       (assert= (:zoom-to m) 19)
       (is (zoom-pending? m))))
-  (test "a whole burst collapses into ONE target, and the flush applies it once"
-    (let (burst (fold (range 12) (m0) (fn (acc _) (zoom-step acc 0.5))) ; 12 kinetic events
+  (test "a notch's whole kinetic stream collapses into ONE target and one apply"
+    (let (burst (notches (m0) 1 2) ; two notches = ~40 events
           flushed (zoom-flush burst))
-      (assert= (:zoom-to burst) 21) ; +6 px asked for
-      (assert= (:height (current flushed)) 21)
-      (is (not (zoom-pending? flushed))) ; nothing left to arm the timer
+      (assert= (:zoom-to burst) 17)
+      (assert= (:height (current flushed)) 17)
+      (is (not (zoom-pending? flushed)))
       (is (nil? (:zoom-to flushed)))))
   (test "the size shows in the echo area and NOT in *Messages*"
     ;; a zoom from 15 to 30 used to append fifteen lines to the buffer
@@ -81,7 +100,7 @@
       (buffer-line-count (nth (:buffers mm)
                            (seq/index-where (:buffers mm) (fn (b) (= (buffer-name b) "*Messages*"))))))
     (let (before (msg-lines (m0))
-          m (fold (range 15) (m0) (fn (acc _) (zoom-flush (zoom-step acc 1.0))))
+          m (fold (range 15) (m0) (fn (acc _) (zoom-flush (notches acc 1 1))))
           after (msg-lines m))
       (assert= (:height (current m)) 30)
       (is (includes? (:echo m) "30 px"))
