@@ -1,0 +1,185 @@
+(defmodule appearance
+  "The window's type setup — family, size, line height — and **named presets** over it
+(`M-x preset-select` / `preset-save` / `preset-delete`).
+
+Two things share one vocabulary here. Ctrl+mouse-wheel steps the SIZE, finely; a preset
+names a whole setup you can switch to in one command. The second is what you want when a
+call starts: `M-x preset-select` → `Presenting`, and the person on the other end of the
+screen share can read your code. Then back to `Default` after.
+
+Why a module and not two knobs. The window has no getter for what it is showing, so
+something has to hold it — the model's `:appearance`. Once that exists, zooming is a step
+on it, a preset is a saved value of it, and `preset-save` is just naming what you are
+looking at. Themes set it too (a theme carries a font), so `themes/themes-apply` records
+what it applied and a preset saved afterwards records the truth.
+
+A preset is a plain map, like a theme: `{:name :family :height :line-height}`. The
+built-ins are the floor; yours are saved beside them in the editor's state dir and win on
+name, so redefining `Presenting` is just saving one with that name."
+  (:use interactive) ; defcommand — register the preset commands for M-x
+  (:use commands) ; ed-name-prompt — the Vertico selection prompt
+  (:use projects) ; persist-read / persist-write! / editor-state-dir — the shared cache layer
+  (:use model)) ; message — the echo-area status
+
+;; ---- what the window is showing ---------------------------------------------
+
+(def *default-appearance* {:family :hack :height 15 :line-height 1.4})
+;; What `main` starts at (the bundled Hack at the theme's size). The model carries the live
+;; one; this is the fallback for a model that has not been through `apply!` yet — a pure
+;; test, or the first frame before startup applies the config.
+
+(def *min-height* 6) ; below this text is unreadable and the grid maths gets silly
+(def *max-height* 72) ; above this a cell is bigger than most panes
+
+(defn current (m)
+  "The window's type setup as a map — the model's, or the default when it has none."
+  (merge *default-appearance* (or (:appearance m) {})))
+
+(defn clamp-height (px)
+  "`px` held inside `*min-height*`..`*max-height*`."
+  (math/max *min-height* (math/min *max-height* px)))
+
+(defn apply! (m appearance)
+  "Set the window's family/size/line-height from `appearance` and record it on the model.
+
+The record is the point: `gui/font` and `gui/line-height` are writes with no read, so the
+model is the only place that knows what is on screen. Every path that changes type goes
+through here — startup, a theme, a preset, a zoom step — so none of them can leave the
+model describing something the window is not."
+  (let (a (merge (current m) appearance) ; over what is showing, not the default: a partial
+        h (clamp-height (:height a))) ; apply must not silently reset the fields it omits
+    (theme/gui-only gui/font {:family (:family a) :height h})
+    (theme/gui-only gui/line-height (:line-height a))
+    (assoc m :appearance (assoc a :height h))))
+
+;; ---- the size step (Ctrl+mouse-wheel) ---------------------------------------
+;; The old Ctrl+wheel moved the hovered pane's INTEGER `:scale`, one level per event. Two
+;; things made that unusable. A level is a whole multiple — 1 → 2 doubles the text, so the
+;; smallest possible step was +100%. And the runtime turns one notch into a kinetic impulse
+;; that decays over ~half a second (see `ed-smooth-scroll-pane`), so a single notch arrived
+;; as a burst of events and took the scale from 1 to its cap before you let go of the wheel.
+;;
+;; So zoom moves the font SIZE, which is continuous (a step is ~7% at 15 px, not 100%), and
+;; it accumulates the same float delta the scroll path reads, stepping only when a whole
+;; notch's worth has arrived. The per-pane block zoom is still there — `panes/ed-zoom-pane`,
+;; on Ctrl+SHIFT+wheel — because "make this one pane huge" is a different thing to want.
+
+(defdyn *zoom-step-lines* 1.0)
+;; How much accumulated wheel delta (in the line units the runtime reports) buys one pixel
+;; of size. Raise it for a slower zoom, lower it for a faster one.
+
+(defn- whole-steps (acc step)
+  "How many whole `step`s fit in `acc`, counted TOWARD ZERO. Deliberately not a floor:
+floor(-0.6) is -1, so shrinking would step on a nudge while growing waited for a full
+notch, and a zoom that is easier to shrink than to grow feels broken rather than sensitive."
+  (let (n (math/floor (/ (math/abs acc) step)))
+    (if (< acc 0) (- 0 n) n)))
+
+(defn zoom-step (m dy)
+  "Fold a Ctrl+wheel delta of `dy` line units into the window size, stepping by whole
+pixels once a notch's worth has accumulated. Returns the model — with the leftover kept, so
+a slow scroll is not rounded away to nothing."
+  (let (acc (+ (or (:zoom-accum m) 0.0) dy)
+        steps (whole-steps acc *zoom-step-lines*))
+    (if (= steps 0)
+      (assoc m :zoom-accum acc)
+      (let (a (current m)
+            h (clamp-height (+ (:height a) steps))
+            m1 (apply! (assoc m :zoom-accum (- acc (* steps *zoom-step-lines*))) (assoc a :height h)))
+        (message m1 (str "size " h " px"))))))
+
+;; ---- the presets ------------------------------------------------------------
+
+(def *presets*
+  ;; The built-in floor. `Default` is what the editor starts at; the rest are the sizes a
+  ;; day actually asks for — someone reading over your shoulder, a call, a dense diff.
+  [{:name "Default" :family :hack :height 15 :line-height 1.4}
+    {:name "Pairing" :family :hack :height 19 :line-height 1.4}
+    {:name "Presenting" :family :hack :height 26 :line-height 1.5}
+    {:name "Compact" :family :hack :height 13 :line-height 1.25}])
+
+(defn presets-file ()
+  "Path of the saved-presets file — one more re-readable literal in the editor's state dir,
+beside bookmarks and the recent-file caches."
+  (path/join (editor-state-dir) "presets.blsp"))
+
+;; The file-taking forms come first and the public ones close over `presets-file`, the same
+;; split `projects.blsp` uses for every persisted cache here — so a test drives the whole
+;; save/list/delete cycle on a temp path and never writes the developer's real presets.
+
+(defn saved-in (file)
+  "The presets saved in `file`, most-recent first (`[]` when there are none or it is
+unreadable — `persist-read`'s tolerance, so a corrupt file costs your presets, not a start)."
+  (persist-read file))
+
+(defn all-in (file)
+  "Every preset for `file`: saved first, then the built-ins not shadowed by one. Saving one
+named `Presenting` replaces the built-in of that name rather than sitting beside it, so the
+list never shows two entries that do different things under one name."
+  (let (mine (saved-in file)
+        names (map mine (fn (p) (:name p))))
+    (append mine (seq/reject *presets* (fn (p) (includes? names (:name p)))))))
+
+(defn saved () (saved-in (presets-file)))
+(defn all () (all-in (presets-file)))
+(defn names () (map (all) (fn (p) (:name p))))
+(defn by-name (name) (seq/find (all) (fn (p) (= (:name p) name))))
+
+(defn preset-apply (m name)
+  "Apply the preset `name` live, or report that there is no such preset."
+  (let (p (by-name name))
+    (if (nil? p)
+      (message m (str "no such preset: " name))
+      (message (apply! m (dissoc p :name))
+        (str "preset → " name "  (" (:height p) " px)")))))
+
+(defn preset-save-to! (file m name)
+  "Save what the window is showing into `file` as the preset `name` (dedup by name,
+most-recent first). Returns the model with a status. Best-effort, like every other persisted
+cache here: a write that fails costs the preset, not the edit you were making."
+  (let (a (current m)
+        entry (assoc a :name name))
+    (persist-write! file (into [entry] (seq/reject (saved-in file) (fn (p) (= (:name p) name)))))
+    (message m (str "preset saved: " name "  (" (:height a) " px, " (:family a) ")"))))
+
+(defn preset-delete-from! (file m name)
+  "Forget the preset `name` saved in `file`. A built-in of that name comes back (it was only
+shadowed); a name that was never saved reports rather than pretending."
+  (if (nil? (seq/find (saved-in file) (fn (p) (= (:name p) name))))
+    (message m (str "no saved preset: " name))
+    (do
+      (persist-write! file (into [] (seq/reject (saved-in file) (fn (p) (= (:name p) name)))))
+      (message m (str "preset deleted: " name)))))
+
+(defn preset-save! (m name) (preset-save-to! (presets-file) m name))
+(defn preset-delete! (m name) (preset-delete-from! (presets-file) m name))
+
+;; ---- the commands -----------------------------------------------------------
+
+(defcommand cmd-preset-select
+  (m key)
+  "Switch the window's type setup (`M-x preset-select`): a Vertico list of named font+size
+presets — yours and the built-ins — applied live. This is the one to reach for when a
+screen share starts: pick `Presenting`, and `Default` again afterwards."
+  (assoc m
+    :minibuffer (ed-name-prompt "Preset: " (names) (fn (mm name) (preset-apply mm name)))))
+
+(defcommand cmd-preset-save
+  (m key)
+  "Save the current font and size as a named preset (`M-x preset-save`) — zoom to what you
+want with Ctrl+wheel, then name it. Saving over an existing name replaces it."
+  (assoc m
+    :minibuffer
+      {:edit (ed-mb-edit "Save preset as: " "")
+       :on-complete (fn (mm name)
+                      (if (string/blank? name) (message mm "preset needs a name") (preset-save! mm name)))}))
+
+(defcommand cmd-preset-delete
+  (m key)
+  "Forget a saved preset (`M-x preset-delete`). Built-ins cannot be deleted — deleting one
+you saved over a built-in's name simply brings the built-in back."
+  (assoc m
+    :minibuffer
+      (ed-name-prompt "Delete preset: "
+        (map (saved) (fn (p) (:name p)))
+        (fn (mm name) (preset-delete! mm name)))))

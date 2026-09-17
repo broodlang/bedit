@@ -1,0 +1,114 @@
+;; The window's type setup and the named presets over it — `src/appearance.blsp`. Pure
+;; model tests: `apply!`'s window calls are `gui-only`, so headless they are no-ops and what
+;; is left is exactly the state the model records.
+;;
+;; The behaviour under test is a complaint: Ctrl+wheel zoom was "VERY sensitive". Two causes,
+;; both pinned below. A `:scale` level is a whole multiple, so the smallest step was +100%;
+;; and the runtime turns one notch into a kinetic burst of events, so a single notch crossed
+;; the entire range. Stepping the font SIZE, and only once a notch's worth of delta has
+;; accumulated, is what makes it incremental.
+
+(defmodule appearance-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use appearance))
+
+(defn m0 () (ed-init (make-buffer "hello")))
+
+(describe "the window's type setup"
+  (test "a fresh model reports the default, and apply! records what it set"
+    (assert= (:height (current (m0))) 15)
+    (let (m (apply! (m0) {:family :hack :height 22 :line-height 1.5}))
+      (assert= (:height (current m)) 22)
+      (assert= (:line-height (current m)) 1.5)))
+  (test "a size outside the readable range is clamped, not applied"
+    (assert= (:height (current (apply! (m0) {:height 900}))) *max-height*)
+    (assert= (:height (current (apply! (m0) {:height 1}))) *min-height*))
+  (test "apply! keeps the fields it was not given"
+    (let (m (apply! (apply! (m0) {:family :hack :height 20 :line-height 1.3}) {:height 21}))
+      (assert= (:line-height (current m)) 1.3))))
+
+(describe "Ctrl+wheel steps the size incrementally"
+  ;; The complaint, as a test: one notch must move one pixel, not the whole range.
+  (test "a notch is one pixel, not a doubling"
+    (let (m (zoom-step (m0) 1.0))
+      (assert= (:height (current m)) 16)))
+  (test "a burst of kinetic events smaller than a notch does not step at all"
+    ;; the runtime decays one notch into many small deltas; they must accumulate
+    (let (m (fold (range 3) (m0) (fn (acc _) (zoom-step acc 0.2))))
+      (assert= (:height (current m)) 15))) ; 0.6 of a notch — nothing yet
+  (test "and the leftover is kept, so slow scrolling still gets there"
+    (let (m (fold (range 5) (m0) (fn (acc _) (zoom-step acc 0.2))))
+      (assert= (:height (current m)) 16))) ; 1.0 accumulated — exactly one step
+  (test "shrinking needs the same push as growing (no floor asymmetry)"
+    (assert= (:height (current (zoom-step (m0) -0.6))) 15)
+    (assert= (:height (current (zoom-step (m0) -1.0))) 14))
+  (test "a spun wheel that reports several notches at once moves several pixels"
+    (assert= (:height (current (zoom-step (m0) 3.0))) 18))
+  (test "zoom stops at the readable bounds"
+    (assert= (:height (current (zoom-step (m0) 500.0))) *max-height*)
+    (assert= (:height (current (zoom-step (m0) -500.0))) *min-height*)))
+
+(describe "presets"
+  (test "the built-ins are there and apply live"
+    (is (includes? (names) "Presenting"))
+    (let (m (preset-apply (m0) "Presenting"))
+      (assert= (:height (current m)) 26)))
+  (test "an unknown name reports rather than changing anything"
+    (let (m (preset-apply (apply! (m0) {:height 17}) "nope"))
+      (assert= (:height (current m)) 17)
+      (is (includes? (:echo m) "no such preset"))))
+  (test "by-name reads the registry, and every built-in is a complete setup"
+    (doseq (n (names))
+      (let (p (by-name n))
+        (is (not (nil? (:family p))))
+        (is (int? (:height p)))
+        (is (not (nil? (:line-height p))))))))
+
+;; The save/list/delete cycle on a TEMP file — the `-in` / `-to!` forms exist for exactly
+;; this, so a test never writes the developer's real presets (the split `projects.blsp` uses
+;; for every persisted cache here).
+(purge-stale-temp "bedit-preset-")
+(defn tmp-presets () (str (temp-dir "bedit-preset-") "/presets.blsp"))
+
+(describe "saving and managing presets"
+  (test "saving records what the window is showing, and it reads back"
+    (let (f (tmp-presets)
+          m (apply! (m0) {:family :hack :height 31 :line-height 1.6})
+          _ (preset-save-to! f m "Call")
+          p (seq/find (all-in f) (fn (p) (= (:name p) "Call"))))
+      (assert= (:height p) 31)
+      (assert= (:line-height p) 1.6)))
+  (test "a saved preset shadows a built-in of the same name — one entry, not two"
+    (let (f (tmp-presets)
+          m (apply! (m0) {:height 40})
+          _ (preset-save-to! f m "Presenting")
+          named (seq/filter (all-in f) (fn (p) (= (:name p) "Presenting"))))
+      (assert= (count named) 1)
+      (assert= (:height (first named)) 40)))
+  (test "deleting a shadowing preset brings the built-in back"
+    (let (f (tmp-presets)
+          m (apply! (m0) {:height 40})
+          _ (preset-save-to! f m "Presenting")
+          _ (preset-delete-from! f m "Presenting")
+          p (seq/find (all-in f) (fn (p) (= (:name p) "Presenting"))))
+      (assert= (:height p) 26))) ; the built-in, not the saved 40
+  (test "deleting something never saved reports rather than pretending"
+    (let (f (tmp-presets)
+          m (preset-delete-from! f (m0) "Nope"))
+      (is (includes? (:echo m) "no saved preset"))))
+  (test "a save replaces rather than accumulating under one name"
+    (let (f (tmp-presets)
+          _ (preset-save-to! f (apply! (m0) {:height 20}) "Call")
+          _ (preset-save-to! f (apply! (m0) {:height 28}) "Call")
+          mine (saved-in f))
+      (assert= (count mine) 1)
+      (assert= (:height (first mine)) 28)))
+  (test "an unreadable presets file costs the presets, not the editor"
+    (let (f (tmp-presets)
+          _ (file/mkdir (path/dirname f))
+          _ (file/spit f "{{{ not a literal")
+          ok (all-in f))
+      (assert= (count (saved-in f)) 0)
+      (is (includes? (map ok (fn (p) (:name p))) "Default")))))
