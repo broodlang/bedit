@@ -3923,6 +3923,41 @@ M-x buffer-server-stop tears it down. (The push/render lives in `web`.)"
             "web server starting…"
             (str "already serving on http://localhost:" p)))))))
 
+(defn- ed-lsp-live (m)
+  "The model's LSP connection while its process is still alive, else nil. A server that
+died — or never started — leaves a pid on the model that every later request sends into
+the void and then waits out its timeout, so liveness is asked here rather than in six
+request sites."
+  (let (conn (:lsp m))
+    (when (and conn (proc/alive? conn)) conn)))
+
+(defn- ed-lsp-start (m what)
+  "Start the language server configured for the current buffer's file, store it on the
+model (`:lsp`) and register the completion source — `[m2 conn]`, with `conn` nil and an
+explanatory message on `m2` when there is nothing to start: the buffer has no file, no
+server is configured for its extension, or the server is not installed. `what` names the
+feature that asked, so the message reads in its voice (`lsp:` / `imenu:`).
+
+The not-installed case is the one that used to be a crash. `os/spawn` raises when the
+binary is missing, and it is called inside the connection PROCESS — so an Elixir buffer on
+a machine without `elixir-ls` answered a goto-definition with a `[crash] #<pid …> exited:
+proc-spawn elixir-ls: No such file or directory` trace where a sentence belongs.
+`os/which` (brood's std/os) asks before spawning."
+  (let (buf (ed-current-buf m)
+        file (buffer-file buf)
+        srv (when file (lsp/lsp-server-for file)))
+    (cond
+      (nil? file) [(message m (str what ": the buffer has no file")) nil]
+      (nil? srv) [(message m (str what ": no server configured for ." (lsp/lsp-extension file))) nil]
+      :else
+        (let ([cmd args] srv)
+          (if (nil? (os/which cmd))
+            [(message m (str what ": " cmd " is not installed (not on PATH)")) nil]
+            (let (root (project-root (path/dirname file))
+                  conn (lsp/lsp-connect cmd args (lsp/lsp-path->uri root)))
+              (complete-at-point/complete-add-source! 'lsp/lsp-complete-source)
+              [(message (assoc m :lsp conn) (str what ": " cmd " connected for " root)) conn]))))))
+
 (defcommand cmd-lsp-connect
   (m key)
   "Start a language server for the current buffer's file type and turn its completions
@@ -3930,20 +3965,11 @@ on (M-x lsp-connect). Looks the file extension up in `lsp/*lsp-servers*` (rust-a
 ruby-lsp, …), spawns it for the buffer's project root, stores the connection on the model
 (`:lsp`), and registers `lsp-complete-source` so Tab now also offers the server's
 candidates — merged with the mode and buffer-word sources. M-x lsp-disconnect stops it."
-  (let (buf (ed-current-buf m)
-        file (buffer-file buf))
-    (cond
-      (nil? file) (message m "lsp: the buffer has no file")
-      (:lsp m) (message m "lsp: already connected (M-x lsp-disconnect first)")
-      :else
-        (let (srv (lsp/lsp-server-for file))
-          (if (nil? srv)
-            (message m (str "lsp: no server configured for ." (lsp/lsp-extension file)))
-            (let ([cmd args] srv
-                  root (project-root (path/dirname file))
-                  conn (lsp/lsp-connect cmd args (lsp/lsp-path->uri root)))
-              (complete-at-point/complete-add-source! 'lsp/lsp-complete-source)
-              (message (assoc m :lsp conn) (str "lsp: " cmd " connected for " root))))))))
+  (if (ed-lsp-live m)
+    (message m "lsp: already connected (M-x lsp-disconnect first)")
+    ;; a `:lsp` whose process is gone is not a connection — drop it and start over,
+    ;; rather than report "already connected" about a pid nothing answers
+    (first (ed-lsp-start (dissoc m :lsp) "lsp"))))
 
 (defcommand cmd-lsp-disconnect
   (m key)
@@ -3958,25 +3984,18 @@ The `lsp-complete-source` stays registered but no-ops with no connection on the 
 
 (defn- ed-lsp-ensure (m)
   "Ensure a language server is connected for the current buffer's file. Returns
-`[m2 ready?]`: `ready?` is true when `:lsp` is already connected; false when a server was
-just started (the caller should ask the user to retry once it initialises) or none is
-configured / the buffer has no file — with an explanatory message already on `m2`."
-  (let (buf (ed-current-buf m)
-        file (buffer-file buf))
-    (cond
-      (:lsp m) [m true]
-      (nil? file) [(message m "imenu: the buffer has no file") false]
-      :else
-        (let (srv (lsp/lsp-server-for file))
-          (if (nil? srv)
-            [(message m (str "imenu: no LSP server configured for ." (lsp/lsp-extension file)))
-              false]
-            (let ([cmd args] srv
-                  root (project-root (path/dirname file))
-                  conn (lsp/lsp-connect cmd args (lsp/lsp-path->uri root)))
-              (complete-at-point/complete-add-source! 'lsp/lsp-complete-source)
-              [(message (assoc m :lsp conn) "imenu: starting LSP — run M-g i again in a moment")
-                false]))))))
+`[m2 ready?]`: `ready?` is true when a LIVE connection is already on the model; false when
+a server was just started (the caller should ask the user to retry once it initialises) or
+there is nothing to start — no file, no server configured, the server not installed — with
+an explanatory message already on `m2` (`ed-lsp-start` writes it)."
+  (if (ed-lsp-live m)
+    [m true]
+    (let ([m2 conn] (ed-lsp-start (dissoc m :lsp) "lsp"))
+      (if (nil? conn)
+        [m2 false]
+        ;; started, but the handshake has not finished: say so in the voice of the
+        ;; feature that asked rather than reporting a connection it cannot use yet
+        [(message m2 "lsp: starting the server — run that again in a moment") false]))))
 
 (defn- ed-imenu-label (s)
   "The imenu candidate text for a symbol `{:name :kind …}` — its (qualified) name with a
