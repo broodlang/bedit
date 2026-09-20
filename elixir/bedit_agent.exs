@@ -270,6 +270,8 @@ defmodule Bedit.Agent do
     reply =
       case what do
         "processes" -> observe_processes(Map.get(state, :attached))
+        "applications" -> observe(Map.get(state, :attached), :applications)
+        "ets" -> observe(Map.get(state, :attached), :ets)
         other -> %{ok: false, error: "unknown observation: " <> other}
       end
 
@@ -335,9 +337,280 @@ defmodule Bedit.Agent do
     Map.put(state, :attached, nil)
   end
 
+  # ---- the debugger: trace a named function, or stop on it ---------------------------
+  #
+  # Brood's side of the editor has had this for a while (`src/debugger.blsp`): a *Spy*
+  # stream of calls and returns, and a *Debug* queue of processes stopped at a breakpoint.
+  # These are the same two things for the BEAM, and they are the same two BEAM primitives
+  # underneath: `:erlang.trace_pattern` on an MFA, and — for a break —
+  # `:erlang.suspend_process` on whoever called it.
+  #
+  # The entries do NOT ride the request's own reply. A trace is open-ended, and an inflight
+  # request with no answer for a quiet minute is what the session's watchdog exists to kill.
+  # So `TRACE` is answered at once and the entries stream against a separate id the editor
+  # chose, which `evalsession` forwards whether or not anything is waiting on it.
+  defp handle("TRACE", id, _timeout, payload, state) do
+    state = stop_tracing(state)
+
+    case String.split(payload, "\n", parts: 3) do
+      [stream, spec, mode] ->
+        case parse_mfa(spec) do
+          {:error, why} ->
+            emit(%{id: id, ok: false, error: why})
+            state
+
+          {:ok, mfa} ->
+            case start_tracing(mfa, String.to_integer(stream), mode == "break") do
+              {:ok, tracer, n} ->
+                emit(%{id: id, ok: true, traced: spec, functions: n})
+                Map.put(state, :tracer, tracer)
+
+              {:error, why} ->
+                emit(%{id: id, ok: false, error: why})
+                state
+            end
+        end
+
+      _ ->
+        emit(%{id: id, ok: false, error: "trace wants a stream id, a function and a mode"})
+        state
+    end
+  end
+
+  defp handle("UNTRACE", id, _timeout, _payload, state) do
+    state = stop_tracing(state)
+    emit(%{id: id, ok: true, traced: nil})
+    state
+  end
+
+  # Let a process the breakpoint stopped carry on. Answered either way: a pid that has
+  # already died is not an error, it is the answer.
+  defp handle("RESUME", id, _timeout, payload, state) do
+    reply =
+      case pid_of(String.trim(payload)) do
+        nil ->
+          %{ok: false, error: "not a pid: " <> payload}
+
+        pid ->
+          try do
+            :erlang.resume_process(pid)
+            %{ok: true, resumed: inspect(pid)}
+          rescue
+            _ -> %{ok: true, resumed: inspect(pid), gone: true}
+          catch
+            _, _ -> %{ok: true, resumed: inspect(pid), gone: true}
+          end
+      end
+
+    emit(Map.put(reply, :id, id))
+    state
+  end
+
+  # What a stopped process is DOING. The BEAM does not expose a suspended process's local
+  # variables — that needs the interpreter (`:int`), which needs every module you might
+  # stop in loaded interpreted — so this answers the two things it does expose and that
+  # are worth most: where it is, and (for anything OTP started) its state.
+  defp handle("PSTATE", id, _timeout, payload, state) do
+    reply =
+      case pid_of(String.trim(payload)) do
+        nil -> %{ok: false, error: "not a pid: " <> payload}
+        pid -> %{ok: true, pid: inspect(pid), stack: stack_of(pid), state: state_of(pid)}
+      end
+
+    emit(Map.put(reply, :id, id))
+    state
+  end
+
   defp handle(_unknown, id, _timeout, _payload, state) do
     emit(%{id: id, ok: false, error: "unknown request"})
     state
+  end
+
+  defp pid_of(text) do
+    charlist = text |> String.replace_prefix("#PID", "") |> String.to_charlist()
+    :erlang.list_to_pid(charlist)
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
+  end
+
+  # `Mod.fun/arity`, `Mod.fun` (any arity) or `Mod` (every function it exports).
+  defp parse_mfa(spec) do
+    {head, arity} =
+      case String.split(spec, "/") do
+        [h, a] -> {h, String.to_integer(a)}
+        [h] -> {h, :_}
+      end
+
+    parts = String.split(head, ".")
+
+    {mod, fun} =
+      case List.last(parts) do
+        last ->
+          if last =~ ~r/^[a-z_]/ do
+            {Enum.join(Enum.drop(parts, -1), "."), String.to_atom(last)}
+          else
+            {head, :_}
+          end
+      end
+
+    module = Module.concat([mod])
+
+    if Code.ensure_loaded?(module) do
+      {:ok, {module, fun, arity}}
+    else
+      {:error, "no such module: " <> mod}
+    end
+  rescue
+    _ -> {:error, "could not read " <> spec <> " — try Mod.fun/arity"}
+  catch
+    _, _ -> {:error, "could not read " <> spec}
+  end
+
+  defp stop_tracing(state) do
+    case Map.get(state, :tracer) do
+      pid when is_pid(pid) ->
+        try do
+          :erlang.trace(:all, false, [:call])
+          Process.exit(pid, :kill)
+        catch
+          _, _ -> :ok
+        end
+
+      _ ->
+        :ok
+    end
+
+    Map.put(state, :tracer, nil)
+  end
+
+  defp start_tracing({module, fun, arity}, stream, break?) do
+    me = self()
+    tracer = spawn(fn -> tracer_loop(stream, break?, me, 0) end)
+
+    # `:return_trace` so a call and its answer both show — a cascade of calls with no
+    # values in it says what happened but not what it produced.
+    matched =
+      :erlang.trace_pattern({module, fun, arity}, [{:_, [], [{:return_trace}]}], [:local])
+
+    if matched == 0 do
+      Process.exit(tracer, :kill)
+      {:error, "nothing matched #{inspect(module)}.#{fun} — is it loaded?"}
+    else
+      # every process, existing and future, but only for the pattern above
+      :erlang.trace(:all, true, [:call, {:tracer, tracer}])
+      {:ok, tracer, matched}
+    end
+  rescue
+    error -> {:error, Exception.message(error)}
+  catch
+    _, reason -> {:error, "could not trace: " <> Exception.format_exit(reason)}
+  end
+
+  # The tracer is a plain process rather than a port: it has to make a DECISION per event
+  # (suspend the caller or not), which a tracer port cannot.
+  defp tracer_loop(stream, break?, agent, seen) do
+    receive do
+      {:trace, pid, :call, {m, f, args}} when pid != agent ->
+        # Suspend FIRST, then report what actually happened. A call trace is delivered
+        # asynchronously, so a function that returns quickly has already returned — and its
+        # process may have exited — by the time this runs. `stopped: false` on a break is
+        # therefore a real and common outcome, not a bug, and saying so is the difference
+        # between a breakpoint you can trust and one that lies about having caught something.
+        stopped = break? and pid != self() and suspend(pid)
+
+        safely(fn ->
+          Bedit.Agent.emit(%{
+            id: stream,
+            more: true,
+            spy: %{
+              kind: if(stopped, do: "break", else: "enter"),
+              pid: inspect(pid),
+              fn: "#{inspect(m)}.#{f}/#{length(args)}",
+              args: Bedit.Agent.trace_text(args),
+              stopped: stopped
+            }
+          })
+        end)
+
+        tracer_loop(stream, break?, agent, seen + 1)
+
+      {:trace, pid, :return_from, {m, f, a}, value} when pid != agent ->
+        safely(fn ->
+          Bedit.Agent.emit(%{
+            id: stream,
+            more: true,
+            spy: %{
+              kind: "exit",
+              pid: inspect(pid),
+              fn: "#{inspect(m)}.#{f}/#{a}",
+              value: Bedit.Agent.trace_text(value),
+              stopped: false
+            }
+          })
+        end)
+
+        tracer_loop(stream, break?, agent, seen + 1)
+
+      _ ->
+        tracer_loop(stream, break?, agent, seen)
+    end
+  end
+
+  # A tracer that dies takes the whole trace with it, silently — there is nothing linked to
+  # it and nothing watching. One malformed term to render must not cost the session its
+  # debugger, so every emit goes through here.
+  defp safely(f) do
+    f.()
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
+
+  defp suspend(pid) do
+    :erlang.suspend_process(pid)
+    true
+  rescue
+    _ -> false
+  catch
+    _, _ -> false
+  end
+
+  @doc false
+  def trace_text(term), do: term |> inspect(limit: 12, printable_limit: 120) |> cap(@spy_text_cap)
+
+  defp stack_of(pid) do
+    case Process.info(pid, :current_stacktrace) do
+      {:current_stacktrace, frames} ->
+        frames
+        |> Enum.take(12)
+        |> Enum.map(fn {m, f, a, opts} ->
+          "#{inspect(m)}.#{f}/#{a}" <>
+            if(opts[:file], do: "  #{opts[:file]}:#{opts[:line]}", else: "")
+        end)
+
+      _ ->
+        []
+    end
+  end
+
+  # `:sys.get_state` is a call INTO the process, so a suspended one cannot answer it —
+  # which is exactly the case this is for. Read from the outside instead, the way
+  # `:observer` does: OTP keeps a process's state in its dictionary under `$ancestors`'
+  # sibling key only for some behaviours, so this is best-effort and says so.
+  defp state_of(pid) do
+    case Process.info(pid, :dictionary) do
+      {:dictionary, dict} ->
+        case Keyword.get(dict, :"$initial_call") do
+          {m, _, _} -> "started as " <> inspect(m)
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
   end
 
   defp attach(cookie, name) do
@@ -396,6 +669,137 @@ defmodule Bedit.Agent do
     quote do
       defmodule Bedit.Remote do
         @moduledoc false
+        # Every started application, with its supervision tree walked flat and carrying a
+        # `:depth` — the editor indents by it, so the shape arrives as data rather than as
+        # pre-drawn box characters nothing downstream can re-sort.
+        def applications(cap) do
+          Application.started_applications()
+          |> Enum.map(fn {app, desc, vsn} ->
+            %{
+              app: to_string(app),
+              description: to_string(desc),
+              vsn: to_string(vsn),
+              tree: tree_of(app, cap)
+            }
+          end)
+        end
+
+        def tree_of(app, cap) do
+          case :application_controller.get_master(app) do
+            master when is_pid(master) ->
+              case :application_master.get_child(master) do
+                {root, _} when is_pid(root) -> Enum.take(walk(root, 0, cap), cap)
+                _ -> []
+              end
+
+            _ ->
+              []
+          end
+        rescue
+          _ -> []
+        catch
+          _, _ -> []
+        end
+
+        # Only a SUPERVISOR is asked for children, and it is identified from its process
+        # dictionary rather than by calling it: `Supervisor.which_children/1` on an ordinary
+        # GenServer is a five-second `GenServer.call` into a process that will never answer
+        # it, and a process list that stalls on one busy worker is not a process list.
+        def walk(pid, depth, cap) when depth < 12 do
+          kids =
+            if supervisor?(pid) do
+              try do
+                Supervisor.which_children(pid)
+              catch
+                _, _ -> []
+              end
+            else
+              []
+            end
+
+          [
+            child_row(pid, depth)
+            | Enum.flat_map(Enum.take(kids, cap), fn
+                {_id, child, _type, _mods} when is_pid(child) -> walk(child, depth + 1, cap)
+                _ -> []
+              end)
+          ]
+        end
+
+        def walk(_pid, _depth, _cap), do: []
+
+        defp supervisor?(pid) do
+          case Process.info(pid, :dictionary) do
+            {:dictionary, dict} ->
+              match?({:supervisor, _, _}, Keyword.get(dict, :"$initial_call"))
+
+            _ ->
+              false
+          end
+        end
+
+        defp child_row(pid, depth) do
+          info = Process.info(pid, [:registered_name, :memory, :message_queue_len]) || []
+
+          name =
+            case info[:registered_name] do
+              n when is_atom(n) and not is_nil(n) ->
+                inspect(n)
+
+              _ ->
+                case Process.info(pid, :dictionary) do
+                  {:dictionary, d} ->
+                    case Keyword.get(d, :"$initial_call") do
+                      {m, _, _} -> inspect(m)
+                      _ -> "-"
+                    end
+
+                  _ ->
+                    "-"
+                end
+            end
+
+          %{
+            pid: inspect(pid),
+            name: name,
+            depth: depth,
+            supervisor: supervisor?(pid),
+            memory: info[:memory] || 0,
+            mailbox: info[:message_queue_len] || 0
+          }
+        end
+
+        def ets_tables(cap) do
+          :ets.all()
+          |> Enum.take(cap)
+          |> Enum.map(fn tid ->
+            case :ets.info(tid) do
+              :undefined ->
+                nil
+
+              info ->
+                %{
+                  name: inspect(info[:name]),
+                  size: info[:size] || 0,
+                  memory: (info[:memory] || 0) * :erlang.system_info(:wordsize),
+                  owner: owner_name(info[:owner]),
+                  type: to_string(info[:type]),
+                  protection: to_string(info[:protection])
+                }
+            end
+          end)
+          |> Enum.reject(&is_nil/1)
+        end
+
+        defp owner_name(pid) when is_pid(pid) do
+          case Process.info(pid, :registered_name) do
+            {:registered_name, n} when is_atom(n) and not is_nil(n) -> inspect(n)
+            _ -> inspect(pid)
+          end
+        end
+
+        defp owner_name(other), do: inspect(other)
+
         def processes(fields) do
           Process.list()
           |> Enum.map(fn pid ->
@@ -659,6 +1063,54 @@ defmodule Bedit.Agent do
     _, reason -> %{ok: false, error: "the node did not answer: " <> Exception.format_exit(reason)}
   end
 
+  # The other two observations. Both run in the helper module when attached — the same
+  # push-and-call as the process list, so what you see of somebody else's node is the same
+  # list you see of your own rather than a second, lesser view.
+  # How much of a tree or a table list one reply may carry. A real application's
+  # supervision tree is tens of processes and its ETS list is hundreds; a node with a pool
+  # per tenant has thousands, and a reply is one line the editor reads whole.
+  @observe_cap 400
+
+  # The helper module is compiled here too, not only pushed to an attached node, so the
+  # local and the remote answer come from the SAME code. Two implementations of "walk a
+  # supervision tree" would differ the day one of them was fixed.
+  defp helper do
+    unless Code.ensure_loaded?(@remote_module) do
+      Code.put_compiler_option(:ignore_module_conflict, true)
+      Code.compile_quoted(remote_source())
+    end
+
+    @remote_module
+  end
+
+  defp observe(nil, :applications),
+    do: %{ok: true, applications: apply(helper(), :applications, [@observe_cap]), node: nil}
+
+  defp observe(nil, :ets),
+    do: %{ok: true, tables: apply(helper(), :ets_tables, [@observe_cap]), node: nil}
+
+  defp observe(name, kind) do
+    node = String.to_atom(name)
+
+    case ensure_remote(node) do
+      {:error, why} ->
+        %{ok: false, error: why}
+
+      :ok ->
+        {fun, key} =
+          case kind do
+            :applications -> {:applications, :applications}
+            :ets -> {:ets_tables, :tables}
+          end
+
+        %{:ok => true, :node => name, key => :erpc.call(node, @remote_module, fun, [@observe_cap], 15_000)}
+    end
+  rescue
+    error -> %{ok: false, error: Exception.message(error)}
+  catch
+    _, reason -> %{ok: false, error: "the node did not answer: " <> Exception.format_exit(reason)}
+  end
+
   defp processes do
     Process.list()
     |> Enum.map(&process_row/1)
@@ -782,7 +1234,14 @@ defmodule Bedit.Agent do
     Process.group_leader(self(), capture)
 
     collector = spawn_collector()
-    trace_on(collector, state.modules)
+
+    # …unless the DEBUGGER is tracing. The BEAM allows one tracer per process, so an
+    # evaluation that installed its own would fight the breakpoint you set — and the error
+    # it logs (`can only have one tracer per process`) is the polite version of one of them
+    # silently losing. The breakpoint wins: you asked for it, and its stream carries the
+    # traffic a playground cascade would have shown anyway.
+    debugging? = not is_nil(Map.get(state, :tracer))
+    unless debugging?, do: trace_on(collector, state.modules)
 
     # The three this evaluation is owed, and must not be charged for.
     ours = MapSet.new([self(), collector, capture])
@@ -802,8 +1261,8 @@ defmodule Bedit.Agent do
 
     elapsed = System.monotonic_time(:millisecond) - started
 
-    trace_off()
-    spy = collect(collector)
+    unless debugging?, do: trace_off()
+    spy = if debugging?, do: [], else: collect(collector)
     left_running = leaked(before_pids, ours)
 
     Process.group_leader(self(), original_leader)

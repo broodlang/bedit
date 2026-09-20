@@ -369,3 +369,174 @@
     (let (m (assoc (m-of "") :beam {:attached "app@host"}))
       (assert= (view/ed-beam-node-label m) "⇄ app@host")
       (assert= (view/ed-beam-node-label (beam/beam-ready m 7 {:ready true})) ""))))
+
+;; ---- the other two observations -------------------------------------------------
+;; The process list says `MyApp.Worker` is busy; the supervision tree says whose child it
+;; is, and therefore what restarting it takes down with it. ETS says which table is
+;; holding the memory — invisible from a process list, since the memory belongs to the
+;; table rather than to the process that made it.
+
+(defn app-node (& overrides)
+  (merge {:pid "#PID<0.49.0>" :name ":kernel_sup" :depth 0 :supervisor true :memory 9300 :mailbox 0}
+    (if (empty? overrides) {} (first overrides))))
+
+(describe "the supervision tree"
+  (test "a node is indented by its depth and marked if it supervises"
+    (let (top (beam/app-tree-row (app-node))
+          child (beam/app-tree-row (app-node {:depth 1 :supervisor false :name ":kernel_refc"})))
+      (is (includes? top "▾ :kernel_sup"))
+      (is (includes? child "· :kernel_refc"))
+      ;; two spaces per level, so the shape survives being read in a plain buffer
+      (is (includes? child "  · :kernel_refc"))
+      (is (includes? top "#PID<0.49.0>"))))
+
+  (test "an application with no tree says so rather than being left out"
+    ;; a library application (`:crypto`, `:stdlib`) has none, and omitting it would read as
+    ;; the list being incomplete rather than as that being what a library application is
+    (let (text (beam/apps-text [{:app "crypto" :vsn "5.9.2" :tree []}]))
+      (is (includes? text "crypto"))
+      (is (includes? text "library application"))))
+
+  (test "each application heads its own tree"
+    (let (text (beam/apps-text [{:app "kernel" :vsn "11.0.3" :tree [(app-node)]}
+                                 {:app "logger" :vsn "1.21.0" :tree [(app-node {:name ":logger_sup"})]}]))
+      (is (includes? text "kernel  11.0.3"))
+      (is (includes? text ":kernel_sup"))
+      (is (includes? text "logger  1.21.0"))
+      (is (includes? text ":logger_sup"))))
+
+  (test "nothing yet is a waiting note, not an empty buffer"
+    (is (includes? (beam/apps-text []) "waiting for the node"))))
+
+(describe "the ETS list"
+  (defn- table (& overrides)
+    (merge {:name ":code_server" :size 679 :memory 430800 :owner ":code_server"
+            :type "set" :protection "protected"}
+      (if (empty? overrides) {} (first overrides))))
+
+  (test "biggest first — the question you open it to ask"
+    (let (text (beam/ets-text [(table {:name ":small" :memory 100})
+                                (table {:name ":huge" :memory 900000})
+                                (table {:name ":middling" :memory 5000})])
+          rows (seq/filter (string/split text "\n") (fn (l) (includes? l ":"))))
+      (is (includes? (nth rows 0 "") ":huge"))
+      (is (includes? (nth rows 2 "") ":small"))))
+
+  (test "a row carries what you would act on"
+    (let (text (beam/ets-text [(table)]))
+      (is (includes? text ":code_server"))
+      (is (includes? text "679")) ; rows
+      (is (includes? text "protected")) ; access
+      (is (includes? text "set")))) ; type
+
+  (test "the header is there even with nothing in it"
+    (is (includes? (beam/ets-text []) "TABLE"))
+    (is (includes? (beam/ets-text []) "waiting for the node"))))
+
+(describe "three views, one mechanism"
+  (test "every view names what to ask for, a buffer and a type"
+    (doseq (kv (%map-pairs beam/*views*))
+      (let ([_ v] kv)
+        (is (string? (get v :what)))
+        (is (string? (get v :buffer)))
+        (is (keyword? (get v :key)))
+        (is (keyword? (get v :type))))))
+
+  (test "the current buffer decides what `g` refreshes"
+    (let (m (commands/ed-show-named (m-of "") "*BEAM ETS*" "" :beam-ets-menu))
+      (assert= (beam/view-of m) :ets))
+    (let (m (commands/ed-show-named (m-of "") "*BEAM Applications*" "" :beam-apps-menu))
+      (assert= (beam/view-of m) :applications))
+    ;; anywhere else, the process list is what `g` means
+    (assert= (beam/view-of (m-of "")) :processes))
+
+  ;; They are ONE client of the session: the tree and the table list are the same node seen
+  ;; from another angle, and closing the process list must not take the session out from
+  ;; under them.
+  (test "any of the three buffers keeps the session wanted"
+    (is (not (beam/beam-live-buffer? (m-of ""))))
+    (is (beam/beam-live-buffer? (commands/ed-show-named (m-of "") "*BEAM ETS*" "" :beam-ets-menu)))
+    (is (beam/beam-live-buffer? (m-open))))
+
+  (test "a reply fills the buffer its view named"
+    (let (m (assoc (commands/ed-show-named (m-of "") "*BEAM ETS*" "" :beam-ets-menu)
+              :beam
+              {:pending 3 :view :ets})
+          m2 (beam/beam-reply m {:id 3 :ok true :tables [{:name ":t" :size 1 :memory 64}]} 1)
+          i (ed-buffer-index-by-name m2 "*BEAM ETS*"))
+      (is (not (nil? i)))
+      (is (includes? (buffer-text (ed-buf-at m2 (or i 0))) ":t")))))
+
+;; ---- the debugger: watch a function, or stop on it --------------------------------
+;; Brood's editor has had a *Spy* stream and a *Debug* queue for a while; these are the
+;; same two things for the BEAM. The agent side is verified against a real node (the
+;; `:erlang.trace_pattern` / `:erlang.suspend_process` round trip); this is the model side
+;; — what a streamed entry becomes.
+
+(defn spy-e (& overrides)
+  (merge {:kind "enter" :pid "#PID<0.114.0>" :fn "Dbg.add/2" :args "[1, 10]" :stopped false}
+    (if (empty? overrides) {} (first overrides))))
+
+(describe "the BEAM spy stream"
+  (test "a call and its return read differently"
+    (is (includes? (beam/spy-row (spy-e)) "→"))
+    (is (includes? (beam/spy-row (spy-e {:kind "exit" :args nil :value "11"})) "←"))
+    ;; a row that STOPPED something is marked, because it reads differently from one that
+    ;; merely watched it go past
+    (is (includes? (beam/spy-row (spy-e {:kind "break" :stopped true})) "■")))
+
+  (test "a row carries who, what and with-what"
+    (let (row (beam/spy-row (spy-e)))
+      (is (includes? row "#PID<0.114.0>"))
+      (is (includes? row "Dbg.add/2"))
+      (is (includes? row "[1, 10]"))))
+
+  (test "nothing yet says it is watching rather than looking broken"
+    (is (includes? (beam/spy-text '()) "nothing has called it yet")))
+
+  (test "entries accumulate newest-first and are capped"
+    (let (m (fold (range 3) (m-of "") (fn (acc i) (beam/spy-append acc (spy-e {:args (str "[" i "]")}))))
+          entries (get-in m [:beam :spy]))
+      (assert= (count entries) 3)
+      ;; newest first on the model; the buffer reverses so it reads top-down
+      (is (includes? (get (first entries) :args) "2")))))
+
+(describe "the BEAM debug queue"
+  (test "a break adds the process to the queue; a plain call does not"
+    (let (watched (beam/spy-append (m-of "") (spy-e))
+          stopped (beam/spy-append (m-of "") (spy-e {:kind "break" :stopped true})))
+      (is (empty? (get-in watched [:beam :stopped] '())))
+      (assert= (count (get-in stopped [:beam :stopped])) 1)
+      (assert= (get (first (get-in stopped [:beam :stopped])) :pid) "#PID<0.114.0>")))
+
+  (test "the queue says what resumes a process, in the buffer"
+    ;; a suspended process holds whatever it holds for as long as you leave it there, so
+    ;; how to let it go belongs on screen rather than in a manual
+    (let (text (beam/stopped-text [{:pid "#PID<0.114.0>" :fn "Dbg.add/2"}]))
+      (is (includes? text "r resumes"))
+      (is (includes? text "#PID<0.114.0>"))))
+
+  (test "an empty queue points at the command that fills it"
+    (is (includes? (beam/stopped-text '()) "beam-break"))))
+
+(describe "routing a streamed trace entry"
+  (test "an entry on THIS editor's stream is folded; another id is not"
+    (let (m (assoc (m-of "") :beam {:stream 901})
+          hit (beam/beam-reply m {:id 901 :more true :spy (spy-e)} 1)
+          miss (beam/beam-reply m {:id 902 :more true :spy (spy-e)} 1))
+      (assert= (count (get-in hit [:beam :spy] '())) 1)
+      (is (empty? (get-in miss [:beam :spy] '())))))
+
+  ;; The stream id is not a request anything is waiting on — which is how an open-ended
+  ;; trace avoids the session's watchdog, and why it needs its own arm in the router.
+  (test "a trace request's own reply reports what it armed"
+    (let (m (assoc (m-of "") :beam {:tracing 5})
+          m1 (beam/beam-reply m {:id 5 :ok true :traced "Dbg.add/2" :functions 1} 1))
+      (is (includes? (:echo m1) "watching Dbg.add/2"))
+      (is (nil? (get-in m1 [:beam :tracing])))))
+
+  (test "a trace that matched nothing says so"
+    (let (m (assoc (m-of "") :beam {:tracing 5})
+          m1 (beam/beam-reply m {:id 5 :ok false :error "nothing matched Dbg.add"} 1))
+      (is (includes? (:echo m1) "could not trace"))
+      (is (nil? (get-in m1 [:beam :stream]))))))

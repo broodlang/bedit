@@ -100,6 +100,103 @@ middle, and nothing about the columns tells you where to look."
     (str (beam-header) "\n\n  (waiting for the node…)\n")
     (str (beam-header) "\n" (string/join (map (beam-busiest rows) beam-row) "\n") "\n")))
 
+;; ---- the supervision tree ---------------------------------------------------------------
+
+(defn app-tree-row (r)
+  "One `*BEAM Applications*` row, indented by its `:depth`.
+
+The tree arrives FLAT with a depth on each node rather than pre-drawn, so this can indent
+it, and something else could sort or filter it. A supervisor is marked, because the shape
+of a tree is which of its nodes have children."
+  (str (string/pad-right (str (string/repeat "  " (get r :depth 0))
+                           (if (get r :supervisor) "▾ " "· ")
+                           (clip (get r :name "-") 40))
+         46)
+    " "
+    (string/pad-right (get r :pid "-") 16)
+    " "
+    (string/pad-left (humanize/byte-size (get r :memory 0)) 9)
+    " "
+    (string/pad-left (str (get r :mailbox 0)) 7)))
+
+(defn apps-text (apps)
+  "The `*BEAM Applications*` buffer: each started application, then its supervision tree.
+
+An application with no tree still gets its heading — a library application (`:logger`'s
+dependencies, `:crypto`) has none, and omitting it would read as the list being incomplete
+rather than as that being what a library application is."
+  (if (empty? apps)
+    "  (waiting for the node…)\n"
+    (string/join
+      (map apps
+        (fn (a)
+          (str (get a :app "?")
+            "  "
+            (get a :vsn "")
+            "\n"
+            (if (empty? (get a :tree []))
+              "  (no supervision tree — a library application)\n"
+              (str (string/join (map (get a :tree) app-tree-row) "\n") "\n")))))
+      "\n")))
+
+;; ---- ETS ---------------------------------------------------------------------------------
+
+(defn- ets-row (t)
+  (str (string/pad-right (clip (get t :name "-") 34) 34)
+    " "
+    (string/pad-left (str (get t :size 0)) 10)
+    " "
+    (string/pad-left (humanize/byte-size (get t :memory 0)) 10)
+    " "
+    (string/pad-right (clip (get t :owner "-") 24) 24)
+    " "
+    (string/pad-right (get t :type "-") 12)
+    " "
+    (get t :protection "-")))
+
+(defn- ets-header ()
+  (str (string/pad-right "TABLE" 34)
+    " "
+    (string/pad-left "SIZE" 10)
+    " "
+    (string/pad-left "MEM" 10)
+    " "
+    (string/pad-right "OWNER" 24)
+    " "
+    (string/pad-right "TYPE" 12)
+    " "
+    "ACCESS"))
+
+(defn ets-text (tables)
+  "The `*BEAM ETS*` buffer — biggest first, because the question you open it to ask is
+which table is holding the memory."
+  (if (empty? tables)
+    (str (ets-header) "\n\n  (waiting for the node…)\n")
+    (str (ets-header)
+      "\n"
+      (string/join (map (reverse (sort-by tables (fn (t) (get t :memory 0)))) ets-row) "\n")
+      "\n")))
+
+;; ---- the views ----------------------------------------------------------------------------
+;; Three observations, one mechanism. A view is a row here: what to ask the node for, which
+;; buffer it fills, and how its rows become text. The request, the reply fold and the
+;; refresh key are written against these fields, so a fourth observation (ports, timers,
+;; the memory breakdown) is an entry rather than another command with its own plumbing.
+
+(def *views*
+  {:processes {:what "processes" :buffer "*BEAM Processes*" :key :processes :type :beam-menu}
+   :applications {:what "applications"
+                  :buffer "*BEAM Applications*"
+                  :key :applications
+                  :type :beam-apps-menu}
+   :ets {:what "ets" :buffer "*BEAM ETS*" :key :tables :type :beam-ets-menu}})
+
+(defn view-of (m)
+  "The view the CURRENT buffer is, or `:processes` when it is none of them — which is what
+`g` refreshes and what a reply fills."
+  (let (nm (buffer-name (ed-current-buf m)))
+    (or (first (seq/find (%map-pairs *views*) (fn ([_ v]) (= (get v :buffer) nm)))) :processes)))
+
 ;; ---- asking the node ------------------------------------------------------------------
 
 (defn- beam-snapshot-reds (rows)
@@ -107,29 +204,46 @@ middle, and nothing about the columns tells you where to look."
   (reduce rows {} (fn (acc p) (assoc acc (get p :pid) (get p :reductions 0)))))
 
 (defn beam-live-buffer? (m)
-  "Is *BEAM Processes* on screen — i.e. does this client still want a session? One of the
-`sandbox-events` client hooks."
-  (not (nil? (ed-buffer-index-by-name m *buffer-name*))))
+  "Is ANY of the node's buffers on screen — i.e. does this client still want a session? One
+of the `sandbox-events` client hooks. Any of them, because they are one client: the
+supervision tree and the ETS list are the same node seen from a different angle, and
+closing the process list should not take the session out from under them."
+  (any? (%map-pairs *views*)
+    (fn ([_ v]) (not (nil? (ed-buffer-index-by-name m (get v :buffer)))))))
 
-(defn beam-request (m)
-  "Ask the node for a fresh snapshot, remembering the request id so the reply can be told
-from the playground's. Answers the model unchanged when the session is not running — the
-reply would never come, and a request recorded as pending that cannot be answered is a
-buffer that never refreshes again."
+(defn beam-request (m &optional (view :processes))
+  "Ask the node for a fresh snapshot of `view`, remembering the request id AND which view it
+was for, so the reply fills the right buffer and can be told from the playground's.
+
+Answers the model unchanged when the session is not running — the reply would never come,
+and a request recorded as pending that cannot be answered is a buffer that never refreshes."
   (let (id (sandbox/sandbox-next-id m)
-        sent (elixir-observe id "processes"))
+        sent (elixir-observe id (get-in *views* [view :what] "processes")))
     (if (not sent)
       m
-      (assoc-in (sandbox/sandbox-ids-used m (inc id)) [*state-key* :pending] id))))
+      (assoc-in (assoc-in (sandbox/sandbox-ids-used m (inc id)) [*state-key* :pending] id)
+        [*state-key* :view]
+        view))))
 
 (defn beam-show (m rows)
-  "Render `rows` into the buffer, rated against the previous snapshot, and record this one
-for the next rating."
+  "Render the process `rows`, rated against the previous snapshot, and record this one for
+the next rating. Only the process list is rated — a rate is a difference between two
+readings of the same counter, and neither a supervision tree nor a table list has one."
   (let (at (os/now)
         prev (get-in m [*state-key* :snapshot])
         rated (ed-rate-procs (get prev :reds) (get prev :at) rows at :pid)
         m1 (ed-show-named m *buffer-name* (beam-text rated) :beam-menu))
     (assoc-in m1 [*state-key* :snapshot] {:at at :reds (beam-snapshot-reds rows)})))
+
+(defn beam-show-view (m view reply)
+  "Render an arrived observation into the buffer its view names."
+  (let (spec (get *views* view)
+        rows (or (get reply (get spec :key)) []))
+    (case view
+      :processes (beam-show m rows)
+      :applications (ed-show-named m (get spec :buffer) (apps-text rows) (get spec :type))
+      :ets (ed-show-named m (get spec :buffer) (ets-text rows) (get spec :type))
+      m)))
 
 ;; ---- the session client hooks (registered in `sandbox-events/*clients*`) ----------------
 
@@ -174,8 +288,14 @@ that request, and an id left pending that can never be answered is a buffer that
 refreshes again."
   (let (pending (get-in m [*state-key* :pending])
         killing (first (or (get-in m [*state-key* :killing]) [nil nil]))
-        attaching (get-in m [*state-key* :attaching]))
+        attaching (get-in m [*state-key* :attaching])
+        tracing (get-in m [*state-key* :tracing]))
     (cond
+      ;; a streamed trace entry — its id is the STREAM this editor chose, not a request
+      ;; anything is waiting on, which is how an open-ended trace avoids the watchdog
+      (and (get reply :more) (get reply :spy) (= (get reply :id) (stream-id m)))
+        (spy-append m (get reply :spy))
+      (and tracing (= tracing (get reply :id))) (beam-trace-reply m reply)
       (and attaching (= attaching (get reply :id))) (beam-attach-reply m reply)
       (and killing (= killing (get reply :id))) (beam-kill-reply m reply)
       (nil? pending) m
@@ -192,7 +312,9 @@ refreshes again."
       ;; reader closed it. The snapshot is still worth keeping for the next open.
       (not (beam-live-buffer? m)) (assoc-in m [*state-key* :pending] nil)
       else
-        (beam-show (assoc-in m [*state-key* :pending] nil) (or (get reply :processes) [])))))
+        (beam-show-view (assoc-in m [*state-key* :pending] nil)
+          (get-in m [*state-key* :view] :processes)
+          reply))))
 
 (defn beam-down (m code)
   "The child went away. Whatever else this means, it means the ATTACHMENT is gone: the
@@ -233,6 +355,23 @@ production node after a crash is worse than making you ask twice."
 (register-type-layers :beam-menu
   (list 'beam/beam-menu-layer 'modes/special-mode-layer 'modes/text-mode-layer))
 
+;; The other two views get `g` but not `k`: a supervision tree and a table list are things
+;; to READ, and killing a supervised process from a tree view would be asking the
+;; supervisor to put it back — a confusing way to do nothing.
+(def beam-read-keymap (-> {} (keymap-bind ["g"] 'beam/cmd-beam-refresh)))
+
+(def beam-read-layer
+  {:name 'beam-read
+   :keymap beam/beam-read-keymap
+   :commands '("beam-refresh")
+   :no-line-numbers true})
+
+(register-type-layers :beam-apps-menu
+  (list 'beam/beam-read-layer 'modes/special-mode-layer 'modes/text-mode-layer))
+
+(register-type-layers :beam-ets-menu
+  (list 'beam/beam-read-layer 'modes/special-mode-layer 'modes/text-mode-layer))
+
 (defn beam-kill-expr (pid)
   "The expression that kills the process a row names.
 
@@ -257,6 +396,27 @@ a buffer that has since been refreshed."
 
 ;; ---- the commands ------------------------------------------------------------------------
 
+(defn- beam-open (m view waiting)
+  "Open `view`'s buffer empty and ask the node to fill it — the one path behind all three
+observations.
+
+Shown at once rather than when the reply lands: a command that waited would block the
+editor for as long as a cold `mix` compile takes, and the buffer saying it is waiting is a
+better answer than the editor appearing to have ignored the key."
+  (let (root (or (:project-root m) (projects/project-root (file/cwd)))
+        spec (get *views* view)
+        missing (missing-tool root))
+    (cond
+      missing (message m (str missing " — there is no node to observe"))
+      (ed-headless?)
+        (message m (str (get spec :buffer) " needs a running editor to receive the node's reply"))
+      else
+        (do
+          (sandbox-events/ensure) ; the UiEvent impls live there; loading it IS registering them
+          (elixir-start root)
+          (message (beam-request (ed-show-named m (get spec :buffer) waiting (get spec :type)) view)
+            (str "asking the node…"))))))
+
 (defcommand cmd-beam-processes
   (m key)
   "What is running in the BEAM node (M-x beam-processes, C-c b p): every process in the VM
@@ -268,31 +428,43 @@ only the second reading can show a rate, since a rate is a difference); `k` kill
 process on the current line.
 
 The node is the playground's — `mix run` in your project root, application started — so
-this is your supervision tree and not a demonstration."
-  (cond
-    (missing-tool (or (:project-root m) (projects/project-root (file/cwd))))
-      (message m (str (missing-tool (or (:project-root m) (projects/project-root (file/cwd))))
-                   " — there is no node to observe"))
-    (ed-headless?) (message m "*BEAM Processes* needs a running editor to receive the node's reply")
-    else
-      (do
-        (sandbox-events/ensure) ; the UiEvent impls live there; loading it IS registering them
-        (elixir-start (or (:project-root m) (projects/project-root (file/cwd))))
-        ;; Show the buffer at once with whatever the last snapshot said (nothing, the first
-        ;; time) and fill it when the reply lands. A command that waited would block the
-        ;; editor for as long as a cold `mix` compile takes.
-        (message (beam-request (ed-show-named m
-                                 *buffer-name*
-                                 (beam-text (or (get-in m [*state-key* :rows]) []))
-                                 :beam-menu))
-          "asking the node what is running…"))))
+this is your own application and not a demonstration."
+  (beam-open m :processes (beam-text (or (get-in m [*state-key* :rows]) []))))
+
+(defcommand cmd-beam-applications
+  (m key)
+  "The node's supervision tree (M-x beam-applications, C-c b s): every started application
+and, under it, the processes its supervisors are supervising — indented by depth, with a
+mark on the ones that are themselves supervisors.
+
+This is the shape of your system rather than a list of its parts. A process list tells you
+`MyApp.Worker` is busy; this tells you whose child it is, and therefore what restarting it
+would take down with it.
+
+`g` refreshes. A library application (`:crypto`, most of `:logger`'s dependencies) has no
+tree, and says so rather than being left out."
+  (beam-open m :applications (apps-text [])))
+
+(defcommand cmd-beam-ets
+  (m key)
+  "The node's ETS tables (M-x beam-ets, C-c b e): name, row count, memory, owner, type and
+access.
+
+Biggest first, because the question you open it to ask is which table is holding the
+memory — an ETS table is the usual answer to \"the node's RSS keeps climbing\", and it is
+invisible from a process list since the memory belongs to the table rather than to the
+process that made it.
+
+`g` refreshes."
+  (beam-open m :ets (ets-text [])))
 
 (defcommand cmd-beam-refresh
   (m key)
-  "Ask the node for a fresh snapshot (`g`). The second and later readings carry REDS/S —
-who is busy *now* — because a rate is a difference and the first reading has nothing to
-differ from."
-  (message (beam-request m) "refreshing…"))
+  "Ask the node for a fresh snapshot of whichever of its buffers you are in (`g`).
+
+For the process list the second and later readings carry REDS/S — who is busy *now* —
+because a rate is a difference and the first reading has nothing to differ from."
+  (message (beam-request m (view-of m)) "refreshing…"))
 
 (defcommand cmd-beam-kill
   (m key)
@@ -400,3 +572,197 @@ one keystroke away from evaluating on production."
         (message m "the node is not running")
         (message (assoc-in (sandbox/sandbox-ids-used m (inc id)) [*state-key* :attaching] id)
           "detaching…")))))
+
+;; ---- the debugger: watch a function, or stop on it ----------------------------------------
+;; Brood's side of the editor has had this for a while (`src/debugger.blsp`): a *Spy* stream
+;; of calls and returns, and a *Debug* queue of processes stopped at a breakpoint. These are
+;; the same two things for the BEAM, over the two primitives that give them:
+;; `:erlang.trace_pattern` on a named function, and `:erlang.suspend_process` on whoever
+;; calls it.
+;;
+;; The entries arrive on a STREAM id rather than as the trace request's reply. A trace is
+;; open-ended, and an inflight request with no answer for a quiet minute is exactly what the
+;; session's watchdog exists to kill.
+
+(def *spy-buffer* "*BEAM Spy*")
+(def *debug-buffer* "*BEAM Debug*")
+(def *spy-cap* 500) ; the tail worth keeping — a traced hot path produces thousands
+
+(defn spy-row (e)
+  "One traced call or return. A break is marked, because a row that STOPPED something reads
+differently from one that merely watched it go past."
+  (str (string/pad-right (case (get e :kind) "enter" "→" "exit" "←" "break" "■" "·") 2)
+    " "
+    (string/pad-right (get e :pid "-") 16)
+    " "
+    (string/pad-right (clip (get e :fn "-") 40) 40)
+    " "
+    (clip (or (get e :args) (get e :value) "") 60)))
+
+(defn spy-text (entries)
+  (if (empty? entries)
+    "  (tracing — nothing has called it yet)\n"
+    (str (string/join (map entries spy-row) "\n") "\n")))
+
+(defn stopped-text (stopped)
+  "The *BEAM Debug* queue: every process a breakpoint has stopped, newest first.
+
+A stopped process stays stopped until you say otherwise, which is the whole point and also
+the hazard — so the buffer says what `r` does, in it, rather than leaving that to a manual."
+  (if (empty? stopped)
+    "  (nothing stopped — M-x beam-break sets a breakpoint)\n"
+    (str "  r resumes the process on this line · g refreshes\n\n"
+      (string/join (map stopped
+                     (fn (s)
+                       (str "  " (string/pad-right (get s :pid "-") 16) "  " (get s :fn "-"))))
+        "\n")
+      "\n")))
+
+(defn spy-append (m e)
+  "Fold one streamed trace entry: into the tail, into the buffer, and — when it STOPPED a
+process — into the queue of things waiting for you."
+  (let (entries (take (cons e (get-in m [*state-key* :spy] '())) *spy-cap*)
+        stopped (if (get e :stopped)
+                  (cons {:pid (get e :pid) :fn (get e :fn)} (get-in m [*state-key* :stopped] '()))
+                  (get-in m [*state-key* :stopped] '()))
+        m1 (assoc-in (assoc-in m [*state-key* :spy] entries) [*state-key* :stopped] stopped)
+        m2 (if (nil? (ed-buffer-index-by-name m1 *spy-buffer*))
+             m1
+             (ed-show-named m1 *spy-buffer* (spy-text (reverse entries)) :beam-spy-menu)))
+    (if (or (not (get e :stopped)) (nil? (ed-buffer-index-by-name m2 *debug-buffer*)))
+      m2
+      (ed-show-named m2 *debug-buffer* (stopped-text stopped) :beam-debug-menu))))
+
+(defn stream-id (m)
+  "The id this editor's trace entries arrive on."
+  (get-in m [*state-key* :stream]))
+
+(defn- beam-ask-trace (m spec mode)
+  (let (id (sandbox/sandbox-next-id m)
+        stream (inc id)
+        sent (elixir-sandbox/elixir-trace id stream spec mode))
+    (if (not sent)
+      (message m "the node is not running — M-x beam-processes starts one")
+      (message (assoc-in (assoc-in (sandbox/sandbox-ids-used m (+ id 2))
+                           [*state-key* :tracing]
+                           id)
+                 [*state-key* :stream]
+                 stream)
+        (str (if (= mode "break") "breaking on " "tracing ") spec "…")))))
+
+(defn- beam-trace-reply (m reply)
+  "Report what a trace request did. `functions: 0` never reaches here — the agent answers
+that as an error, because a trace that matched nothing looks exactly like a trace that is
+simply quiet."
+  (let (m1 (assoc-in m [*state-key* :tracing] nil))
+    (if (not (get reply :ok))
+      (message (assoc-in m1 [*state-key* :stream] nil)
+        (str "could not trace: " (get reply :error "unknown error")))
+      (message m1
+        (str "watching " (get reply :traced) " — " (get reply :functions 0) " function(s)")))))
+
+(defcommand cmd-beam-trace
+  (m key)
+  "Watch a function in the running node (M-x beam-trace, C-c b t): every call and every
+return, streamed into *BEAM Spy* as it happens.
+
+`Mod.fun/arity` for one clause set, `Mod.fun` for every arity, `Mod` for everything it
+exports. This is the BEAM's own tracer, so it sees calls your code makes to itself — not
+just the ones you put a print in.
+
+`M-x beam-untrace` stops it. One trace at a time, deliberately: a second would silently
+replace the first, and the buffer gives you no way to tell which rows came from which."
+  (if (not (elixir-running?))
+    (message m "no node to trace — M-x beam-processes starts one")
+    (assoc (ed-show-named m *spy-buffer* (spy-text '()) :beam-spy-menu)
+      :minibuffer
+        {:edit (ed-mb-edit "Trace (Mod.fun/arity): " "")
+         :on-complete
+           (fn (m1 spec)
+             (if (= (string/trim spec) "")
+               (message m1 "nothing named")
+               (beam-ask-trace m1 (string/trim spec) "trace")))})))
+
+(defcommand cmd-beam-break
+  (m key)
+  "STOP the node on a function (M-x beam-break, C-c b B): whoever calls it is suspended
+where it stands, and listed in *BEAM Debug* until you resume it.
+
+This is a real breakpoint in a running system, so it is also a real hazard: a suspended
+process holds whatever it holds — a database connection, a lock, a GenServer's mailbox
+filling behind it — for as long as you leave it there. The buffer lists what is stopped and
+`r` resumes the one on the line.
+
+What it cannot show you is local variables: the BEAM does not expose them without running
+the module interpreted (`:int`). What it does show is where the process is and what started
+it, which is most of what a stack trace is for."
+  (if (not (elixir-running?))
+    (message m "no node to break in — M-x beam-processes starts one")
+    (assoc (ed-show-named (ed-show-named m *spy-buffer* (spy-text '()) :beam-spy-menu)
+             *debug-buffer*
+             (stopped-text '())
+             :beam-debug-menu)
+      :minibuffer
+        {:edit (ed-mb-edit "Break on (Mod.fun/arity): " "")
+         :on-complete
+           (fn (m1 spec)
+             (if (= (string/trim spec) "")
+               (message m1 "nothing named")
+               (beam-ask-trace m1 (string/trim spec) "break")))})))
+
+(defcommand cmd-beam-untrace
+  (m key)
+  "Stop tracing (M-x beam-untrace). Anything already stopped stays stopped — resume it from
+*BEAM Debug* — because dropping the trace is not the same as letting those processes go,
+and guessing which you meant would be the wrong kind of helpful."
+  (let (id (sandbox/sandbox-next-id m)
+        sent (elixir-sandbox/elixir-untrace id))
+    (if (not sent)
+      (message m "the node is not running")
+      (message (assoc-in (sandbox/sandbox-ids-used m (inc id)) [*state-key* :stream] nil)
+        "stopped tracing"))))
+
+(defcommand cmd-beam-resume
+  (m key)
+  "Resume the stopped process on this line (`r` in *BEAM Debug*)."
+  (let (pid (beam-pid-at-point m))
+    (if (nil? pid)
+      (message m "not on a stopped process")
+      (let (id (sandbox/sandbox-next-id m)
+            sent (elixir-sandbox/elixir-resume id pid)
+            left (seq/reject (get-in m [*state-key* :stopped] '())
+                   (fn (s) (= (get s :pid) pid))))
+        (if (not sent)
+          (message m "the node is not running")
+          (message (ed-show-named (assoc-in (sandbox/sandbox-ids-used m (inc id))
+                                    [*state-key* :stopped]
+                                    left)
+                     *debug-buffer*
+                     (stopped-text left)
+                     :beam-debug-menu)
+            (str "resumed " pid)))))))
+
+(def beam-spy-keymap (-> {} (keymap-bind ["g"] 'beam/cmd-beam-untrace)))
+
+(def beam-spy-layer
+  {:name 'beam-spy
+   :keymap beam/beam-spy-keymap
+   :commands '("beam-untrace")
+   :no-line-numbers true})
+
+(def beam-debug-keymap
+  (-> {}
+    (keymap-bind ["r"] 'beam/cmd-beam-resume)
+    (keymap-bind ["g"] 'beam/cmd-beam-refresh)))
+
+(def beam-debug-layer
+  {:name 'beam-debug
+   :keymap beam/beam-debug-keymap
+   :commands '("beam-resume" "beam-refresh")
+   :no-line-numbers true})
+
+(register-type-layers :beam-spy-menu
+  (list 'beam/beam-spy-layer 'modes/special-mode-layer 'modes/text-mode-layer))
+
+(register-type-layers :beam-debug-menu
+  (list 'beam/beam-debug-layer 'modes/special-mode-layer 'modes/text-mode-layer))
