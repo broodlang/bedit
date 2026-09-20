@@ -1,0 +1,159 @@
+;; tools/profile-ops.blsp — a sweep across the operations a reader actually performs.
+;;
+;; `profile-turn` measures ONE steady-state turn in depth. This measures the breadth: open,
+;; scroll, page, search, select, kill, yank, undo, split, switch buffer, M-x — each on a big
+;; file, each reported in ms. It exists to find the outlier, not to shave the median: the
+;; costs worth fixing in an editor are the ones that are 100× the others, and they hide in
+;; the operations nobody profiles because they feel occasional.
+;;
+;;     nest run tools/profile-ops.blsp -- <file> <cols> <rows>
+(require-one 'project)
+(project/load-config)
+(let (root (project/find-root (file/cwd)))
+  (when root
+    (project/setup root)
+    (project/load-sources root)))
+
+(def *args* (let (a (system/argv) i (index-of a "--")) (if i (drop a (inc i)) (list))))
+(def *file* (or (first *args*) "src/commands.blsp"))
+(def *cols* (let (n (string/->number (or (second *args*) "213"))) (if (int? n) n 213)))
+(def *rows* (let (n (string/->number (or (nth *args* 2) "49"))) (if (int? n) n 49)))
+
+(proc/register :editor (self)) ; the async paths are live — see tools/profile-turn.blsp
+
+(def *settle-handles* [:diag-proc :gitdiff-proc :eldoc-proc :tree-warm-proc :git-proc :signature-proc])
+
+(defn settle (m)
+  "Fold async replies until nothing is in flight — waiting on the HANDLES, not merely on a
+quiet mailbox. See `tools/profile-turn.blsp`: a timeout alone lets a launched recompute run
+through the measurements and the profiler then reports its own load."
+  (let (busy (any? *settle-handles* (fn (k) (not (nil? (get m k)))))
+        ev (receive (msg msg) (after (if busy 20000 300) nil)))
+    (if (nil? ev) m (settle (input/ed-update m ev *cols* *rows*)))))
+
+(defn ms (label thunk reps)
+  "Run `thunk` `reps` times; print the mean wall ms; answer the last result."
+  (let (t0 (os/now-ns)
+        r (fold (range reps) nil (fn (_ _) (thunk)))
+        e (/ (- (os/now-ns) t0) (* reps 1000000.0)))
+    (do
+      (io/puts (str (string/pad-right label 38) (string/pad-left (string/format "%.2f" e) 9) " ms"))
+      r)))
+
+(defn press (m keys)
+  (fold keys m (fn (acc k) (input/ed-update acc k *cols* *rows*))))
+
+(defn frame (m) (view/ed-view m *cols* *rows*))
+
+(defn memo-of (m)
+  "The memo table a previous turn would have left for `m` — so a measured turn pays what the
+loop pays, not what a cold first frame does."
+  (second (editor/ui/ui-harvest (binding (*ui-memo* {}) (frame m)))))
+
+(defn turn (m key)
+  "One whole loop turn WITHOUT a memo — a cold first frame. For the few measurements that
+genuinely are one."
+  (frame (input/ed-update m key *cols* *rows*)))
+
+(defn turns (label m key reps)
+  "Time `reps` whole loop turns of `key` on `m`, with the previous turn's memo table in
+scope — which is what `ui-run` does. The table is built ONCE, outside the timing; rendering
+without it measures a cold first frame, and every number here read several ms high for it."
+  (let (table (memo-of m))
+    (ms label
+      (fn () (binding (*ui-memo* table) (frame (input/ed-update m key *cols* *rows*))))
+      reps)))
+
+(def *base*
+  (settle (input/ed-update
+            (settle (input/ed-update
+                      (commands/ed-find-file
+                        (assoc (model/ed-init (editor/buffer/make-buffer "" "*scratch*"))
+                          :recent-files true)
+                        *file*)
+                      [:timer :idle-recompute]
+                      *cols*
+                      *rows*))
+            [:timer :idle-recompute]
+            *cols*
+            *rows*)))
+
+(io/puts (str "== " *file* " · "
+           (editor/buffer/buffer-line-count (model/ed-current-buf *base*))
+           " lines · " *cols* "x" *rows*))
+
+;; ---- opening -----------------------------------------------------------------
+(ms "find-file (cold, incl. fontify)"
+  (fn () (commands/ed-find-file (model/ed-init (editor/buffer/make-buffer "" "*scratch*")) *file*))
+  5)
+(ms "first frame after open"
+  (fn ()
+    (frame (commands/ed-find-file (model/ed-init (editor/buffer/make-buffer "" "*scratch*")) *file*)))
+  5)
+
+;; ---- moving ------------------------------------------------------------------
+(io/puts "")
+(turns "turn: C-n (line down)" *base* :ctrl-n 30)
+(turns "turn: C-v (page down)" *base* :ctrl-v 30)
+(turns "turn: M-> (end of buffer)" *base* (keyword "alt->") 20)
+(let (deep (press *base* [(keyword "alt->")]))
+  (do
+    (turns "turn: C-n at EOF (deep point)" deep :ctrl-n 30)
+    (turns "turn: self-insert at EOF" deep "x" 30)))
+(turns "turn: mouse wheel scroll" *base* [:mouse :scroll nil 10 10 {} 0 3] 30)
+
+
+
+;; ---- editing -----------------------------------------------------------------
+(io/puts "")
+(turns "turn: self-insert" *base* "x" 30)
+(turns "turn: backspace" *base* :backspace 30)
+(turns "turn: newline" *base* :enter 20)
+(let (typed (press *base* ["a" "b" "c" "d" "e"]))
+  (turns "turn: undo (C-/)" typed (keyword "ctrl-/") 20))
+
+;; ---- the whole buffer as a region --------------------------------------------
+(io/puts "")
+(let (marked (press *base* [:ctrl-x "h"])) ; mark-whole-buffer
+  (do
+    (ms "frame: whole buffer selected" (fn () (frame marked)) 20)
+    (turns "turn: C-n with the whole buffer selected" marked :ctrl-n 20)
+    (let (killed (ms "kill the whole buffer (C-w)"
+                   (fn () (input/ed-update marked :ctrl-w *cols* *rows*))
+                   5))
+      (ms "yank it back (C-y)" (fn () (input/ed-update killed :ctrl-y *cols* *rows*)) 5))))
+
+;; ---- searching ---------------------------------------------------------------
+(io/puts "")
+(let (searching (press *base* [:ctrl-s]))
+  (do
+    (turns "turn: isearch first char" searching "d" 20)
+    (let (s2 (press searching ["d" "e" "f"]))
+      (turns "turn: isearch 4th char" s2 "n" 20))))
+
+;; ---- panes -------------------------------------------------------------------
+(io/puts "")
+(let (two (press *base* [:ctrl-x "2"])
+      three (press two [:ctrl-x "2"]))
+  (do
+    (ms "frame: 2 panes on this buffer" (fn () (frame two)) 20)
+    (ms "frame: 3 panes on this buffer" (fn () (frame three)) 20)
+    (turns "turn: C-n with 3 panes" three :ctrl-n 20)
+    (turns "turn: self-insert with 3 panes" three "x" 20)))
+
+;; ---- prompts -----------------------------------------------------------------
+(io/puts "")
+(ms "M-x opens" (fn () (input/ed-update *base* (keyword "alt-x") *cols* *rows*)) 10)
+(let (mx (press *base* [(keyword "alt-x")]))
+  (do
+    (turns "turn: M-x first char" mx "f" 20)
+    (turns "turn: M-x 4th char" (press mx ["f" "i" "n"]) "d" 20)))
+(ms "C-x b opens (buffer list)" (fn () (input/ed-update *base* [:ctrl-x "b"] *cols* *rows*)) 10)
+
+;; ---- visual-line (wrapping) --------------------------------------------------
+(io/puts "")
+(let (wrapped (model/ed-set-buf *base*
+                (editor/buffer/annotate (model/ed-current-buf *base*) :visual-line true)))
+  (do
+    (ms "frame: visual-line on" (fn () (frame wrapped)) 20)
+    (turns "turn: C-n with visual-line on" wrapped :ctrl-n 20)))

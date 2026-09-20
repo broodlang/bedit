@@ -1,0 +1,162 @@
+(defmodule drive-async
+  "The editor's off-the-loop work, driven end to end through a real `ui-run`.
+
+Four things were moved off the loop process because each of them blocked the editor for
+tens to hundreds of milliseconds: the minibuffer's candidate ranking (a fuzzy `ranker`
+session), the project file walk behind `C-x p f` (`git ls-files` in a subprocess), the
+status-bar git summary (five `git` subprocesses, including a 40 ms `git status` on a large
+repo), and the diff-hl gutter. Each now ASKS and folds the answer when it arrives.
+
+Every one of those is invisible to `nest test`, which drives `ed-update` directly and is
+headless — and headless is exactly the branch where each of them falls back to running
+synchronously instead. So this registers `:editor` (the flag that turns the async paths on)
+and runs the real loop over a scripted frontend, asserting the model ends up holding the
+answers rather than merely having asked for them.
+
+    nest run tools/drive-async.blsp"
+  (:use-internals bedit/input))
+
+(require-one 'project)
+(project/load-config)
+(let (root (project/find-root (file/cwd)))
+  (when root (project/setup root) (project/load-sources root)))
+
+(def *cols* 120)
+(def *rows* 40)
+(def *deadline-ms* 20000)
+
+;; A table, like `tools/drive-elixir.blsp`: a model cannot cross a process boundary (it
+;; holds ropes), so the assertions run INSIDE the loop's update fn and only the tally comes
+;; back out.
+(def *failures* (%table))
+
+(defn- nap (ms) (receive (:never nil) (after ms nil)))
+
+(defn check (what ok)
+  (do
+    (io/puts (str (if ok "  ok  " "  FAIL ") what))
+    (when (not ok) (%table-put *failures* :n (inc (%table-get *failures* :n 0))))
+    ok))
+
+;; ---- the scripted frontend --------------------------------------------------
+;; `:poll` hands over the scripted inputs in order, then answers nil (a timed-out poll) —
+;; which is what lets the loop's own timers fire, the idle beat among them.
+
+(defn sched-loop (pending)
+  (receive
+    ([:next from]
+      (if (empty? pending)
+        (do (send from [:scripted nil]) (sched-loop pending))
+        (do (send from [:scripted (first pending)]) (sched-loop (rest pending)))))
+    ([:stop] nil)))
+
+(defn poll-fn (sch me)
+  "The display's `:poll`: the next scripted input if there is one, else whatever is in this
+process's mailbox — **any** message, which is the whole point. The real frontends poll with a
+catch-all `receive`, and that is how an async reply (`[:task-done …]`, `[:fuzzy-ranked …]`)
+reaches the loop at all. A driver that selected only on its own scripted protocol would leave
+every one of them queued forever, and would report that nothing arrived when in truth nothing
+was ever collected — which is exactly what this driver did on its first run."
+  (fn (ms)
+    (let (scripted (do (send sch [:next me]) (receive ([:scripted e] e) (after 5000 nil))))
+      (if (nil? scripted) (receive (msg msg) (after (math/max 1 ms) nil)) scripted))))
+
+(defn drive (m0 script arrived? on-arrival what)
+  "Run the real loop from `m0` over `script` until `arrived?` holds of the model, then call
+`on-arrival` with it (where the assertions live — the model never leaves this process) and
+stop. Fails the run if the deadline passes first."
+  (let (t0 (os/now)
+        sch (spawn (fn () (sched-loop script)))
+        me (self)
+        display {:enter (fn () nil)
+                 :leave (fn () nil)
+                 :size (fn () [*cols* *rows*])
+                 :draw (fn (frame) nil)
+                 :poll (poll-fn sch me)}
+        update (fn (m input cols rows)
+                 (let (next (input/ed-update m input cols rows))
+                   (cond
+                     (arrived? next) (do (on-arrival next) (assoc next :done true))
+                     (> (- (os/now) t0) *deadline-ms*)
+                       (do (check (str what " arrived before the deadline") false)
+                         (assoc next :done true))
+                     :else next))))
+    (do (editor/ui/ui-run m0 view/ed-view update display) (send sch [:stop]))))
+
+;; ---- the run ----------------------------------------------------------------
+
+(defn drive-project-scan (m0 root)
+  (let (opened (commands/ed-find-file-in-project m0 root))
+    (do
+      (check "the prompt opens with NO files — the walk has not run yet"
+        (empty? (get-in opened [:minibuffer :rank-source])))
+      (check "…and a scan is in flight" (not (nil? (:project-scan opened))))
+      (drive opened
+        '()
+        (fn (m) (not (empty? (get-in m [:minibuffer :rank-source]))))
+        (fn (m)
+          (do
+            (check "the file list arrived and filled the prompt"
+              (> (count (get-in m [:minibuffer :rank-source])) 10))
+            (check "the scan slot was freed" (nil? (:project-scan m)))
+            (check "this project's own source is in the list"
+              (includes? (get-in m [:minibuffer :rank-source]) "src/view.blsp"))))
+        "the project scan"))))
+
+(defn drive-ranking (m0 root)
+  ;; This project has ~170 files, under the session threshold, so the source is padded to
+  ;; exercise the path a 27k-file project takes — which is the one that used to cost 133 ms
+  ;; on the first keystroke and 210 ms on every ↓.
+  (let (files (into [] (append (projects/project-files root)
+                         (map (range 2000) (fn (i) (str "generated/file" i ".txt")))))
+        opened (assoc m0
+                 :minibuffer
+                   (assoc (:minibuffer (commands/ed-find-file-in-project m0 root))
+                     :rank-source files
+                     :scanning nil))
+        ready (dissoc opened :project-scan))
+    (drive ready
+      (list "v" "i" "e" "w")
+      (fn (m) (= (get-in m [:minibuffer :cand-cache :for]) "view"))
+      (fn (m)
+        (do
+          (check "a ranking session was started for the big source"
+            (not (nil? (get-in m [:minibuffer :ranker]))))
+          (check "the ranked list came back for what was typed"
+            (= (get-in m [:minibuffer :cand-cache :for]) "view"))
+          (check "and it ranked the right file first"
+            (= (first (model/mb-candidates (:minibuffer m))) "src/view.blsp"))))
+      "the ranking")))
+
+(defn drive-git-summary (m0)
+  (drive (commands/ed-find-file m0 "src/view.blsp")
+    '()
+    (fn (m) (not (nil? (:git-summary m))))
+    (fn (m)
+      (do
+        (check "the summary arrived" (not (nil? (:git-summary m))))
+        (check "naming the branch we are actually on" (not (nil? (:branch (:git-summary m)))))
+        (check "the status-bar segments were rebuilt from it" (> (count (:git-segments m)) 0))
+        (check "the git slot was freed" (nil? (:git-proc m)))))
+    "the git summary"))
+
+(let (_ (proc/register :editor (self))
+      root (file/cwd)
+      m0 (assoc (model/ed-init (editor/buffer/make-buffer "" "*scratch*"))
+           :recent-files false
+           :gui-keys true))
+  (do
+    (check "the async paths are live (`:editor` registered, not headless)"
+      (not (model/ed-headless?)))
+    (io/puts "== the project file walk lands off the loop (C-x p f)")
+    (drive-project-scan m0 root)
+    (io/puts "== typing into a big prompt ranks off the loop")
+    (drive-ranking m0 root)
+    (io/puts "== the status-bar git summary lands off the loop")
+    (drive-git-summary m0)
+    (io/puts "")
+    ;; A raise, not a status code: `nest run` reports an uncaught error as a non-zero exit,
+    ;; which is what a `make` target needs, and it prints the count.
+    (if (= (%table-get *failures* :n 0) 0)
+      (io/puts "all async paths delivered")
+      (error "drive-async: " (%table-get *failures* :n 0) " check(s) failed"))))

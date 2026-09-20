@@ -1,0 +1,89 @@
+(defmodule probe-repeat
+  "Does a single key TAP ever move twice when the frames are slow?
+
+Runs the real `ui-run` loop with bedit's real `view` / `update` over a SCRIPTED display:
+`:draw` burns a given number of ms (a *busy* frame) and `:poll` delivers a scripted
+key-down / key-up pair at scripted times. Prints every input the loop folded and the
+point after it, so a tap that moved twice shows up as two dispatches of one key.
+
+    nest run tools/probe-repeat.blsp -- <draw-ms> <hold-ms>
+
+`(:use-internals bedit/input)` is load-bearing, not tidiness: `ed-event-handlers` resolves
+each handler with `reflect/eval` at dispatch, and the privacy check reads the module the
+call is made FROM. `main` passes `input/ed-update` itself, so the real editor resolves
+inside `bedit/input` and every handler is in reach; a wrapper defined here would be denied
+`ed-ev-key-up` (a `defn-`), `ui-fold` would swallow the throw, and the key-up would look
+like it silently failed to stop the repeat."
+  (:use-internals bedit/input))
+
+(require-one 'project)
+(project/load-config)
+(let (root (project/find-root (file/cwd)))
+  (when root (project/setup root) (project/load-sources root)))
+
+(def *args* (let (a (system/argv) i (index-of a "--")) (if i (drop a (inc i)) (list))))
+(def *draw-ms* (let (n (string/->number (or (first *args*) "0"))) (if (int? n) n 0)))
+(def *hold-ms* (let (n (string/->number (or (second *args*) "60"))) (if (int? n) n 60)))
+(def *cols* 120)
+(def *rows* 40)
+
+;; ---- the scripted input source ----------------------------------------------
+;; A process holding `[[at-ms event] …]` (times relative to start). `[:poll from ms]`
+;; answers the next event once its time has come, or nil after `ms` — the `:poll` contract.
+
+(defn- nap (ms) (receive (:never nil) (after ms nil)))
+
+(defn sched-loop (t0 script)
+  (receive
+    ([:poll from ms]
+      (let (now (- (os/now) t0)
+            head (first script))
+        (cond
+          (nil? head) (do (nap ms) (send from [:polled nil]) (sched-loop t0 script))
+          (<= (first head) now)
+            (do (send from [:polled (second head)]) (sched-loop t0 (rest script)))
+          (<= (- (first head) now) ms)
+            (do (nap (- (first head) now))
+              (send from [:polled (second head)])
+              (sched-loop t0 (rest script)))
+          :else (do (nap ms) (send from [:polled nil]) (sched-loop t0 script)))))
+    ([:stop] nil)))
+
+(defn run-probe ()
+  (let (buf (editor/buffer/make-buffer
+              (string/join (map (range 200) (fn (i) (str "line " i))) "\n")
+              "probe.txt")
+        m0 (assoc (model/ed-init buf) :gui-keys true)
+        ;; the tap: key down at 10ms, key up at 10+hold; then quiet, then stop
+        script (list [10 :ctrl-n] [(+ 10 *hold-ms*) [:key-up :ctrl-n]] [1200 :probe-stop])
+        t0 (os/now)
+        sch (spawn (fn () (sched-loop t0 script)))
+        me (self)
+        display {:enter (fn () nil)
+                 :leave (fn () nil)
+                 :size (fn () [*cols* *rows*])
+                 :draw (fn (frame) (when (> *draw-ms* 0) (nap *draw-ms*)))
+                 :poll (fn (ms)
+                         (do (send sch [:poll me (math/max 1 ms)])
+                           (receive ([:polled e] e) (after 30000 :timeout))))}
+        wrapped (fn (m input cols rows)
+                  (if (= input :probe-stop)
+                    (assoc m :done true)
+                    (let (next (input/ed-update m input cols rows))
+                      (do
+                        (io/puts (str (string/pad-left (->string (- (os/now) t0)) 6)
+                                   "  "
+                                   (string/pad-right (pr-str input) 26)
+                                   " point="
+                                   (pr-str (editor/buffer/buffer-point (model/ed-current-buf next)))
+                                   " held="
+                                   (pr-str (:held-key m))
+                                   "->"
+                                   (pr-str (:held-key next))))
+                        next)))))
+    (io/puts (str "== draw burns " *draw-ms* "ms; key held " *hold-ms* "ms; delay "
+               (input/ed-repeat-delay m0) "ms rate " (input/ed-repeat-rate m0) "ms"))
+    (editor/ui/ui-run m0 view/ed-view wrapped display)
+    (send sch [:stop])))
+
+(run-probe)

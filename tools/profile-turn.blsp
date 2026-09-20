@@ -1,12 +1,20 @@
-;; tools/profile-turn.blsp — where a loop turn's time goes, headless.
+;; tools/profile-turn.blsp — where a loop turn's time goes.
 ;;
 ;; Opens a file into a model at the GUI window's grid, then samples `ed-view` and
 ;; `ed-update` (a cursor-blink timer, a typed character, the idle beat) under the
 ;; runtime's sampling profiler (`dev/profile-start`), printing each phase's wall time
 ;; per call and the hottest stacks. The numbers `BROOD_UI_TRACE=1` prints for a live
-;; run, attributed. Pure model + view, no window:
+;; run, attributed. Model + view, no window:
 ;;
 ;;     nest run tools/profile-turn.blsp -- src/view.blsp 213 49
+;;
+;; It registers `:editor`, and that is not a detail: every recompute that was moved off the
+;; loop (the git summary, the diff-hl gutter, eldoc, diagnostics, the project walk) asks
+;; `model/ed-headless?` first and falls back to running SYNCHRONOUSLY when there is no loop
+;; for a reply to land in. Profiling without the registration measured the fallbacks — the
+;; idle beat read 10.8 ms, most of it five `git` subprocesses this editor no longer runs on
+;; the loop at all. The replies pile up unread in this process's mailbox, which is what we
+;; want: the launch is the cost the loop pays, and the launch is what is being measured.
 (require-one 'project)
 (project/load-config)
 (let (root (project/find-root (file/cwd)))
@@ -20,8 +28,31 @@
 (def *rows* (let (n (string/->number (or (nth *args* 2) "49"))) (if (int? n) n 49)))
 (def *reps* 40)
 
+(proc/register :editor (self)) ; the async paths are live — see the header
+
+(def *settle-handles* [:diag-proc :gitdiff-proc :eldoc-proc :tree-warm-proc :git-proc :signature-proc])
+
+(defn in-flight? (m)
+  "Whether any launched recompute has not answered yet."
+  (any? *settle-handles* (fn (k) (not (nil? (get m k))))))
+
+(defn settle (m cols rows)
+  "Fold every async reply until nothing is in flight and nothing more arrives. The idle beat
+LAUNCHES — the git summary, the diff-hl gutter, eldoc, diagnostics, the tree warm — and what
+we want to measure is a turn in the settled state those launches produce, not one racing
+four tasks for the CPU.
+
+Waiting on the HANDLES, not just on a quiet mailbox, is what makes that true. A timeout
+alone returns as soon as no reply happens to be waiting, which on a big file is long before
+the work is done — a tree-sitter warm over 2.4 MB kept running through every later phase and
+read `view (memo)` at **858 ms** for a frame that genuinely costs 3.5 ms. A profiler that
+reports the load it is itself generating is worse than no profiler."
+  (let (ev (receive (msg msg) (after (if (in-flight? m) 20000 300) nil)))
+    (if (nil? ev) m (settle (input/ed-update m ev cols rows) cols rows))))
+
 (defn model-of (file cols rows)
-  "A model with `file` visited, its span cache warm — the state after the first frame."
+  "A model with `file` visited, its caches warm and every launched recompute already folded
+back in — the state a reader is actually sitting in between keystrokes."
   (let (m0 (commands/ed-find-file
              (assoc (model/ed-init (editor/buffer/make-buffer (main/welcome-text :emacs {}) "*scratch*"))
                :recent-files true
@@ -29,9 +60,10 @@
              file)
         ;; a loop turn refreshes the caches at its tail; run one so the steady state is measured
         m1 (input/ed-update m0 [:timer :cursor-blink] cols rows)
-        m2 (input/ed-update m1 [:timer :idle-recompute] cols rows)
-        m3 (input/ed-update m2 [:timer :cursor-blink] cols rows))
-    m3))
+        m2 (settle (input/ed-update m1 [:timer :idle-recompute] cols rows) cols rows)
+        ;; a second beat: the first one's answers may have made more work stale
+        m3 (settle (input/ed-update m2 [:timer :idle-recompute] cols rows) cols rows))
+    (input/ed-update m3 [:timer :cursor-blink] cols rows)))
 
 (defn ms-per (label thunk reps)
   "Run `thunk` `reps` times, print the mean wall ms, return the last result."
@@ -66,6 +98,25 @@ time spent inside each — skipping the anonymous bucket and the entry itself."
   (let (hist (dev/profile-stop))
     (top-stacks hist 18)))
 
+;; The memoised view (ADR-336): a second turn whose fragments all hit.
+;;
+;; FIRST, before anything runs under `dev/profile-start`. The sampler's cost outlives the
+;; block that started it, and these are the cheapest measurements here — so run after the
+;; `profiled` blocks they read 250× high (3.3 ms of real work reported as 822 ms), which
+;; looked exactly like the memo being catastrophic on long lines and is not. Wall-clock
+;; measurements before sampled ones; keep it that way.
+(let (m (model-of *file* *cols* *rows*)
+      first-frame (binding (*ui-memo* {}) (view/ed-view m *cols* *rows*))
+      [_ table] (editor/ui/ui-harvest first-frame))
+  (io/puts (str "== memo: " (count table) " fragments"))
+  (ms-per "view (memo, all hit)" (fn () (binding (*ui-memo* table) (view/ed-view m *cols* *rows*))) *reps*)
+  (ms-per "view + harvest (memo, all hit)"
+    (fn () (editor/ui/ui-harvest (binding (*ui-memo* table) (view/ed-view m *cols* *rows*)))) *reps*)
+  (let (m2 (input/ed-update m :ctrl-n *cols* *rows*))
+    (ms-per "view after C-n (memo)" (fn () (binding (*ui-memo* table) (view/ed-view m2 *cols* *rows*))) *reps*))
+  (let (m3 (input/ed-update m "x" *cols* *rows*))
+    (ms-per "view after typing x (memo)" (fn () (binding (*ui-memo* table) (view/ed-view m3 *cols* *rows*))) *reps*)))
+
 (let (m (model-of *file* *cols* *rows*))
   (io/puts (str "== " *file* " at " *cols* "x" *rows* ", " *reps* " reps each"))
   (profiled "view" (fn () (view/ed-view m *cols* *rows*)) *reps*)
@@ -86,15 +137,3 @@ time spent inside each — skipping the anonymous bucket and the entry itself."
     (doseq (e (take req 8))
       (io/puts (str "  " (:count e) "  " (string/join (take (:stack e) 10) " < "))))))
 
-;; the memoised view (ADR-336): a second turn whose fragments all hit
-(let (m (model-of *file* *cols* *rows*)
-      first-frame (binding (*ui-memo* {}) (view/ed-view m *cols* *rows*))
-      [_ table] (editor/ui/ui-harvest first-frame))
-  (io/puts (str "== memo: " (count table) " fragments"))
-  (ms-per "view (memo, all hit)" (fn () (binding (*ui-memo* table) (view/ed-view m *cols* *rows*))) *reps*)
-  (ms-per "view + harvest (memo, all hit)"
-    (fn () (editor/ui/ui-harvest (binding (*ui-memo* table) (view/ed-view m *cols* *rows*)))) *reps*)
-  (let (m2 (input/ed-update m :ctrl-n *cols* *rows*))
-    (ms-per "view after C-n (memo)" (fn () (binding (*ui-memo* table) (view/ed-view m2 *cols* *rows*))) *reps*))
-  (let (m3 (input/ed-update m "x" *cols* *rows*))
-    (ms-per "view after typing x (memo)" (fn () (binding (*ui-memo* table) (view/ed-view m3 *cols* *rows*))) *reps*)))
