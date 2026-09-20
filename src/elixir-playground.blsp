@@ -1,0 +1,444 @@
+(defmodule elixir-playground
+  "The **Elixir playground** (`M-x elixir-playground`, `C-c p e`) — `*Elixir Playground*`,
+a scratch `.exs` buffer that runs as you type.
+
+    defmodule Fac do
+      def f(0), do: 1
+      def f(n), do: n * f(n - 1)
+    end
+                                        => Fac  : Fac, 2 functions
+    Fac.f(5)
+                                        => 120  : Integer
+
+with *Elixir Playground Spy* beside it showing the nested call/return cascade that
+produced the form under the cursor — `:erlang.trace` over the modules this session
+defined, so a private helper you never exported shows up and your application's ten
+thousand other calls do not.
+
+**Inside your project.** The session is a real BEAM node started with `mix run` in the
+project root, so the application is compiled and STARTED before the first form runs:
+`Accounts.list_users()` and `Repo.aggregate(Post, :count)` mean here what they mean in
+`iex -S mix`. Opening this in a cold checkout therefore costs a compile — the buffer says
+so rather than sitting blank.
+
+**What is in this file is the language.** The playground itself — form diffing, the
+marker-anchored notes, the launch plan, the reply fold, the pane — is `playground-core`,
+shared with the Brood playground. Here: how Elixir text splits into top-level forms, what
+one form's dependencies are, and what a reply's note says.
+
+Two things this needed that Brood did not have, both added there rather than worked around
+here (see `../brood`):
+
+  - `editor/treesit/parse-state` — is this text blank, mid-form, broken, or ready? Brood's
+    reader answers that for Brood with two error codes. tree-sitter answers it for any
+    grammar, but only if the kernel will say WHERE the parse came apart: an unclosed
+    `do` is repaired with an ERROR node, not a MISSING `end`, so the kind alone would have
+    put a red ✗ on every `defmodule` the moment its first line was typed.
+  - `include-str` — the agent that runs inside the BEAM is an Elixir program, and a
+    release bundle carries module source and no asset files. Without a compile-time file
+    embed it would have had to live as an escaped blob in a Brood string literal."
+  (:use model) ; message / ed-current-buf / ed-headless?
+  (:use commands) ; ed-show-named / ed-select
+  (:use interactive) ; defcommand — M-x elixir-playground
+  (:use editor/buffer) ; buffer-text
+  (:use editor/layers) ; register-type-layers / request-close
+  (:use theme) ; *subtext* / *teal* / *overlay0* — the spy pane's faces
+  (:use elixir-sandbox)) ; elixir-start / elixir-eval / elixir-available?
+;; liveeval, playground-core, workings, sandbox-events, modes, projects and
+;; editor/treesit are referenced qualified below — each `mod/name` auto-loads its module.
+
+(def *buffer-name* "*Elixir Playground*")
+(def *spy-buffer-name* "*Elixir Playground Spy*")
+
+(def *spy-spec*
+  {:key :elixir-playground
+   :buffer elixir-playground/*spy-buffer-name*
+   :type :elixir-playground-spy
+   :noun "form"
+   :heading "What ran"
+   :report 'elixir-playground/report-text})
+
+(def *welcome*
+  ;; Two lines and one expression, like the Brood playground's: a surface that opens full
+  ;; of somebody else's examples is a file you clear before you can use it.
+  (str "# Elixir playground — every top-level expression runs as you stop typing.\n"
+    "# Results appear at the end of each one; the pane on the right shows what ran.\n\n"
+    "1 + 1\n"))
+
+;; ---- splitting the buffer into forms ------------------------------------------------
+
+;; Node kinds that are not code. A comment evaluated as a form would answer `nil` and
+;; stamp `=> nil` on every prose line in the buffer, which is both wrong and the most
+;; visible thing on screen.
+(def *skip-kinds* #{:comment})
+
+(defn forms-of (text)
+  "The buffer's top-level expressions as positioned nodes — the named children of the
+tree's root, comments dropped.
+
+`%tree-sitter-kids` at offset 0 is the root's own child list: the deepest node STRICTLY
+containing offset 0 is the root, since nothing else can begin before the first character.
+Error-tolerant like the rest of tree-sitter, so it answers over text someone is mid-typing;
+whether a given form *evaluates* is [[parse-state]]'s separate question."
+  ;; check-allow :discarded-catch — no grammar installed is "no forms", which the command guards against
+  (check-allow :discarded-catch
+    (try
+      (seq/reject (%tree-sitter-kids text :elixir 0)
+        (fn (node) (contains? *skip-kinds* (get node :kind))))
+      (catch _ '()))))
+
+(defn parse-state (src)
+  "Is this form blank, mid-typing, broken, or ready? `editor/treesit/parse-state` over the
+Elixir grammar — which reads WHERE the parse came apart, so `defmodule Foo do` is
+`[:incomplete \"unclosed `do`\"]` and not an error.
+
+Locally, and deliberately: this runs per form on every settled keystroke, where a round
+trip to the node cannot. Elixir's own parser would answer more precisely — it names a
+missing terminator as such — but the one case the grammar is wrong about is a stray
+closing delimiter, which it reads as unfinished rather than broken, and that is the
+direction that costs nothing: a dim pending note on text someone is mid-way through
+fixing. A form that really is broken says so when it evaluates."
+  ;; check-allow :discarded-catch — without the grammar nothing can be classified, so nothing is sent
+  (check-allow :discarded-catch
+    (try (editor/treesit/parse-state src :elixir) (catch _ [:err "no Elixir grammar installed"]))))
+
+;; ---- what one form defines and uses ---------------------------------------------------
+;; Brood asks its own checker (`reflect/source-deps`). Elixir has no such thing reachable
+;; from here without a round trip per keystroke, so this reads the two bindings that
+;; actually flow between top-level forms in a playground buffer:
+;;
+;;   a MODULE   `defmodule Fac do … end` defines `Fac`, and every later form naming `Fac`
+;;              depends on it — the dominant shape, and the one worth being precise about;
+;;   a VARIABLE `x = 41` defines `x`, and every later form naming `x` depends on it.
+;;
+;; References are read generously — every alias and every bare lowercase word in the form —
+;; because over-matching only re-runs a form that did not need it, which is the direction
+;; `playground-core/stale-forms` documents as safe. Under-matching shows a stale answer,
+;; which is the failure this whole mechanism exists to prevent.
+
+(def *alias-pattern* "[A-Z][A-Za-z0-9_]*(\\.[A-Z][A-Za-z0-9_]*)*")
+(def *name-pattern* "[a-z_][A-Za-z0-9_]*[?!]?")
+(def *defmodule-pattern* "^\\s*defmodule\\s+([A-Z][A-Za-z0-9_.]*)")
+;; A top-level binding: everything up to the form's first `=` that is not `==`, `!=`, `<=`,
+;; `>=`, `=~` or `=>`. The LEFT-HAND SIDE, not a single name — Elixir's `=` is a pattern
+;; match, so `{a, b} = …`, `[h | t] = …` and `%{k: v} = …` each bind several, and a rule
+;; that only saw a bare name reported that they bound NOTHING. That is the one direction
+;; this whole mechanism must not fail in: a form below using `a` was then never re-run, and
+;; sat there showing the value from before the edit.
+(def *binding-pattern* "^\\s*([^=<>!~\\n]+?)\\s*=[^=~>]")
+
+(defn- matches (pattern src)
+  ;; Every match of `pattern` in `src` as text. `()` rather than a raise on a source the
+  ;; regex engine chokes on — a dependency it cannot see costs a re-run, never a crash.
+  ;; check-allow :discarded-catch — an unmatchable fragment mid-typing has no deps, which is the answer
+  (check-allow :discarded-catch
+    (try (map (regex/find-all pattern src) (fn (m) (get m :text))) (catch _ '()))))
+
+(defn- first-group (pattern src)
+  ;; The first capture group of `pattern`'s first match, or nil.
+  ;; check-allow :discarded-catch — same as `matches`
+  (check-allow :discarded-catch
+    (try
+      (let (m (regex/find pattern src))
+        (when m (get (first (get m :groups)) :text)))
+      (catch _ nil))))
+
+(defn form-deps (src)
+  "`{:defines (…) :references (…)}` for one top-level Elixir form — see the section note
+above for the rule and why references are read generously."
+  (let (module (first-group *defmodule-pattern* src)
+        ;; every name the left-hand side binds, which for a pattern match is several
+        bound (let (lhs (first-group *binding-pattern* src))
+                (if lhs (matches *name-pattern* lhs) '()))
+        defines (into '() (seq/reject (cons module bound) nil?))
+        ;; What it defines is not a reference to itself: a `defmodule Fac` naming `Fac` in
+        ;; its own body would otherwise make every module depend on itself and re-run the
+        ;; whole tail on any edit to any of them.
+        own (into #{} defines)
+        references (seq/reject (append (matches *alias-pattern* src) (matches *name-pattern* src))
+                     (fn (r) (contains? own r))))
+    {:defines defines :references references}))
+
+(defn deps-of (text)
+  "Per top-level form of `text`, `{:defines :references}` — [[form-deps]] over each. The
+count must line up with [[forms-of]] one-for-one or `playground-core/launch-plan` falls
+back to the suffix rule, which is why both walk the same node list."
+  (let (forms (forms-of text))
+    (map forms (fn (node) (form-deps (string/substring text (:start node) (:end node)))))))
+
+(defn namespace-form? (src)
+  "Does this form change what names MEAN below it? `import`, `alias`, `require` and `use`
+all do — they are exactly the edges a name-based dependency scan cannot see, since the
+affected forms name nothing that changed — so re-running one takes the whole tail with it."
+  (let (head (first-group "^\\s*(import|alias|require|use)\\b" src))
+    (not (nil? head))))
+
+;; ---- what a reply says -------------------------------------------------------------------
+
+(defn- type-hint (reply)
+  "The `: Integer` / `: %User{}` / `: Fac, 2 functions` hint, computed in the agent because
+only the BEAM can see what a term is. Brood derives its hint from the checker; here the
+value itself is the only source, so it travels on the reply."
+  (let (t (get reply :type)) (when (and (string? t) (not (= t ""))) (str ": " t))))
+
+(defn- error-note (reply)
+  "The `✗ …` note for a reply that raised or timed out, or nil when it did neither.
+
+Its own rather than `liveeval/error-note`'s, for one word: the timeout advice has to name
+the command that restarts THIS session."
+  (cond
+    (get reply :timeout)
+      {:kind :fail
+       :error? true
+       :text "✗ timed out — still running? (M-x elixir-playground-restart)"}
+    (not (get reply :ok)) {:kind :fail :error? true :text (str "✗ " (get reply :error "error"))}
+    else nil))
+
+(defn note-of (reply src)
+  "The ghost-text note for one reply — `=> 120` with what it printed, what it cost and what
+it left running, plus the term's type as the `:hint` anchored at the form.
+
+`src` is unused: Brood derives its hint by asking the checker about the source, and Elixir's
+comes back with the value. The parameter stays because it is `playground-core`'s contract
+and the two languages differ only in which end computes it."
+  (or (error-note reply)
+    (let (hint (type-hint reply)
+          note {:kind :info
+                :text (str "=> "
+                        (get reply :value)
+                        (liveeval/printed-note reply)
+                        (liveeval/slow-note reply)
+                        (liveeval/proc-note reply))})
+      (if hint (assoc note :hint hint) note))))
+
+(defn dbg-lines (reply)
+  "The `dbg` block for the pane — `()` when the form called none.
+
+`dbg/2` is the best thing in Elixir's debugging toolbox, and its output is the wrong shape
+for ghost text: a piped expression decomposes into one line per step, which is a paragraph
+next to a form and a sentence in a pane. So it goes where the cascade goes. Indented under
+a heading of its own, because it answers a different question from the cascade — `dbg` is
+what YOU asked to see, the cascade is everything that happened."
+  (let (dbg (get reply :dbg ""))
+    (if (= (string/trim dbg) "")
+      '()
+      (cons "what dbg showed:" (map (string/split (string/trimr dbg) "\n") (fn (l) (str "  " l)))))))
+
+(defn report-text (reply src)
+  "The pane's body for one reply — what it answered, what `dbg` showed, what it printed,
+what it cost, and the cascade of everything it called.
+
+`liveeval`'s report with two things a language computes for itself: the term's type on the
+value line, and the `dbg` block under it."
+  (let (base (liveeval/report-text reply nil)
+        hint (type-hint reply)
+        lines (string/split base "\n")
+        ;; the first line is the `=> value`; the type belongs beside it, as it does in the
+        ;; note
+        head (if (or (nil? hint) (not (get reply :ok)))
+               (first lines)
+               (str (first lines) "   " hint))
+        dbg (dbg-lines reply))
+    (string/join (append (list head)
+                   (if (empty? dbg) '() (cons "" dbg))
+                   (rest lines))
+      "\n")))
+
+(defn send-eval (id src timeout-ms)
+  "Put one form on the Elixir session's wire. The agent traces the modules the session has
+defined for the duration, so the reply carries the cascade the pane shows."
+  (elixir-eval id src timeout-ms))
+
+(def *spec*
+  {:key :elixir-playground
+   :buffer elixir-playground/*buffer-name*
+   :spy elixir-playground/*spy-spec*
+   :type :elixir-playground
+   :timeout-ms elixir-sandbox/*elixir-default-timeout-ms*
+   :restart "M-x elixir-playground-restart"
+   :spawn-failed-message "could not start the Elixir session (is `elixir` on PATH?)"
+   :forms-of 'elixir-playground/forms-of
+   :parse-state 'elixir-playground/parse-state
+   :deps-of 'elixir-playground/deps-of
+   :namespace-form? 'elixir-playground/namespace-form?
+   :note-of 'elixir-playground/note-of
+   :eval 'elixir-playground/send-eval})
+;; No `:in-image`: an Elixir session IS a child process, so there is no in-image answer to
+;; fall back to when the editor is headless. A launch with no loop to deliver replies to
+;; therefore sends nothing and stamps nothing, which is the honest outcome — the Brood
+;; playground's in-image path exists only because Brood can evaluate Brood.
+
+;; ---- the buffer ---------------------------------------------------------------------------
+
+(defn playground-buffer? (b) (and b (= (:name b) *buffer-name*)))
+
+(defn elixir-playground-live-buffer? (m)
+  "Is *Elixir Playground* on screen — i.e. does it still want a session? One of the
+`sandbox-events` client hooks."
+  (playground-core/live-buffer? *spec* m))
+
+(defn- playground-live? () (not (ed-headless?)))
+
+;; ---- the eval-on-type triple (the model's timers call these) --------------------------------
+
+(defn ed-elixir-playground-stale? (m) (playground-core/ed-stale? *spec* m))
+(defn ed-elixir-playground-reanchor (m) (playground-core/ed-reanchor *spec* m))
+(defn ed-elixir-playground-launch (m) (playground-core/ed-launch *spec* m))
+
+;; ---- the session client hooks (registered in `sandbox-events/*clients*`) --------------------
+
+(defn elixir-playground-ready (m gen banner)
+  "The agent announced itself. Beyond the shared bookkeeping this says so out loud, because
+the wait was long enough to need explaining: in a mix project the boot compiled the whole
+project, and the buffer sat showing nothing while it did.
+
+And it says WHICH session you got. An application is entitled to refuse to start — a
+pending migration, a database that is down, a startup task that raises — and the retry that
+follows runs `mix run --no-start`, which still compiles the project and loads your modules
+but supervises nothing. `Repo.all(User)` working and `Repo.all(User)` raising are different
+tools, and the difference must not be something a reader discovers by trying it.
+
+It also says so when the Elixir that came up is older than bedit expects. That is worth a
+sentence rather than a silence for the same reason: the agent degrades (no dbg stream) and
+keeps working, so without being told you would just find one feature missing and no
+explanation of why."
+  (let (m1 (playground-core/sandbox-ready *spec* m gen)
+        stale (elixir-sandbox/version-notice banner))
+    (cond
+      (not (playground-core/live-buffer? *spec* m1)) m1
+      stale (message m1 stale)
+      (elixir-sandbox/app-started? banner)
+        (message m1 (str "Elixir session ready — " (elixir-sandbox/app-started? banner) " is running"))
+      (elixir-sandbox/elixir-project? (or (:project-root m1) (projects/project-root (file/cwd))))
+        (message m1
+          "Elixir session ready — your application is NOT started (see *Messages*); modules are loaded")
+      else (message m1 "Elixir session ready"))))
+
+(defn elixir-playground-reply (m reply gen) (playground-core/sandbox-reply *spec* m reply gen))
+(defn elixir-playground-down (m code) (playground-core/sandbox-down *spec* m code))
+
+;; ---- the pane follows the cursor ---------------------------------------------------------------
+
+(defn spy-on-screen? (m) (playground-core/spy-on-screen? *spec* m))
+(defn elixir-playground-on-move (m) (playground-core/on-move *spec* m))
+
+;; ---- the modes ---------------------------------------------------------------------------------
+
+;; Stacks over the real elixir-mode, so the buffer is an Elixir file first: tree-sitter
+;; highlighting, the `do`/`end` indenter, the `C-M-*` structural motions and `beginning-of-defun`
+;; all come for free. A playground where RET did not indent would be a worse place to try the
+;; language than the file you already had open.
+(def elixir-playground-mode-layer
+  {:name 'elixir-playground
+   :on-move 'elixir-playground/elixir-playground-on-move
+   :hooks {:on-close '(elixir-playground/elixir-playground-on-close)}})
+
+(register-type-layers :elixir-playground
+  (list 'elixir-playground/elixir-playground-mode-layer
+    'modes/elixir-mode-layer 'modes/prog-mode-layer 'modes/text-mode-layer))
+
+(defn- spy-line-face (line)
+  (cond
+    (string/starts-with? line "What ran") {:fg *subtext*}
+    (string/starts-with? line "what dbg showed") {:fg *subtext*}
+    (string/starts-with? line liveeval/*untraced-note*) {:fg *overlay0* :italic true}
+    ;; a `dbg` step and a traced return are the same idea — a value coming back out — so
+    ;; they read in the same accent
+    (includes? line "#=>") {:fg *teal*}
+    (string/starts-with? (string/triml line) "= ") {:fg *teal*}
+    else nil))
+
+(defn spy-fontify (src)
+  "The spy pane's colouring: the heading dim, every `= value` return in the accent — so a
+cascade reads as calls going in and values coming back rather than as a wall of text."
+  (modes/fontify-line-faces src elixir-playground/spy-line-face))
+
+(def elixir-playground-spy-layer
+  {:name 'elixir-playground-spy :no-line-numbers true :fontify 'elixir-playground/spy-fontify})
+
+(register-type-layers :elixir-playground-spy
+  (list 'elixir-playground/elixir-playground-spy-layer
+    'modes/special-mode-layer 'modes/text-mode-layer))
+
+(defn elixir-playground-on-close (buf)
+  "The `:on-close` hook: killing the playground takes its pane with it. The session is
+deliberately NOT stopped — `sandbox-events` is the only place that can see whether every
+client is gone, and in a mix project restarting one costs a compile."
+  (editor/layers/request-close buf *spy-buffer-name*))
+
+;; ---- the commands -------------------------------------------------------------------------------
+
+(defn- grammar-installed? ()
+  "Can the editor parse Elixir at all? Everything here reads the tree-sitter grammar — how
+the buffer splits into forms, whether a form is finished, where the cursor is — so without
+it the playground would open a buffer that never evaluates anything and never says why."
+  ;; check-allow :discarded-catch — the error IS the answer to "is the grammar loaded?"
+  (check-allow :discarded-catch (try (do (%tree-sitter-kids "" :elixir 0) true) (catch _ false))))
+
+(defcommand cmd-elixir-playground
+  (m key)
+  "Open the Elixir playground (M-x elixir-playground, C-c p e): a free-text
+`*Elixir Playground*` buffer whose top-level expressions evaluate as you settle typing,
+results as ghost text, and an *Elixir Playground Spy* pane showing what each one called.
+
+In a mix project the session runs inside YOUR application — compiled and started — so the
+buffer can call your own contexts and query your Repo. That costs a compile on the first
+open, which is why it says so and then says when it is ready.
+
+Running it again switches to the buffer you already have and brings the pane back if you
+closed it, on the form the cursor is in."
+  (cond
+    (not (grammar-installed?))
+      (message m
+        "no Elixir tree-sitter grammar — M-x grammar-list shows how to install one")
+    (elixir-sandbox/missing-tool (or (:project-root m) (projects/project-root (file/cwd))))
+      (message m
+        (str (elixir-sandbox/missing-tool (or (:project-root m) (projects/project-root (file/cwd))))))
+    else
+      (let (root (or (:project-root m) (projects/project-root (file/cwd)))
+            booting? (and (playground-live?) (not (elixir-running?))))
+        (when (playground-live?)
+          ;; the UiEvent impls live in `sandbox-events`; loading it IS registering them
+          (sandbox-events/ensure)
+          (elixir-start root))
+        (let (existing (playground-core/pg-index *spec* m))
+          (if existing
+            (let (m1 (ed-select m existing)
+                  b (playground-core/pg-buf *spec* m1))
+              (if (nil? b)
+                m1
+                (let (text (buffer-text b))
+                  (workings/reopen *spy-spec*
+                    m1
+                    (or (playground-core/form-index-in (playground-core/form-spans-in text
+                                                         (forms-of text))
+                          (:point b 0))
+                      0)))))
+            (message (workings/refresh *spy-spec*
+                       (ed-show-named m *buffer-name* *welcome* :elixir-playground)
+                       0
+                       true)
+              (cond
+                ;; A cold `mix run` compiles the project before it answers anything, and a
+                ;; buffer that sits there showing nothing for thirty seconds reads as broken.
+                (and booting? (elixir-project? root))
+                  "Elixir playground — starting your project (this compiles the first time)…"
+                booting? "Elixir playground — starting an Elixir session…"
+                else "Elixir playground — type Elixir; it runs as you stop typing")))))))
+
+(defcommand cmd-elixir-playground-restart
+  (m key)
+  "Restart the Elixir session (M-x elixir-playground-restart): a fresh VM — every module and
+binding the buffer defined is gone — and the whole buffer re-evaluates against it once the
+agent announces ready.
+
+Also the retry path when the session gave up or never started, which is why it starts a dead
+one rather than resetting it: a reset on a worker that is not running is a silent no-op, and
+a silent no-op is the wrong answer to \"please try again\". In a mix project this recompiles,
+so it is a real pause and never something the editor does on its own."
+  (do
+    (when (playground-live?)
+      (do
+        (sandbox-events/ensure)
+        (if (elixir-running?) (elixir-reset) (elixir-start (or (:project-root m) (projects/project-root (file/cwd)))))))
+    (message m "restarting the Elixir session…")))

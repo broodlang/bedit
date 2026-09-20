@@ -1,0 +1,615 @@
+;; The Elixir playground (`src/elixir-playground.blsp`, `src/elixir-sandbox.blsp`) — the
+;; second client of `playground-core`, and the first that evaluates something other than
+;; Brood.
+;;
+;; Everything here runs WITHOUT an Elixir session. The eval path is a round trip to a BEAM
+;; node, so the tests drive the two halves it sits between directly: what the launcher
+;; decides to send (the form split, `parse-state`, the dependency rule) and what a reply
+;; becomes once it lands (`elixir-playground-reply` fed a synthetic reply map, shaped
+;; exactly as `elixir/bedit_agent.exs` writes it). That is the seam the Brood playground's
+;; own suite uses, and it is why a feature built on a subprocess is testable in
+;; milliseconds with no window and no VM.
+;;
+;; The suites that need to PARSE Elixir are gated on the tree-sitter grammar being
+;; installed (`~/.config/bedit/grammars/libtree-sitter-elixir.so`), the same way brood's
+;; own treesit suite gates on its grammars: without it the editor cannot colour or indent
+;; an `.ex` file either, and a red suite on a machine that simply has not installed a
+;; grammar is noise.
+
+(defmodule elixir-playground-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use-internals elixir-playground)
+  (:use-internals elixir-sandbox)
+  (:use session)) ; the shared session events every backend emits
+
+(defn m-of (text) (ed-init (make-buffer text)))
+
+(defn payload-of (line)
+  "The base64 field of a request line, decoded. `nth` answers `nil | string` and a nil
+would decode as a silent empty payload rather than as a failed assertion, so a line with
+no fourth field is an error here — which is what a malformed request is."
+  (let (parts (string/split line " "))
+    (encoding/base64-decode (or (nth parts 3) (error "request line has no payload: " line)))))
+
+(defn grammar? ()
+  ;; check-allow :discarded-catch — the error IS the answer to "is the grammar loaded?"
+  (check-allow :discarded-catch (try (do (%tree-sitter-kids "" :elixir 0) true) (catch _ false))))
+
+(def elixir-grammar? (grammar?))
+
+;; ---- the wire, which needs no grammar and no Elixir ---------------------------------
+
+(describe "the Elixir agent's wire"
+  (test "a request is the verb, the id, the timeout and the source, base64'd"
+    (let (line (elixir-sandbox/encode-request 7 2000 {:verb "EVAL" :src "1 + 1"})
+          parts (string/split line " "))
+      (assert= (first parts) "EVAL")
+      (assert= (second parts) "7")
+      (assert= (nth parts 2) "2000")
+      (assert= (payload-of line) "1 + 1")))
+
+  ;; The whole reason the payload is encoded: an Elixir program is full of the characters a
+  ;; space-separated line is framed with. A heredoc alone would have broken a naive framing
+  ;; on the first day.
+  (test "source with newlines and quotes survives the framing"
+    (let (src "defmodule A do\n  @doc \"\"\"\n  hi \"there\"\n  \"\"\"\nend"
+          line (elixir-sandbox/encode-request 1 0 {:verb "EVAL" :src src}))
+      (is (not (includes? line "\n")))
+      (assert= (payload-of line) src)))
+
+  (test "a reply is one JSON object per line, keyed as keywords"
+    (let (reply (elixir-sandbox/decode-reply "{\"id\":3,\"ok\":true,\"value\":\"42\"}"))
+      (assert= (get reply :id) 3)
+      (assert= (get reply :value) "42")))
+
+  ;; `mix` prints its compilation progress on the same stdout the agent answers on, and so
+  ;; does anything the evaluated code spawns. The session drops what does not decode, which
+  ;; is what lets the agent share a channel with the build that starts it.
+  (test "a line that is not a reply decodes to nil rather than raising"
+    (is (nil? (elixir-sandbox/decode-reply "Compiling 41 files (.ex)")))
+    (is (nil? (elixir-sandbox/decode-reply "")))
+    (is (nil? (elixir-sandbox/decode-reply "[1,2,3]"))))
+
+  (test "the ready banner is the protocol's, so the session recognises it"
+    (assert= (get (elixir-sandbox/decode-reply "{\"ready\":true}") :ready) true))
+
+  ;; The banner says whether the project's APPLICATION is running, which is the difference
+  ;; between a playground where `Repo` works and one where it raises.
+  (test "the banner reports the running application, and nil when there is none"
+    (assert= (elixir-sandbox/app-started? {:ready true :app "moneyclub"}) "moneyclub")
+    (is (nil? (elixir-sandbox/app-started? {:ready true :app nil})))
+    (is (nil? (elixir-sandbox/app-started? {:ready true})))
+    (is (nil? (elixir-sandbox/app-started? {:ready true :app ""})))))
+
+(describe "starting the agent when the application will not"
+  ;; The case a real Phoenix app hit on the first try: `mix run` STARTS the application,
+  ;; and an application is entitled to refuse — a pending migration, a database that is
+  ;; down, a startup task that raises. Retried identically it fails identically, three
+  ;; times, and the session gives up. So the retry is not identical.
+  (test "the first attempt starts the application and a later one does not"
+    (let (root (temp-dir "bedit-elixir-"))
+      (file/mkdir root)
+      (file/spit (path/join (or root "") "mix.exs") "defmodule M.MixProject do\nend\n")
+      (let ([prog0 args0] (elixir-sandbox/agent-argv root 0)
+            [prog1 args1] (elixir-sandbox/agent-argv root 1))
+        (assert= prog0 "mix")
+        (is (not (includes? (into [] args0) "--no-start")))
+        (assert= prog1 "mix")
+        ;; still `mix run`, so the project is compiled and your modules are on the code
+        ;; path — only the supervision tree is missing
+        (is (includes? (into [] args1) "run"))
+        (is (includes? (into [] args1) "--no-start")))))
+
+  (test "outside a mix project there is no application to start, on any attempt"
+    (let (root (temp-dir "bedit-elixir-"))
+      (file/mkdir root)
+      (assert= (first (elixir-sandbox/agent-argv root 0)) "elixir")
+      (assert= (first (elixir-sandbox/agent-argv root 2)) "elixir"))))
+
+;; What happens on a machine that does not have Elixir, and on one whose Elixir is older
+;; than the agent expects. Both are ordinary situations rather than errors, and the only
+;; wrong answer to either is a feature that fails three times and calls itself broken.
+(describe "an Elixir that is missing, or older than the agent wants"
+  (test "a projectless session needs elixir; a mix project needs mix too"
+    ;; separate executables, even though they ship together — and the project paths start
+    ;; `mix`, not `elixir`
+    (let (root (temp-dir "bedit-elixir-"))
+      (file/mkdir root)
+      ;; on this machine both are present, so the guard is silent
+      (is (nil? (elixir-sandbox/missing-tool root)))
+      (file/spit (path/join (or root "") "mix.exs") "defmodule M.MixProject do\nend\n")
+      (is (nil? (elixir-sandbox/missing-tool root)))))
+
+  (test "the version comes from the banner — the one that actually ran"
+    ;; not from `elixir --version`: `mix` may resolve to a different install, and an asdf
+    ;; or mise shim picks a per-project version no PATH lookup here would see
+    (assert= (elixir-sandbox/banner-elixir {:ready true :elixir "1.18.2"}) "1.18.2")
+    (assert= (elixir-sandbox/banner-otp {:ready true :otp "27"}) "27")
+    (is (nil? (elixir-sandbox/banner-elixir {:ready true})))
+    (is (nil? (elixir-sandbox/banner-elixir {:ready true :elixir ""}))))
+
+  (test "below the floor is a sentence, not a failure"
+    ;; the agent still evaluates — `install_dbg` is rescue-guarded so an older Elixir loses
+    ;; the dbg stream rather than the session
+    (is (elixir-sandbox/elixir-too-old? {:elixir "1.12.3"}))
+    (is (not (elixir-sandbox/elixir-too-old? {:elixir "1.14.0"})))
+    (is (not (elixir-sandbox/elixir-too-old? {:elixir "1.18.2"})))
+    ;; 1.9 vs 1.14 — compared numerically, not as text, or every 1.9 would read as newer
+    (is (elixir-sandbox/elixir-too-old? {:elixir "1.9.4"}))
+    ;; an agent that did not say is not evidence that it is old
+    (is (not (elixir-sandbox/elixir-too-old? {:ready true})))
+    (is (includes? (elixir-sandbox/version-notice {:elixir "1.12.3"}) "1.12.3"))
+    (is (nil? (elixir-sandbox/version-notice {:elixir "1.18.2"}))))
+
+  (test "the playground says so when the session that came up is too old"
+    (let (m (model/ed-init (editor/buffer/make-buffer "x"))
+          ;; the buffer has to be live for the ready fold to say anything at all
+          m1 (commands/ed-show-named m "*Elixir Playground*" "" :elixir-playground)
+          m2 (elixir-playground/elixir-playground-ready m1 1 {:ready true :elixir "1.12.3"}))
+      (is (includes? (:echo m2) "older than bedit expects")))))
+
+(describe "where the Elixir agent is started"
+  (test "a directory with mix.exs is a project; one without is a bare session"
+    (let (root (temp-dir "bedit-elixir-"))
+      (file/mkdir root)
+      (is (not (elixir-sandbox/elixir-project? root)))
+      (file/spit (path/join (or root "") "mix.exs") "defmodule M.MixProject do\nend\n")
+      (is (elixir-sandbox/elixir-project? root))))
+
+  ;; The boot budget is the backend's, and it has to be: a cold `mix run` in a Phoenix
+  ;; project compiles the world before the agent prints its first line, where the Brood
+  ;; sandbox's child loads an image in under a second.
+  (test "the Elixir session asks for far longer to boot than a Brood one"
+    (is (> (get elixir-sandbox/*spec* :boot-timeout-ms) 60000))
+    (is (> (get elixir-sandbox/*spec* :boot-timeout-ms) sandbox/*sandbox-boot-timeout-ms*)))
+
+  (test "the agent travels inside the editor, not beside it"
+    ;; `include-str` spliced the .exs in at compile time — a release bundle carries module
+    ;; source and no asset files, so anything else would ship an editor whose Elixir
+    ;; playground could not start.
+    (is (includes? elixir-sandbox/*agent-source* "defmodule Bedit.Agent"))
+    (is (includes? elixir-sandbox/*agent-source* "Bedit.Agent.main(__ENV__)"))))
+
+;; ---- what one reply becomes ------------------------------------------------------------
+;; Shaped exactly as the agent writes them — see `elixir/bedit_agent.exs`.
+
+(defn ok-reply (& overrides)
+  (merge {:id 1
+          :ok true
+          :value "42"
+          :type "Integer"
+          :output ""
+          :ms 0
+          :spy []
+          :procs {:alive 0}}
+    (if (empty? overrides) {} (first overrides))))
+
+(describe "an Elixir reply as a note"
+  (test "a value carries the term's type as its hint"
+    (let (note (elixir-playground/note-of (ok-reply) nil))
+      (assert= (:kind note) :info)
+      (is (includes? (:text note) "=> 42"))
+      ;; the type is the HINT, not part of the answer: it is anchored at the form while the
+      ;; answer sits under it, so a type appearing never moves the value
+      (assert= (:hint note) ": Integer")))
+
+  (test "a struct names itself, because `%User{}` says more than `Map`"
+    (assert= (:hint (elixir-playground/note-of (ok-reply {:type "MyApp.User"}) nil))
+      ": MyApp.User"))
+
+  ;; `2 functions` was a poor version of this. The names and arities tell you whether the
+  ;; clause you just typed landed where you meant it, and what you can call next.
+  (test "a module answers with its name and what it defined"
+    (let (note (elixir-playground/note-of
+                 (ok-reply {:value "Fac" :type "Fac · f/1, g/2"})
+                 nil))
+      (is (includes? (:text note) "=> Fac"))
+      (assert= (:hint note) ": Fac · f/1, g/2")))
+
+  ;; The per-function type information Elixir actually has: a captured named function
+  ;; carries its module, name and arity, and anything compiled to disk — your project, its
+  ;; dependencies, the standard library — carries its declared `@spec` too.
+  (test "a captured function shows its signature"
+    (assert= (:hint (elixir-playground/note-of
+                      (ok-reply {:value "&Enum.map/2"
+                                 :type "Enum.map(t(), (element() -> any())) :: list()"})
+                      nil))
+      ": Enum.map(t(), (element() -> any())) :: list()"))
+
+  (test "what it printed rides the note, which is the half a value alone loses"
+    (is (includes? (:text (elixir-playground/note-of (ok-reply {:output "hello\n"}) nil))
+          "printed: hello")))
+
+  (test "processes left running are reported, and silence when none were"
+    (is (includes? (:text (elixir-playground/note-of (ok-reply {:procs {:alive 2}}) nil))
+          "2 processes still running"))
+    (is (not (includes? (:text (elixir-playground/note-of (ok-reply) nil)) "still running"))))
+
+  (test "a raise is a failure note carrying the exception banner"
+    (let (note (elixir-playground/note-of {:id 1 :ok false :error "** (RuntimeError) boom"} nil))
+      (assert= (:kind note) :fail)
+      (is (:error? note))
+      (is (includes? (:text note) "RuntimeError"))))
+
+  ;; The advice has to name the command that restarts THIS session — `liveeval`'s shared
+  ;; timeout note points at the Brood sandbox's key, which does nothing here.
+  (test "a timeout points at the command that restarts the Elixir session"
+    (let (note (elixir-playground/note-of {:id 1 :ok false :timeout true} nil))
+      (assert= (:kind note) :fail)
+      (is (includes? (:text note) "timed out"))
+      (is (includes? (:text note) "elixir-playground-restart")))))
+
+(describe "an Elixir reply as the pane's report"
+  (test "the cascade the agent traced reads as calls in and values out"
+    (let (body (elixir-playground/report-text
+                 (ok-reply {:value "24"
+                            :spy [{:kind "call" :fn "Fac.f" :args "4"}
+                                   {:kind "call" :fn "Fac.f" :args "3"}
+                                   {:kind "return" :value "6"}
+                                   {:kind "return" :value "24"}]})
+                 nil))
+      (is (includes? body "=> 24"))
+      (is (includes? body "Fac.f 4"))
+      (is (includes? body "= 24"))))
+
+  (test "the type sits beside the value on the report's first line"
+    (let (body (elixir-playground/report-text (ok-reply) nil))
+      (is (includes? (first (string/split body "\n")) "=> 42"))
+      (is (includes? (first (string/split body "\n")) ": Integer"))))
+
+  ;; "traced nothing" and "nothing happened" look identical, and the difference is worth
+  ;; exactly one dim line — `liveeval`'s rule, inherited whole.
+  (test "an evaluation that traced nothing says so, once"
+    (is (includes? (elixir-playground/report-text (ok-reply) nil) liveeval/*untraced-note*)))
+
+  ;; `dbg/2` writes to stdout, so it arrived inside `printed:` — a pipeline's step-by-step
+  ;; trace squeezed onto one line of ghost text beside an `IO.puts` it had nothing to do
+  ;; with. It is pane material: one line per step, and it answers a different question from
+  ;; the cascade (what you ASKED to see, versus everything that happened).
+  (test "dbg output is a section of the pane, not part of the note"
+    (let (reply (ok-reply {:value "12" :dbg "[1, 2, 3] #=> [1, 2, 3]\n|> Enum.sum() #=> 6"})
+          body (elixir-playground/report-text reply nil))
+      (is (includes? body "what dbg showed"))
+      (is (includes? body "|> Enum.sum() #=> 6"))
+      ;; …and it stays out of the ghost text, which has one line to work with
+      (is (not (includes? (:text (elixir-playground/note-of reply nil)) "#=>")))))
+
+  (test "a form that called no dbg gets no dbg section"
+    (is (not (includes? (elixir-playground/report-text (ok-reply) nil) "what dbg showed")))
+    (is (not (includes? (elixir-playground/report-text (ok-reply {:dbg "   "}) nil) "what dbg"))))
+
+  (test "the value line still leads, with its type, above the dbg block"
+    (let (lines (string/split (elixir-playground/report-text (ok-reply {:dbg "x #=> 1"}) nil) "\n"))
+      (is (includes? (first lines) "=> 42"))
+      (is (includes? (first lines) ": Integer")))))
+
+;; ---- the language services ------------------------------------------------------------
+
+(when elixir-grammar?
+  (describe "splitting an Elixir buffer into top-level forms"
+    (test "each top-level expression is one form"
+      (let (text "x = 1\ny = 2\nx + y\n")
+        (assert= (count (elixir-playground/forms-of text)) 3)))
+
+    (test "a whole defmodule is one form, however many defs it holds"
+      (let (text "defmodule Fac do\n  def f(0), do: 1\n  def f(n), do: n * f(n - 1)\nend\n"
+            forms (elixir-playground/forms-of text))
+        (assert= (count forms) 1)
+        (assert= (string/substring text (:start (first forms)) (:end (first forms)))
+          (string/trimr text))))
+
+    ;; A comment evaluated as a form answers `nil`, and `=> nil` stamped on every prose line
+    ;; is both wrong and the most visible thing on screen.
+    (test "comments are not forms"
+      (assert= (count (elixir-playground/forms-of "# just prose\n# more prose\n")) 0)
+      (assert= (count (elixir-playground/forms-of "# a note\n1 + 1\n")) 1)))
+
+  (describe "is this Elixir finished?"
+    (test "a complete expression is ready to send"
+      (assert= (elixir-playground/parse-state "1 + 1") :ok)
+      (assert= (elixir-playground/parse-state "defmodule A do\n  def f, do: 1\nend") :ok))
+
+    ;; The rule the whole feature turns on: a form you are still writing is not a mistake.
+    ;; tree-sitter-elixir repairs an unclosed `do` with an ERROR node rather than a MISSING
+    ;; `end`, so reading the kind alone would put a red ✗ on every `defmodule` the moment
+    ;; its first line was typed.
+    (test "a half-typed defmodule is incomplete, not an error"
+      (assert= (editor/treesit/parse-tag (elixir-playground/parse-state "defmodule Foo do"))
+        :incomplete)
+      (assert= (editor/treesit/parse-tag (elixir-playground/parse-state "Enum.map([1], fn x ->"))
+        :incomplete)
+      (assert= (editor/treesit/parse-tag (elixir-playground/parse-state "x = \"unterminated"))
+        :incomplete))
+
+    (test "an error with good code after it is an error"
+      (assert= (editor/treesit/parse-tag (elixir-playground/parse-state "1 +* 2")) :err))
+
+    (test "blank text is blank, and nothing is sent for it"
+      (assert= (elixir-playground/parse-state "   \n  ") :blank)))
+
+  (describe "what an Elixir form defines and uses"
+    (test "a defmodule defines its alias"
+      (assert= (:defines (elixir-playground/form-deps "defmodule Fac do\n  def f, do: 1\nend"))
+        (list "Fac")))
+
+    (test "a top-level assignment defines its name"
+      (assert= (:defines (elixir-playground/form-deps "x = 41")) (list "x")))
+
+    ;; Elixir's `=` is a pattern MATCH, so one form binds several names. A rule that only
+    ;; looked for a bare name reported that these bound nothing — and a form below using
+    ;; `a` was then never re-run, and sat showing the value from before the edit. Under-
+    ;; matching here is the one failure this mechanism exists to prevent.
+    (test "a destructuring binding defines every name on its left-hand side"
+      (assert= (:defines (elixir-playground/form-deps "{a, b} = {1, 2}")) (list "a" "b"))
+      (assert= (:defines (elixir-playground/form-deps "[h | t] = [1, 2]")) (list "h" "t"))
+      ;; `%{k: v}` over-defines the key as well, which only costs a re-run — the safe way
+      ;; to be wrong
+      (is (includes? (:defines (elixir-playground/form-deps "%{k: v} = %{k: 1}")) "v")))
+
+    (test "a comparison is not an assignment"
+      (assert= (:defines (elixir-playground/form-deps "x == 41")) '())
+      (assert= (:defines (elixir-playground/form-deps "a != b")) '())
+      (assert= (:defines (elixir-playground/form-deps "x <= 3")) '())
+      (assert= (:defines (elixir-playground/form-deps "x >= 3")) '())
+      ;; nor is a regex match, nor a map literal's `=>`
+      (assert= (:defines (elixir-playground/form-deps "s =~ ~r/x/")) '())
+      (assert= (:defines (elixir-playground/form-deps "%{\"a\" => 1}")) '()))
+
+    (test "a form referencing a module depends on it"
+      (is (includes? (:references (elixir-playground/form-deps "Fac.f(5)")) "Fac")))
+
+    ;; Without this, `defmodule Fac` naming `Fac` in its own body would make every module
+    ;; depend on itself and re-run the whole tail on any edit to any of them.
+    (test "a form does not reference what it defines"
+      (let (deps (elixir-playground/form-deps "defmodule Fac do\n  def f, do: Fac\nend"))
+        (is (not (includes? (:references deps) "Fac")))))
+
+    ;; The edges a name-based scan structurally cannot see: the affected forms name nothing
+    ;; that changed, so re-running one of these has to take the whole tail with it.
+    (test "import / alias / require / use change what names mean below them"
+      (is (elixir-playground/namespace-form? "import Enum"))
+      (is (elixir-playground/namespace-form? "alias MyApp.Accounts"))
+      (is (elixir-playground/namespace-form? "require Logger"))
+      (is (elixir-playground/namespace-form? "use GenServer"))
+      (is (not (elixir-playground/namespace-form? "Enum.map([1], & &1)"))))
+
+    ;; `playground-core/launch-plan` falls back to the suffix rule unless the deps line up
+    ;; with the forms one-for-one, so this is the difference between re-running the form you
+    ;; touched and re-running everything below it.
+    (test "deps line up one-for-one with the forms"
+      (let (text "defmodule A do\nend\nx = 1\nA.f(x)\n")
+        (assert= (count (elixir-playground/deps-of text))
+          (count (elixir-playground/forms-of text))))))
+
+  (describe "the launch plan over Elixir"
+    ;; The payoff of the dependency rule: editing a module re-runs what calls it, and
+    ;; editing a call re-runs nothing else — where the old suffix rule re-ran the tail.
+    (defn plan (before after)
+      (let (srcs-of (fn (t)
+                      (playground-core/form-srcs-in t (elixir-playground/forms-of t)))
+            after-srcs (srcs-of after)
+            total (count (elixir-playground/forms-of after))
+            evaluated (fold (srcs-of before)
+                        {}
+                        (fn (acc kv)
+                          (let ([i src] kv)
+                            (assoc acc
+                              i {:src src :deps (elixir-playground/form-deps src)}))))
+            realigned (playground-core/realign-evaluated after-srcs evaluated total))
+        (playground-core/launch-plan elixir-playground/*spec*
+          after-srcs
+          realigned
+          (elixir-playground/deps-of after)
+          total)))
+
+    (test "nothing changed, nothing re-sent"
+      (assert= (plan "x = 1\ny = 2\n" "x = 1\ny = 2\n") '()))
+
+    (test "editing a call re-runs that form alone"
+      (assert= (plan "defmodule A do\nend\nA.f(1)\n" "defmodule A do\nend\nA.f(2)\n") (list 1)))
+
+    ;; The end-to-end shape of the bug the left-hand-side rule fixes: without it this plan
+    ;; was `(0)` and the sum below kept showing the old answer.
+    (test "editing a destructuring binding re-runs what uses the names it bound"
+      (assert= (plan "{a, b} = {1, 2}\na + b\n" "{a, b} = {10, 20}\na + b\n") (list 0 1)))
+
+    (test "editing a module re-runs what calls it"
+      (assert= (plan "defmodule A do\n  def f(x), do: x\nend\nA.f(1)\n"
+                 "defmodule A do\n  def f(x), do: x * 2\nend\nA.f(1)\n")
+        (list 0 1)))
+
+    (test "an import takes the whole tail with it"
+      (assert= (plan "import Enum\nmap([1], & &1)\ncount([1])\n"
+                 "import List\nmap([1], & &1)\ncount([1])\n")
+        (list 0 1 2)))))
+
+;; ---- the model plumbing, which needs neither grammar nor Elixir ------------------------
+
+(describe "the Elixir playground in the model"
+  (test "it is a live-eval client, with its own debounce timer"
+    (let (timers (map model/*live-eval-clients* :timer))
+      (is (includes? timers :elixir-playground-eval))
+      ;; its OWN timer: two playgrounds sharing one would have each other's edits arming
+      ;; and re-arming a single debounce
+      (assert= (count (into #{} timers)) (count timers))))
+
+  (test "it is registered against the Elixir session, not the Brood one"
+    (let (client (seq/find sandbox-events/*clients*
+                   (fn (c) (includes? (->string (get c :reply)) "elixir"))))
+      (is (not (nil? client)))
+      (assert= (get client :session) :elixir-sandbox)))
+
+  (test "its buffer and pane are its own"
+    (is (not (= elixir-playground/*buffer-name* playground/*buffer-name*)))
+    (is (not (= elixir-playground/*spy-buffer-name* playground/*spy-buffer-name*)))
+    (is (not (= (get elixir-playground/*spec* :key) (get playground/*spec* :key)))))
+
+  ;; An Elixir session IS a child process, so there is nothing to fall back to when the
+  ;; editor is headless — where Brood can evaluate Brood in its own image.
+  (test "it declares no in-image path, and the Brood playground does"
+    (is (nil? (get elixir-playground/*spec* :in-image)))
+    (is (not (nil? (get playground/*spec* :in-image)))))
+
+  (test "a command that cannot start a session says so instead of opening a dead buffer"
+    ;; nothing is asserted about WHICH sentence — only that a refusal is a message and not
+    ;; an empty buffer with no results and no explanation
+    (let (m (m-of ""))
+      (is (string? (:echo (elixir-playground/cmd-elixir-playground m :none))))))
+
+  (test "a reply for an id nobody sent leaves the model alone"
+    (let (m (m-of ""))
+      (assert= (elixir-playground/elixir-playground-reply m {:id 999 :ok true :value "1"} 1) m))))
+
+;; ---- the live round trip -----------------------------------------------------------------
+;; One isolated test through the whole stack: `evalsession` supervising a real `os/spawn`ed
+;; BEAM node running the agent, the base64 line protocol in both directions, and the four
+;; things the playground actually depends on — a value, a captured print, a session that
+;; remembers, and the trace cascade the pane paints.
+;;
+;; Barriers, never sleeps: every step waits on the event it is expecting. Skipped when there
+;; is no `elixir` on PATH, because a suite cannot install one.
+
+(defn ep-await-ready ()
+  (receive
+    ((record session/session-ready {}) :ready)
+    (after 60000 :timed-out)))
+
+(defn ep-await-reply (id)
+  (receive
+    ((record session/session-reply {:reply r}) :when
+      (= (get r :id) id)
+      r)
+    (after 60000 nil)))
+
+(when (elixir-sandbox/elixir-available?)
+  (describe "Elixir session live round-trip"
+    :isolated (test "spawn → ready → eval → print → session persists → trace → shutdown"
+      (let (_ (proc/register :editor (self))
+            ;; projectless: a bare `elixir` session starts in under a second, where a mix
+            ;; project would compile first. What is under test is the protocol, not mix.
+            _ (elixir-sandbox/elixir-start "/tmp"))
+        (assert= (ep-await-ready) :ready)
+        ;; a value, its type, and what it printed — the three halves of the note
+        (elixir-sandbox/elixir-eval 1 "IO.puts(\"out\"); 40 + 2" 10000)
+        (let (r (ep-await-reply 1))
+          (assert= (get r :ok) true)
+          (assert= (get r :value) "42")
+          (assert= (get r :type) "Integer")
+          (assert= (get r :output) "out\n"))
+        ;; the session remembers: a binding from one request serves the next
+        (elixir-sandbox/elixir-eval 2 "ep_live = 21" 10000)
+        (ep-await-reply 2)
+        (elixir-sandbox/elixir-eval 3 "ep_live * 2" 10000)
+        (assert= (get (ep-await-reply 3) :value) "42")
+        ;; and a module defined in one request is callable in the next — which only works
+        ;; because the agent evaluates against the SCRIPT's env and not its own module's
+        (elixir-sandbox/elixir-eval 4
+          "defmodule EpFac do\n  def f(0), do: 1\n  def f(n), do: n * f(n - 1)\nend"
+          10000)
+        (assert= (get (ep-await-reply 4) :value) "EpFac")
+        ;; the cascade the pane shows: every call and return, for the modules this session
+        ;; defined and nothing else
+        ;;
+        ;; The count is EXACT on purpose. `f(4)` recurses to `f(0)`, so it is five calls
+        ;; and five returns, and asserting "at least eight" is what let a real race hide:
+        ;; `:erlang.trace/3` returning only means nothing FURTHER will be traced, and the
+        ;; messages already emitted are still in flight — so the collector was regularly
+        ;; dumping before the last returns arrived, and the cascade just stopped partway.
+        ;; The agent waits on `:erlang.trace_delivered/1` now; this is what holds it to it.
+        (elixir-sandbox/elixir-eval 5 "EpFac.f(4)" 10000)
+        (let (r (ep-await-reply 5))
+          (assert= (get r :value) "24")
+          (assert= (count (get r :spy)) 10)
+          (assert= (count (seq/filter (get r :spy) (fn (e) (= (get e :kind) "call")))) 5)
+          (assert= (count (seq/filter (get r :spy) (fn (e) (= (get e :kind) "return")))) 5)
+          ;; and it is the SESSION's module being traced, not the whole VM
+          (is (every? (seq/filter (get r :spy) (fn (e) (= (get e :kind) "call")))
+                (fn (e) (= (get e :fn) "EpFac.f")))))
+        ;; a raise is answered, not fatal: the session is still there afterwards
+        (elixir-sandbox/elixir-eval 6 "raise \"boom\"" 10000)
+        (let (r (ep-await-reply 6))
+          (assert= (get r :ok) false)
+          (is (includes? (get r :error) "RuntimeError")))
+        (elixir-sandbox/elixir-eval 7 "1 + 1" 10000)
+        (assert= (get (ep-await-reply 7) :value) "2")
+        ;; an evaluation that will not stop is killed in the child and answered
+        (elixir-sandbox/elixir-eval 8 ":timer.sleep(30_000)" 500)
+        (is (get (ep-await-reply 8) :timeout))
+        ;; and the agent survives being asked to do that
+        (elixir-sandbox/elixir-eval 9 "3 + 4" 10000)
+        (assert= (get (ep-await-reply 9) :value) "7")
+        (elixir-sandbox/elixir-shutdown)))))
+
+;; ---- the agent's own hardening ------------------------------------------------------
+;; Each of these was found by feeding the agent things a playground buffer can legitimately
+;; contain, and each one was wrong.
+
+(when (elixir-sandbox/elixir-available?)
+  (describe "the agent under hostile input"
+    :isolated (test "capture, tracing and typing all survive what a buffer can contain"
+      (let (_ (proc/register :editor (self))
+            _ (elixir-sandbox/elixir-start "/tmp")
+            _ (receive
+                ((record session/session-ready {}) :ready)
+                (after 60000 :timed-out))
+            ask (fn (id src)
+                  (do
+                    (elixir-sandbox/elixir-eval id src 15000)
+                    (receive
+                      ((record session/session-reply {:reply r}) :when
+                        (= (get r :id) id)
+                        r)
+                      (after 30000 nil)))))
+        ;; A forged reply line cannot impersonate the protocol: the capture takes it, so it
+        ;; is DATA on the real reply rather than a second reply.
+        (let (r (ask 1 "IO.puts(~s|{\"id\":1,\"ok\":true,\"value\":\"FORGED\"}|); :real"))
+          (assert= (get r :value) ":real")
+          (is (includes? (get r :output) "FORGED")))
+
+        ;; BOTH modules of a two-module form are traced. `Code.eval_string` answers with the
+        ;; LAST one, so reading the return value tracked `Bee` and not `Ay` — and the
+        ;; cascade showed the inner call while silently omitting the outer, which is worse
+        ;; than showing nothing.
+        (ask 2 "defmodule TAy do\n  def go, do: TBee.go()\nend\ndefmodule TBee do\n  def go, do: :ok\nend")
+        (let (r (ask 3 "TAy.go()")
+              called (into #{} (seq/keep (get r :spy) (fn (e) (get e :fn)))))
+          (is (contains? called "TAy.go"))
+          (is (contains? called "TBee.go")))
+
+        ;; …and nothing ELSE is traced. Diffing loaded modules alone caught every module the
+        ;; VM lazily loads — `survivor = :yes` pulls in `List.Chars` — so a one-line form's
+        ;; cascade opened with protocol implementations instead of the call you asked about.
+        (let (r (ask 4 "survivor = :yes"))
+          (is (empty? (get r :spy))))
+
+        ;; A process the code spawns keeps working after its evaluation ends. With a capture
+        ;; device closed per evaluation, its next `IO.puts` raised `:terminated` and killed
+        ;; it — a plain `spawn` in a buffer died 300ms later for a reason having nothing to
+        ;; do with the code.
+        (ask 5 "spawn(fn -> :timer.sleep(200); IO.puts(\"late\") end); :spawned")
+        (let (r (ask 6 ":timer.sleep(600); :alive"))
+          (assert= (get r :value) ":alive")
+          (is (includes? (get r :output) "late")))
+
+        ;; Every Elixir string is a binary and not every binary is a string.
+        (assert= (get (ask 7 "<<0, 1, 2, 255>>") :type) "Binary")
+        (assert= (get (ask 8 "\"hi\"") :type) "String")
+
+        ;; dbg on its own stream, and a signature for a captured function
+        (let (r (ask 9 "[1, 2] |> Enum.sum() |> dbg()"))
+          (assert= (get r :output) "")
+          (is (includes? (get r :dbg) "#=>"))
+          ;; the `[file:line: context]` header names the agent's temp script — dropped
+          (is (not (includes? (get r :dbg) ".exs"))))
+        (is (includes? (get (ask 10 "&Enum.map/2") :type) "Enum.map("))
+        (assert= (get (ask 11 "fn a, b -> a + b end") :type) "fn/2")
+        (let (r (ask 12 "defmodule TShape do\n  def area(r), do: r\n  defp hush, do: :x\n  def uses, do: hush()\nend"))
+          (is (includes? (get r :type) "area/1"))
+          ;; a private function is not part of the module's surface
+          (is (not (includes? (get r :type) "hush"))))
+
+        ;; and the session is still the same session after all of it
+        (assert= (get (ask 13 "survivor") :value) ":yes")
+        (elixir-sandbox/elixir-shutdown)))))

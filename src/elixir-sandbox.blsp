@@ -1,0 +1,306 @@
+(defmodule elixir-sandbox
+  "The **Elixir side of the editor** — a live BEAM node bedit owns.
+
+One `os/spawn`ed child running `elixir/bedit_agent.exs`, supervised by
+`std/editor/evalsession` (the same worker that supervises the Brood sandbox: queue
+until ready, id-matched replies, a watchdog, generations, strikes, respawn). This
+module is only the BACKEND — how to start that child, how to put a request on its
+wire, how to take a reply off it, and how to turn an event into something the `ui-run`
+loop folds.
+
+**It boots inside your project.** In a directory with a `mix.exs` the child is started
+with `mix run`, so the project is compiled and the application is STARTED before the
+first request is read: `Accounts.list_users()` and `Repo.aggregate(Post, :count)` mean
+in the playground what they mean in `iex -S mix`. Outside a mix project it is a plain
+`elixir` session — a language scratchpad with nothing on the path.
+
+That choice is why the boot budget here is minutes rather than the Brood sandbox's
+twenty seconds: a cold Phoenix compile dwarfs it, and a watchdog that gave up during a
+first compile would make the feature unusable in exactly the projects it is for. It is
+also why a client tracks readiness for itself, off the `elixir-ready-event`: until that
+lands the editor should say \"compiling your project…\" rather than leave a buffer
+looking broken.
+
+**The wire is not Brood's.** The Brood sandbox and its child are both Brood, so they
+`pr-str` maps at each other and the reader is the parser. Here the peer is foreign, so
+requests go out as `VERB id timeout base64-payload` — base64 because an Elixir program
+is full of newlines and quotes, and framing that cannot be confused by its own payload
+is worth one encode — and replies come back as one JSON object per line. `eval-server`'s
+own preamble names this as the case where framing earns its keep.
+
+**The agent travels as a string.** `elixir/bedit_agent.exs` is an ordinary Elixir file —
+`mix format` and `elixir` can both read it — spliced in here by `include-str` at compile
+time, because a release bundle carries module source and no asset files (ADR-038). See
+that form's docstring in `std/prelude/control.blsp`.")
+;; No imports: this module is spoken to by its clients and speaks only to `evalsession`
+;; and the kernel. `editor/evalsession`, `encoding` and `json` are referenced qualified
+;; below — each `mod/name` auto-loads its module.
+
+;; The events are `session`'s, carrying the name below — this module is consumer-blind,
+;; and `sandbox-events` routes. What rides the ready banner here and not on the Brood
+;; sandbox's is whether the project's APPLICATION started, and which Elixir is running:
+;; facts only the child can know (see [[app-started?]] and [[banner-elixir]]).
+(def *session* :elixir-sandbox) ; the registered name of the worker process
+
+;; The agent program, spliced in at compile time — see the module docstring.
+(def *agent-source* (include-str "elixir/bedit_agent.exs"))
+
+;; Minted once per editor process (`path/temp` — random, unguessable). NOT a fixed name:
+;; that is one file two editors fight over, and a path anyone on the machine can create
+;; first as a symlink, so this `spit` would overwrite their choice of file with our
+;; privileges and then hand it to `elixir` to run. The Brood sandbox mints its script the
+;; same way and for the same reason.
+(def *agent-path* (str (path/temp "bedit-elixir-agent-") ".exs"))
+
+;; A cold `mix run` in a Phoenix project compiles the world before the agent's first
+;; line of output. Three minutes is generous rather than tuned: the cost of being wrong
+;; high is a wedged child noticed late, and the cost of being wrong low is the feature
+;; declaring a healthy project dead every time someone opens it on a clean checkout.
+(def *elixir-boot-timeout-ms* 180000)
+
+;; Past this an evaluation is killed in the child and answered `{:timeout true}`. Longer
+;; than the Brood playground's 5s because a first call into a mix project can pay for
+;; lazy loading, an Ecto connection, an ETS warm-up — none of which is the code's fault.
+(def *elixir-default-timeout-ms* 15000)
+
+(def *mix-marker* "mix.exs")
+
+(defn elixir-project? (root)
+  "Is `root` a mix project — does the agent get the project's modules and a started
+application, or a bare language session?"
+  (and root (file/exists? (path/join root *mix-marker*))))
+
+(defn elixir-available? ()
+  "Is there an Elixir on PATH to be the child at all? What a command checks before
+opening a buffer that could never evaluate anything, so the answer is a sentence in the
+echo area rather than three silent strikes and a dead session."
+  (not (nil? (os/which "elixir"))))
+
+(defn mix-available? ()
+  "Is `mix` on PATH? Checked separately from [[elixir-available?]] because the project
+paths — the playground in a mix project, and the whole test session — start `mix` and not
+`elixir`, and the two are separate executables even though they ship together."
+  (not (nil? (os/which "mix"))))
+
+(defn missing-tool (root)
+  "The sentence to show instead of starting a session, when the tool it would need is not
+on PATH — or nil when it is all there.
+
+Both are checked because both are used: a projectless session is started with `elixir` and
+a mix project's with `mix`, and they are separate executables. The point of asking here is
+that the alternative is the session's own failure path — a child that cannot spawn, three
+strikes, and a feature that reads as broken rather than as not installed."
+  (cond
+    (not (elixir-available?)) "no `elixir` on PATH — bedit's Elixir features need one"
+    (and (elixir-project? root) (not (mix-available?)))
+      "no `mix` on PATH — a session inside a mix project is started with it"
+    else nil))
+
+;; ---- what this agent needs of the Elixir it lands in -----------------------------
+
+(def *minimum-elixir* "1.14.0")
+;; The floor, and it is a real one rather than a guess. 1.14 is where `dbg/2` and the
+;; `:dbg_callback` hook arrive, which is what routes a `dbg` pipeline into the spy pane
+;; instead of into `printed:`; the rest of the agent reaches back to about 1.12
+;; (`String.slice/2` with a stepped range, `Code.put_compiler_option/2`). Below the floor
+;; the session still runs and still evaluates — `install_dbg` is rescue-guarded precisely
+;; so an older Elixir loses the dbg stream rather than the agent — and a reader is told
+;; once, which is the difference between a missing feature and a broken editor.
+
+(defn banner-elixir (banner)
+  "The Elixir version the agent actually booted under, from its ready `banner`, or nil for
+an older agent that did not say.
+
+From the banner rather than from `elixir --version`, because the version that matters is
+the one that ran: `mix` can resolve to a different install than `elixir`, and an asdf or
+mise shim picks a per-project version that no PATH lookup here would see."
+  (let (v (get banner :elixir)) (when (and (string? v) (not (= v ""))) v)))
+
+(defn banner-otp (banner)
+  "The OTP release the agent booted under (`\"27\"`), or nil."
+  (let (v (get banner :otp)) (when (and (string? v) (not (= v ""))) v)))
+
+(defn elixir-too-old? (banner)
+  "Whether the agent's Elixir is below [[*minimum-elixir*]] — the one thing worth saying out
+loud about a session that came up. Nil version answers false: an agent that did not say is
+not evidence that it is old."
+  (let (v (banner-elixir banner))
+    (and v (< (version/compare v *minimum-elixir*) 0))))
+
+(defn version-notice (banner)
+  "The one sentence to show a reader whose Elixir is below the floor, or nil when there is
+nothing to say."
+  (when (elixir-too-old? banner)
+    (str "elixir " (banner-elixir banner) " is older than bedit expects (" *minimum-elixir*
+      ") — dbg output will not appear in the pane")))
+
+;; ---- spawning the child ---------------------------------------------------------
+
+(defn agent-argv (root attempt)
+  "The program and arguments that start the agent in `root`, on this `attempt`.
+
+`mix run <script>` rather than `elixir <script>`: it compiles the project and STARTS the
+application first, which is the difference between a scratchpad and a session inside your
+app. `--no-halt` is deliberately absent — the script blocks on stdin and is the thing
+keeping the VM up, so mix has nothing to wait for.
+
+**A later attempt adds `--no-start`, and that is the important part.** Starting the
+application runs your `Application.start/2`, and an application can legitimately refuse to
+start: a pending migration, a database that is down, a startup task that raises. When it
+does, the agent never gets to run at all — and retrying the same way just fails again,
+three times, until the session gives up. A Phoenix app with a column missing from its dev
+database took the whole playground down that way.
+
+So the first attempt is optimistic and every one after it is not. `--no-start` still
+compiles the project and puts your modules and dependencies on the code path — you can
+call your own functions, just not the ones that need a supervision tree — which is a
+usable playground where a dead session is nothing at all. [[app-started?]] is how a reader
+finds out which of the two they got."
+  (cond
+    (not (elixir-project? root)) ["elixir" [*agent-path*]]
+    (= attempt 0) ["mix" ["run" *agent-path*]]
+    else ["mix" ["run" "--no-start" *agent-path*]]))
+
+(defn spawn-child (root &optional (attempt 0))
+  "`evalsession`'s `:spawn` hook: write the agent out and start it in `root`. nil when it
+cannot be started — no Elixir on PATH, an unwritable script path — which the session
+turns into a `:spawn-failed` event rather than a crashed worker."
+  ;; check-allow :discarded-catch — every failure here is "no child", which is the contract
+  (check-allow :discarded-catch
+    (try
+      (do
+        (file/spit *agent-path* *agent-source*)
+        (let ([prog args] (agent-argv root attempt))
+          (os/spawn prog args {:cwd (or root "/tmp")})))
+      (catch e
+        (do (log/warn (str "elixir-sandbox: could not start the agent: " (error-message e))) nil)))))
+
+;; ---- the wire --------------------------------------------------------------------
+
+(defn encode-request (id timeout-ms payload)
+  "`evalsession`'s `:encode` hook — one request line, `VERB id timeout base64-payload`.
+
+`payload` is `{:verb :src}`; the source is base64'd because it is arbitrary Elixir,
+which means newlines, quotes and backslashes, and a framing that its own content can
+break is a framing that will be broken by the first heredoc anybody types."
+  (str (or (:verb payload) "EVAL")
+    " "
+    id
+    " "
+    (or timeout-ms *elixir-default-timeout-ms*)
+    " "
+    (encoding/base64-encode (or (:src payload) ""))))
+
+(defn decode-reply (line)
+  "`evalsession`'s `:decode` hook — the JSON object in `line`, with its keys as keywords,
+or nil for a line that is not one.
+
+Nil is the common case and not an error: `mix` prints its compilation progress on the
+same stdout, and so does anything the evaluated code spawns. The session drops what does
+not decode, which is what lets the agent share a channel with the build that starts it."
+  ;; check-allow :discarded-catch — a non-JSON line is the documented nil case
+  (check-allow :discarded-catch
+    (try
+      (let (v (json/decode line)) (if (map? v) v nil))
+      (catch _ nil))))
+
+(defn emit (sink kind payload gen name)
+  "`evalsession`'s `:emit` hook — [[session/emit-after-script]] over this backend's agent."
+  (session/emit-after-script *agent-path* sink kind payload gen name))
+
+(def *spec*
+  {:spawn 'elixir-sandbox/spawn-child
+   :encode 'elixir-sandbox/encode-request
+   :decode 'elixir-sandbox/decode-reply
+   :emit 'elixir-sandbox/emit
+   :boot-timeout-ms elixir-sandbox/*elixir-boot-timeout-ms*
+   :default-timeout-ms elixir-sandbox/*elixir-default-timeout-ms*})
+
+;; ---- the client API ---------------------------------------------------------------
+;; Thin over `evalsession`, and thin on purpose: what these add is the session NAME, so
+;; no caller has to know it, and the two sandboxes cannot be confused for one another.
+
+(defn elixir-running? ()
+  "Is the Elixir session's worker alive?"
+  (session/running? *session*))
+
+(defn elixir-start (&optional (root nil) (sink nil))
+  "Ensure the Elixir session is up, its agent rooted in `root` — a mix project root, whose
+application it then compiles and starts. Idempotent; a session already running elsewhere
+is re-rooted. Answers its pid.
+
+Call it as early as a feature knows it will want one: in a real project this spends tens
+of seconds compiling, and all of that can happen while the reader is still reading."
+  (session/start *session* *spec* root sink))
+
+(defn elixir-eval (id src timeout-ms)
+  "Fire-and-forget: evaluate `src` in the session. The reply arrives on the editor
+mailbox as an `elixir-reply-event` carrying `:id id`, and is queued rather than lost
+while the agent is still booting.
+
+Answers whether the request was ACCEPTED. False means the session is not running and no
+reply for this id will ever arrive — which the caller must not record as in flight, or
+the form it belongs to waits forever on an answer that is not coming and, being already
+\"in flight\", is never re-sent either."
+  (session/request *session* id (or timeout-ms *elixir-default-timeout-ms*) {:verb "EVAL" :src src}))
+
+(defn app-started? (banner)
+  "The name of the project's application when the agent's `banner` says it is running, else
+nil — for a projectless session, and for one where the application refused to start and the
+retry came up `--no-start`.
+
+The difference is worth telling a reader about: with the application up, `Repo` queries and
+GenServer calls work and the playground is your app; without it, your modules are loadable
+and nothing is supervised. Only the child can answer it, so it rides the banner."
+  (let (app (get banner :app)) (when (and (string? app) (not (= app ""))) app)))
+
+(defn elixir-observe (id what)
+  "Ask the agent what is running in the node — `what` is `\"processes\"` today. The reply
+arrives like any other, as an `elixir-reply-event` carrying `:id id`, so an observation and
+an evaluation queue behind the same child and can never be confused for one another.
+
+Deliberately the same session as the playground's, and not a second child: the point of
+observing from inside the node is that it is YOUR node, with your application started and
+your processes in it. A separate agent would be watching a different VM."
+  (session/request *session* id 10000 {:verb "OBSERVE" :src what}))
+
+;; ---- attaching the session to somebody else's node ------------------------------
+
+(def *cookie-path* (path/join (or (os/env "HOME") "") ".erlang.cookie"))
+
+(defn default-cookie ()
+  "The cookie in `~/.erlang.cookie`, or nil. OFFERED as the default when attaching and
+never used silently: a cookie is a credential, and reading one out of the filesystem on the
+reader's behalf without their saying so is the kind of convenience that turns into a
+surprise about which machine bedit just connected to."
+  ;; check-allow :discarded-catch — no file, no permission, and no cookie are one answer
+  (check-allow :discarded-catch
+    (try
+      (when (file/exists? *cookie-path*)
+        (let (s (string/trim (file/slurp *cookie-path*))) (when (not (= s "")) s)))
+      (catch _ nil))))
+
+(defn elixir-attach (id node cookie)
+  "Point the session at `node` — `Node.connect/1`, with `cookie`. Every `EVAL` and
+`OBSERVE` after it is routed there with `:erpc`, so the playground and the process list are
+about THAT VM.
+
+Answers whether the request was accepted. The reply carries `:node` on success and
+`:error` on failure, and the editor must show which: an attach that silently did not happen
+would leave you evaluating locally while believing you were not, which is the one failure
+mode this feature must never have."
+  (session/request *session* id 20000 {:verb "ATTACH" :src (str cookie "\n" node)}))
+
+(defn elixir-detach (id)
+  "Route the session back to its own node."
+  (session/request *session* id 10000 {:verb "DETACH" :src ""}))
+
+(defn elixir-reset ()
+  "Restart the session: a fresh VM, an empty binding, no modules. In a mix project this
+recompiles, so it is a real pause — which is why it is a command someone asks for and
+never something the editor does on its own."
+  (session/reset *session*))
+
+(defn elixir-shutdown ()
+  "Kill the agent and stop the worker. A no-op when it is not running."
+  (session/shutdown *session*))
