@@ -1,0 +1,152 @@
+;; The Elixir playground, end to end — every layer above the frontend.
+;;
+;; `nest test` covers the model with synthetic replies: it can prove what a reply BECOMES,
+;; but not that one ever arrives. This runs the real thing — the real `M-x` command against
+;; a real model, a real BEAM node started by `elixir-sandbox`, the real launch over a real
+;; tree-sitter parse, the real events folded through the real `UiEvent` impls — and then
+;; asserts on the FRAME the view paints. The only thing it does not exercise is the
+;; terminal, which `tools/drive_playground.py` already covers for the playground shape.
+;;
+;;     nest run tools/drive-elixir.blsp
+;;
+;; It exists because everything interesting about this feature happens between processes.
+;; Each of these steps is fine in isolation and the chain is what breaks: a command that
+;; opens a buffer whose mode cannot parse it, a launch that sends nothing because the
+;; session is not ready, a reply that lands on the wrong form, a note stamped where the
+;; view does not look for it.
+
+(require-one 'project)
+(project/load-config)
+(let (root (project/find-root (file/cwd)))
+  (when root
+    (project/setup root)
+    (project/load-sources root)))
+
+;; The editor process the session's events are sent to. Without this the agent answers into
+;; the void and every form sits on `⋯ evaluating…` forever.
+(proc/register :editor (self))
+(theme/apply-syntax-theme!)
+(modes/load-user-grammars)
+
+(def *rows* 40)
+(def *cols* 140)
+
+(def *failures* (%table))
+
+(defn- check (ok label)
+  (do
+    (io/puts (str (if ok "ok:   " "FAIL: ") label))
+    (when (not ok) (%table-put *failures* :n (inc (%table-get *failures* :n 0))))
+    ok))
+
+;; ---- what the view actually paints -------------------------------------------------
+;; Asserting on the MODEL would pass over a note the renderer never draws, which is half
+;; the bugs a driver exists to catch. `ed-view` is the same function the window calls.
+
+(defn- frame-text (m)
+  "Every string the rendered frame contains, joined — what a reader would see."
+  (string/join (map (seq/filter (view/ed-view m *cols* *rows*) (fn (op) (= (first op) :text)))
+                 (fn (op) (nth op 3 "")))
+    "\n"))
+
+(defn- painted? (m needle) (includes? (frame-text m) needle))
+
+;; ---- driving the loop --------------------------------------------------------------
+
+(defn- drain (m)
+  "Fold every `UiEvent` record now in the mailbox — a session reply, a ready banner — the
+way `ui-run`'s poll does: hand it to `ed-update`, which is where the loop dispatches one."
+  (letrec (go (fn (acc)
+                (let (r (receive (x :when (record? x) x) (after 0 nil)))
+                  (if (nil? r) acc (go (input/ed-update acc r *cols* *rows*))))))
+    (go m)))
+
+(defn- await (m label needle budget-ms)
+  "Pump timers and events until `needle` is painted, or `budget-ms` runs out. Reports how
+long it took, because the number is the point for anything that starts a BEAM node."
+  (let (t0 (os/now))
+    (letrec (go (fn (acc)
+                  (let (acc (drain acc))
+                    (cond
+                      (painted? acc needle)
+                        (do
+                          (check true (str label " (" (- (os/now) t0) "ms)"))
+                          acc)
+                      (> (- (os/now) t0) budget-ms)
+                        (do (check false (str label " — timed out after " budget-ms "ms")) acc)
+                      ;; keep the timers turning while waiting: a reply that lands has to be
+                      ;; re-anchored and re-launched before it is on screen
+                      else (go (settle acc 200))))))
+      (go m))))
+
+(defn- type-text (m text)
+  "Type `text` a key at a time, through the real input fold — so the edit takes the path a
+keystroke takes, markers and all."
+  (fold (string/->list text) m (fn (acc k) (input/ed-update acc k *cols* *rows*))))
+
+(defn- settle (m ms)
+  "Let the debounce fire, then drain whatever it produced.
+
+The launch is on an idle TIMER, and `ui-run` fires one by handing the loop a `[:timer
+name]` input (ADR-102) — so a driver that only waits evaluates nothing at all, which is
+exactly what this file caught the first time it ran. The timers the model has armed are
+read off `:timers` and fired the way the loop fires them, so the debounce, the re-anchor
+and the blink beat all take their real path."
+  (let (deadline (+ (os/now) ms))
+    (letrec (go (fn (acc)
+                  (if (> (os/now) deadline)
+                    acc
+                    (let (armed (keys (or (:timers acc) {}))
+                          fired (fold armed
+                                  acc
+                                  (fn (a name) (input/ed-update a [:timer name] *cols* *rows*))))
+                      (do (sleep 80) (go (drain fired)))))))
+      (go m))))
+
+;; ---- the run -------------------------------------------------------------------------
+
+(let (m0 (assoc (model/ed-init (editor/buffer/make-buffer "" "*scratch*")) :recent-files true))
+  (if (not (elixir-sandbox/elixir-available?))
+    (io/puts "skipped: no `elixir` on PATH")
+    (let (
+          ;; 1. the command opens the buffer and its pane — pure model work, and the only
+          ;;    part that should be instant
+          m1 (elixir-playground/cmd-elixir-playground m0 :none)
+          _ (check (painted? m1 "Elixir Playground") "the playground buffer is on screen")
+          _ (check (painted? m1 "What ran") "the spy pane is beside it")
+          ;; 2. the welcome buffer's own `1 + 1` evaluates against a real agent. This is the
+          ;;    whole chain: idle timer → launch → tree-sitter form split → base64 request →
+          ;;    `mix run`/`elixir` child → JSON reply → UiEvent → note → view.
+          m2 (settle m1 2000)
+          m3 (await m2 "a result comes back from the real session" "=> 2" 90000)
+          ;; the type hint is the agent's, not the checker's — only a real reply carries it
+          _ (check (painted? m3 ": Integer") "the term's type is painted beside the value")
+          ;; 3. a module defined in the buffer is callable below it, and the cascade of that
+          ;;    call reaches the pane. Nothing but a live session can produce either.
+          ;;
+          ;;    The call is typed WITHOUT a trailing newline, deliberately: the pane follows
+          ;;    the form the cursor is IN, and a newline puts point past the call's extent,
+          ;;    where there is no form and so nothing to show. That is the pane behaving
+          ;;    correctly, and the first version of this driver asserted against it.
+          m4 (type-text m3 "\ndefmodule DrvFac do\n  def f(0), do: 1\n  def f(n), do: n * f(n - 1)\nend\n")
+          m5 (type-text (settle m4 2000) "DrvFac.f(4)")
+          m6 (await (settle m5 2000) "a module defined above is callable below" "=> 24" 60000)
+          _ (check (painted? m6 "DrvFac")
+              "the module's own name is the answer, not its BEAM binary")
+          m7 (await m6 "the pane shows the traced cascade" "DrvFac.f" 30000)
+          _ (check (painted? m7 "= 24") "…with the values coming back out")
+          ;; 4. a form someone is still typing is dim and pending, never a verdict. Which
+          ;;    reason the grammar gives — `unclosed do` before the newline, `missing end`
+          ;;    after it — is the grammar's business; that it is PENDING is the contract.
+          m8 (settle (type-text m7 "\ndefmodule Half do") 2500)
+          _ (check (or (painted? m8 "unclosed") (painted? m8 "missing"))
+              "a half-typed defmodule reads as unfinished")
+          _ (check (not (painted? m8 "✗ unclosed")) "…in the pending voice, not as an error"))
+      (elixir-sandbox/elixir-shutdown)
+      (sleep 200)
+      (io/puts "")
+      ;; A raise rather than a status code: `nest run` reports an uncaught error as a
+      ;; non-zero exit, which is what a `make` target needs, and it prints the count.
+      (if (= (%table-get *failures* :n 0) 0)
+        (io/puts "all live Elixir playground checks passed")
+        (error "drive-elixir: " (%table-get *failures* :n 0) " check(s) failed")))))

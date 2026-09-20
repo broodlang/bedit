@@ -87,6 +87,10 @@ test:
 # from the screen). See tools/README.md. Slow by nature: each one starts an editor.
 drive:
 	@for d in tools/drive_*.py; do echo "== $$d"; python3 $$d || exit 1; done
+	# The Brood drivers run the editor's own loop rather than a pty — everything above
+	# the frontend, against a real child process. `nest run` reports a failed check as a
+	# non-zero exit, so this line fails the target the way the python ones do.
+	@for d in tools/drive-*.blsp; do echo "== $$d"; nest run $$d || exit 1; done
 
 check:
 	nest check

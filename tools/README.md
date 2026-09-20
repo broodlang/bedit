@@ -8,9 +8,16 @@ really gone from the screen.
 These drivers run the actual editor on a pty and assert on what it paints.
 
 ```bash
-make drive                 # all of them
-python3 tools/drive_mspc.py # or one at a time (from anywhere)
+make drive                       # all of them
+python3 tools/drive_mspc.py      # or one at a time (from anywhere)
+nest run tools/drive-elixir.blsp # the Brood ones are ordinary scripts
 ```
+
+Two shapes. The `drive_*.py` ones put the editor on a **pty** and read what it paints, which
+is the only way to prove a key reaches its command. The `drive-*.blsp` ones run the editor's
+own loop in-process — the real command, the real timers, the real async events, the real
+`ed-view` — and assert on the frame; they cannot see the frontend, but they can drive a
+child process and wait on its replies without a terminal in the way.
 
 | Driver | What only a live run can show |
 |---|---|
@@ -23,6 +30,7 @@ python3 tools/drive_mspc.py # or one at a time (from anywhere)
 | `drive_contract.py` | `M-x` shows each command's declared `model -> model` contract in the margin (with its key and doc) — the marginalia the model tests build but cannot paint. |
 | `drive_narrow.py` | `C-x n n` paints ONLY the focused region and the mode line shows `⊸ Narrowed`; `C-x n w` brings the rest back. The model tests confine point; only a frame shows the render slice + indicator. |
 | `drive_tutor_readonly.py` | The REAL editor refuses a backspace at a box's edge and says so, while the box stays writable — the tutorial's prose/borders are read-only at the edit primitive (`:read-only-spans`, ADR-219), not a `:post-key` guard a held key could outrun. |
+| `drive-elixir.blsp` | The Elixir playground against a **real BEAM node**: `M-x` opens the buffer and its pane, the welcome expression comes back `=> 2 : Integer`, a `defmodule` typed into the buffer is callable by the form below it, that call's traced cascade reaches the pane, and a half-typed `defmodule` reads as pending rather than as an error. Every one of those crosses a process boundary, and the model tests use synthetic replies — they can prove what a reply BECOMES, never that one arrives. It earned its keep on the first run: the buffer opened, the pane painted, and nothing ever evaluated, because the launch is on an idle timer and the driver was waiting instead of firing one. |
 | `check-modes.sh` | The RELEASED binary, opened from `$HOME` on one file per lexical mode, prints no view error. A mode names its services by symbol, resolved at render time; the model tests load every module, so only the installed editor with no project around it can show a service whose module nothing loads (`editor/lexer/line-restart`, 2026-09-15). `make check-modes`. |
 
 **Three bugs these caught that 1200 model tests could not.** A new tutorial key was added to the
