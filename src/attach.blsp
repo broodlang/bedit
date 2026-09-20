@@ -1,0 +1,153 @@
+(defmodule attach
+  "**Which runtime is my code running in?** — one answer, for every session the editor
+keeps.
+
+bedit can point an evaluation session at a process it did not start: the Elixir agent at a
+BEAM node (`Node.connect`), the Brood sandbox at a peer (`node/connect`). Those are the
+same feature twice, and for a while they were the same CODE twice — two reply folds, two
+`attached-node` accessors, two prompt flows, two state keys.
+
+That cost a bug, which is why this module exists rather than being tidiness. The rule
+\"an attachment must not outlive the child that held it\" was found and fixed on the BEAM
+side; the Brood copy was written afterwards without it, so its chip went on naming a node
+while evaluation had quietly gone back to running locally — the one failure the feature is
+supposed to make impossible. One implementation cannot drift from itself.
+
+A language is a row in [[*targets*]]: which session, where its state lives, how to ask it
+to attach, and what to do once it has."
+  (:use model)) ; message / ed-mb-edit — the prompt and the echo
+;; The backends are referenced through their rows' symbols, resolved late: both are
+;; DEFERRED modules, and naming them eagerly would load a BEAM agent into an editor that
+;; never opens an Elixir file.
+
+(defdyn *targets*
+  ;; One row per session that can be pointed somewhere else.
+  ;;
+  ;;   :state-key  where this session's attachment lives on the model
+  ;;   :attach / :detach   (id …) -> accepted? — the backend's request
+  ;;   :runtime    what to call the thing it goes back to, in a sentence
+  ;;   :needs      the sentence when there is no session to attach at all
+  ;;   :after      (m) -> m, run once an attach succeeds (refresh what is on screen)
+  {:elixir {:state-key :beam
+            :attach 'elixir-sandbox/elixir-attach
+            :detach 'elixir-sandbox/elixir-detach
+            :running? 'elixir-sandbox/elixir-running?
+            :cookie 'elixir-sandbox/default-cookie
+            :runtime "node"
+            :needs "no Elixir session to attach — M-x elixir-playground starts one"
+            :after 'beam/beam-request}
+   :brood {:state-key :sandbox
+           :attach 'sandbox/sandbox-attach
+           :detach 'sandbox/sandbox-detach
+           :running? 'sandbox/sandbox-running?
+           :runtime "runtime"
+           :needs "no Brood session to attach — open a playground or evaluate something first"
+           :after nil}})
+
+(defn- call (target key args fallback)
+  (let (sym (get-in *targets* [target key]))
+    (if (or (nil? sym) (not (bound? sym))) fallback (apply (reflect/eval sym) args))))
+
+(defn- state-key (target) (get-in *targets* [target :state-key]))
+
+(defn attached-node (m target)
+  "The node `target`'s session is routed to, or nil for its own."
+  (get-in m [(state-key target) :attached]))
+
+(defn any-attached (m)
+  "The node ANY session is attached to, or nil when they are all at home — what the mode
+line reads. One chip, because the question it answers (\"is what I evaluate running
+somewhere else?\") has one answer whichever language asked it."
+  (first (seq/keep (keys *targets*) (fn (t) (attached-node m t)))))
+
+(defn forget (m target)
+  "Drop `target`'s attachment — what a session's death means, whatever else it means.
+
+The respawn that follows is a fresh runtime that has never heard of the node you were on,
+so the alternative is a chip naming a node while your evaluations quietly run locally
+again. Not re-attached either: silently reconnecting to somebody's production node after a
+crash is worse than making you ask twice."
+  (assoc-in (assoc-in m [(state-key target) :attached] nil) [(state-key target) :attaching] nil))
+
+(defn pending? (m target reply)
+  "Is `reply` the answer to an attach/detach this editor asked `target` for?"
+  (let (id (get-in m [(state-key target) :attaching]))
+    (and id (= id (get reply :id)))))
+
+(defn reply (m target r)
+  "Fold the answer. Reported rather than assumed: an attach that silently did not happen
+leaves you evaluating locally while believing you are not."
+  (let (m1 (assoc-in m [(state-key target) :attaching] nil)
+        node (get r :node))
+    (cond
+      (not (get r :ok))
+        (message (forget m1 target) (str "could not attach: " (get r :error "unknown error")))
+      (nil? node)
+        (message (forget m1 target)
+          (str "detached — back on bedit's own " (get-in *targets* [target :runtime])))
+      else
+        (let (m2 (assoc-in m1 [(state-key target) :attached] node))
+          (message (call target :after (list m2) m2)
+            (str "attached to " node " — every evaluation now runs THERE"))))))
+
+(defn- ask (m target verb args note)
+  ;; The request id comes from `sandbox`'s shared id space, resolved at CALL time for the
+  ;; same reason the backends are: a bare `sandbox/…` reference in this module's body would
+  ;; load the Brood eval session when `attach` loads, and `attach` is on the mode line's
+  ;; path — so every editor that never evaluates anything would pay for one. Nothing here
+  ;; runs until you have actually asked to attach.
+  (let (next-id (reflect/eval 'sandbox/sandbox-next-id)
+        ids-used (reflect/eval 'sandbox/sandbox-ids-used)
+        id (next-id m)
+        sent (call target verb (cons id args) false))
+    (if (not sent)
+      (message m "the session is not running")
+      (message (assoc-in (ids-used m (inc id)) [(state-key target) :attaching] id) note))))
+
+(defn prompt (m target)
+  "The two-step attach prompt: the node, then its cookie.
+
+The node is TYPED, never picked from a list of what is reachable — that menu is one
+keystroke from evaluating on production. The cookie is asked for rather than read on your
+behalf, because a credential used without being asked for is how you find out afterwards
+which machine you connected to."
+  (if (not (call target :running? '() false))
+    (message m (get-in *targets* [target :needs]))
+    (assoc m
+      :minibuffer
+        {:edit (ed-mb-edit "Attach to node: " "")
+         :on-complete
+           (fn (m1 spec)
+             (let (spec (string/trim spec))
+               (if (= spec "")
+                 (message m1 "no node named")
+                 (assoc m1
+                   :minibuffer
+                     {:edit (ed-mb-edit (str "Cookie for " spec ": ") (default-cookie target))
+                      :on-complete
+                        (fn (m2 cookie)
+                          (ask m2
+                            target
+                            :attach
+                            (list spec (string/trim cookie))
+                            (str "connecting to " spec "…")))}))))})))
+
+(defn detach (m target)
+  "Route `target`'s session back to bedit's own runtime."
+  (if (nil? (attached-node m target))
+    (message m "not attached to anything")
+    (ask m target :detach '() "detaching…")))
+
+(defn default-cookie (target)
+  "The cookie offered as the prompt's default: the BEAM's `~/.erlang.cookie` where there is
+one, and nothing for Brood (whose `node/connect` authenticates with the runtime's own).
+
+OFFERED, never used silently — see [[prompt]].
+
+Through [[call]] like every other backend hook, and that is not tidiness: naming
+`elixir-sandbox/default-cookie` here would have been a bare qualified reference, which
+LOADS the module. `attach` is reached from the mode line, so that one mention put a BEAM
+agent into the startup of every editor that never opens an Elixir file. Only a session that
+is already running gets this far ([[prompt]] checks `:running?` first), so by the time it is
+asked the module is loaded and the late lookup finds it."
+  (or (call target :cookie '() nil) ""))

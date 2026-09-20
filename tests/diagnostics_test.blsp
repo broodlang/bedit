@@ -1,0 +1,208 @@
+;; The diagnostics pane, the margin marks that lead to it, and the click that opens it.
+(defmodule diagnostics-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use-internals commands)
+  (:use diagnostics))
+
+(defn dm (text diags)
+  ;; a model whose current buffer carries `diags` (1-based lines), stamped the one way
+  ;; they are ever stamped
+  (let (m (ed-init (make-buffer text)))
+    (ed-set-diagnostics m diags (buffer-rope (ed-current-buf m)))))
+
+(defn pane-index (m)
+  ;; the pane's pool slot — named, because `ed-buffer-index-by-name` answers `nil | int`
+  ;; and an index error three lines later says nothing about what went wrong
+  (or (ed-buffer-index-by-name m "*Diagnostics*") (error "no *Diagnostics* buffer")))
+
+(def warn {:line 2 :col 3 :message "unbound symbol: acc"})
+(def err {:line 4 :col 1 :message "does not compile: defn: expected at least 1 argument"})
+
+(describe "findings reach the margin"
+  ;; They never did: every other margin mark is a buffer ANNOTATION and the gutter's cell
+  ;; cache is keyed on the buffer, so diagnostics living only on the model could not get
+  ;; there. The one setter now stamps them.
+  (test "a warning marks its line ⚠ and an error marks its line ✗"
+    (let (buf (ed-current-buf (dm "a\nb\nc\nd\n" (list warn err))))
+      (assert= (first (modes/gutter-mark-for buf 1)) "⚠") ; :line 2 is 0-based 1
+      (assert= (first (modes/gutter-mark-for buf 3)) "✗")
+      (is (nil? (modes/gutter-mark-for buf 0)))))
+
+  (test "an error outranks a warning on the same line — one cell says the worse thing"
+    (let (buf (ed-current-buf (dm "a\nb\n" (list {:line 1 :col 0 :message "just advice"}
+                                             {:line 1 :col 0 :message "does not compile: x"}))))
+      (assert= (first (modes/gutter-mark-for buf 0)) "✗")))
+
+  (test "LSP severity 1 is an error without the message having to say so"
+    (let (buf (ed-current-buf (dm "a\n" (list {:line 1 :col 0 :severity 1 :message "oops"}))))
+      (assert= (first (modes/gutter-mark-for buf 0)) "✗")))
+
+  (test "a verdict already on the line keeps it — the playground's ✗ is about what RAN"
+    ;; the diagnostics source is last in precedence for exactly this: an advisory about
+    ;; what the code might do must not displace the answer about what it did
+    (let (m (dm "(boom)\n" (list warn))
+          buf (results/set-note (ed-current-buf m) 0 {:kind :fail :text "it raised"} 0))
+      (assert= (first (modes/gutter-mark-for buf 0)) "✗")))
+
+  (test "the marks go stale with the text, like every other margin mark"
+    (let (m (dm "a\nb\nc\nd\n" (list warn))
+          edited (insert (ed-current-buf m) "zz"))
+      ;; still marked, but dimmed — the finding described text that has since moved
+      (assert= (first (modes/gutter-mark-for edited 1)) "⚠")
+      (assert= (second (modes/gutter-mark-for edited 1)) modes/gutter-face-test-stale))))
+
+(describe "the margin click opens the pane"
+  (test "a marked line's click is the mark's, an unmarked line's is the mode's"
+    ;; the same table paints the glyph and answers the click, so the margin cannot show
+    ;; one thing and do another
+    (let (buf (ed-current-buf (dm "a\nb\nc\nd\n" (list warn))))
+      (assert= (modes/gutter-click-for buf 1) 'diagnostics/open-from-margin)
+      (is (nil? (modes/gutter-click-for buf 0))))))
+
+(describe "the report"
+  (test "one row per finding, in line order, whatever order they arrived in"
+    (let (m (dm "a\nb\nc\nd\n" (list err warn))
+          [text _] (diagnostics/report m))
+      (is (includes? text "2 diagnostics in "))
+      ;; the warning is on line 2 and the error on line 4: reading order, not arrival order
+      (is (< (index-of text "unbound symbol") (index-of text "does not compile")))))
+
+  (test "a row's location names the BUFFER, not a path"
+    ;; the findings are about the buffer in front of you, which may never have been saved —
+    ;; resolving its NAME against the project root would open a file called *scratch*
+    (let (m (dm "a\nb\nc\nd\n" (list warn))
+          [_ links] (diagnostics/report m)
+          loc (get links 2))
+      (assert= (:line loc) 2)
+      (assert= (:buffer loc) (buffer-name (ed-current-buf m)))
+      (is (nil? (:file loc)))))
+
+  (test "a multi-line message stays ONE row"
+    ;; rows are keyed by line for the jump map; a message with a newline in it would make
+    ;; one finding look like two and put every later row's location on the wrong line
+    (let (m (dm "a\nb\n" (list {:line 1 :col 0 :message "first\nsecond"}))
+          [text links] (diagnostics/report m))
+      (assert= (count (string/split (string/trim text) "\n")) 3) ; header, blank, one row
+      (assert= (:line (get links 2)) 1)))
+
+  (test "no findings says so rather than showing an empty pane"
+    (let ([text _] (diagnostics/report (dm "a\n" '())))
+      (is (includes? text "no diagnostics in ")))))
+
+(describe "the pane itself"
+  (test "the command opens it, and again closes it"
+    (let (m (dm "a\nb\nc\nd\n" (list warn err))
+          opened (diagnostics/cmd-diagnostics m nil))
+      (is (not (nil? (ed-buffer-index-by-name opened "*Diagnostics*"))))
+      (is (nil? (ed-buffer-index-by-name (diagnostics/cmd-diagnostics opened nil) "*Diagnostics*")))))
+
+  (test "a margin click opens it even after the reader dismissed it"
+    ;; clicking the mark IS asking, so it beats the aside's close latch
+    (let (m (dm "a\nb\nc\nd\n" (list warn))
+          closed (diagnostics/cmd-diagnostics (diagnostics/cmd-diagnostics m nil) nil)
+          clicked (diagnostics/open-from-margin closed 1))
+      (is (not (nil? (ed-buffer-index-by-name clicked "*Diagnostics*"))))))
+
+  (test "the open pane follows the findings, and costs nothing when they have not moved"
+    (let (m (diagnostics/cmd-diagnostics (dm "a\nb\nc\nd\n" (list warn)) nil)
+          settled (diagnostics/refresh m)
+          idx (pane-index settled))
+      ;; a second refresh with the same findings is the SAME model — this runs per event
+      (assert= (diagnostics/refresh settled) settled)
+      (is (includes? (buffer-text (ed-buf-at settled idx)) "unbound symbol: acc"))))
+
+  (test "it never reports on itself"
+    ;; point inside the pane must not turn the list into a list of the list's own findings
+    (let (m (diagnostics/cmd-diagnostics (dm "a\nb\nc\nd\n" (list warn)) nil)
+          idx (pane-index m)
+          inside (commands/ed-switch-to-named m "*Diagnostics*")
+          before (buffer-text (ed-buf-at inside idx)))
+      (assert= (buffer-text (ed-buf-at (diagnostics/refresh inside) idx)) before))))
+
+(describe "findings belong to the buffer they were computed from"
+  ;; The check runs in a task; its reply folds in whenever it lands. Both of these used to
+  ;; read "whatever buffer is current now", so a check that finished a keystroke after
+  ;; C-x b put one buffer's findings in another buffer's margin, at its line numbers.
+  (test "a reply landing after a buffer switch does not mark the new buffer"
+    (let (m (ed-init (make-buffer "a\nb\nc\nd\n"))
+          other (ed-switch-to-named (commands/ed-show-named m "other" "x\ny\n" :text) "other")
+          ;; the check was computed for the FIRST buffer's rope, and lands now
+          landed (ed-set-diagnostics other (list warn) (buffer-rope (ed-current-buf m))))
+      (is (empty? (results/diagnostic-lines (ed-current-buf landed))))
+      (is (nil? (modes/gutter-mark-for (ed-current-buf landed) 1)))))
+
+  (test "the pane names the buffer whose findings it is showing"
+    (let (m (dm "a\nb\nc\nd\n" (list warn))
+          other (ed-switch-to-named (commands/ed-show-named m "other" "x\ny\n" :text) "other")
+          [text links] (diagnostics/report other))
+      ;; `other` has no findings of its own — and must not inherit the model's
+      (is (includes? text "no diagnostics in other"))
+      (is (empty? links)))))
+
+(describe "the open pane keeps up"
+  (test "a re-publish for unchanged text still refreshes it"
+    ;; the case a rope-based guard misses: a language server re-reports a file whose text
+    ;; never moved. Same rope, different findings — and the pane must not keep the old ones
+    (let (m (diagnostics/cmd-diagnostics (dm "a\nb\nc\nd\n" (list warn)) nil)
+          rope (buffer-rope (ed-current-buf m))
+          settled (diagnostics/refresh m)
+          republished (ed-set-diagnostics settled (list err) rope)
+          after (diagnostics/refresh republished)
+          text (buffer-text (ed-buf-at after (pane-index after))))
+      (is (includes? text "does not compile"))
+      (is (not (includes? text "unbound symbol"))))))
+
+(describe "the mode line's findings chip"
+  ;; The margin can only mark lines that are ON SCREEN, so a file with one error forty
+  ;; lines down looked exactly like a clean one. The count is the part of the answer a
+  ;; margin cannot give.
+  (test "it counts by severity, and is empty for a clean buffer"
+    (let (m (dm "a\nb\nc\nd\n" (list warn err {:line 3 :col 0 :message "more advice"})))
+      (assert= (view/ed-diagnostics-label (ed-current-buf m)) "✗ 1 ⚠ 2")
+      (assert= (view/ed-diagnostics-label (make-buffer "x")) "")))
+
+  (test "either half is dropped when it is zero"
+    (assert= (view/ed-diagnostics-label (ed-current-buf (dm "a\nb\n" (list warn)))) "⚠ 1")
+    (assert= (view/ed-diagnostics-label (ed-current-buf (dm "a\nb\nc\nd\n" (list err)))) "✗ 1"))
+
+  (test "an error colours it red, advice alone amber"
+    (is (:bold (view/ed-diagnostics-face (ed-current-buf (dm "a\nb\nc\nd\n" (list err))))))
+    (is (not (:bold (view/ed-diagnostics-face (ed-current-buf (dm "a\nb\n" (list warn))))))))
+
+  (test "it reads the SAME annotation the margin does"
+    ;; a chip disagreeing with the marks beside the code would be worse than no chip
+    (let (m (dm "a\nb\nc\nd\n" (list warn err))
+          other (ed-switch-to-named (commands/ed-show-named m "other" "x\n" :text) "other"))
+      (assert= (view/ed-diagnostics-label (ed-current-buf other)) ""))))
+
+(describe "clicking a mark lands on that finding"
+  ;; The click is how you ask for the rest of a message the margin could only mark; landing
+  ;; at the top of a list you then have to search through is not answering that.
+  (test "the pane scrolls to the row for the line you clicked"
+    (let (m (dm "a\nb\nc\nd\n" (list warn err))
+          buf (ed-current-buf m))
+      ;; line 4 (0-based 3) is the SECOND finding, so row 3 of the report
+      (assert= (diagnostics/row-of buf 3) 3)
+      (assert= (diagnostics/row-of buf 1) 2)
+      (is (nil? (diagnostics/row-of buf 0)))))
+
+  (test "a click on a line with no finding still opens the pane rather than failing"
+    (let (m (dm "a\nb\nc\nd\n" (list warn))
+          clicked (diagnostics/open-from-margin m 0))
+      (is (not (nil? (ed-buffer-index-by-name clicked "*Diagnostics*"))))))
+
+  (test "the empty report has no trailing blank rows"
+    ;; the header is followed by a blank line, and nothing else — three newlines made the
+    ;; pane look like it had lost something
+    (let ([text _] (diagnostics/report (dm "a\n" '())))
+      (assert= text "no diagnostics in *scratch*")))
+
+  (test "the command counts off the BUFFER, not the model's list"
+    ;; the third place this distinction mattered: the model holds one list and it belongs
+    ;; to whichever buffer it was computed from
+    (let (m (dm "a\nb\nc\nd\n" (list warn))
+          other (ed-switch-to-named (commands/ed-show-named m "other" "x\n" :text) "other")
+          opened (diagnostics/cmd-diagnostics other nil))
+      (assert= (:echo opened) "no diagnostics in this buffer"))))

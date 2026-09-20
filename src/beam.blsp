@@ -32,6 +32,8 @@ in pid order it would be one of four hundred rows."
 ;; modes and projects are referenced qualified below — each `mod/name` auto-loads its module.
 
 (def *buffer-name* "*BEAM Processes*")
+(def *spy-buffer* "*BEAM Spy*") ; the debugger's stream
+(def *debug-buffer* "*BEAM Debug*") ; …and its queue of stopped processes
 (def *state-key* :beam) ; where the pending request and the last snapshot live on the model
 
 ;; ---- the rows -----------------------------------------------------------------------
@@ -208,8 +210,13 @@ which table is holding the memory."
 of the `sandbox-events` client hooks. Any of them, because they are one client: the
 supervision tree and the ETS list are the same node seen from a different angle, and
 closing the process list should not take the session out from under them."
-  (any? (%map-pairs *views*)
-    (fn ([_ v]) (not (nil? (ed-buffer-index-by-name m (get v :buffer)))))))
+  (any? (append (map (%map-pairs *views*) (fn ([_ v]) (get v :buffer)))
+          ;; …and the debugger's two, which are NOT views (they are pushed to, not asked
+          ;; for) but are just as much somebody watching. Left out, a trace running with
+          ;; only *BEAM Spy* open answered \"nobody is watching\" the moment the node
+          ;; hiccuped, and the session was shut down out from under it.
+          [*spy-buffer* *debug-buffer*])
+    (fn (nm) (not (nil? (ed-buffer-index-by-name m nm))))))
 
 (defn beam-request (m &optional (view :processes))
   "Ask the node for a fresh snapshot of `view`, remembering the request id AND which view it
@@ -288,7 +295,6 @@ that request, and an id left pending that can never be answered is a buffer that
 refreshes again."
   (let (pending (get-in m [*state-key* :pending])
         killing (first (or (get-in m [*state-key* :killing]) [nil nil]))
-        attaching (get-in m [*state-key* :attaching])
         tracing (get-in m [*state-key* :tracing]))
     (cond
       ;; a streamed trace entry — its id is the STREAM this editor chose, not a request
@@ -296,7 +302,7 @@ refreshes again."
       (and (get reply :more) (get reply :spy) (= (get reply :id) (stream-id m)))
         (spy-append m (get reply :spy))
       (and tracing (= tracing (get reply :id))) (beam-trace-reply m reply)
-      (and attaching (= attaching (get reply :id))) (beam-attach-reply m reply)
+      (attach/pending? m :elixir reply) (attach/reply m :elixir reply)
       (and killing (= killing (get reply :id))) (beam-kill-reply m reply)
       (nil? pending) m
       (not (= pending (get reply :id))) m
@@ -325,7 +331,15 @@ failure this feature must not have — the chip still naming a node while your e
 quietly run locally again. Not re-attached either: silently reconnecting to somebody's
 production node after a crash is worse than making you ask twice."
   (let (was (attached-node m)
-        m1 (assoc-in m [*state-key* :attached] nil))
+        ;; …and the DEBUGGER state with it. A tracer dies with the VM that held it, so a
+        ;; stream id that can never fire again, and a queue of processes stopped in a node
+        ;; that no longer exists, are both lies — and `r` on one of those rows would ask a
+        ;; fresh node to resume a pid it has never seen.
+        m1 (assoc-in (assoc-in (assoc-in (attach/forget m :elixir) [*state-key* :stream] nil)
+                       [*state-key* :tracing]
+                       nil)
+             [*state-key* :stopped]
+             (quote ())))
     (cond
       was (message m1 (str "the node went away — no longer attached to " was))
       (not (beam-live-buffer? m1)) m1
@@ -477,14 +491,14 @@ the playground beside it would be a second, quieter API to audit."
   (let (pid (beam-pid-at-point m))
     (if (nil? pid)
       (message m "not on a process line")
+      ;; Pended, so the outcome is REPORTED. Announcing the kill here and refreshing would
+      ;; say "killed …" whether or not anything died — and the first version of this
+      ;; command could not kill anything at all, because the expression it sent was
+      ;; malformed and nothing was listening for the error it came back with.
       (let (id (sandbox/sandbox-next-id m)
             sent (elixir-eval id (beam-kill-expr pid) 5000))
         (if (not sent)
           (message m "the node is not running")
-          ;; Pended, so the outcome is REPORTED. Announcing the kill here and refreshing
-          ;; would say "killed …" whether or not anything died — and the first version of
-          ;; this command could not kill anything at all, because the expression it sent
-          ;; was malformed and nothing was listening for the error it came back with.
           (message (assoc-in (sandbox/sandbox-ids-used m (inc id)) [*state-key* :killing] [id pid])
             (str "killing " pid "…")))))))
 
@@ -505,33 +519,13 @@ the playground beside it would be a second, quieter API to audit."
 ;;   * the mode line NAMES the node while you are attached (`statusbar`'s `beam` segment),
 ;;     because the whole risk here is forgetting.
 
+;; The attachment itself is `attach`'s — one implementation for both languages. See that
+;; module for why it had to become one: this was two copies, and the second was written
+;; without a fix the first had already been given.
+
 (defn attached-node (m)
-  "The node this editor's session is currently routed to, or nil for its own. What the
-status bar reads."
-  (get-in m [*state-key* :attached]))
-
-(defn- beam-attach-reply (m reply)
-  "Report what an attach or detach actually did. Reported rather than assumed, because an
-attach that silently did not happen leaves you evaluating locally while believing you are
-not — the one failure this must never have."
-  (let (m1 (assoc-in m [*state-key* :attaching] nil)
-        node (get reply :node))
-    (cond
-      (not (get reply :ok))
-        (message (assoc-in m1 [*state-key* :attached] nil)
-          (str "could not attach: " (get reply :error "unknown error")))
-      (nil? node) (message (assoc-in m1 [*state-key* :attached] nil) "detached — back on bedit's own node")
-      else
-        (message (beam-request (assoc-in m1 [*state-key* :attached] node))
-          (str "attached to " node " — every evaluation now runs THERE")))))
-
-(defn- beam-ask-attach (m node cookie)
-  (let (id (sandbox/sandbox-next-id m)
-        sent (elixir-sandbox/elixir-attach id node cookie))
-    (if (not sent)
-      (message m "the node is not running — M-x elixir-playground starts one")
-      (message (assoc-in (sandbox/sandbox-ids-used m (inc id)) [*state-key* :attaching] id)
-        (str "connecting to " node "…")))))
+  "The node the Elixir session is routed to, or nil for its own."
+  (attach/attached-node m :elixir))
 
 (defcommand cmd-beam-attach
   (m key)
@@ -544,34 +538,12 @@ THERE — which is the point, and is also why the mode line says so for as long 
 
 The node is typed rather than picked from a list on purpose: a menu of reachable nodes is
 one keystroke away from evaluating on production."
-  (if (not (elixir-running?))
-    (message m "no Elixir session to attach — M-x elixir-playground starts one")
-    (assoc m
-      :minibuffer
-        {:edit (ed-mb-edit "Attach to node: " "")
-         :on-complete
-           (fn (m1 node)
-            (if (= (string/trim node) "")
-              (message m1 "no node named")
-              (assoc m1
-                :minibuffer
-                  {:edit (ed-mb-edit (str "Cookie for " (string/trim node) ": ")
-                            (or (elixir-sandbox/default-cookie) ""))
-                   :on-complete
-                     (fn (m2 cookie)
-                       (beam-ask-attach m2 (string/trim node) (string/trim cookie)))})))})))
+  (attach/prompt m :elixir))
 
 (defcommand cmd-beam-detach
   (m key)
-  "Route the Elixir session back to bedit's own node (M-x beam-detach)."
-  (if (nil? (attached-node m))
-    (message m "not attached to anything")
-    (let (id (sandbox/sandbox-next-id m)
-          sent (elixir-sandbox/elixir-detach id))
-      (if (not sent)
-        (message m "the node is not running")
-        (message (assoc-in (sandbox/sandbox-ids-used m (inc id)) [*state-key* :attaching] id)
-          "detaching…")))))
+  "Route the Elixir session back to bedit's own node (M-x beam-detach, C-c b d)."
+  (attach/detach m :elixir))
 
 ;; ---- the debugger: watch a function, or stop on it ----------------------------------------
 ;; Brood's side of the editor has had this for a while (`src/debugger.blsp`): a *Spy* stream
@@ -584,8 +556,6 @@ one keystroke away from evaluating on production."
 ;; open-ended, and an inflight request with no answer for a quiet minute is exactly what the
 ;; session's watchdog exists to kill.
 
-(def *spy-buffer* "*BEAM Spy*")
-(def *debug-buffer* "*BEAM Debug*")
 (def *spy-cap* 500) ; the tail worth keeping — a traced hot path produces thousands
 
 (defn spy-row (e)
@@ -643,9 +613,7 @@ process — into the queue of things waiting for you."
         sent (elixir-sandbox/elixir-trace id stream spec mode))
     (if (not sent)
       (message m "the node is not running — M-x beam-processes starts one")
-      (message (assoc-in (assoc-in (sandbox/sandbox-ids-used m (+ id 2))
-                           [*state-key* :tracing]
-                           id)
+      (message (assoc-in (assoc-in (sandbox/sandbox-ids-used m (+ id 2)) [*state-key* :tracing] id)
                  [*state-key* :stream]
                  stream)
         (str (if (= mode "break") "breaking on " "tracing ") spec "…")))))

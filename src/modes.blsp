@@ -133,16 +133,12 @@ dims all three."
     else ["✗" modes/gutter-face-test-fail]))
 
 (defn- mark-note-glyph (note stale)
-  ;; an eol note: a result ·, a pass ✓, a failure ✗, work in flight ⋯. The ⋯ takes the
+  ;; an eol note: a result ·, a pass ✓, a failure ✗, work in flight ⋯ — the glyph from
+  ;; `results/note-glyph`, which is where every renderer gets it. The ⋯ takes the
   ;; dim face deliberately — grey reads as "pending", and it must NOT take the
   ;; pass/fail colours, which would look like a verdict that has already landed.
   (let (kind (if (:warn note) :warn (:kind note))
-        glyph (cond
-                (= kind :pass) "✓"
-                (= kind :fail) "✗"
-                (results/note-pending? kind) "⋯"
-                (= kind :warn) "⚠"
-                else "·"))
+        glyph (results/note-glyph note))
     (cond
       ;; a warning is about the code as WRITTEN, so an edit doesn't make it stale in the
       ;; way a result is — it's recomputed on every launch
@@ -153,37 +149,81 @@ dims all three."
       (= kind :fail) [glyph modes/gutter-face-test-fail]
       else [glyph modes/gutter-face-test-stale])))
 
+(defn- mark-diagnostic-glyph (ds stale)
+  ;; the checker's / the language server's findings on a line: ✗ for something that will
+  ;; not compile, ⚠ for an advisory. Worst-first, because one cell can only say one thing
+  ;; and an error outranks a warning about the same line.
+  (let (error? (any? ds results/diagnostic-error?))
+    (cond
+      stale [(if error? "✗" "⚠") modes/gutter-face-test-stale]
+      error? ["✗" modes/gutter-face-test-fail]
+      else ["⚠" modes/gutter-face-warn])))
+
 (def gutter-mark-sources
-  ;; The margin's sources in PRECEDENCE order — each `[reader glyph-fn]`, where the
-  ;; reader answers `{:at value :stale? bool}` for a line. Adding a source (an inline
-  ;; eval result, an LSP hint) is one row here, not another branch that re-implements
-  ;; the staleness dance.
-  [[(fn (buf line) (mark-line-keyed buf :debug-break-lines line))
-     (fn (_ _) ["●" modes/gutter-face-breakpoint])]
-    [(fn (buf line) (mark-line-keyed buf :test-marks line))
-      (fn (verdict stale) (mark-verdict-glyph verdict stale))]
-    [(fn (buf line) (mark-line-keyed buf :describe-marks line))
-      (fn (tally stale) (describe-rollup-mark tally stale))]
-    [(fn (buf line) (mark-eol-note buf line))
-      (fn (note stale) (mark-note-glyph note stale))]])
+  ;; The margin's sources in PRECEDENCE order. Each is `{:reader :glyph :on-click}`: the
+  ;; reader answers `{:at value :stale? bool}` for a line, the glyph turns that into
+  ;; `[text face]`, and `:on-click` is the command symbol a CLICK on that mark runs.
+  ;; Adding a source (an inline eval result, an LSP hint) is one row here, not another
+  ;; branch that re-implements the staleness dance.
+  ;;
+  ;; The click lives beside the glyph deliberately: the margin shows one mark per line,
+  ;; and resolving the click through the same table is what makes pressing it do the thing
+  ;; you can see. A row with no `:on-click` leaves the click to the mode's own
+  ;; `:gutter-click` — as does a line with no mark at all, which is how a breakpoint gets
+  ;; SET on a bare line rather than only cleared from a marked one.
+  [{:reader (fn (buf line) (mark-line-keyed buf :debug-break-lines line))
+    :glyph (fn (_ _) ["●" modes/gutter-face-breakpoint])
+    :on-click nil} ; brood-mode's `:gutter-click` toggles it — setting and clearing are one command
+   {:reader (fn (buf line) (mark-line-keyed buf :test-marks line))
+    :glyph (fn (verdict stale) (mark-verdict-glyph verdict stale))
+    :on-click nil}
+   {:reader (fn (buf line) (mark-line-keyed buf :describe-marks line))
+    :glyph (fn (tally stale) (describe-rollup-mark tally stale))
+    :on-click nil}
+   {:reader (fn (buf line) (mark-eol-note buf line))
+    :glyph (fn (note stale) (mark-note-glyph note stale))
+    :on-click nil}
+   ;; last: a line that already carries a verdict keeps it. A playground form that RAISED
+   ;; says ✗ about what it did, which outranks an advisory about what it might do.
+   {:reader (fn (buf line) (mark-line-keyed buf :diagnostic-lines line))
+    :glyph (fn (ds stale) (mark-diagnostic-glyph ds stale))
+    :on-click 'diagnostics/open-from-margin}])
+
+(defn- gutter-hit (buf line)
+  ;; `[source found]` for the first source with something to say about `line`, or nil.
+  ;; `keep` then `first`: each source's reader runs at most ONCE per line (a `find`
+  ;; followed by re-reading the winner ran it twice — two annotation lookups and two
+  ;; staleness comparisons per line per frame).
+  (first (seq/keep gutter-mark-sources
+           (fn (source)
+             (let (found ((:reader source) buf line))
+               (when found [source found]))))))
 
 (defn gutter-mark-for (buf line)
   "The `[glyph face]` margin mark for `line`, or nil: the first source in
 `gutter-mark-sources` that has something to say — a breakpoint ●, a per-test verdict
-✓/✗/·, a `(describe …)` rollup ✓/◐/◔, or an end-of-line note's ·/✓/✗/⋯.
+✓/✗/·, a `(describe …)` rollup ✓/◐/◔, an end-of-line note's ·/✓/✗/⋯, or a diagnostic's
+⚠/✗.
 
 Every source is a buffer ANNOTATION (`std/editor/buffer`), so all of them share one
-discipline instead of four copies of it: a mark blanks entirely once lines have
+discipline instead of five copies of it: a mark blanks entirely once lines have
 shifted (it would point at the wrong line) and DIMS while the text differs from what
-produced it (an edit dims a verdict; undoing back restores it)."
-  ;; `keep` then `first`: each source's reader runs at most ONCE per line (a `find`
-  ;; followed by re-reading the winner ran it twice — two annotation lookups and two
-  ;; scans on every marked line, every frame the gutter cache misses).
-  (first (seq/keep gutter-mark-sources
-           (fn (source)
-             (let ([reader glyph] source
-                   found (reader buf line))
-               (when found (glyph (:at found) (:stale? found))))))))
+produced it (an edit dims a verdict; undoing back restores it). That is also why the
+model's diagnostics are stamped onto the buffer to get here — the gutter's cell cache is
+keyed on the buffer, so model state cannot reach it and would go stale unnoticed if it
+did."
+  (let (hit (gutter-hit buf line))
+    (when hit (let ([source found] hit) ((:glyph source) (:at found) (:stale? found))))))
+
+(defn gutter-click-for (buf line)
+  "The command symbol — `(m line) -> m` — that a margin click on `line` should run, or nil
+to leave the click to the mode's own `:gutter-click`.
+
+The mark you clicked decides, through the SAME table that painted it, so the margin cannot
+show one thing and do another. Only a marked line claims a click: an unmarked one still
+reaches the mode, which is what lets a click on empty margin set a breakpoint."
+  (let (hit (gutter-hit buf line))
+    (when hit (:on-click (first hit)))))
 
 (defn gutter-annotate (buf line cell)
   "Overlay the line's margin mark (if any) on a gutter `cell` — the mark replaces the
@@ -1545,6 +1585,22 @@ window re-fontify from lagging as output pours in."
 
 (register-type-layers :occur
   (list 'modes/occur-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
+
+;; ---- the *Diagnostics* list (src/diagnostics.blsp) ---------------------------
+;; Every warning and error in the buffer, one row each, beside it. The rows carry their
+;; locations OFF-text (`:line-links`, resolved by `results/line-links-loc`) because they
+;; name a BUFFER rather than a path — the findings are about the buffer in front of you,
+;; which may never have been saved.
+(def diagnostics-list-mode-layer
+  {:name 'diagnostics-list
+   :line-loc 'results/line-links-loc
+   :commands '("diagnostics")})
+
+(register-type-layers :diagnostics-list
+  (list 'modes/diagnostics-list-mode-layer
+    'results/location-jump-layer
+    'modes/special-mode-layer
+    'modes/text-mode-layer))
 
 ;; ---- dired-mode: the read-only directory browser ----------------------------
 ;; The dired buffer (commands/cmd-dired) lists a directory; it's stamped :dired, made

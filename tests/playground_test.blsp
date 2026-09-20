@@ -640,7 +640,9 @@
           note (get (pg-notes m) 0))
       (assert= (:kind note) :fail)
       (is (:error? note)) ; so a checker advisory does not repeat the error beside it
-      (is (string/starts-with? (:text note) "✗ "))))
+      ;; the message ONLY — the ✗ is the margin's, from `results/note-glyph`
+      (assert= (results/note-glyph note) "✗")
+      (is (not (includes? (:text note) "✗")))))
 
   (test "an in-flight form says so in the same voice"
     (is (results/note-pending? (:kind (liveeval/running-note))))))
@@ -1015,3 +1017,96 @@
       "⇄ app@host")
     (assert= (view/ed-beam-node-label (assoc-in (pat-model) [:beam :attached] "ex@host"))
       "⇄ ex@host")))
+
+;; The bug that made `attach` one module instead of two: this rule was found and fixed on
+;; the BEAM side, and the Brood copy was written afterwards without it.
+(describe "the Brood attachment does not outlive its child"
+  (test "a session that went away takes the node with it"
+    (let (m (assoc (ed-init (make-buffer "x")) :sandbox {:attached "app@host" :attaching 9})
+          m1 (playground/playground-sandbox-down m 1))
+      (is (nil? (playground/attached-node m1)))
+      (is (nil? (get-in m1 [:sandbox :attaching])))
+      ;; …and the chip stops naming it
+      (assert= (view/ed-beam-node-label m1) ""))))
+
+;; ---- the note channel carries N derived notes, not one ------------------------------
+;; A form used to have exactly one place to say a derived thing: its opening line. That is
+;; right for an expression, which has one type — and wrong for a `defmodule`, whose
+;; functions each have their own line and their own type.
+(describe "a note's derived hints"
+  (defn hint-texts (buf line)
+    (map (seq/filter (results/notes-on-line buf line) (fn (n) (= (:kind n) :hint))) :text))
+
+  (test "one hint per entry, each on its own line"
+    (let (buf (results/set-note (make-buffer "defmodule Foo do\n  def bar do\n  end\n  def zar do\n  end\nend\n")
+                0
+                {:kind :info
+                 :text "=> Foo"
+                 :hints [{:line 0 :text ": Foo"}
+                         {:line 1 :text "bar/0 : integer()"}
+                         {:line 3 :text "zar/0 : binary()"}]}
+                6
+                0))
+      (assert= (hint-texts buf 0) (list ": Foo"))
+      (assert= (hint-texts buf 1) (list "bar/0 : integer()"))
+      (assert= (hint-texts buf 3) (list "zar/0 : binary()"))
+      (assert= (hint-texts buf 2) '())))
+
+  (test "re-stamping REBUILDS them — a function you deleted takes its note with it"
+    ;; they are keyed per index under one owner, so a shorter list must not leave the old
+    ;; tail sitting on a line that no longer defines anything
+    (let (text "defmodule Foo do\n  def bar do\n  end\n  def zar do\n  end\nend\n"
+          three (results/set-note (make-buffer text)
+                  0
+                  {:kind :info :text "=> Foo"
+                   :hints [{:line 0 :text ": Foo"}
+                           {:line 1 :text "bar/0"}
+                           {:line 3 :text "zar/0"}]}
+                  6 0)
+          two (results/set-note three
+                0
+                {:kind :info :text "=> Foo"
+                 :hints [{:line 0 :text ": Foo"} {:line 1 :text "bar/0"}]}
+                6 0))
+      (assert= (hint-texts two 3) '())
+      (assert= (hint-texts two 1) (list "bar/0"))))
+
+  (test "a lone :hint still behaves exactly as it did"
+    ;; the N=1 case is the old one: it rejoins the answer when they share a line, and sits
+    ;; apart when they do not
+    (let (apart (results/set-note (make-buffer "(+ 1 2)\n\n") 0 {:kind :info :text "=> 3" :hint ": int"} 1 0)
+          shared (results/set-note (make-buffer "(+ 1 2)\n") 0 {:kind :info :text "=> 3" :hint ": int"} 0 0))
+      (assert= (hint-texts apart 0) (list ": int"))
+      (assert= (:text (first (results/notes-on-line shared 0))) "=> 3  : int"))))
+
+(describe "a hint can never be anchored off the end of the buffer"
+  ;; These lines come back from the CHILD, which was sent the form as it stood some
+  ;; milliseconds ago. Delete a line while a reply is in flight and its notes name lines
+  ;; that no longer exist — and a note past EOF does not merely fail to show, it takes the
+  ;; FRAME down the next time a renderer asks the rope for that line (`answer-line`'s
+  ;; docstring records the same crash for the answer anchor).
+  (test "a hint past the last line is dropped, not stored"
+    (let (buf (results/set-note (make-buffer "a\n")
+                0
+                {:kind :info :text "=> 1" :hints [{:line 0 :text "here"} {:line 99 :text "gone"}]}
+                0))
+      (assert= (map (seq/filter (results/notes-on-line buf 0) (fn (n) (= (:kind n) :hint))) :text)
+        (list "here"))
+      (is (empty? (results/notes-on-line buf 99)))))
+
+  (test "a negative line is dropped too"
+    (let (buf (results/set-note (make-buffer "a\n")
+                0 {:kind :info :text "=> 1" :hints [{:line -3 :text "gone"}]} 0))
+      ;; the answer itself, and nothing else
+      (assert= (count (results/eol-notes-any buf)) 1)))
+
+  (test "the shrink case end to end: the reply describes more lines than remain"
+    (let (buf (results/set-note (make-buffer "defmodule Foo do\nend\n")
+                0
+                {:kind :info :text "=> Foo"
+                 :hints [{:line 0 :text ": Foo"}
+                         {:line 4 :text "bar/0 : integer()"}
+                         {:line 6 :text "zar/0 : binary()"}]}
+                1))
+      (assert= (count (results/eol-notes-any buf)) 2))) ; the answer and the one live hint
+  )

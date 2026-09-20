@@ -605,10 +605,29 @@ no fourth field is an error here — which is what a malformed request is."
           (is (not (includes? (get r :dbg) ".exs"))))
         (is (includes? (get (ask 10 "&Enum.map/2") :type) "Enum.map("))
         (assert= (get (ask 11 "fn a, b -> a + b end") :type) "fn/2")
-        (let (r (ask 12 "defmodule TShape do\n  def area(r), do: r\n  defp hush, do: :x\n  def uses, do: hush()\nend"))
-          (is (includes? (get r :type) "area/1"))
-          ;; a private function is not part of the module's surface
-          (is (not (includes? (get r :type) "hush"))))
+        (let (r (ask 12 "defmodule TShape do\n  def area(r), do: r\n  defp hush, do: :x\n  def uses, do: hush()\nend")
+              defs (get r :defs)
+              named (fn (nm) (seq/find defs (fn (d) (= (get d :name) nm)))))
+          ;; the module's own hint is now just its NAME — the functions have their own lines
+          (assert= (get r :type) "TShape")
+          ;; …and one entry each, carrying the LINE it was written on inside the form
+          (assert= (get (named "area/1") :line) 2)
+          (assert= (get (named "uses/0") :line) 4)
+          ;; the compiler's inference, with no @spec written anywhere: this is the payload
+          (is (includes? (get (named "area/1") :type) "->"))
+          ;; inferred through a private call, so the compiler keeps it `dynamic(…)`
+          (is (includes? (get (named "uses/0") :type) ":x"))
+          ;; a private function has a line but no inferred signature (the checker chunk
+          ;; records exports only) — it still says where it landed
+          (is (not (nil? (named "hush/0"))))
+          (assert= (get (named "hush/0") :private) true)
+          (assert= (get (named "hush/0") :type) nil))
+
+        ;; a declared @spec beats the inference — it is what the author meant
+        (let (r (ask 14 "defmodule TSpec do\n  @spec twice(integer()) :: integer()\n  def twice(n), do: n * 2\nend")
+              d (first (get r :defs)))
+          (is (includes? (get d :type) "integer()"))
+          (is (includes? (get d :type) "::")))
 
         ;; and the session is still the same session after all of it
         (assert= (get (ask 13 "survivor") :value) ":yes")
@@ -690,3 +709,120 @@ no fourth field is an error here — which is what a malformed request is."
               (assert= (get summary :failed) 1) ; still one, but the OTHER one
               (assert= (get summary :reloaded) 1))))
         (elixir-test/elixir-test-shutdown)))))
+
+;; ---- a defmodule's functions are noted at their own `def`s -------------------------
+;; The module hint used to read `: Foo · bar/0, zar/0`: every name piled onto the one line
+;; none of them is on, clipped at whatever fitted. Each definition knows its line, so its
+;; note goes there — with the type the compiler inferred, which is the thing worth the room.
+(describe "per-definition notes"
+  (defn defmodule-reply ()
+    {:ok true
+     :value "Foo"
+     :type "Foo"
+     :defs [{:name "bar/0" :line 2 :type "integer()"}
+            {:name "zar/0" :line 6 :type "binary()"}]})
+
+  (test "one hint per function, at its own line within the form"
+    (let (note (elixir-playground/note-of (defmodule-reply) "")
+          hints (:hints note))
+      (assert= (count hints) 3) ; the module itself, then the two functions
+      (assert= (:offset (first hints)) 0)
+      (assert= (:text (first hints)) ": Foo")
+      (assert= (:offset (nth hints 1)) 1) ; :line 2 is the second line of the form
+      (assert= (:text (nth hints 1)) "bar/0 : integer()")
+      (assert= (:offset (nth hints 2)) 5)
+      (assert= (:text (nth hints 2)) "zar/0 : binary()")))
+
+  (test "a function the compiler could not type still says where it landed"
+    (let (note (elixir-playground/note-of
+                 (assoc (defmodule-reply) :defs [{:name "hidden/0" :line 3}])
+                 "")
+          h (nth (:hints note) 1))
+      (assert= (:text h) "hidden/0")))
+
+  (test "a plain expression keeps the single hint at the form"
+    ;; the N=1 shape is the old one and must not have moved
+    (let (note (elixir-playground/note-of {:ok true :value "42" :type "Integer"} ""))
+      (assert= (:hint note) ": Integer")
+      (is (empty? (:hints note)))))
+
+  (test "a reply with no defs falls back to the listing hint"
+    ;; a remote eval, or a runtime whose chunks this build cannot read: the agent keeps
+    ;; naming the functions in the type, so they are never simply lost
+    (let (note (elixir-playground/note-of
+                 {:ok true :value "Foo" :type "Foo · bar/0, zar/0"} ""))
+      (assert= (:hint note) ": Foo · bar/0, zar/0")
+      (is (empty? (:hints note))))))
+
+;; ---- dbg's steps land against the steps ---------------------------------------------
+(describe "dbg steps inline"
+  (def pipeline-src "\"foo bar zar\"\n|> String.split()\n|> Enum.join()\n|> dbg()")
+  (def pipeline-dbg
+    (str "\"foo bar zar\" #=> \"foo bar zar\"\n"
+      "|> String.split() #=> [\"foo\", \"bar\", \"zar\"]\n"
+      "|> Enum.join() #=> \"foobarzar\""))
+
+  (test "each step's value is placed at the line that produced it"
+    (let (hints (elixir-playground/dbg-hints {:dbg pipeline-dbg} pipeline-src))
+      (assert= (map hints :offset) (list 0 1 2))
+      (assert= (:text (nth hints 1)) "#=> [\"foo\", \"bar\", \"zar\"]")
+      (assert= (:text (nth hints 2)) "#=> \"foobarzar\"")))
+
+  (test "a repeated step pairs with its OWN line, not the first match"
+    ;; scanning from the top would stack both values on the first `|> Enum.reverse()`
+    ;; and leave the second bare
+    (let (src "[1, 2]\n|> Enum.reverse()\n|> Enum.reverse()\n|> dbg()"
+          dbg (str "[1, 2] #=> [1, 2]\n"
+                "|> Enum.reverse() #=> [2, 1]\n"
+                "|> Enum.reverse() #=> [1, 2]")
+          hints (elixir-playground/dbg-hints {:dbg dbg} src))
+      (assert= (map hints :offset) (list 0 1 2))
+      (assert= (:text (nth hints 1)) "#=> [2, 1]")))
+
+  (test "a one-line pipeline places nothing rather than guessing"
+    ;; every step's source is INSIDE that line and no line equals any of them; a value
+    ;; against the wrong step would be worse than one only in the pane
+    (is (empty? (elixir-playground/dbg-hints
+                  {:dbg pipeline-dbg}
+                  "\"foo bar zar\" |> String.split() |> Enum.join() |> dbg()"))))
+
+  (test "a form with no dbg has no step notes"
+    (is (empty? (elixir-playground/dbg-hints {:ok true :value "2"} "1 + 1"))))
+
+  (test "the whole note: the type at the form, a value at each step"
+    (let (note (elixir-playground/note-of
+                 {:ok true :value "\"foobarzar\"" :type "String" :dbg pipeline-dbg}
+                 pipeline-src)
+          hints (:hints note))
+      (assert= (:text (first hints)) ": String") ; the form's own type, at its first line
+      (assert= (:offset (nth hints 2)) 1)
+      (assert= (:text (nth hints 2)) "#=> [\"foo\", \"bar\", \"zar\"]")))
+
+  (test "the pane still carries the whole block"
+    ;; the inline values are the glance; the block is the record, and stays
+    (is (includes? (string/join (elixir-playground/dbg-lines {:dbg pipeline-dbg}) "\n")
+          "what dbg showed:"))))
+
+(describe "the pane does not contradict itself"
+  (test "a dbg block replaces the 'nothing of yours ran' line, not sits above it"
+    ;; `String.split` is not a module this session defined, so the spy traced nothing and
+    ;; the note was literally true — and read as a flat denial of the steps printed above it
+    (let (text (elixir-playground/report-text
+                 {:ok true :value "\"foobarzar\"" :type "String" :dbg pipeline-dbg :spy []}
+                 pipeline-src))
+      (is (includes? text "what dbg showed:"))
+      (is (not (includes? text "nothing of yours ran")))))
+
+  (test "without a dbg block the line stays — it answers a real question"
+    ;; "traced nothing" and "nothing happened" look identical, and the difference is worth
+    ;; one line
+    (let (text (elixir-playground/report-text {:ok true :value "2" :type "Integer" :spy []} "1 + 1"))
+      (is (includes? text "nothing of yours ran"))))
+
+  (test "a real cascade always wins over both"
+    (let (text (elixir-playground/report-text
+                 {:ok true :value "3" :dbg pipeline-dbg
+                  :spy [{:kind "call" :module "Foo" :function "bar" :arity 0 :depth 0}]}
+                 pipeline-src))
+      (is (includes? text "traced call"))
+      (is (not (includes? text "nothing of yours ran"))))))

@@ -80,7 +80,13 @@ defmodule Bedit.Agent do
 
     state = %{
       binding: [],
-      env: env,
+      # …with its line forced to 1, so everything the compiler reports about an evaluation
+      # is numbered from the FORM the editor sent rather than from the line of this script
+      # that captured `__ENV__`. The editor anchors a definition's note by that number; left
+      # alone it read 1944 for the second line of a form and put the note a thousand lines
+      # past the end of the buffer. The remote path already evaluates with `line: 1`, so this
+      # also makes the two agree.
+      env: %{env | line: 1},
       modules: MapSet.new(),
       # the node this session's requests are routed to, or nil for "this one" — see the
       # ATTACH handler
@@ -824,9 +830,20 @@ defmodule Bedit.Agent do
   end
 
   defp ensure_remote(node) do
-    [{module, binary} | _] = Code.compile_quoted(remote_source())
-    {:module, ^module} = :erpc.call(node, :code, :load_binary, [module, ~c"bedit_remote.ex", binary], 10_000)
-    :ok
+    # Pushed ONCE per node, not once per observation. `g` in an attached process list is a
+    # refresh, and recompiling a module from AST and shipping it on every one of those is
+    # both waste and a small hazard: each `load_binary` makes the previous version old and
+    # purges it, which kills anything still running the code it replaced.
+    if :erpc.call(node, :erlang, :function_exported?, [@remote_module, :processes, 1], 10_000) do
+      :ok
+    else
+      [{module, binary} | _] = Code.compile_quoted(remote_source())
+
+      {:module, ^module} =
+        :erpc.call(node, :code, :load_binary, [module, ~c"bedit_remote.ex", binary], 10_000)
+
+      :ok
+    end
   rescue
     error -> {:error, Exception.message(error)}
   catch
@@ -1301,11 +1318,13 @@ defmodule Bedit.Agent do
   # nothing.
   defp settle(%{outcome: {:ok, value, binding}} = result, state) do
     modules = MapSet.union(state.modules, result.defined)
+    defs = defs_of(value)
 
     reply = %{
       ok: true,
       value: render(value),
-      type: type_of(value),
+      type: type_of(value, defs),
+      defs: defs,
       output: cap(result.printed, @output_cap),
       ms: result.ms,
       spy: result.spy,
@@ -1498,6 +1517,19 @@ defmodule Bedit.Agent do
 
   defp cap(other, _limit), do: to_string(other)
 
+  # A `defmodule` whose definitions each got their own note says only its NAME here: the
+  # editor is about to paint `bar/0 : integer()` against every `def`, and repeating the
+  # list on the `defmodule` line is the pile this moved away from.
+  #
+  # The listing stays for the case that produced no notes — a remote eval, or a runtime
+  # whose chunks this build cannot read — so the names are never lost, only moved to the
+  # lines they belong on whenever that is possible.
+  defp type_of({:module, module, binary, _}, [_ | _])
+       when is_atom(module) and is_binary(binary),
+       do: inspect(module)
+
+  defp type_of(value, _defs), do: type_of(value)
+
   # The `: Integer` hint the editor paints at the form — Elixir's answer to a type. A
   # struct names itself, because `%User{}` says far more than "a map".
   defp type_of(value) do
@@ -1593,6 +1625,132 @@ defmodule Bedit.Agent do
 
   defp map_type(%module{}), do: inspect(module)
   defp map_type(_), do: "Map"
+
+  # ---- what a `defmodule` defined, function by function ------------------------------
+
+  # The module hint used to carry the whole list — `: Foo · bar/0, zar/0` painted on the
+  # `defmodule` line — which piles every name at the one line none of them is on. Each
+  # definition knows the line it was written on, so its note belongs THERE, against the
+  # `def` it describes, and the module keeps only its own name.
+  #
+  # Three chunks off the binary the evaluation just produced. None of them needs the module
+  # to have been written to disk, which is the whole reason this can work at all for code
+  # that exists only in this session:
+  #
+  #   Dbgi   every definition, its kind and its LINE — private ones included
+  #   ExCk   the compiler's INFERRED signature per exported function. Elixir computes
+  #          these from the code itself, with no `@spec` written anywhere, which is what
+  #          makes this worth showing on ordinary code rather than only on annotated code
+  #   specs  the declared `@spec`, which beats an inference: it is what the author meant,
+  #          and the inference is only what this particular body happens to allow
+  #
+  # All three are internal formats read defensively. A release that moves them should cost
+  # the notes and nothing else — never the evaluation that produced them.
+  defp defs_of({:module, module, binary, _}) when is_atom(module) and is_binary(binary) do
+    signatures = inferred_signatures(binary)
+    specs = declared_specs(binary)
+
+    binary
+    |> definition_lines()
+    |> Enum.sort_by(fn {_name_arity, _kind, line} -> line end)
+    |> Enum.map(fn {{name, arity} = name_arity, kind, line} ->
+      %{
+        name: "#{name}/#{arity}",
+        line: line,
+        private: kind in [:defp, :defmacrop],
+        type: specs[name_arity] || signatures[name_arity]
+      }
+    end)
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
+  end
+
+  defp defs_of(_), do: nil
+
+  # `{name_arity, kind, line}` for every definition in the module, private ones included —
+  # a `defp` has no inferred signature to show (the checker chunk records only exports) but
+  # it is still a definition, and a note saying only its name and arity still says where it
+  # landed.
+  defp definition_lines(binary) do
+    {:ok, {_, [{~c"Dbgi", data}]}} = :beam_lib.chunks(binary, [~c"Dbgi"])
+    {:debug_info_v1, _, {:elixir_v1, %{definitions: definitions}, _}} = :erlang.binary_to_term(data)
+
+    definitions
+    |> Enum.map(fn {name_arity, kind, meta, _clauses} -> {name_arity, kind, meta[:line]} end)
+    |> Enum.filter(fn {_, _, line} -> is_integer(line) end)
+  rescue
+    _ -> []
+  catch
+    _, _ -> []
+  end
+
+  # The compiler's own inference, per exported function, as `%{{name, arity} => text}`.
+  defp inferred_signatures(binary) do
+    {:ok, {_, [{~c"ExCk", data}]}} = :beam_lib.chunks(binary, [~c"ExCk"])
+    {:elixir_checker_v10, %{exports: exports}} = :erlang.binary_to_term(data)
+
+    Map.new(exports, fn {name_arity, %{sig: sig}} -> {name_arity, render_signature(sig)} end)
+  rescue
+    _ -> %{}
+  catch
+    _, _ -> %{}
+  end
+
+  # One inferred signature as text. A zero-arity function shows its RETURN TYPE alone —
+  # `() -> integer()` beside a `def bar()` spends half its width restating the empty parens
+  # already on the line. Anything else shows the arrow, because the argument types are the
+  # half you cannot see.
+  #
+  # `Module.Types.Descr` is the compiler's own renderer and is not a public API, so its
+  # absence is a normal outcome rather than an error: no inferred types, everything else
+  # unchanged.
+  defp render_signature({:infer, _, clauses}) do
+    if descr_available?() do
+      clauses
+      |> Enum.map_join(" | ", fn {arguments, return} ->
+        returned = Module.Types.Descr.to_quoted_string(return)
+
+        case arguments do
+          [] -> returned
+          _ -> "(#{Enum.map_join(arguments, ", ", &Module.Types.Descr.to_quoted_string/1)}) -> #{returned}"
+        end
+      end)
+      |> cap(@spec_cap)
+    end
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
+  end
+
+  defp render_signature(_), do: nil
+
+  defp descr_available? do
+    Code.ensure_loaded?(Module.Types.Descr) and
+      function_exported?(Module.Types.Descr, :to_quoted_string, 1)
+  end
+
+  # The declared `@spec`s, as `%{{name, arity} => text}`. Read off the BINARY rather than
+  # the module: `Code.Typespec.fetch_specs/1` given a module name goes looking for a .beam
+  # file, and a module this session just defined has none — which is why the agent used to
+  # report that a fresh module had no specs when it had just been handed them.
+  defp declared_specs(binary) do
+    case Code.Typespec.fetch_specs(binary) do
+      {:ok, specs} ->
+        Map.new(specs, fn {{name, _arity} = name_arity, [form | _]} ->
+          {name_arity, name |> Code.Typespec.spec_to_quoted(form) |> Macro.to_string() |> cap(@spec_cap)}
+        end)
+
+      _ ->
+        %{}
+    end
+  rescue
+    _ -> %{}
+  catch
+    _, _ -> %{}
+  end
 
   # ---- the reply encoder --------------------------------------------------------------
   # Hand-rolled, and deliberately: the agent has to boot inside whatever project it is

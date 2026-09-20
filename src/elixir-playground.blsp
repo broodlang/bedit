@@ -190,26 +190,93 @@ the command that restarts THIS session."
     (get reply :timeout)
       {:kind :fail
        :error? true
-       :text "✗ timed out — still running? (M-x elixir-playground-restart)"}
-    (not (get reply :ok)) {:kind :fail :error? true :text (str "✗ " (get reply :error "error"))}
+       :text "timed out — still running? (M-x elixir-playground-restart)"}
+    (not (get reply :ok)) {:kind :fail :error? true :text (get reply :error "error")}
     else nil))
 
-(defn note-of (reply src)
-  "The ghost-text note for one reply — `=> 120` with what it printed, what it cost and what
-it left running, plus the term's type as the `:hint` anchored at the form.
+(defn- def-hints (reply)
+  "One `{:offset :text}` per function a `defmodule` defined — `bar/0 : integer()` against
+the `def` that declares it — or `()` for a form that defined nothing.
 
-`src` is unused: Brood derives its hint by asking the checker about the source, and Elixir's
-comes back with the value. The parameter stays because it is `playground-core`'s contract
-and the two languages differ only in which end computes it."
-  (or (error-note reply)
-    (let (hint (type-hint reply)
-          note {:kind :info
-                :text (str "=> "
-                        (get reply :value)
-                        (liveeval/printed-note reply)
-                        (liveeval/slow-note reply)
-                        (liveeval/proc-note reply))})
-      (if hint (assoc note :hint hint) note))))
+This is the whole reason the reply carries `defs`. The module hint used to read
+`: Foo · bar/0, zar/0`, which piles every name onto the one line none of them is on, gets
+clipped at whatever fits, and says nothing about any of them but that they exist. Each
+definition knows its own line, so its note goes there, and there is room on it for the
+TYPE — which the BEAM has for ordinary code with no `@spec` written anywhere, because the
+compiler infers one (`bar/0 :: integer()`) and no checker over Brood could.
+
+`:offset` is the line within the form, not in the buffer: the child was sent one form and
+counts from its first line. `playground-core/pg-place-hints` puts it where the form is."
+  (let (defs (get reply :defs))
+    (if (empty? defs)
+      '()
+      (map defs
+        (fn (d)
+          (let (t (get d :type)
+                nm (get d :name))
+            {:offset (math/max 0 (dec (or (get d :line) 1)))
+             :text (if (and (string? t) (not (= t ""))) (str nm " : " t) nm)}))))))
+
+;; ---- `dbg`, against the steps it is about -------------------------------------------
+;; `dbg/2` on a pipeline is the best thing in Elixir's debugging toolbox because it
+;; decomposes: it reports the value AFTER EVERY STEP, not just the answer. The pane shows
+;; that block in full — and the block is a table of contents for code that is right there
+;; on screen, so reading it means looking down a list of steps in one pane and matching
+;; them by eye to the same steps in another.
+;;
+;; Each step's value belongs against the step. `dbg`'s own output makes that placement
+;; possible without asking the child for anything new: every line it prints is the step's
+;; SOURCE followed by `#=>` and the value, and the form's source is right here.
+
+(def *dbg-arrow* " #=> ")
+
+(defn dbg-step-pairs (dbg)
+  "`([source value] …)` for each step in a `dbg` block, in order — `()` for a block that
+has none.
+
+A line `dbg` printed is `<the step's source> #=> <its value>`. A line without the arrow is
+not a step (a `dbg` of something that does not decompose prints the value alone) and is
+left to the pane."
+  (seq/keep (string/split (string/trimr (or dbg "")) "\n")
+    (fn (line)
+      (let (i (index-of line *dbg-arrow*))
+        ;; `index-of` answers -1 for "not found", and -1 is TRUTHY here — only nil and
+        ;; false are falsy — so the miss has to be tested for, not merely relied on
+        (when (>= i 0)
+          [(string/trim (string/substring line 0 i))
+            (string/trim (string/substring line (+ i (string/length *dbg-arrow*))))])))))
+
+(defn- dbg-offset-from (lines source from)
+  ;; The first line at or after `from` whose text IS this step's source, or nil.
+  ;;
+  ;; Searched FORWARD from the last step's line rather than from the top, because a
+  ;; pipeline may apply the same step twice (`|> Enum.reverse() … |> Enum.reverse()`) and
+  ;; matching both to the first occurrence would stack two values on one line and leave
+  ;; the other bare. `dbg` reports steps in source order, so in-order scanning pairs them
+  ;; the way a reader does.
+  (let (hit (seq/find (drop (seq/enumerate lines) from)
+              (fn ([_ text]) (= (string/trim text) source))))
+    (when hit (first hit))))
+
+(defn dbg-hints (reply src)
+  "One `{:offset :text}` per `dbg` step — `#=> [\"foo\", \"bar\", \"zar\"]` against the line
+of the pipeline that produced it — or `()` when the form called no `dbg` or its steps do
+not match the source.
+
+A step whose source cannot be found on a line of its own is DROPPED rather than guessed at:
+a pipeline written on one line has every step's source inside that line and no line equal
+to any of them, and a value placed against the wrong step is worse than one only in the
+pane, which still has the whole block."
+  (let (lines (string/split (or src "") "\n"))
+    (second (fold (dbg-step-pairs (get reply :dbg))
+              [0 '()]
+              (fn (acc pair)
+                (let ([from hints] acc
+                      [source value] pair
+                      at (dbg-offset-from lines source from))
+                  (if (nil? at)
+                    acc
+                    [(inc at) (append hints (list {:offset at :text (str "#=> " value)}))])))))))
 
 (defn dbg-lines (reply)
   "The `dbg` block for the pane — `()` when the form called none.
@@ -224,21 +291,50 @@ what YOU asked to see, the cascade is everything that happened."
       '()
       (cons "what dbg showed:" (map (string/split (string/trimr dbg) "\n") (fn (l) (str "  " l)))))))
 
+(defn note-of (reply src)
+  "The ghost-text note for one reply — `=> 120` with what it printed, what it cost and what
+it left running, plus the term's type as the `:hint` anchored at the form.
+
+`src` is what places the per-line notes: a `dbg` step names its own source, and finding
+that source among the form's lines is what turns a block in the pane into a value against
+the step it belongs to (see [[dbg-hints]]). The type itself comes back on the reply, because
+only the BEAM can see what a term is — which is the one thing Brood derives from the
+checker instead."
+  (or (error-note reply)
+    (let (hint (type-hint reply)
+          derived (append (def-hints reply) (dbg-hints reply src))
+          note {:kind :info
+                :text (str "=> "
+                        (get reply :value)
+                        (liveeval/printed-note reply)
+                        (liveeval/slow-note reply)
+                        (liveeval/proc-note reply))})
+      (cond
+        ;; a form with per-line derived text — a `defmodule`'s functions, a pipeline's
+        ;; `dbg` steps — carries the type at its opening line and one note per line below.
+        ;; Same channel, one entry instead of many.
+        (not (empty? derived))
+          (assoc note :hints (if hint (cons {:offset 0 :text hint} derived) derived))
+        hint (assoc note :hint hint)
+        else note))))
+
 (defn report-text (reply src)
   "The pane's body for one reply — what it answered, what `dbg` showed, what it printed,
 what it cost, and the cascade of everything it called.
 
 `liveeval`'s report with two things a language computes for itself: the term's type on the
 value line, and the `dbg` block under it."
-  (let (base (liveeval/report-text reply nil)
+  (let (dbg (dbg-lines reply)
+        ;; a `dbg` block explains how the evaluation ran, so liveeval's "nothing of yours
+        ;; ran" line would contradict the steps printed right above it
+        base (liveeval/report-text reply nil (not (empty? dbg)))
         hint (type-hint reply)
         lines (string/split base "\n")
         ;; the first line is the `=> value`; the type belongs beside it, as it does in the
         ;; note
         head (if (or (nil? hint) (not (get reply :ok)))
                (first lines)
-               (str (first lines) "   " hint))
-        dbg (dbg-lines reply))
+               (str (first lines) "   " hint)))
     (string/join (append (list head)
                    (if (empty? dbg) '() (cons "" dbg))
                    (rest lines))
