@@ -8,7 +8,8 @@
   (:use test)
   (:use-internals lsp)
   (:use lsp-requests)
-  (:use-internals commands))
+  (:use-internals commands)
+  (:use-internals input)) ; ed-event-handlers — the table the loop routes by
 
 (describe "lsp: framing"
   (test "lsp--frame prefixes a Content-Length header and a blank line"
@@ -84,6 +85,163 @@
           [st2 replies] (lsp/lsp-ingest state resp))
       (assert= replies (list [:my-pid [:lsp-completion :corr-1 (list "foo" "bar")]]))
       (is (nil? (get (:pending st2) 7)))))
+  ;; The protocol is bidirectional and this half was simply missing. A server may ask the
+  ;; CLIENT to do something — `client/registerCapability` is the usual one, sent by every
+  ;; server that registers its file watchers dynamically — and it is a request, so the
+  ;; server BLOCKS on the answer. Never answering does not degrade gracefully: Expert
+  ;; initialised, advertised a full completionProvider, and then answered nothing at all,
+  ;; forever, which reads as a broken server rather than a missing client feature.
+  (test "a request FROM the server is answered, not ignored"
+    (let (state {:proc :fake :buf "" :next-id 8 :pending {} :opened {} :version 1}
+          ask (lsp/lsp-frame (json/encode {:jsonrpc "2.0"
+                                           :id 1
+                                           :method "client/registerCapability"
+                                           :params {:registrations []}}))
+          [st2 replies] (lsp/lsp-ingest state ask))
+      ;; nothing goes to a waiter — this is not anyone's response
+      (is (empty? replies))
+      ;; …but a frame is queued for the server, carrying ITS id
+      (assert= (count (:outbox st2)) 1)
+      (is (includes? (first (:outbox st2)) "\"id\":1"))
+      (is (includes? (first (:outbox st2)) "\"result\":null"))))
+
+  (test "a server request this client does not implement is refused, still answered"
+    ;; MethodNotFound is a real answer: it unblocks the server just as well as agreement,
+    ;; and silence is the only response that does not.
+    (let (state {:proc :fake :buf "" :next-id 8 :pending {} :opened {} :version 1}
+          ask (lsp/lsp-frame (json/encode {:jsonrpc "2.0"
+                                           :id 4
+                                           :method "workspace/somethingElse"
+                                           :params {}}))
+          [st2 _] (lsp/lsp-ingest state ask))
+      (assert= (count (:outbox st2)) 1)
+      (is (includes? (first (:outbox st2)) "-32601"))
+      (is (includes? (first (:outbox st2)) "\"id\":4"))))
+
+  ;; …and the one server request that carries WORK: a code action's command produces its
+  ;; edits this way round, as a request to us rather than as the reply to anything.
+  (test "workspace/applyEdit is accepted, and its edits queued for the editor"
+    (let (state {:proc :fake :buf "" :next-id 8 :pending {} :opened {} :version 1}
+          ask (lsp/lsp-frame (json/encode {:jsonrpc "2.0"
+                                           :id 4
+                                           :method "workspace/applyEdit"
+                                           :params {:edit {:changes {"file:///a.ex" [{:range {:start {:line 0
+                                                                                                      :character 0}
+                                                                                              :end {:line 0
+                                                                                                    :character 1}}
+                                                                                      :newText "N"}]}}}}))
+          [st2 _] (lsp/lsp-ingest state ask))
+      ;; answered at once and positively: the loop that owns the buffers applies it, and a
+      ;; connection that stops reading its server until that lands is how a client deadlocks
+      (assert= (count (:outbox st2)) 1)
+      (is (includes? (first (:outbox st2)) "\"applied\":true"))
+      (is (includes? (first (:outbox st2)) "\"id\":4"))
+      (assert= (into [] (:edits st2))
+        [{"/a.ex" (list {:start-line 0 :start-char 0 :end-line 0 :end-char 1 :text "N"})}])))
+
+  (test "a notification is still nothing to answer"
+    ;; :method with no :id — publishDiagnostics, logMessage. Answering one would be a
+    ;; protocol error in the other direction.
+    (let (state {:proc :fake :buf "" :next-id 8 :pending {} :opened {} :version 1}
+          note (lsp/lsp-frame (json/encode {:jsonrpc "2.0"
+                                            :method "window/logMessage"
+                                            :params {:message "hi" :type 3}}))
+          [st2 replies] (lsp/lsp-ingest state note))
+      (is (empty? replies))
+      (is (empty? (or (:outbox st2) [])))
+      ;; …but it IS narrated: a server is entitled to be slow before it is useful, and the
+      ;; good ones say so. Expert answers `initialize` at once, advertises a full
+      ;; completionProvider, then IGNORES every request — without replying — until its
+      ;; engine node is compiled and up. With its narration dropped, that half-minute is
+      ;; indistinguishable from a broken server.
+      (assert= (into [] (:notices st2)) ["hi"])))
+
+  ;; What makes a language server worth connecting for. bedit already renders diagnostics —
+  ;; the underline on the token, the ⚠ note at the end of the line, the gutter mark — and
+  ;; the only thing that ever produced them was the Brood checker, so every other language
+  ;; had the whole apparatus and nothing to put in it.
+  (test "a published diagnostic converts to bedit's 1-based shape"
+    ;; LSP counts lines and characters from 0 and bedit's view reads 1-based, so both are
+    ;; shifted. Getting this wrong puts every mark one line above the code it is about, and
+    ;; it looks plausible.
+    (let (d (lsp/lsp-diagnostic {:range {:start {:line 3 :character 17}}
+                                 :severity 2
+                                 :message "variable \"unused\" is unused"}))
+      (assert= (:line d) 4)
+      (assert= (:col d) 18)
+      ;; bedit's diagnostics carry no severity field, so the word goes in the message —
+      ;; which is how the Brood checker's own findings already read
+      (assert= (:message d) "warning: variable \"unused\" is unused")))
+
+  (test "each LSP severity names itself in the message"
+    (let (msg (fn (sev)
+                (:message (lsp/lsp-diagnostic {:range {:start {:line 0 :character 0}}
+                                               :severity sev
+                                               :message "x"}))))
+      (assert= (msg 1) "error: x")
+      (assert= (msg 2) "warning: x")
+      ;; an absent severity is not invented
+      (assert= (:message (lsp/lsp-diagnostic {:range {:start {:line 0 :character 0}} :message "x"}))
+        "x")))
+
+  (test "publishDiagnostics is routed as diagnostics, not as narration"
+    (let (state {:proc :fake :buf "" :next-id 8 :pending {} :opened {} :version 1}
+          note (lsp/lsp-frame (json/encode {:jsonrpc "2.0"
+                                            :method "textDocument/publishDiagnostics"
+                                            :params {:uri "file:///tmp/a.ex"
+                                                     :diagnostics [{:range {:start {:line 0
+                                                                                    :character 0}}
+                                                                    :severity 1
+                                                                    :message "boom"}]}}))
+          [st2 replies] (lsp/lsp-ingest state note))
+      (is (empty? replies))
+      (is (empty? (or (:notices st2) []))) ; not a log line
+      (assert= (count (:diags st2)) 1)
+      (let ([path items raw] (first (:diags st2)))
+        (assert= path "/tmp/a.ex") ; a path, not a URI — that is what a buffer carries
+        (assert= (count items) 1)
+        (assert= (:line (first items)) 1)
+        ;; the server's own object is kept beside the rendered one: a quickfix is asked for
+        ;; by handing the diagnostic BACK, and bedit's flattened shape is not one a server
+        ;; recognises
+        (assert= (:message (first raw)) "boom")
+        (assert= (get-in (first raw) [:range :start :line]) 0))))
+
+  ;; An empty list is a MESSAGE, not an absence: it is how a server says the file is clean
+  ;; now, and dropping it leaves the errors you have just fixed sitting on screen.
+  (test "an empty diagnostic list is published like any other"
+    (let (state {:proc :fake :buf "" :next-id 8 :pending {} :opened {} :version 1}
+          note (lsp/lsp-frame (json/encode {:jsonrpc "2.0"
+                                            :method "textDocument/publishDiagnostics"
+                                            :params {:uri "file:///tmp/a.ex" :diagnostics []}}))
+          [st2 _] (lsp/lsp-ingest state note))
+      (assert= (count (:diags st2)) 1)
+      (assert= (second (first (:diags st2))) [])))
+
+  (test "a server's narration is one line, clipped to the echo area"
+    ;; Expert's startup log includes the entire `PATH` and a fifteen-line list of ebin
+    ;; directories. The first line is the sentence; the rest is the attachment.
+    (assert= (lsp/lsp-progress-text {:method "window/logMessage"
+                                     :params {:message "ebin paths:\n[\"/a\"\n \"/b\"]"}})
+      "ebin paths:")
+    (let (long (string/repeat "x" 400)
+          ;; the clip answers a string for a message with content; a nil here would be the
+          ;; test passing vacuously, so it is an error rather than a skipped assertion
+          out (or (lsp/lsp-progress-text {:method "window/logMessage" :params {:message long}})
+                (error "a long log line should still be narrated, clipped")))
+      (is (<= (string/length out) lsp/*lsp-notice-width*))
+      (is (string/ends-with? out "…")))
+    ;; progress `begin` carries :title, `report` carries :message — both are worth showing
+    (assert= (lsp/lsp-progress-text {:method "$/progress"
+                                     :params {:value {:kind "begin" :title "Starting engine node"}}})
+      "Starting engine node")
+    (assert= (lsp/lsp-progress-text {:method "$/progress"
+                                     :params {:value {:kind "report" :message "Compiling…"}}})
+      "Compiling…")
+    ;; nothing to say, nothing shown
+    (is (nil? (lsp/lsp-progress-text {:method "$/progress" :params {:value {:kind "end"}}})))
+    (is (nil? (lsp/lsp-progress-text {:method "textDocument/publishDiagnostics" :params {}}))))
+
   (test "a response split across two chunks reassembles, then routes"
     (let (f (lsp/lsp-frame (json/encode {:jsonrpc "2.0" :id 7 :result {:items []}}))
           mid (math/quot (string/length f) 2)
@@ -164,6 +322,100 @@
       (list {:path "/a" :line 0 :char 0} {:path "/b" :line 3 :char 1})))
   (test "nil locations → empty"
     (assert= (lsp-locations nil) '()))
+  ;; ---- signature help: the one line, with the argument you are on picked out ----
+  (test "the active parameter is marked, by offsets or by substring"
+    ;; both forms are in the wild: Expert and rust-analyzer send `[start end]`, gopls and
+    ;; several TypeScript servers send the parameter's own text
+    (let (by-text {:signatures [{:label "get(map, key, default)"
+                                 :parameters [{:label "map"} {:label "key"} {:label "default"}]}]
+                   :activeParameter 2}
+          by-offset {:signatures [{:label "get(map, key, default)"
+                                   :parameters [{:label [4 7]} {:label [9 12]}]}]
+                     :activeParameter 0})
+      (assert= (lsp-signature-text by-text) "get(map, key, ‹default›)")
+      (assert= (lsp-signature-text by-offset) "get(‹map›, key, default)")))
+
+  (test "the signature's own activeParameter wins over the help's (LSP 3.16)"
+    (assert= (lsp-signature-text {:signatures [{:label "f(a, b)"
+                                                :parameters [{:label "a"} {:label "b"}]
+                                                :activeParameter 1}]
+                                  :activeParameter 0})
+      "f(a, ‹b›)"))
+
+  (test "more than one arity says so — the one you are typing towards is not the only one"
+    (assert= (lsp-signature-text {:signatures [{:label "f(a)" :parameters [{:label "a"}]}
+                                                {:label "f(a, b)"
+                                                 :parameters [{:label "a"} {:label "b"}]}]
+                                  :activeSignature 1
+                                  :activeParameter 1})
+      "f(a, ‹b›)  (2/2)"))
+
+  (test "nothing to say is \"\" — which is the server's answer outside a call"
+    (assert= (lsp-signature-text nil) "")
+    (assert= (lsp-signature-text {:signatures []}) "")
+    ;; no activeParameter at all: the label, unmarked, rather than a guess
+    (assert= (lsp-signature-text {:signatures [{:label "f(a, b)"}]}) "f(a, b)")
+    ;; an out-of-range index is a server bug we survive rather than mark at the wrong place
+    (assert= (lsp-signature-text {:signatures [{:label "f(a)" :parameters [{:label "a"}]}]
+                                  :activeParameter 9})
+      "f(a)")
+    ;; a parameter whose text is not in the label locates nothing, and marks nothing
+    (assert= (lsp-signature-text {:signatures [{:label "f(a)" :parameters [{:label "zzz"}]}]
+                                  :activeParameter 0})
+      "f(a)"))
+
+  ;; ---- code actions: two wire shapes, one list ----------------------------------
+  ;; The server answers with `Command`s (`{:title :command :arguments}` — ask it to do the
+  ;; thing) and `CodeAction`s (`{:title :kind :edit :command}` — edits we apply ourselves),
+  ;; mixed in one array. Normalised here so the editor never has to tell them apart.
+  (test "a CodeAction's edits and a Command's call normalise to the same shape"
+    (let (as (lsp-code-action-list [{:title "Add alias"
+                                     :kind "quickfix"
+                                     :edit {:changes {"file:///a.ex" [{:range {:start {:line 0
+                                                                                       :character 0}
+                                                                               :end {:line 0
+                                                                                     :character 0}}
+                                                                       :newText "alias Foo\n"}]}}}
+                                     {:title "Run the thing"
+                                      :command "expert.doIt"
+                                      :arguments ["a"]}])
+          [fixit cmd] [(first as) (second as)])
+      (assert= (:title fixit) "Add alias")
+      (assert= (:kind fixit) "quickfix")
+      (assert= (keys (:edit fixit)) (list "/a.ex"))
+      (is (nil? (:command fixit)))
+      (assert= (:title cmd) "Run the thing")
+      (assert= (:command cmd) "expert.doIt")
+      (assert= (:arguments cmd) ["a"])
+      (is (nil? (:edit cmd)))))
+
+  (test "a CodeAction's nested Command is unwrapped, not mistaken for a name"
+    ;; a Command's `:command` is a string; a CodeAction's is a whole Command object — the
+    ;; one field that tells the two forms apart
+    (let (a (first (lsp-code-action-list [{:title "Organize imports"
+                                           :kind "source.organizeImports"
+                                           :command {:title "Organize imports"
+                                                     :command "expert.organize"
+                                                     :arguments [1 2]}}])))
+      (assert= (:command a) "expert.organize")
+      (assert= (:arguments a) [1 2])))
+
+  (test "an action with neither edits nor a command is dropped"
+    ;; a title with nothing behind it would promise a fix that cannot happen
+    (assert= (lsp-code-action-list [{:title "Nothing"} {:title "Empty" :edit {}}]) '())
+    (assert= (lsp-code-action-list nil) '()))
+
+  (test "the code-action context is the diagnostics on THAT line"
+    ;; a server matches its quickfixes to the finding you hand back, so the wrong line's
+    ;; diagnostics read as the fix for the error under your cursor not existing
+    (let (raw [{:range {:start {:line 2 :character 0} :end {:line 2 :character 9}} :message "a"}
+                {:range {:start {:line 7 :character 0} :end {:line 9 :character 0}} :message "b"}])
+      (assert= (map (lsp/lsp-diagnostics-at-line raw 2) :message) (list "a"))
+      ;; a multi-line range covers every line it spans
+      (assert= (map (lsp/lsp-diagnostics-at-line raw 8) :message) (list "b"))
+      (assert= (lsp/lsp-diagnostics-at-line raw 4) [])
+      (assert= (lsp/lsp-diagnostics-at-line nil 0) [])))
+
   (test "hover text: string, {:value}, and array contents"
     (assert= (lsp-hover-text {:contents "doc"}) "doc")
     (assert= (lsp-hover-text {:contents {:kind "markdown" :value "**x**"}}) "**x**")
@@ -209,6 +461,41 @@
           resp (lsp/lsp-frame (json/encode {:jsonrpc "2.0" :id 2 :result {:contents "the docs"}}))
           [st2 replies] (lsp/lsp-ingest state resp))
       (assert= replies (list [:p [:lsp-hover :c "the docs"]]))))
+  (test "the requests carry the position and the context the server needs"
+    (let (sig (lsp/lsp-signature-request 3 "file:///a.rs" 7 12)
+          act (lsp/lsp-code-action-request 4
+                "file:///a.ex"
+                2
+                0
+                [{:range {:start {:line 2 :character 0} :end {:line 2 :character 4}} :message "boom"}])
+          cmd (lsp/lsp-execute-command-request 5 "expert.doIt" ["x"]))
+      (is (includes? sig "textDocument/signatureHelp"))
+      (is (includes? sig "\"line\":7"))
+      (is (includes? sig "\"character\":12"))
+      (is (includes? act "textDocument/codeAction"))
+      ;; the diagnostics go WITH it — without them most servers answer with their
+      ;; unconditional refactorings only, which reads as the fix for your error not existing
+      (is (includes? act "boom"))
+      (is (includes? cmd "workspace/executeCommand"))
+      (is (includes? cmd "expert.doIt"))))
+
+  (test "a :signature-tagged response routes [:lsp-signature line]"
+    (let (state {:proc :fake
+                 :buf ""
+                 :next-id 3
+                 :pending {2 [:p :c (lsp-signature)]}
+                 :opened {}
+                 :version 1}
+          resp (lsp/lsp-frame (json/encode {:jsonrpc "2.0"
+                                            :id 2
+                                            :result {:signatures [{:label "put(map, key, value)"
+                                                                   :parameters [{:label "map"}
+                                                                                 {:label "key"}
+                                                                                 {:label "value"}]}]
+                                                     :activeSignature 0
+                                                     :activeParameter 1}}))
+          [st2 replies] (lsp/lsp-ingest state resp))
+      (assert= replies (list [:p [:lsp-signature :c "put(map, ‹key›, value)"]]))))
   (test "a :rename-tagged response routes [:lsp-workspace-edit edit]"
     (let (state {:proc :fake
                  :buf ""
@@ -246,6 +533,160 @@
         ;; the same reply again (or after C-g cleared the table): stale → dropped
         (assert= (:echo (commands/ed-ev-lsp-reply m2 [:lsp-hover corr "AGAIN"] 24 80 24))
           "DOCS"))))
+  ;; The argument hint is the one LSP lookup nobody asks for: the idle beat fires it as you
+  ;; type. So it must be silent going out, and it must be sure it is still about where the
+  ;; cursor is before it says anything coming back.
+  (test "a signature reply lands in the eldoc slot, not the echo"
+    (let (me (self)
+          m (model/ed-init (editor/buffer/make-buffer "foo(1, 2)"))
+          b (model/ed-current-buf m)
+          at [(editor/buffer/buffer-point b) (editor/buffer/buffer-rope b)]
+          m1 (commands/ed-lsp-ask m
+               (lsp-signature)
+               (fn (corr) (send me [:corr corr]))
+               {:at at}
+               :quiet)
+          corr (receive ([:corr c] c) (after 1000 :none)))
+      (assert= (:echo m1) "") ; :quiet — no narration on every keystroke
+      (let (m2 (commands/ed-ev-lsp-reply m1 [:lsp-signature corr "foo(‹a›, b)"] 24 80 24))
+        (assert= (:eldoc m2) "foo(‹a›, b)")
+        (assert= (:echo m2) ""))))
+
+  (test "a signature reply about a call point has left is dropped"
+    (let (me (self)
+          m (model/ed-init (editor/buffer/make-buffer "foo(1, 2)"))
+          b (model/ed-current-buf m)
+          m1 (commands/ed-lsp-ask m
+               (lsp-signature)
+               (fn (corr) (send me [:corr corr]))
+               {:at [(editor/buffer/buffer-point b) (editor/buffer/buffer-rope b)]}
+               :quiet)
+          corr (receive ([:corr c] c) (after 1000 :none))
+          ;; the user typed on while the server worked
+          moved (model/ed-set-buf m1 (editor/buffer/insert (model/ed-current-buf m1) "X"))
+          m2 (commands/ed-ev-lsp-reply moved [:lsp-signature corr "foo(‹a›, b)"] 24 80 24))
+      (is (nil? (:eldoc m2)))))
+
+  (test "an empty signature clears the hint — the server saying you are out of the call"
+    (let (me (self)
+          m (model/ed-init (editor/buffer/make-buffer "foo(1, 2)"))
+          b (model/ed-current-buf m)
+          m1 (assoc (commands/ed-lsp-ask m
+                      (lsp-signature)
+                      (fn (corr) (send me [:corr corr]))
+                      {:at [(editor/buffer/buffer-point b) (editor/buffer/buffer-rope b)]}
+                      :quiet)
+               :eldoc "foo(‹a›, b)")
+          corr (receive ([:corr c] c) (after 1000 :none))
+          m2 (commands/ed-ev-lsp-reply m1 [:lsp-signature corr ""] 24 80 24))
+      (is (nil? (:eldoc m2)))))
+
+  ;; A code action REWRITES your file on the server's say-so, and "add missing import" and
+  ;; "delete this clause" arrive through the same door. So: a picker, always, and the title
+  ;; read before anything happens.
+  (test "code actions open a picker; choosing one applies its edits"
+    (let (me (self)
+          m (model/ed-init (editor/buffer/make-buffer "defmodule M do\nend\n"))
+          m1 (commands/ed-lsp-ask m
+               (lsp-code-actions)
+               (fn (corr) (send me [:corr corr]))
+               nil
+               "code actions…")
+          corr (receive ([:corr c] c) (after 1000 :none))
+          buf-name (editor/buffer/buffer-name (model/ed-current-buf m1))
+          action {:title "Add alias"
+                  :kind "quickfix"
+                  :edit {buf-name (list {:start-line 0 :start-char 0 :end-line 0 :end-char 0 :text "# "})}}
+          m2 (commands/ed-ev-lsp-reply m1 [:lsp-code-actions corr (list action)] 24 80 24)
+          mb (:minibuffer m2))
+      ;; nothing has changed yet — a list, not an edit
+      (is (not (nil? mb)))
+      (assert= (editor/buffer/buffer-text (model/ed-current-buf m2)) "defmodule M do\nend\n")
+      (assert= (into [] (:rank-source mb)) ["Add alias  [quickfix]"])))
+
+  (test "no code actions says so rather than opening an empty picker"
+    (let (me (self)
+          m (model/ed-init (editor/buffer/make-buffer "x"))
+          m1 (commands/ed-lsp-ask m
+               (lsp-code-actions)
+               (fn (corr) (send me [:corr corr]))
+               nil
+               "code actions…")
+          corr (receive ([:corr c] c) (after 1000 :none))
+          m2 (commands/ed-ev-lsp-reply m1 [:lsp-code-actions corr '()] 24 80 24))
+      (is (nil? (:minibuffer m2)))
+      (is (includes? (:echo m2) "no code actions"))))
+
+  (test "actions sharing a title are numbered — the picker matches rows by label"
+    ;; Expert offers `Add alias` once per candidate module; two identical rows would
+    ;; silently mean the first one
+    (let (me (self)
+          m (model/ed-init (editor/buffer/make-buffer "x"))
+          m1 (commands/ed-lsp-ask m
+               (lsp-code-actions)
+               (fn (corr) (send me [:corr corr]))
+               nil
+               "code actions…")
+          corr (receive ([:corr c] c) (after 1000 :none))
+          two (list {:title "Add alias" :kind "quickfix" :command "a"}
+                {:title "Add alias" :kind "quickfix" :command "b"})
+          m2 (commands/ed-ev-lsp-reply m1 [:lsp-code-actions corr two] 24 80 24))
+      (assert= (into [] (:rank-source (:minibuffer m2)))
+        ["1. Add alias  [quickfix]" "2. Add alias  [quickfix]"])))
+
+  (test "a server's own applyEdit lands on the buffers it names"
+    ;; what a chosen action's `workspace/executeCommand` produces: edits arriving as a
+    ;; request TO us, not as the reply to anything
+    (let (path (str "/tmp/bedit-applyedit-" (:id (proc/info (self))) ".ex")
+          _ (file/spit path "abc\n")
+          m (commands/ed-find-file (model/ed-init (editor/buffer/make-buffer "x")) path)
+          m2 (commands/ed-ev-lsp-apply-edit m
+               [:lsp-apply-edit
+                 {path (list {:start-line 0 :start-char 0 :end-line 0 :end-char 3 :text "zzz"})}]
+               24
+               80
+               24))
+      (assert= (editor/buffer/buffer-text (model/ed-current-buf m2)) "zzz\n")
+      (is (includes? (:echo m2) "applied edits"))
+      (file/rm path)))
+
+  ;; A server says what it can do, and bedit has to read it: Expert advertises code
+  ;; actions, hover, definition and references and does NOT advertise signature help. The
+  ;; difference between knowing that and not is a key that explains itself versus one that
+  ;; appears to do nothing.
+  (test "a provider is true, an options object, or absent — and only absent means no"
+    (is (lsp/lsp-capable? {:hoverProvider true} :hoverProvider))
+    (is (lsp/lsp-capable? {:codeActionProvider {:codeActionKinds ["quickfix"]}} :codeActionProvider))
+    (is (not (lsp/lsp-capable? {:hoverProvider true} :signatureHelpProvider)))
+    (is (not (lsp/lsp-capable? {:signatureHelpProvider false} :signatureHelpProvider)))
+    (is (not (lsp/lsp-capable? nil :hoverProvider))))
+
+  (test "the idle beat never asks a server that does not offer signature help"
+    ;; Expert is one, so in an Elixir buffer the argument hints cost exactly nothing
+    (let (m (assoc (model/ed-init (editor/buffer/make-buffer "foo(1)")) :lsp :fake-conn)
+          expert (assoc m :lsp-caps {:codeActionProvider true :hoverProvider true}))
+      (assert= (commands/ed-launch-signature expert) expert) ; not even a stamp
+      (is (empty? (:lsp-pending (commands/ed-launch-signature expert) {})))))
+
+  (test "the command says so rather than doing nothing"
+    (let (m (assoc (model/ed-init (editor/buffer/make-buffer "foo(1)"))
+              :lsp (self) ; a live pid, so `ed-lsp-ensure` reads the connection as ready
+              :lsp-caps {:hoverProvider true}))
+      (is (includes? (:echo (commands/cmd-lsp-signature-help m :key)) "does not offer signature help"))
+      (is (includes? (:echo (commands/cmd-lsp-code-action m :key)) "does not offer code actions"))))
+
+  (test "the idle beat asks once per position, and only where nothing else answers"
+    (let (m (assoc (model/ed-init (editor/buffer/make-buffer "foo(1, 2)")) :lsp :fake-conn)
+          b (model/ed-current-buf m))
+      (is (model/ed-signature-stale? m)) ; never asked here yet
+      (let (asked (assoc m :signature-at [(editor/buffer/buffer-point b) (editor/buffer/buffer-rope b)]))
+        (is (not (model/ed-signature-stale? asked))) ; and not again for the same point
+        ;; point moved: ask again
+        (is (model/ed-signature-stale? (model/ed-set-buf asked
+                                         (editor/buffer/goto-char (model/ed-current-buf asked) 4)))))
+      ;; no server, nothing to ask
+      (is (not (model/ed-signature-stale? (dissoc m :lsp))))))
+
   (test "a mutating reply is rope-guarded: format edits after a buffer change drop"
     (let (me (self)
           m (model/ed-init (editor/buffer/make-buffer "abc"))
@@ -327,7 +768,11 @@
   (def lspt-missing "bedit-no-such-language-server")
   (test "the real .ex mapping is configured, and a name that cannot exist is seen to be absent"
     (let ([cmd args] (lsp/lsp-server-for "/tmp/m.ex"))
-      (assert= "elixir-ls" cmd) ; the shipped config, installed here or not
+      ;; Expert (expert-lsp.org) — the official Elixir server, and the one ElixirLS,
+      ;; Lexical and Next LS converged into. `--stdio` because that is this client's only
+      ;; transport.
+      (assert= "expert" cmd) ; the shipped config, installed here or not
+      (assert= ["--stdio"] (into [] args))
       (is (nil? (os/which lspt-missing)))))
   (test "M-x lsp-connect names the missing binary and leaves the model unconnected"
     (binding (*lsp-servers* {"ex" [lspt-missing []]})
@@ -351,3 +796,86 @@
       (is (nil? (lsp/lsp-complete-source m))) ; no 1 s stall per Tab
       (let (m2 (commands/cmd-lsp-connect m nil))
         (is (not (includes? (:echo m2) "already connected")))))))
+
+(describe "lsp diagnostics land on the buffer they are about"
+  (defn lspd-model ()
+    (model/ed-init (editor/buffer/make-buffer "defmodule M do\nend\n" "m.ex" "/tmp/m.ex")))
+  (defn lspd-items () [{:line 1 :col 3 :message "warning: boom"}])
+
+  (test "diagnostics for the current buffer are shown"
+    (let (m (commands/ed-ev-lsp-diagnostics (lspd-model)
+              [:lsp-diagnostics "/tmp/m.ex" (lspd-items)]
+              24 80 24))
+      (assert= (count (:diagnostics m)) 1)
+      ;; indexed by 0-based line for the view, from the 1-based diagnostic
+      (assert= (count (get (:diag-by-line m) 0)) 1)))
+
+  ;; The model holds ONE diagnostic set — it is a view of the buffer you are looking at —
+  ;; so a server publishing about a file in the background must not replace what is on
+  ;; screen with findings about something else.
+  (test "diagnostics for another file are ignored"
+    (let (m (commands/ed-ev-lsp-diagnostics (lspd-model)
+              [:lsp-diagnostics "/tmp/somewhere-else.ex" (lspd-items)]
+              24 80 24))
+      (is (nil? (:diagnostics m)))))
+
+  (test "a buffer with no file is never matched"
+    (let (m (commands/ed-ev-lsp-diagnostics (model/ed-init (editor/buffer/make-buffer "x"))
+              [:lsp-diagnostics "/tmp/m.ex" (lspd-items)]
+              24 80 24))
+      (is (nil? (:diagnostics m)))))
+
+  ;; Clearing is a message too: it is how a server says the file is clean now.
+  (test "an empty list clears what was there"
+    (let (m1 (commands/ed-ev-lsp-diagnostics (lspd-model)
+               [:lsp-diagnostics "/tmp/m.ex" (lspd-items)]
+               24 80 24)
+          m2 (commands/ed-ev-lsp-diagnostics m1 [:lsp-diagnostics "/tmp/m.ex" []] 24 80 24))
+      (assert= (count (:diagnostics m2)) 0)
+      (is (empty? (or (:diag-by-line m2) {})))))
+
+  (test "the handler is registered, so the loop actually routes the event"
+    ;; the table and the function are two different things, and only the table is consulted
+    (is (contains? input/ed-event-handlers :lsp-diagnostics))
+    (is (contains? input/ed-event-handlers :lsp-notice))))
+
+(describe "a server starts on its own for a buffer that has one"
+  ;; It used to start on the first LOOKUP, which was fine while a server was only ever a
+  ;; lookup. Diagnostics changed that: the underline on the mistake you just made is the
+  ;; thing you want without asking, and a reader who never presses `M-.` would never see one.
+  (defn lspa-model (name path)
+    (model/ed-init (editor/buffer/make-buffer "defmodule M do\nend\n" name path)))
+
+  (test "a buffer with no file never starts anything"
+    (let (m (model/ed-init (editor/buffer/make-buffer "x")))
+      (assert= (commands/ed-lsp-autostart m) m)))
+
+  (test "a buffer whose extension has no server configured never starts anything"
+    (let (m (lspa-model "notes.txt" "/tmp/notes.txt"))
+      (assert= (commands/ed-lsp-autostart m) m)))
+
+  (test "a configured server that is not installed is not started, and says nothing"
+    ;; silence matters here: a message would fire on every idle beat in every buffer whose
+    ;; language has a server nobody installed
+    (binding (*lsp-servers* {"ex" ["bedit-no-such-language-server" []]})
+      (let (m (lspa-model "m.ex" "/tmp/m.ex")
+            m2 (commands/ed-lsp-autostart m))
+        (is (nil? (:lsp m2)))
+        (assert= (:echo m2) (:echo m)))))
+
+  (test "a connection already alive on the model is left alone"
+    ;; a real pid, because `ed-lsp-live` asks whether the process is still there — a
+    ;; keyword would read as dead and the autostart would go and start a second server
+    (let (conn (spawn (receive (_ :done) (after 30000 :done)))
+          m (assoc (lspa-model "m.ex" "/tmp/m.ex") :lsp conn))
+      (assert= (:lsp (commands/ed-lsp-autostart m)) conn)
+      (exit conn :kill)))
+
+  ;; Expert compiles the whole mix project before it answers anything, which is a real
+  ;; cost to pay unasked — so it is one `defdyn` in init.blsp to turn off. The name is
+  ;; BARE: an earmuffed `defdyn` is ambient, never namespaced, however deep the module.
+  (test "autostart is off when the reader turns it off"
+    (binding (*lsp-autostart* false)
+      (binding (*lsp-servers* {"ex" ["expert" ["--stdio"]]})
+        (let (m (lspa-model "m.ex" "/tmp/m.ex"))
+          (assert= (commands/ed-lsp-autostart m) m))))))

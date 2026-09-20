@@ -1163,9 +1163,12 @@ A hex view is refused: its text renders the binary, it is not the binary."
     (fn (mm ch)
       (if (not (string? ch))
         mm
+        ;; the same case rule as search (`isearch/search-fold?`): `a` zaps to the next `a`
+        ;; or `A`, and `A` zaps only to an `A`
         (let (found (buffer-search-forward (ed-current-buf mm)
                       ch
-                      (buffer-point (ed-current-buf mm))))
+                      (buffer-point (ed-current-buf mm))
+                      (isearch/search-fold? ch)))
           (if (nil? found)
             (message mm (str "not found: " ch))
             (ed-kill-span mm (fn (b) (goto-char b (inc found)))))))))) ; kill [point, found] to ring
@@ -3520,14 +3523,21 @@ negative delta (a recycled id) to 0. Mirrors `observe-reds-rate`."
     (<= (- at prev-at) 0) nil
     else (math/quot (* 1000 (math/max 0 (- reds prev-reds))) (- at prev-at))))
 
-(defn- ed-rate-procs (prev-reds prev-at infos at)
+(defn ed-rate-procs (prev-reds prev-at infos at &optional (key :id))
   "Tag each `process-info` map in `infos` with `:reds-rate` — its reductions/second
-since the matching id in the previous snapshot (`prev-reds` an id→reductions map,
-`prev-at` its wall-clock ms). A process new this tick gets nil. Pure; O(n)."
+since the matching process in the previous snapshot (`prev-reds` a key→reductions map,
+`prev-at` its wall-clock ms). A process new this tick gets nil. Pure; O(n).
+
+`key` is which field identifies a process across two snapshots: `:id` for this runtime's
+own, `:pid` for a BEAM node's, where the identity that comes back over the wire is the
+printed pid. Public for that second caller (`beam`): reductions are the scheduler's own
+measure of work done, so the DIFFERENCE between two snapshots is who is busy right now —
+which is the question a process list exists to answer, and it is the same arithmetic
+whichever runtime is being asked."
   (map infos
     (fn (p)
       (assoc p
-        :reds-rate (ed-reds-rate (get prev-reds (:id p)) prev-at (:reductions p) at)))))
+        :reds-rate (ed-reds-rate (get prev-reds (get p key)) prev-at (:reductions p) at)))))
 
 (defn- ed-proc-row (p)
   "One `*Process List*` row from a `process-info` map. The ID stays flush-left (so
@@ -3939,12 +3949,12 @@ server is configured for its extension, or the server is not installed.
 
 Every message says `lsp:`, whichever feature asked — six of them share this one server
 (completion, imenu, goto, references, hover, rename), and what went wrong is the server's,
-not theirs; `imenu: elixir-ls is not installed` would read as a fact about imenu.
+not theirs; `imenu: expert is not installed` would read as a fact about imenu.
 
 The not-installed case is the one that used to be a crash. `os/spawn` raises when the
 binary is missing, and it is called inside the connection PROCESS — so an Elixir buffer on
 a machine without `elixir-ls` answered a goto-definition with a `[crash] #<pid …> exited:
-proc-spawn elixir-ls: No such file or directory` trace where a sentence belongs.
+proc-spawn expert: No such file or directory` trace where a sentence belongs.
 `os/which` (brood's std/os) asks before spawning."
   (let (buf (ed-current-buf m)
         file (buffer-file buf)
@@ -3982,6 +3992,39 @@ The `lsp-complete-source` stays registered but no-ops with no connection on the 
     (if (nil? conn)
       (message m "lsp: not connected")
       (do (lsp/lsp-shutdown conn) (message (dissoc m :lsp) "lsp: disconnected")))))
+
+(defdyn *lsp-autostart* true)
+;; Whether opening a file whose language has an installed server starts it.
+;;
+;; It used to be that a server started on the first LOOKUP — the first `M-.`, hover or
+;; rename — which was a fine rule while a server was only ever a lookup. Diagnostics
+;; changed that: the underline on the mistake you just made is the thing you want without
+;; asking, and a reader who never presses `M-.` in a file would never have seen one.
+;;
+;; `(defdyn *lsp-autostart* false)` in `init.blsp` turns it off, for a project where the
+;; server's startup is heavy enough to want on demand — Expert compiles the whole mix
+;; project before it answers anything, which is a real cost to pay unasked. The name is
+;; bare, not `commands/…`: an earmuffed `defdyn` is ambient however deep the module.
+
+(defn ed-lsp-autostart (m)
+  "Start the current buffer's language server if it has one and nothing is connected yet —
+the idle beat's hook, so it happens once the buffer has settled rather than in the middle
+of opening it.
+
+Silent about every reason not to: no file, no server configured for the extension, the
+server not installed, one already connected. A message for each of those would fire on
+every idle beat in every buffer that has no server, which is most of them."
+  (if (or (not *lsp-autostart*) (ed-lsp-live m) (ed-headless?))
+    m
+    (let (buf (ed-current-buf m)
+          file (buffer-file buf)
+          srv (when file (lsp/lsp-server-for file)))
+      (if (nil? srv)
+        m
+        (let ([cmd _] srv)
+          (if (nil? (os/which cmd))
+            m
+            (let ([m2 _] (ed-lsp-start (dissoc m :lsp))) m2)))))))
 
 ;; ---- imenu: jump to a symbol in the buffer via LSP documentSymbol (M-g i) ----
 
@@ -4080,11 +4123,13 @@ picker opens when the symbol list arrives."
   "Register a pending LSP lookup of `kind` (an `LspRequest` record, see `lsp-requests`)
 under a fresh corr and `fire` it (a `(corr) -> nil` sender — one of lsp's `-async` fns,
 with `(self)` as reply-to). `extra` merges context the fold will need onto the record
-(a rope guard, the rename's origin); `note` is the in-flight echo."
+(a rope guard, the rename's origin); `note` is the in-flight echo — `:quiet` for a lookup
+the reader did not ask for (the idle beat's signature help), which must not narrate itself
+into the echo area every time point moves."
   (let (corr (ref))
     (fire corr)
-    (message (assoc m :lsp-pending (assoc (:lsp-pending m {}) corr (merge kind (or extra {}))))
-      (or note "lsp: resolving…"))))
+    (let (m2 (assoc m :lsp-pending (assoc (:lsp-pending m {}) corr (merge kind (or extra {})))))
+      (if (= note :quiet) m2 (message m2 (or note "lsp: resolving…"))))))
 
 (defn ed-ev-lsp-reply (m input textrows cols rows)
   "An LSP reply landing on the loop (`[:lsp-definition corr locs]`, `[:lsp-hover corr
@@ -4098,6 +4143,72 @@ and drops silently."
       (lsp-request-fold pend
         (assoc m :lsp-pending (dissoc (:lsp-pending m) corr))
         (nth input 2)))))
+
+(defn ed-ev-lsp-notice (m input textrows cols rows)
+  "A language server narrating its own startup (`[:lsp-notice line]`) — logged to
+`*Messages*`, and echoed so the reader sees it without going to look.
+
+A server is entitled to be slow before it is useful, and the good ones say so. Expert
+answers `initialize` instantly, advertises a full `completionProvider`, and then ignores
+every request — without answering — until its engine node is compiled and up. Dropping
+its narration made that half-minute indistinguishable from a broken server, which is
+precisely the conclusion it led to here."
+  (message m (str "lsp: " (nth input 1))))
+
+(defn ed-ev-lsp-diagnostics (m input textrows cols rows)
+  "A language server publishing a file's diagnostics (`[:lsp-diagnostics path items]`) —
+shown on that buffer if it is the one on screen.
+
+This is what makes an LSP worth connecting for. bedit already renders diagnostics — the
+underline on the token, the ⚠ note at the end of the line, the gutter mark — and until now
+the only thing that ever produced them was the Brood checker, so every other language had
+the whole apparatus and nothing to put in it. Elixir, Rust, Ruby, Python, Go and
+TypeScript all publish them; none of it was read.
+
+Applied only for the CURRENT buffer, and stamped with its rope. The model holds one
+diagnostic set — it is a view of the buffer you are looking at — so a server publishing
+about a file in the background must not replace what is on screen with findings about
+something else. An empty list is applied like any other: it is how a server says the file
+is clean now, and ignoring it would leave the errors you just fixed sitting there.
+
+The server's own untouched objects are kept beside the rendered ones, on `:lsp-raw-diags`:
+a quickfix is asked for by handing the diagnostic back (see [[cmd-lsp-code-action]]), and
+bedit's flattened shape — all the view needs — is not a thing a server recognises."
+  (let (path (nth input 1)
+        items (nth input 2)
+        raw (nth input 3 [])
+        buf (ed-current-buf m))
+    ;; `buffer-file` is `nil | string` — a scratch buffer has none, and nil never matches
+    ;; a published path, so this is the whole guard
+    (if (= (buffer-file buf) path)
+      (assoc (ed-set-diagnostics m items (buffer-rope buf)) :lsp-raw-diags raw)
+      m)))
+
+(defn ed-ev-lsp-capabilities (m input textrows cols rows)
+  "A connected server reporting what it can do (`[:lsp-capabilities caps]`), kept on
+`:lsp-caps`.
+
+Worth keeping for one reason: it is the difference between \"this server does not offer
+that\" and a command that appears to do nothing. Expert advertises code actions, hover,
+definition and references and does NOT advertise signature help — so the argument hints
+are silent in Elixir and loud in Rust, and only its own answer here can say which."
+  (assoc m :lsp-caps (nth input 1 {})))
+
+(defn ed-ev-lsp-apply-edit (m input textrows cols rows)
+  "A server asking to change files itself (`[:lsp-apply-edit wsedit]`) — what a code
+action's `workspace/executeCommand` produces instead of carrying its edits inline.
+
+Applied to whatever those files are, because that is the whole request: unlike a rename,
+nothing here was computed against a buffer we can rope-guard — the action was chosen from
+a list the server offered, and the server is the one that decided what it means. Files not
+already open are opened to receive it, and every touched buffer is left modified for you
+to read before saving."
+  (let (wsedit (nth input 1)
+        paths (keys wsedit))
+    (if (empty? paths)
+      m
+      (message (fold paths m (fn (mm path) (ed-lsp-apply-file-edits mm path (get wsedit path))))
+        (str "applied edits in " (count paths) " file(s)")))))
 
 (defn- ed-lsp-here (m)
   "The LSP request context for the current buffer at point:
@@ -4194,6 +4305,88 @@ current one: the user may have switched buffers while the server worked."
     (if (string/blank? payload) (message m "no hover info") (message m payload))))
 
 (impl LspRequest
+  lsp-requests/lsp-signature
+  ;; The argument hint goes in the `:eldoc` slot, not the echo: `message` is what the
+  ;; editor says to you and this is not the editor saying anything, it is the signature of
+  ;; the call your cursor is in. The echo row shows it only when nothing louder is there
+  ;; (`view/ed-echo-or-eldoc`), which is exactly the precedence it should have.
+  ;;
+  ;; Dropped unless point is still where the question was asked from: an answer about a
+  ;; call you have already typed past is worse than no answer, because it reads as being
+  ;; about the one you are in now. A blank payload is applied, not dropped — it is how the
+  ;; server says "you are not inside a call any more", and keeping the old hint there
+  ;; would leave a signature under a cursor that has left it.
+  (lsp-request-fold [pend m payload]
+    (let (buf (ed-current-buf m))
+      (if (not (= [(buffer-point buf) (buffer-rope buf)] (:at pend)))
+        m
+        (assoc m :eldoc (if (string/blank? payload) nil payload))))))
+
+(defn- ed-lsp-action-label (action n)
+  "The picker label for a code `action` — its title, with its LSP `kind` after it and the
+1-based ordinal `n` in front when the list needs it to tell two apart.
+
+Titles are the server's prose and are not guaranteed distinct: Expert offers `Add alias`
+once per candidate module. The picker matches the chosen row back to an action BY label,
+so two identical rows would silently mean the first one."
+  (str (if n (str n ". ") "")
+    (:title action)
+    (if (:kind action) (str "  [" (:kind action) "]") "")))
+
+(defn- ed-lsp-action-rows (actions)
+  "`[[label action] …]` for the code-action picker, numbering the rows only when two share
+a title — an ordinal on every row would be noise on the common case of one or two."
+  (let (titles (map actions :title)
+        dup? (not (= (count (seq/distinct titles)) (count titles))))
+    (into []
+      (map (seq/enumerate actions)
+        (fn ([i a]) [(ed-lsp-action-label a (when dup? (+ i 1))) a])))))
+
+(defn- ed-lsp-run-action (m action)
+  "Carry out one chosen code action: apply the edits it carries, and/or ask the server to
+run the command it names. An action may be both (LSP allows it, and `organize imports`
+often is), so neither arm excludes the other."
+  (let (edit (:edit action)
+        m1 (if (or (nil? edit) (empty? edit))
+             m
+             (message (fold (keys edit) m (fn (mm path) (ed-lsp-apply-file-edits mm path (get edit path))))
+               (str (:title action) " — " (count (keys edit)) " file(s)"))))
+    (if (nil? (:command action))
+      m1
+      (ed-lsp-ask m1
+        (lsp-execute-command)
+        (fn (corr)
+          (lsp/lsp-execute-command-async (:lsp m1) corr (self) (:command action) (:arguments action)))
+        nil
+        (str (:title action) "…")))))
+
+(impl LspRequest
+  lsp-requests/lsp-code-actions
+  ;; The picker rather than a straight apply, even for one action: a code action REWRITES
+  ;; your file on the server's say-so, and "add missing import" and "delete this clause"
+  ;; arrive through the same door. Reading the title first is the whole safety story.
+  (lsp-request-fold [_ m payload]
+    (if (empty? payload)
+      (message m "lsp: no code actions here")
+      (let (labeled (ed-lsp-action-rows payload)
+            labels (map labeled first))
+        (assoc m
+          :minibuffer
+            (ed-name-prompt "Code action: "
+              labels
+              (fn (mm t)
+                (let (hit (seq/find labeled (fn (p) (= (first p) t))))
+                  (if (nil? hit)
+                    (message mm "lsp: action gone")
+                    (ed-lsp-run-action mm (second hit)))))))))))
+
+(impl LspRequest
+  lsp-requests/lsp-execute-command
+  ;; Nothing to fold: the server answers `null` and sends its edits separately, as a
+  ;; `workspace/applyEdit` request that lands on [[ed-ev-lsp-apply-edit]].
+  (lsp-request-fold [_ m payload] (message m "lsp: action ran")))
+
+(impl LspRequest
   lsp-requests/lsp-symbols
   (lsp-request-fold [_ m payload]
     (if (empty? payload)
@@ -4281,6 +4474,90 @@ Async — the picker opens when the list arrives."
               (:char cx)))
           nil
           "finding references…")))))
+
+(defn- ed-lsp-signature-ask (m note)
+  "Fire a `textDocument/signatureHelp` for point and stamp the model with the position it
+was asked from (`:signature-at`), so the same question is not asked twice and the answer
+knows whether it is still about where the cursor is."
+  (let (cx (ed-lsp-here m)
+        buf (ed-current-buf m)
+        at [(buffer-point buf) (buffer-rope buf)])
+    (ed-lsp-ask (assoc m :signature-at at)
+      (lsp-signature)
+      (fn (corr)
+        (lsp/lsp-signature-async (:conn cx)
+          corr
+          (self)
+          (:uri cx)
+          (:lang cx)
+          (:text cx)
+          (:line cx)
+          (:char cx)))
+      {:at at}
+      note)))
+
+(defn ed-launch-signature (m)
+  "The idle beat's argument hints: ask the connected language server what call point is
+inside, and show its signature in the eldoc slot (`model/ed-signature-stale?` decides when).
+
+This is eglot's `eglot-signature-eldoc-function` and it is the feature that makes a server
+worth having open while you TYPE rather than when you stop and ask a question — every
+other LSP command here is one you invoke. Silent in every direction: it never starts a
+server (`ed-lsp-autostart` owns that), never messages, and a server that does not offer
+signature help is never asked — Expert is one, so in Elixir this costs exactly nothing."
+  (if (or (not (:lsp m))
+        (ed-headless?)
+        (not (lsp/lsp-capable? (:lsp-caps m) :signatureHelpProvider))
+        (not (ed-signature-stale? m))
+        (nil? (buffer-file (ed-current-buf m))))
+    m
+    (ed-lsp-signature-ask m :quiet)))
+
+(defcommand cmd-lsp-code-action
+  (m key)
+  "Offer the language server's fixes for the code at point and run the chosen one (C-c C-a).
+
+Emacs' `eglot-code-actions`. The diagnostics on the current line go WITH the request —
+that is how a server knows which quickfix you mean, and without them most servers answer
+with their unconditional refactorings only, which reads as the fix for the error under
+your cursor not existing."
+  (let ([m2 ready?] (ed-lsp-ensure m))
+    (cond
+      (not ready?) m2
+      (not (lsp/lsp-capable? (:lsp-caps m2) :codeActionProvider))
+        (message m2 "lsp: this server does not offer code actions")
+      else
+        (let (cx (ed-lsp-here m2)
+              here (lsp/lsp-diagnostics-at-line (:lsp-raw-diags m2 []) (:line cx)))
+          (ed-lsp-ask m2
+            (lsp-code-actions)
+            (fn (corr)
+              (lsp/lsp-code-actions-async (:conn cx)
+                corr
+                (self)
+                (:uri cx)
+                (:lang cx)
+                (:text cx)
+                (:line cx)
+                (:char cx)
+                here))
+            nil
+            "code actions…")))))
+
+(defcommand cmd-lsp-signature-help
+  (m key)
+  "Show the signature of the call point is inside, in the echo area (C-c C-s).
+
+Normally you never press this — the idle beat asks the same question as you type
+(`ed-launch-signature`). It is here for the buffer whose mode answers eldoc itself, where
+the automatic path stands back, and for asking again after a message has covered the hint."
+  (let ([m2 ready?] (ed-lsp-ensure m))
+    (cond
+      (not ready?) m2
+      ;; said plainly, because the alternative is a key that appears to do nothing
+      (not (lsp/lsp-capable? (:lsp-caps m2) :signatureHelpProvider))
+        (message m2 "lsp: this server does not offer signature help")
+      else (ed-lsp-signature-ask m2 "signature…"))))
 
 (defcommand cmd-lsp-hover
   (m key)

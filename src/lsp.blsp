@@ -43,14 +43,35 @@ document sync (no incremental edits)."
 
 (def *lsp-timeout-ms* 1000) ; how long a Tab waits for the server before giving up
 (def *lsp-symbol-timeout-ms* 3000) ; how long M-g i (imenu) waits — symbols can index slower
+;; How long the handshake waits for the `initialize` response before giving up on it.
+;;
+;; Three minutes, where this was ten seconds — because a real language server's
+;; `initialize` is not a handshake, it is a BUILD. Expert compiles and indexes the whole
+;; mix project before it answers; rust-analyzer does the same with cargo. At ten seconds
+;; the client gave up, sent `initialized` to a server that had not initialized, and every
+;; request after it was answered by nobody: an Elixir buffer with a correctly configured,
+;; correctly installed server that silently never completed anything.
+;;
+;; A generous bound costs nothing here: this wait is inside the CONNECTION process, so a
+;; server that never replies at all delays its own first answer and blocks neither the
+;; editor nor any other connection.
+(def *lsp-init-timeout-ms* 180000)
+;; How much of a server's log line is worth showing. The echo area is one row, and a
+;; server's log is written for a log file — Expert's startup narration includes the whole
+;; `PATH` and a fifteen-line list of ebin directories.
+(def *lsp-notice-width* 110)
 (defdyn *lsp-servers*
   ;; file extension → [server-command arg-vector]. The `M-x lsp-connect` command looks
   ;; the buffer's extension up here. Extend live to add a language/server.
   {"blsp" ["brood-lsp" []]
    "rs" ["rust-analyzer" []]
    "rb" ["ruby-lsp" []]
-   "ex" ["elixir-ls" []]
-   "exs" ["elixir-ls" []]
+   ;; Expert (expert-lsp.org) — the official Elixir language server, and the one the
+   ;; ElixirLS, Lexical and Next LS efforts converged into. A single static binary, so
+   ;; there is nothing to build per project the way `elixir-ls` needed. `--stdio` because
+   ;; that is this client's only transport; Expert also speaks TCP.
+   "ex" ["expert" ["--stdio"]]
+   "exs" ["expert" ["--stdio"]]
    "py" ["pylsp" []]
    "go" ["gopls" []]
    "ts" ["typescript-language-server" ["--stdio"]]})
@@ -70,6 +91,31 @@ carries a multi-byte char (e.g. a `didOpen` of a source file with unicode)."
 (defn lsp-notification (method params)
   "A framed JSON-RPC notification (no `id`, so no response expected)."
   (lsp-frame (json/encode {:jsonrpc "2.0" :method method :params params})))
+
+(defn lsp-response (id result)
+  "A framed JSON-RPC response to a request the SERVER made of us.
+
+The protocol is bidirectional and this half was missing. A server may ask the client to do
+things — `client/registerCapability` is the common one, and every server that registers
+its file watchers dynamically sends it — and it is a REQUEST, so the server waits for the
+answer. Never answering does not degrade anything gracefully: the server blocks, and from
+the outside it looks like a server that initialised perfectly and then ignored every
+request forever, which is exactly how Expert appeared."
+  (lsp-frame (json/encode {:jsonrpc "2.0" :id id :result result})))
+
+(defn lsp-error-response (id code message)
+  "A framed JSON-RPC error response — what we owe a server request we cannot honour.
+`-32601` is MethodNotFound, the honest answer to a request this client does not implement."
+  (lsp-frame (json/encode {:jsonrpc "2.0" :id id :error {:code code :message message}})))
+
+(def *lsp-server-requests-handled*
+  ;; Server→client requests this client answers with a plain `null` result — an
+  ;; acknowledgement, which is what the protocol specifies for each. Registration is
+  ;; genuinely a no-op here: this client has no dynamic capability table and no file
+  ;; watcher, so "registered" and "ignored" are the same state — but SAYING so is not
+  ;; optional, because the server is blocked until we do.
+  #{"client/registerCapability" "client/unregisterCapability" "workspace/semanticTokens/refresh"
+     "workspace/codeLens/refresh" "workspace/inlayHint/refresh" "workspace/diagnostic/refresh"})
 
 ;; ---- pure protocol: decoding a byte stream into messages --------------------
 
@@ -246,6 +292,104 @@ MarkedString object)."
         (vector? c) (string/join (seq/reject (map c lsp-marked) empty?) "\n\n")
         :else (lsp-marked c)))))
 
+;; ---- pure protocol: signature help (the argument hints as you type) ----------
+;; `textDocument/signatureHelp` is `{:signatures [{:label :parameters [{:label …}]}]
+;;  :activeSignature :activeParameter}`. What the reader wants out of it is one line —
+;; the signature being called, with the argument the cursor is sitting on picked out —
+;; and that is the whole of what this produces.
+
+(def *signature-mark* ["‹" "›"])
+;; The active parameter is MARKED rather than faced: the echo row is one `text` op with
+;; one face (see `view/ed-echo-line`), so there is nowhere to put a highlight. Guillemets
+;; because they are light enough to read through and rare enough in source that
+;; `‹conn›` is unambiguously our mark and not part of the signature.
+
+(defn- lsp-param-span (label param)
+  "The `[start end]` character span of `param` (a `SignatureInformation.parameters` entry)
+within the signature's `label` — the protocol's own offsets when it gives them, else the
+first occurrence of the parameter's own label text. Nil when neither locates it.
+
+Both forms are in the wild and a client has to read both: Expert and rust-analyzer send
+offsets, gopls and several TypeScript servers send the substring."
+  (let (l (:label param))
+    (cond
+      (vector? l) (when (= (count l) 2) [(first l) (second l)])
+      (string? l) (let (i (index-of label l))
+                    (when i [i (+ i (string/length l))]))
+      else nil)))
+
+(defn- lsp-mark-param (label span)
+  "`label` with the characters in `span` wrapped in [[*signature-mark*]]; `label`
+unchanged when `span` is nil or does not lie inside it."
+  (let ([open close] *signature-mark*
+        n (string/length label))
+    (if (nil? span)
+      label
+      (let ([s e] span)
+        (if (or (< s 0) (> e n) (>= s e))
+          label
+          (str (string/substring label 0 s)
+            open
+            (string/substring label s e)
+            close
+            (string/substring label e n)))))))
+
+(defn lsp-signature-text (result)
+  "The one line a `textDocument/signatureHelp` `result` is worth showing — the active
+signature's label with the active parameter marked — or `\"\"` when the server has nothing
+to say (which is its answer whenever point is not inside a call).
+
+`activeParameter` is read from the signature first and the help second: LSP 3.16 let a
+`SignatureInformation` carry its own, and a server that sends both means the inner one."
+  (if (nil? result)
+    ""
+    (let (sigs (or (:signatures result) [])
+          i (or (:activeSignature result) 0)
+          sig (nth sigs (if (and (>= i 0) (< i (count sigs))) i 0) nil))
+      (if (nil? sig)
+        ""
+        (let (label (str (:label sig ""))
+              params (or (:parameters sig) [])
+              active (or (:activeParameter sig) (:activeParameter result))
+              param (when (and active (>= active 0) (< active (count params))) (nth params active))
+              ;; more than one signature is worth knowing about — otherwise the reader has
+              ;; no way to tell that the arity they are typing towards is not the only one
+              more (if (> (count sigs) 1) (str "  (" (+ 1 i) "/" (count sigs) ")") ""))
+          (str (if param (lsp-mark-param label (lsp-param-span label param)) label) more))))))
+
+;; ---- pure protocol: code actions (the fix-it list at point) -------------------
+;; `textDocument/codeAction` answers a list whose entries are either a `Command`
+;; (`{:title :command :arguments}` — ask the server to do it) or a `CodeAction`
+;; (`{:title :kind :edit :command}` — edits we apply ourselves, a command, or both).
+;; Normalised here to one shape so the editor side never has to tell them apart.
+
+(defn lsp-code-action-list (result)
+  "The `textDocument/codeAction` `result` as a list of
+`{:title :kind :edit :command :arguments}` — `:edit` a normalised workspace edit (nil when
+the action carries none) and `:command`/`:arguments` the server-side call to make instead
+(nil when it carries edits).
+
+An action with neither is dropped: it is a title with nothing behind it, and offering it
+in the picker would promise a fix that cannot happen."
+  (if (nil? result)
+    '()
+    (seq/keep result
+      (fn (a)
+        (let (cmd (:command a)
+              ;; a `Command`'s own `:command` is a string; a `CodeAction`'s is a nested
+              ;; Command object — the one field that tells the two forms apart
+              [name args] (cond
+                            (string? cmd) [cmd (or (:arguments a) [])]
+                            (map? cmd) [(:command cmd) (or (:arguments cmd) [])]
+                            else [nil []])
+              edit (when (:edit a) (lsp-workspace-edit (:edit a))))
+          (when (or name (and edit (not (empty? edit))))
+            {:title (str (:title a ""))
+             :kind (:kind a)
+             :edit edit
+             :command name
+             :arguments args}))))))
+
 (defn- lsp-text-edit (e)
   "Normalise one `TextEdit` (`:range {:start :end}` + `:newText`) to
 `{:start-line :start-char :end-line :end-char :text}` (0-based)."
@@ -325,6 +469,21 @@ shapes; `{}` when nil."
     {:textDocument {:uri uri} :position (lsp-pos line char) :context {:includeDeclaration true}}))
 (defn- lsp-hover-request (id uri line char)
   (lsp-request id "textDocument/hover" {:textDocument {:uri uri} :position (lsp-pos line char)}))
+(defn- lsp-code-action-request (id uri line char diags)
+  (lsp-request id
+    "textDocument/codeAction"
+    {:textDocument {:uri uri}
+     ;; an empty range AT point: the actions offered for where the cursor is. (A region
+     ;; would widen it to "extract this" territory — a later feature, not a wider range
+     ;; smuggled in here.)
+     :range {:start (lsp-pos line char) :end (lsp-pos line char)}
+     :context {:diagnostics (or diags [])}}))
+(defn- lsp-execute-command-request (id command arguments)
+  (lsp-request id "workspace/executeCommand" {:command command :arguments (or arguments [])}))
+(defn- lsp-signature-request (id uri line char)
+  (lsp-request id
+    "textDocument/signatureHelp"
+    {:textDocument {:uri uri} :position (lsp-pos line char)}))
 (defn- lsp-formatting-request (id uri)
   (lsp-request id
     "textDocument/formatting"
@@ -394,6 +553,18 @@ hover, formatting, rename. Returns `[state' frames]`."
   lsp-requests/lsp-hover
   (lsp-request-shape [_ result] [:lsp-hover (lsp-hover-text result)]))
 (impl LspRequest
+  lsp-requests/lsp-signature
+  (lsp-request-shape [_ result] [:lsp-signature (lsp-signature-text result)]))
+(impl LspRequest
+  lsp-requests/lsp-code-actions
+  (lsp-request-shape [_ result] [:lsp-code-actions (lsp-code-action-list result)]))
+(impl LspRequest
+  lsp-requests/lsp-execute-command
+  ;; `workspace/executeCommand` answers with whatever the command returns, usually null:
+  ;; the EDITS come separately, as a `workspace/applyEdit` request from the server
+  ;; ([[lsp-answer-server]]). So this reply is only ever "it ran".
+  (lsp-request-shape [_ result] [:lsp-command-done result]))
+(impl LspRequest
   lsp-requests/lsp-formatting
   (lsp-request-shape [_ result] [:lsp-text-edits (lsp-text-edits result)]))
 (impl LspRequest
@@ -406,22 +577,146 @@ record — `lsp-request-shape`), shaping the raw `result` into what the waiting 
 wants. Completion is the fallback for an untagged (2-element) pending entry."
   (lsp-request-shape (or kind (lsp-completion)) result))
 
+(defn lsp-progress-text (msg)
+  "The one line a server's `window/logMessage` or `$/progress` notification is worth
+showing, or nil for one that says nothing.
+
+Servers narrate their own startup and bedit dropped every word of it. That matters more
+than it sounds: Expert answers nothing until its engine node is up — it replies to
+`initialize` at once, advertises a full `completionProvider`, and then *ignores* requests
+with `Received request textDocument/completion before engine … was initialized`, never
+answering them at all. With the narration dropped, the first half-minute in an Elixir
+buffer is a server that looks installed, connected and broken. With it, you can watch
+`Starting engine node` → `Compiling …` → `Engine node started` go by."
+  (let (params (or (:params msg) {})
+        value (or (:value params) {})
+        raw (cond
+              (= (:method msg) "window/logMessage") (:message params)
+              ;; a progress `begin` carries :title, a `report` :message, an `end` either
+              (= (:method msg) "$/progress") (or (:title value) (:message value))
+              else nil))
+    ;; ONE line, clipped. A server's log is written for a log file: Expert's startup
+    ;; includes the whole `PATH` and a fifteen-line list of ebin directories, and the echo
+    ;; area is one row. The first line is the sentence; the rest is the attachment.
+    (when raw
+      (let (line (first (string/split (str raw) "\n")))
+        (when (not (= (string/trim line) ""))
+          (if (> (string/length line) *lsp-notice-width*)
+            (str (string/substring line 0 (- *lsp-notice-width* 1)) "…")
+            line))))))
+
+(def *lsp-severity-labels*
+  ;; LSP severities are numbers; bedit's diagnostics carry no severity field, so the word
+  ;; goes in the message — which is also how the Brood checker's own findings read
+  ;; (`warning: unbound symbol: x`), so one buffer's notes cannot be told from another's
+  ;; by their shape.
+  {1 "error: " 2 "warning: " 3 "note: " 4 "hint: "})
+
+(defn lsp-diagnostic (d)
+  "One LSP `Diagnostic` in bedit's own shape — `{:line :col :message}`, **1-based**, which
+is what `model/ed-diag-index` and the view's token underline read. LSP counts lines and
+characters from 0, so both are shifted by one; getting that wrong puts every mark one line
+above the code it is about."
+  (let (start (get-in d [:range :start] {})
+        sev (get *lsp-severity-labels* (:severity d) ""))
+    {:line (inc (or (:line start) 0))
+     :col (inc (or (:character start) 0))
+     :message (str sev (or (:message d) ""))}))
+
+(defn lsp-diagnostics-notice (params)
+  "A `textDocument/publishDiagnostics` payload as `[path items raw]` — the file it is
+about, its diagnostics in bedit's shape, and the server's own untouched objects. An empty
+list is meaningful and is kept: it is how a server says a file is now CLEAN, and dropping
+it leaves the last errors on screen after they have been fixed.
+
+The raw objects are kept because a quickfix is asked for by handing the diagnostic BACK
+(`textDocument/codeAction`'s context): a server matches the fix to the finding by the
+object it published, so bedit's flattened `{:line :col :message}` — which is all the view
+needs — cannot ask for one."
+  (let (raw (into [] (or (:diagnostics params) [])))
+    [(lsp-uri->path (or (:uri params) "")) (into [] (map raw lsp-diagnostic)) raw]))
+
+(defn lsp-diagnostics-at-line (raw line)
+  "The raw LSP diagnostics whose range covers 0-based `line` — the `context.diagnostics`
+for a code-action request at point, which is how a server knows which quickfixes to offer."
+  (into []
+    (seq/filter (or raw [])
+      (fn (d)
+        (let (start (get-in d [:range :start] {})
+              end (get-in d [:range :end] {}))
+          (and (<= (or (:line start) 0) line) (>= (or (:line end) 0) line)))))))
+
+(defn- lsp-publish (state msg)
+  "Queue a server's diagnostics for the editor, on the state's `:diags`."
+  (assoc state
+    :diags (append (or (:diags state) []) [(lsp-diagnostics-notice (or (:params msg) {}))])))
+
+(defn- lsp-narrate (state msg)
+  "Queue a server's narration for the editor, on the state's `:notices` (the shell sends
+it). Kept out of `:outbox`, which is frames for the SERVER — these go the other way."
+  (let (line (lsp-progress-text msg))
+    (if (or (nil? line) (= (string/trim (str line)) ""))
+      state
+      (assoc state :notices (append (or (:notices state) []) [(str line)])))))
+
+(defn- lsp-apply-edit-request (state msg)
+  "A server's `workspace/applyEdit` — the edits a code action's command produced. Queued
+for the editor on `:edits`, and answered `{:applied true}` at once.
+
+Answered optimistically, and that is a decision rather than a shortcut: the edit is
+applied by the editor loop, which is a different process, so the only honest alternative
+is to block this connection until it reports back — and a connection that stops reading
+its server mid-action is how a client deadlocks. The edits go through the same rope guard
+every other applied edit does, so `true` here means \"accepted\", which is what the field
+is worth in every client."
+  (let (id (:id msg)
+        params (or (:params msg) {})
+        edit (lsp-workspace-edit (:edit params)))
+    (assoc state
+      :edits (append (or (:edits state) []) [edit])
+      :outbox (append (or (:outbox state) []) [(lsp-response id {:applied true})]))))
+
+(defn- lsp-answer-server (state msg)
+  "Queue this client's answer to a request the SERVER made, on the state's `:outbox` (the
+shell writes it). `workspace/applyEdit` carries work and is handled; the rest are
+acknowledged; anything else gets MethodNotFound, which is a real answer and unblocks the
+server just as well as agreement would."
+  (let (id (:id msg)
+        method (:method msg))
+    (if (= method "workspace/applyEdit")
+      (lsp-apply-edit-request state msg)
+      (let (frame (if (contains? *lsp-server-requests-handled* method)
+                    (lsp-response id nil)
+                    (lsp-error-response id -32601 (str "bedit does not implement " method))))
+        (assoc state :outbox (append (or (:outbox state) []) [frame]))))))
+
 (defn- lsp-dispatch (acc msg)
-  ;; Fold step: route one decoded message. A response whose `:id` is pending is shaped by
-  ;; its `:pending` kind tag (`lsp-shape`) and sent to its waiter as `[tag corr value]`; an
-  ;; absent tag (the original 2-element `[reply-to corr]` entries) shapes as completion. A
-  ;; notification (publishDiagnostics) or an unmatched id is ignored.
+  ;; Fold step: route one decoded message. Three kinds arrive on this stream and they are
+  ;; told apart by which fields they carry:
+  ;;
+  ;;   :id + :method  a REQUEST from the server — it is waiting on us, so it is answered
+  ;;   :id            a response to one of ours — shaped and sent to its waiter
+  ;;   :method        a notification (publishDiagnostics, logMessage) — nothing to do
+  ;;
+  ;; The first was missing entirely, and its absence does not look like a missing feature:
+  ;; the server simply stops, because it is blocked on an answer that never comes.
   (let ([state replies] acc
         id (:id msg)
         entry (when id (get-in state [:pending id])))
-    (if (nil? entry)
-      [state replies]
-      (let (reply-to (first entry)
-            corr (second entry)
-            kind (when (>= (count entry) 3) (nth entry 2))
-            [tag value] (lsp-shape kind (:result msg)))
-        [(assoc state :pending (dissoc (:pending state) id))
-          (cons [reply-to [tag corr value]] replies)]))))
+    (cond
+      (and id (:method msg)) [(lsp-answer-server state msg) replies]
+      ;; a notification: nothing to answer, but the server may be telling us where the
+      ;; errors are, or saying something the reader needs (see [[lsp-progress-text]])
+      (= (:method msg) "textDocument/publishDiagnostics") [(lsp-publish state msg) replies]
+      (nil? id) [(lsp-narrate state msg) replies]
+      (nil? entry) [state replies]
+      else
+        (let (reply-to (first entry)
+              corr (second entry)
+              kind (when (>= (count entry) 3) (nth entry 2))
+              [tag value] (lsp-shape kind (:result msg)))
+          [(assoc state :pending (dissoc (:pending state) id))
+            (cons [reply-to [tag corr value]] replies)]))))
 
 (defn- lsp-ingest (state chunk)
   "Pure: fold a stdout `chunk` into the connection. Appends it to the frame buffer,
@@ -438,18 +733,26 @@ reply is `[pid message]` for the shell to `send`."
 
 (defn- lsp-await-init (state id)
   "Read frames until the `initialize` response (jsonrpc `id`) arrives, returning the
-state with the consumed bytes drained. Bounded so a server that never replies can't
-hang the connection process forever."
+state with the consumed bytes drained. Bounded (`*lsp-init-timeout-ms*`) so a server that
+never replies can't hang the connection process forever.
+
+The bound is on the CONNECTION process, never on the editor: this runs in the pid
+`lsp-connect` spawned, and every request has its own timeout, so a slow handshake costs a
+late first completion rather than a frozen editor."
   (receive
     ([:proc p chunk] (let (buf (str (:buf state) chunk)
                            [msgs remaining] (lsp-decode buf)
-                           st (assoc state :buf remaining))
-                       (if (any? msgs (fn (msg) (= (:id msg) id)))
-                         st
+                           st (assoc state :buf remaining)
+                           hit (seq/find msgs (fn (msg) (= (:id msg) id))))
+                       (if hit
+                         ;; …keeping what it says it can do. A server that does not offer
+                         ;; signature help should not be asked for it on every keystroke,
+                         ;; and the only honest source for that is its own answer here.
+                         (assoc st :caps (or (get-in hit [:result :capabilities]) {}))
                          (lsp-await-init st id))))
     ([:proc-err p chunk] (lsp-await-init state id))
     ([:proc-closed p code] state)
-    (after 10000 state)))
+    (after *lsp-init-timeout-ms* state)))
 
 (defn- lsp-loop (state)
   "The connection's main receive loop: server output folds in via `lsp-ingest` (replies
@@ -458,7 +761,19 @@ server; `:shutdown` or the server dying stops it."
   (receive
     ([:proc p chunk] (let ([st2 replies] (lsp-ingest state chunk))
                        (doseq (r replies) (send (first r) (second r)))
-                       (lsp-loop st2)))
+                       ;; …anything we owe the SERVER goes back down its stdin, and
+                       ;; anything the server SAID goes to the editor. Both drained here
+                       ;; rather than in the fold, so the fold stays pure.
+                       (lsp-send-all (:proc st2) (or (:outbox st2) []))
+                       (doseq (line (or (:notices st2) [])) (send :editor [:lsp-notice line]))
+                       (doseq (d (or (:diags st2) []))
+                         (let ([path items raw] d)
+                           (send :editor [:lsp-diagnostics path items raw])))
+                       ;; …and anything the server asked us to CHANGE (a code action's
+                       ;; command, applied by the loop that owns the buffers)
+                       (doseq (e (or (:edits st2) [])) (send :editor [:lsp-apply-edit e]))
+                       (lsp-loop (dissoc (dissoc (dissoc (dissoc st2 :outbox) :notices) :diags)
+                                   :edits))))
     ([:proc-err p chunk] (lsp-loop state))
     ([:proc-closed p code] :lsp-stopped)
     ([:complete corr reply-to uri lang text line char] (let ([st2 frames] (lsp-request-complete state
@@ -507,6 +822,45 @@ server; `:shutdown` or the server dying stops it."
                                                                              uri line char))))
                                                       (lsp-send-all (:proc st2) frames)
                                                       (lsp-loop st2)))
+    ([:code-actions corr reply-to uri lang text line char diags] (let ([st2 frames] (lsp-issue state
+                                                                                      corr
+                                                                                      reply-to
+                                                                                      uri
+                                                                                      lang
+                                                                                      text
+                                                                                      (lsp-code-actions)
+                                                                                      (fn (id)
+                                                                                        (lsp-code-action-request id
+                                                                                          uri line
+                                                                                          char
+                                                                                          diags))))
+                                                                   (lsp-send-all (:proc st2) frames)
+                                                                   (lsp-loop st2)))
+    ;; no document to sync: the server is being asked to run something it already offered,
+    ;; not to look at text, so this bypasses `lsp-issue` and its didOpen/didChange
+    ([:execute-command corr reply-to command args] (let (id (:next-id state)
+                                                         st2 (assoc state
+                                                               :next-id (+ id 1)
+                                                               :pending (assoc (:pending state)
+                                                                          id
+                                                                          [reply-to
+                                                                            corr
+                                                                            (lsp-execute-command)])))
+                                                     (lsp-send-all (:proc st2)
+                                                       [(lsp-execute-command-request id command args)])
+                                                     (lsp-loop st2)))
+    ([:signature corr reply-to uri lang text line char] (let ([st2 frames] (lsp-issue state
+                                                                             corr
+                                                                             reply-to
+                                                                             uri
+                                                                             lang
+                                                                             text
+                                                                             (lsp-signature)
+                                                                             (fn (id)
+                                                                               (lsp-signature-request id
+                                                                                 uri line char))))
+                                                          (lsp-send-all (:proc st2) frames)
+                                                          (lsp-loop st2)))
     ([:formatting corr reply-to uri lang text] (let ([st2 frames] (lsp-issue state
                                                                     corr
                                                                     reply-to
@@ -537,8 +891,14 @@ server; `:shutdown` or the server dying stops it."
 (defn- lsp-init-params (root-uri)
   {:processId nil
    :rootUri root-uri
+   ;; `workspaceFolders` as well as `rootUri`. `rootUri` is deprecated in the protocol and
+   ;; a server written against the current spec may read only this one — which looks from
+   ;; the outside exactly like a server that initialises cleanly and then answers nothing,
+   ;; because it has no workspace to answer about.
+   :workspaceFolders [{:uri root-uri :name (path/basename (lsp-uri->path root-uri))}]
    :clientInfo {:name "bedit"}
-   :capabilities {:textDocument {:completion {:completionItem {:snippetSupport false}}
+   :capabilities {:workspace {:workspaceFolders true :configuration true}
+                  :textDocument {:completion {:completionItem {:snippetSupport false}}
                                  :documentSymbol {:hierarchicalDocumentSymbolSupport true}}}})
 
 (defn- lsp-run (cmd cmd-args root-uri)
@@ -551,7 +911,14 @@ way here is a race (the binary went away between the two) or a server that canno
 executed at all — and in a spawned process a raise is a `[crash]` trace on the user's
 screen, which is a worse answer to that than the connection simply not existing. The
 model drops a connection whose process is gone (`ed-lsp-live`)."
-  (let (p (check-allow :discarded-catch (try (os/spawn cmd cmd-args) (catch e nil))))
+  ;; Started IN the project root, not in whatever directory the editor happens to have.
+  ;; A language server that builds the project reads its own working directory to find it —
+  ;; Expert runs `mix`, rust-analyzer runs `cargo` — and `rootUri` in the handshake does not
+  ;; set one. Launched from elsewhere, Expert initialised, reported a full
+  ;; `completionProvider`, and then answered every request with nothing, because there was
+  ;; no project where it was standing.
+  (let (p (check-allow :discarded-catch
+            (try (os/spawn cmd cmd-args {:cwd (lsp-uri->path root-uri)}) (catch e nil))))
     (when p (lsp-run-connected p root-uri))))
 
 (defn- lsp-run-connected (p root-uri)
@@ -560,6 +927,9 @@ model drops a connection whose process is gone (`ed-lsp-live`)."
     (os/write p (lsp-request 0 "initialize" (lsp-init-params root-uri)))
     (let (state2 (lsp-await-init state 0))
       (os/write p (lsp-notification "initialized" {}))
+      ;; tell the editor what this server can do, so a command can say "this server does
+      ;; not do that" instead of showing nothing and reading as broken
+      (send :editor [:lsp-capabilities (or (:caps state2) {})])
       (lsp-loop state2))))
 
 (defn lsp-connect (cmd cmd-args root-uri)
@@ -567,6 +937,18 @@ model drops a connection whose process is gone (`ed-lsp-live`)."
 `root-uri` and return the connection process pid. Store it on the model under `:lsp` to
 turn `lsp-complete-source` on. `(lsp-shutdown conn)` stops it."
   (spawn (lsp-run cmd cmd-args root-uri)))
+
+(defn lsp-capable? (caps feature)
+  "Whether a server's advertised `caps` include `feature` (`:signatureHelpProvider`,
+`:codeActionProvider`, …). A provider field is `true`, or an options object, or absent —
+all three are answers, and only the last means no.
+
+Asked before a request the reader did not make (the idle beat's signature help) and before
+telling them a command is unavailable. Never asked to VETO a request they did make: a
+server that under-advertises and answers anyway is a thing that happens, and refusing on
+its behalf would be worse than letting it say no itself."
+  (let (v (get (or caps {}) feature))
+    (not (or (nil? v) (= v false)))))
 
 (defn lsp-shutdown (conn)
   "Stop a connection: kill the server and end the connection process."
@@ -602,6 +984,21 @@ only on an explicit trigger, not per keystroke."
   "Fire a hover lookup; `[:lsp-hover corr text]` lands on `reply-to`."
   (send conn [:hover corr reply-to uri lang text line char]))
 
+(defn lsp-code-actions-async (conn corr reply-to uri lang text line char diags)
+  "Fire a codeAction lookup at point; `[:lsp-code-actions corr actions]` lands on
+`reply-to`. `diags` are the raw diagnostics on that line — the context a server matches
+its quickfixes against."
+  (send conn [:code-actions corr reply-to uri lang text line char diags]))
+
+(defn lsp-execute-command-async (conn corr reply-to command arguments)
+  "Ask the server to run `command`; `[:lsp-command-done corr result]` lands on `reply-to`.
+Any EDITS it produces arrive separately, as `[:lsp-apply-edit wsedit]` on the editor."
+  (send conn [:execute-command corr reply-to command arguments]))
+
+(defn lsp-signature-async (conn corr reply-to uri lang text line char)
+  "Fire a signatureHelp lookup; `[:lsp-signature corr line]` lands on `reply-to`."
+  (send conn [:signature corr reply-to uri lang text line char]))
+
 (defn lsp-document-symbols-async (conn corr reply-to uri lang text)
   "Fire a documentSymbol request; `[:lsp-symbols corr syms]` lands on `reply-to`."
   (send conn [:document-symbols corr reply-to uri lang text]))
@@ -623,6 +1020,7 @@ boundary rule the other sources use (`symbol-prefix-at`), so the merge keeps thi
 
 (defn lsp-path->uri (path)
   (str "file://" path))
+
 
 (def *lsp-language-ids*
   ;; file extension → LSP languageId. Servers key document handling off this, so it
