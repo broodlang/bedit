@@ -423,6 +423,16 @@ with another FRAME of this editor) is not a collaboration either: no chip."
           (if (empty? who) "just you" (string/join who ", "))
           (if f (str " → " (:name f)) ""))))))
 
+(defn ed-beam-node (m)
+  "The node bedit's Elixir session is attached to, or nil for its own. Read straight off the
+model rather than through `beam`, which is a deferred module: the status bar is drawn every
+frame and must not load one."
+  (get-in m [:beam :attached]))
+
+(defn ed-beam-node-label (m)
+  "The attached-node chip, or `\"\"` when this editor is on its own node."
+  (let (node (ed-beam-node m)) (if (nil? node) "" (str "⇄ " node))))
+
 (sig ed-statusbar-segments (model pane buffer -> any))
 (defn ed-statusbar-segments (m pane buf)
   "The ordered status-bar segments for `pane`: an always-on left group (buffer name, mode,
@@ -507,7 +517,20 @@ segment is clickable/hoverable exactly where it's drawn."
                                        " procs · "
                                        (ed-reds-human (or (:reductions p) 0))
                                        " reds")
-                                     "click for *Run*"]))}))
+                                     "click for *Run*"]))})
+                   ;; ATTACHED: the node every Elixir evaluation is now going to. Red, and
+                   ;; on the bar of whatever you are editing rather than only in the
+                   ;; *BEAM Processes* buffer, because the whole risk of the feature is
+                   ;; forgetting you are on somebody else's VM.
+                   (seg :beam-node
+                     (ed-beam-node-label m)
+                     {:sep "  —  "
+                      :face {:fg *red* :bold true}
+                      :on-click 'beam/cmd-beam-detach
+                      :tooltip (fn (mm)
+                                 [(str "attached to " (or (ed-beam-node mm) "?"))
+                                   "every Elixir evaluation and observation runs THERE"
+                                   "click to detach (M-x beam-detach)"])}))
                  (fn (s) (not (= "" (:text s))))))
     (if sel
       (append core extras (or (:git-segments m) '()) (ed-layer-segments m buf))
@@ -871,6 +894,31 @@ so it reads as a link. (The hover underscore is a text-merged range,
 ;; whole thing is still one keystroke away: the echo row (`results/eol-note-at`) prints the
 ;; full text whenever point is on the line.
 
+(def face-completion-preview
+  ;; The inline completion preview: the SAME dim as a pending note, and not italic. It is
+  ;; text you are about to write rather than a remark about your code, so it should read as
+  ;; your own line continuing in a lighter hand — italics would make it a different kind of
+  ;; thing sitting in the middle of an identifier.
+  {:fg *overlay0*})
+
+(defn ed-preview-op (m buf pane-selected? row col avail)
+  "The one op for the inline completion preview — the top candidate's remainder painted
+immediately after the cursor — or nil.
+
+Painted only for the selected pane, and only while the cached preview still describes the
+buffer as it stands (`:completion-preview-at`, the point-and-rope it was computed for).
+That guard is the whole difference between a suggestion and a lie: the preview is computed
+on the idle beat, so between the keystroke and the recompute the cached one describes text
+that has already moved on, and painting it there would put somebody else's word after your
+cursor."
+  (let (pv (:completion-preview m))
+    (when (and pane-selected?
+            pv
+            (nil? (:minibuffer m))
+            (= (:completion-preview-at m) [(buffer-point buf) (buffer-rope buf)])
+            (> avail 0))
+      (text row col (ui-clip (:text pv) avail) face-completion-preview))))
+
 (defn- ed-eol-note-face (kind stale)
   (cond
     ;; no-answer-yet reads as pending (dim, italic), never as a stale verdict — whether
@@ -1074,6 +1122,12 @@ frac = 0 the ops are emitted flat (no region wrapper) for test-compatibility and
                       (cursor (+ by k)
                         (+ bx gw (math/max 0 (math/min (dec tw) (ed-visual-column-from buf from))))
                         (ed-cursor-style m))))
+        ;; the inline completion preview, at the cursor's own cell — same row and column
+        ;; the caret is on, so it reads as the line continuing
+        preview-op (when point-row
+                     (let ([k from] point-row
+                           vc (math/max 0 (math/min (dec tw) (ed-visual-column-from buf from))))
+                       (ed-preview-op m buf (:selected pane) (+ by k) (+ bx gw vc) (- tw vc))))
         ;; all ops that belong inside the scroll-region (shifted by frac × cell_h)
         scrollable (into []
                      (append
@@ -1117,6 +1171,9 @@ frac = 0 the ops are emitted flat (no region wrapper) for test-compatibility and
                        ;; other participants' carets + name tags (collab presence) — drawn
                        ;; over the text, under our own cursor
                        (ed-remote-cursor-ops m pane buf top bx by bw gw text-h hscroll rows)
+                       ;; before the caret, so a block cursor sits ON the preview's first
+                       ;; character rather than under it
+                       (if preview-op [preview-op] [])
                        (if cursor-op [cursor-op] [])))
         ;; scrollable region: flat when frac ≈ 0 (no overhead, tests see top-level ops),
         ;; wrapped in a scroll-region when frac > 0 (self-resetting, no sentinel needed)
@@ -1425,7 +1482,24 @@ the width of the slice on its own."
   ;; (`:radius`) and the selected row is a full-width pill, so with no top/bottom pad
   ;; the highlight ran into the rounded corner and the hairline — the first and last
   ;; items looked clipped. One row of breathing space above and below fixes it.
-  {:fg :on-surface :bg :surface :border :hairline :pad [1 1 1 1] :radius 0.5})
+  ;;
+  ;; `:inset 2` / `:gap 3` are what make it read as a menu rather than a list that
+  ;; happens to be floating. A context menu is a handful of short rows with a shortcut
+  ;; column, so it can afford room; the kit's default of one cell each side is tuned for
+  ;; Plume, where the marginalia column IS the width and every cell spent on margin is a
+  ;; cell taken off the candidate. Three cells between the label and its key stops
+  ;; `Select All` and `C-x h` from reading as one run-on string.
+  {:fg :on-surface
+   :bg :surface
+   :border :hairline
+   :pad [1 1 1 1]
+   :radius 0.5
+   :inset 2
+   :gap 3
+   ;; The shortcut column is a reminder, not content — a weight below a disabled label,
+   ;; so `Cut` greyed out because there is no selection cannot be confused with `C-w`
+   ;; greyed out because it is a hint.
+   :key-fg :faint})
 
 (defn ed-menu-widget (m cols rows)
   "The context menu as a widget: a `ui-list` of the items in a `ui-panel`, sized and
@@ -1436,7 +1510,9 @@ keeps the menu open). `{:ops [] :zones [] :area nil}` when no menu is open."
     (if (nil? menu)
       {:ops [] :zones [] :area nil}
       (let (items (:items menu)
-            meas (ui-list-measure items ed-menu-rowfn (:sel menu))
+            ;; measured WITH the style the rows are rendered with, so the width reserved
+            ;; and the inset actually used cannot disagree
+            meas (ui-list-measure items ed-menu-rowfn (:sel menu) ed-menu-style)
             ;; the card's outer size = the rows plus the style's padding on each edge
             ;; (`ui-panel` renders the body into the PADDED inner rect, so the caller
             ;; owns the outer size — a vertical pad the area didn't account for would

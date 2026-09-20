@@ -106,6 +106,119 @@ current buffer that start with `prefix` and aren't exactly it, sorted."
   (list 'complete-at-point/complete-source-mode
     'complete-at-point/complete-source-buffer-words))
 
+;; ---- the inline preview (Emacs 30's `completion-preview-mode`) ----------------
+;; The top candidate's remainder, shown after point in a dim face as you type — the
+;; suggestion as a shadow of what you are about to write, which you take with Tab or
+;; ignore by carrying on. Emacs added this in 30; the rules below are its rules.
+
+(defdyn *preview-sources*
+  ;; Which sources the PREVIEW may ask. The two instant ones, deliberately — never an
+  ;; LSP source.
+  ;;
+  ;; `complete-at` is fine with a slow source because Tab is a request: you pressed it and
+  ;; you can wait a second for a server. The preview is not a request; it recomputes every
+  ;; time typing settles, and a source that blocks for a second would block the editor
+  ;; loop for a second, repeatedly, while you type. So the preview is the instant guess and
+  ;; Tab is the considered answer that may go and ask.
+  (list 'complete-at-point/complete-source-mode
+    'complete-at-point/complete-source-buffer-words))
+
+(def *preview-min-prefix* 3)
+;; Emacs' `completion-preview-minimum-symbol-length`. Below three characters almost
+;; anything matches, so the suggestion is noise that flickers under your hands rather than
+;; a guess worth reading.
+
+(defn preview-candidates (items prefix)
+  "Every candidate a preview could show for `prefix` — those that genuinely EXTEND it — in
+sorted order.
+
+Sorted rather than ranked, because a preview that reorders itself as you type shows you a
+different word every keystroke, and the one thing this has to be is predictable enough to
+accept without reading it twice."
+  (into []
+    (seq/filter (sort (seq/distinct items))
+      (fn (c) (and (string/starts-with? c prefix) (> (string/length c) (string/length prefix)))))))
+
+(defn preview-candidate (items prefix)
+  "The candidate a preview shows first: the first that extends `prefix`, or nil."
+  (first (preview-candidates items prefix)))
+
+(defn completion-preview (m)
+  "`{:start :prefix :text}` for the inline preview at point — `:text` being the REMAINDER
+to paint after the cursor — or nil when there is nothing worth showing.
+
+Nil for a prefix shorter than [[*preview-min-prefix*]], for a point that is not at the end
+of its line, and when no candidate extends what you have typed. The end-of-line rule is
+the one concession to the renderer: text drawn mid-line would sit on top of the characters
+after point rather than pushing them along, and a preview that obscures your own code is
+worse than no preview. Typing an identifier at the end of a line is where you want it
+anyway."
+  (let (buf (ed-current-buf m)
+        p (buffer-point buf)
+        text (buffer-text buf)
+        eol? (or (>= p (string/length text)) (= (string/char-at text p) "\n")))
+    (when eol?
+      (let (results (seq/keep *preview-sources* (fn (s) ((reflect/eval s) m))))
+        (when (not (empty? results))
+          (let ([start prefix _] (first results))
+            (when (>= (string/length prefix) *preview-min-prefix*)
+              (let (items (apply append
+                            (map results (fn (r) (if (= (first r) start) (nth r 2) '()))))
+                    cands (preview-candidates items prefix))
+                (when (not (empty? cands))
+                  (preview-at {:start start :prefix prefix :items cands} 0))))))))))
+
+(defn preview-at (pv i)
+  "`pv` showing candidate `i` — its `:index` and the `:text` that follows from it. One step
+past either end wraps round, which is all a ring walked a step at a time ever needs.
+
+The remainder is derived rather than stored twice, so the two can never disagree about
+which candidate is on screen."
+  (let (n (count (:items pv))
+        i (cond (= n 0) 0 (< i 0) (- n 1) (>= i n) 0 :else i)
+        hit (nth (:items pv) i "")
+        prefix (:prefix pv))
+    (assoc pv
+      :index i
+      :text (string/substring hit (string/length prefix) (string/length hit)))))
+
+(defn preview-cycle (m d)
+  "Show the next (`d` 1) or previous (`d` -1) candidate in the preview — Emacs'
+`completion-preview-next-candidate` on M-n / M-p.
+
+The first suggestion is a guess; cycling is how you say \"nearly, the one after it\"
+without abandoning what you have typed to open a popup and read a list. Wraps, because a
+handful of candidates is a ring and a dead end at the last one is just a key that stops
+working."
+  (let (pv (:completion-preview m))
+    (if (or (nil? pv) (empty? (:items pv)))
+      m
+      (assoc m :completion-preview (preview-at pv (+ (:index pv 0) d))))))
+
+(def *preview-keys* [:meta-n :meta-p])
+
+(defn preview-control-key? (input)
+  "Whether a showing preview consumes `input` — M-n / M-p, and nothing else. Every other
+key falls through untouched: a preview is a suggestion sitting beside what you are doing,
+not a mode you have to leave."
+  (includes? *preview-keys* input))
+
+(defn preview-handle (m input)
+  "Fold one preview key: M-n forward, M-p back."
+  (preview-cycle m (if (= input :meta-p) -1 1)))
+
+(defn preview-accept (m)
+  "Insert the preview's remainder at point and clear it — what Tab does when one is
+showing. The text is inserted rather than the region replaced: the prefix is already
+exactly what the candidate starts with, so there is nothing to rewrite, and inserting
+keeps the undo step small and obvious."
+  (let (pv (:completion-preview m))
+    (if (nil? pv)
+      m
+      (let (buf (ed-current-buf m)
+            buf2 (insert buf (:text pv)))
+        (assoc (ed-set-buf m buf2) :completion-preview nil :status "modified")))))
+
 (defn complete-add-source! (sym)
   "Add completion source `sym` (a fn symbol) to the front of `*completion-sources*`,
 idempotently — the way a feature turns its source on (e.g. `lsp` adds its source when a
@@ -173,7 +286,19 @@ before point is completed against every source (mode globals + buffer words + �
 candidate inserts it. Several: the **longest common prefix** is inserted when it extends
 what was typed — `al` → `alpha-` — and nothing pops up; when nothing more can be expanded,
 the popup lists the candidates (alphabetical) for C-n/C-p + Enter. None echoes a note; an
-empty prefix is a no-op."
+empty prefix is a no-op.
+
+**With an inline preview showing, Tab takes it** — Emacs 30's
+`completion-preview-insert`. The suggestion is already on screen under your cursor, so the
+key that means \"yes, that one\" should be the key your hand is on, and asking the sources
+again to arrive at the word you can already read would be slower and could answer
+differently."
+  (if (:completion-preview m)
+    (preview-accept m)
+    (cmd-complete-sources m key)))
+
+(defn- cmd-complete-sources (m key)
+  "`cmd-complete` proper: ask every source and act on what comes back."
   (let ([start prefix items0] (complete-at m)
         items (complete-order items0))
     (if (= prefix "")

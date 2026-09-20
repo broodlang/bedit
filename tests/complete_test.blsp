@@ -67,3 +67,127 @@
       (assert= (:items (:completion m2)) (list "alpha-two"))
       (assert= (text-of m3) "(def alpha-one 1) (def alpha-two 2) alpha-two")
       (is (nil? (:completion m3))))))
+
+;; ---- the inline preview (Emacs 30's `completion-preview-mode`) ----------------------
+;; The top candidate's remainder, shown after point in a dim face as you type. Everything
+;; below is the rules that keep it a suggestion rather than a distraction.
+(describe "the inline completion preview"
+  (defn- pv (text)
+    "The preview for a buffer whose point is at the end of `text`."
+    (completion-preview (ed-init (goto-char (make-buffer text) (string/length text)))))
+
+  (test "the remainder of the top candidate, not the whole word"
+    ;; what is painted sits AFTER the cursor, so it must not repeat what is already typed
+    (let (p (pv "alphabetical algorithm\nalp"))
+      (assert= (:text p) "habetical")
+      (assert= (:prefix p) "alp")))
+
+  (test "sorted order, so the suggestion does not change under your hands"
+    ;; `alp` matches both; a preview that re-ranked as you typed would show a different
+    ;; word each keystroke, and the one thing it has to be is predictable enough to accept
+    ;; without reading twice
+    (assert= (preview-candidate (list "zeta" "alpha" "alphabet") "alph") "alpha"))
+
+  (test "a candidate that only equals the prefix is no suggestion at all"
+    (is (nil? (preview-candidate (list "alp") "alp")))
+    (is (nil? (preview-candidate '() "alp"))))
+
+  ;; Emacs' `completion-preview-minimum-symbol-length`: below three characters almost
+  ;; anything matches, so the suggestion is noise flickering under your hands.
+  (test "a short prefix suggests nothing"
+    (is (nil? (pv "alphabetical\nal")))
+    (is (nil? (pv "alphabetical\na")))
+    (is (not (nil? (pv "alphabetical\nalp")))))
+
+  ;; The one concession to the renderer: text drawn mid-line would sit ON the characters
+  ;; after point rather than pushing them along, and a preview that obscures your own code
+  ;; is worse than none.
+  (test "nothing mid-line — only where there is room after the cursor"
+    (let (m (ed-init (goto-char (make-buffer "alphabetical\nalp tail") 16)))
+      (is (nil? (completion-preview m)))))
+
+  (test "nothing when there is no word before point"
+    (is (nil? (pv "alphabetical\n")))
+    (is (nil? (pv ""))))
+
+  ;; The preview asks only the instant sources. Tab is a request you pressed and can wait
+  ;; for; the preview recomputes every time typing settles, so a source that blocks for a
+  ;; second would block the editor loop for a second, repeatedly.
+  (test "the preview's sources never include a server"
+    (is (not (includes? *preview-sources* 'lsp/lsp-complete-source)))
+    (is (includes? *preview-sources* 'complete-at-point/complete-source-buffer-words)))
+
+  ;; M-n / M-p — Emacs' `completion-preview-next-candidate`. The first suggestion is a
+  ;; guess; cycling is how you say "nearly, the one after it" without abandoning what you
+  ;; have typed to open a popup and read a list.
+  (test "M-n walks to the next candidate, M-p back"
+    (let (m (ed-init (goto-char (make-buffer "alpha alphabet alphabetical\nalp") 31))
+          m1 (assoc m :completion-preview (completion-preview m))
+          m2 (preview-handle m1 :meta-n)
+          m3 (preview-handle m2 :meta-p))
+      (assert= (:text (:completion-preview m1)) "ha")
+      (assert= (:text (:completion-preview m2)) "habet")
+      (assert= (:text (:completion-preview m3)) "ha")))
+
+  (test "cycling wraps — a ring, not a key that stops working"
+    (let (pv {:prefix "alp" :items ["alpha" "alphabet"]}
+          last (preview-at pv 1)
+          wrapped (preview-at pv 2)
+          back (preview-at pv -1))
+      (assert= (:text last) "habet")
+      (assert= (:index wrapped) 0)
+      (assert= (:index back) 1)))
+
+  (test "accepting takes the candidate you cycled to, not the first"
+    (let (m (ed-init (goto-char (make-buffer "alpha alphabet alphabetical\nalp") 31))
+          m1 (assoc m :completion-preview (completion-preview m))
+          m2 (preview-handle (preview-handle m1 :meta-n) :meta-n)
+          m3 (cmd-complete m2 :tab))
+      (assert= (buffer-text (ed-current-buf m3)) "alpha alphabet alphabetical\nalphabetical")))
+
+  (test "the idle beat leaves a cycled preview where you put it"
+    ;; recomputing a preview the text has not changed under would walk it back to the first
+    ;; candidate while your hands were off the keys
+    (let (m (ed-init (goto-char (make-buffer "alpha alphabet alphabetical\nalp") 31))
+          m1 (ed-refresh-preview m)
+          m2 (preview-handle m1 :meta-n)
+          m3 (ed-refresh-preview m2))
+      (assert= (:text (:completion-preview m2)) "habet")
+      (assert= (:text (:completion-preview m3)) "habet")))
+
+  (test "a preview consumes M-n / M-p and nothing else"
+    ;; every other key falls through untouched: a preview sits beside what you are doing,
+    ;; it is not a mode you have to leave
+    (is (preview-control-key? :meta-n))
+    (is (preview-control-key? :meta-p))
+    (is (not (preview-control-key? :tab)))
+    (is (not (preview-control-key? :escape)))
+    (is (not (preview-control-key? "a"))))
+
+  (test "cycling an empty or absent preview is a no-op, not a crash"
+    (let (m (ed-init (make-buffer "x")))
+      (assert= (:completion-preview (preview-cycle m 1)) nil)
+      (assert= (:completion-preview (preview-cycle (assoc m :completion-preview {:items []}) 1))
+        {:items []})))
+
+  (test "accepting inserts the remainder and clears the preview"
+    (let (m (ed-init (goto-char (make-buffer "alphabetical\nalp") 16))
+          m1 (assoc m :completion-preview {:start 13 :prefix "alp" :text "habetical"})
+          m2 (preview-accept m1))
+      (assert= (buffer-text (ed-current-buf m2)) "alphabetical\nalphabetical")
+      (is (nil? (:completion-preview m2)))))
+
+  (test "Tab takes the preview rather than asking the sources again"
+    ;; the suggestion is already on screen under the cursor, so the key that means "yes,
+    ;; that one" should be the key your hand is on
+    (let (m (ed-init (goto-char (make-buffer "alphabetical\nalp") 16))
+          m1 (assoc m :completion-preview {:start 13 :prefix "alp" :text "habetical"})
+          m2 (cmd-complete m1 :tab))
+      (assert= (buffer-text (ed-current-buf m2)) "alphabetical\nalphabetical")
+      ;; and no popup was opened on the way
+      (is (nil? (:completion m2)))))
+
+  (test "with no preview showing, Tab is the completion it always was"
+    (let (m (ed-init (goto-char (make-buffer "alphabetical\nalp") 16))
+          m2 (cmd-complete m :tab))
+      (assert= (buffer-text (ed-current-buf m2)) "alphabetical\nalphabetical"))))
