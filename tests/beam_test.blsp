@@ -1,0 +1,371 @@
+;; `*BEAM Processes*` (`src/beam.blsp`) — the editor as `:observer`, over the same agent
+;; the Elixir playground evaluates in.
+;;
+;; The rendering and the reply routing are pure and tested here directly; the one thing
+;; only a live node can show — that an `OBSERVE` request comes back with real processes in
+;; it — is the isolated test at the bottom, gated on `elixir` being on PATH.
+
+(defmodule beam-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use-internals beam)
+  (:use session)) ; the shared session events every backend emits
+
+(defn m-of (text) (ed-init (make-buffer text)))
+
+;; A model with the buffer already on screen — the state a reply arrives into. Distinct
+;; from `m-of`, which is a model that has never opened it: a reply must fill the one and
+;; must not resurrect the other.
+(defn m-open ()
+  (commands/ed-show-named (m-of "") beam/*buffer-name* (beam/beam-text []) :beam-menu))
+
+(defn row (& overrides)
+  (merge {:pid "#PID<0.42.0>"
+          :name "MyApp.Worker"
+          :status "running"
+          :mailbox 0
+          :memory 4096
+          :reductions 1000
+          :monitored_by 0
+          :current "MyApp.Worker.crunch/2"}
+    (if (empty? overrides) {} (first overrides))))
+
+(describe "a BEAM process row"
+  (test "the pid is flush left, because the kill key parses it back off the line"
+    ;; no side table to go stale against a buffer that has since refreshed
+    (is (string/starts-with? (beam/beam-row (row)) "#PID<0.42.0>")))
+
+  (test "memory is human-sized and the current function is shown"
+    (let (line (beam/beam-row (row)))
+      (is (includes? line "4.0 KB"))
+      (is (includes? line "MyApp.Worker.crunch/2"))))
+
+  ;; A rate is a DIFFERENCE, so the first reading genuinely has nothing to show — and `-`
+  ;; says that, where `0` would claim the process is idle.
+  (test "a process with no previous snapshot reads `-` for its rate, not zero"
+    (is (includes? (beam/beam-row (row)) " - "))
+    (is (includes? (beam/beam-row (assoc (row) :reds-rate 900)) "900")))
+
+  (test "a name longer than its column is cut rather than allowed to wrap"
+    ;; a row that wraps stops being a row, and real module names are long
+    (let (line (beam/beam-row (assoc (row) :name "MyApp.Some.Very.Long.Module.Name.Indeed")))
+      (is (not (includes? line "\n")))
+      (is (not (includes? line "Indeed"))))))
+
+(describe "ordering a BEAM process list"
+  ;; The whole usefulness of the list. A node runs hundreds of processes and all but a
+  ;; handful are parked in a receive; in pid order the one that is spinning is buried
+  ;; somewhere in the middle and nothing about the columns tells you where to look.
+  (test "the busiest process is first, by rate"
+    (let (text (beam/beam-text [(row {:pid "#PID<0.1.0>" :reds-rate 5})
+                                 (row {:pid "#PID<0.2.0>" :reds-rate 9000})
+                                 (row {:pid "#PID<0.3.0>" :reds-rate 100})])
+          lines (string/split text "\n"))
+      ;; line 0 is the header
+      (is (includes? (nth lines 1) "#PID<0.2.0>"))
+      (is (includes? (nth lines 2) "#PID<0.3.0>"))))
+
+  (test "with no rates yet, total reductions decides"
+    (let (lines (string/split (beam/beam-text [(row {:pid "#PID<0.1.0>" :reductions 5})
+                                                (row {:pid "#PID<0.2.0>" :reductions 900})])
+                  "\n"))
+      (is (includes? (nth lines 1) "#PID<0.2.0>"))))
+
+  (test "an empty snapshot still paints the header and says it is waiting"
+    (let (text (beam/beam-text []))
+      (is (includes? text "REDS/S"))
+      (is (includes? text "waiting for the node")))))
+
+(describe "routing a reply to the process list"
+  ;; One session serves the playground and this buffer, and a reply carries only its id.
+  ;; "not mine" has to be a no-op on every path or the two clients fight over each other's
+  ;; answers.
+  (test "a reply this buffer did not ask for is left alone"
+    (let (m (m-of ""))
+      (assert= (beam/beam-reply m {:id 7 :ok true :processes []} 1) m)))
+
+  (test "a reply for a different id than the pending one is left alone"
+    (let (m (assoc-in (m-of "") [:beam :pending] 3))
+      (assert= (beam/beam-reply m {:id 4 :ok true :processes []} 1) m)))
+
+  ;; Either way the id is forgotten: it is the last thing that will ever be said about that
+  ;; request, and a pending id that can never be answered is a buffer that never refreshes.
+  (test "a failed observation reports it and stops waiting on that request"
+    (let (m (assoc-in (m-of "") [:beam :pending] 3)
+          m1 (beam/beam-reply m {:id 3 :ok false :error "nope"} 1))
+      (is (includes? (:echo m1) "nope"))
+      (is (nil? (get-in m1 [:beam :pending])))))
+
+  (test "a good reply fills the buffer and remembers the snapshot for the next rating"
+    (let (m (assoc-in (m-open) [:beam :pending] 3)
+          m1 (beam/beam-reply m {:id 3 :ok true :processes [(row)]} 1)
+          b (ed-buf-at m1 (model/ed-buffer-index-by-name! m1 beam/*buffer-name*)))
+      (is (includes? (buffer-text b) "#PID<0.42.0>"))
+      (is (nil? (get-in m1 [:beam :pending])))
+      ;; the reductions are kept per PID, which is the identity a BEAM snapshot has
+      (assert= (get-in m1 [:beam :snapshot :reds "#PID<0.42.0>"]) 1000)))
+
+  ;; The arithmetic is `commands/ed-rate-procs`', keyed by `:pid` — which is the identity a
+  ;; BEAM snapshot has, where the native list has an int id. Asserted exactly here, because
+  ;; the rendered row's number depends on the wall clock between two calls.
+  (test "a rate is reductions per second against the previous snapshot, keyed by pid"
+    (let (rated (commands/ed-rate-procs {"#PID<0.42.0>" 1000}
+                  1000
+                  [(row {:reductions 3000})]
+                  2000
+                  :pid))
+      (assert= (:reds-rate (first rated)) 2000))
+    ;; a process that was not in the previous snapshot has nothing to differ from
+    (let (rated (commands/ed-rate-procs {} 1000 [(row {:reductions 3000})] 2000 :pid))
+      (is (nil? (:reds-rate (first rated))))))
+
+  (test "the second reading carries a rate, which the first could not"
+    (let (m0 (assoc-in (m-open) [:beam :pending] 1)
+          m1 (beam/beam-reply m0 {:id 1 :ok true :processes [(row {:reductions 1000})]} 1)
+          b1 (ed-buf-at m1 (model/ed-buffer-index-by-name! m1 beam/*buffer-name*))
+          ;; the snapshot's clock is the model's, so push it back to make the gap real
+          m2 (assoc-in m1 [:beam :snapshot :at] (- (get-in m1 [:beam :snapshot :at]) 1000))
+          m3 (beam/beam-reply (assoc-in m2 [:beam :pending] 2)
+               {:id 2 :ok true :processes [(row {:reductions 3000})]}
+               1)
+          b2 (ed-buf-at m3 (model/ed-buffer-index-by-name! m3 beam/*buffer-name*)))
+      ;; first reading: nothing to differ from, so the column is honest about it
+      (is (includes? (buffer-text b1) " - "))
+      ;; second: ~2000 reductions over ~1s, so the column is a number and not a dash
+      (is (not (includes? (buffer-text b2) " - "))))))
+
+(describe "killing a process in the node"
+  ;; This is a string built for ANOTHER language's parser, so nothing in the editor could
+  ;; have told us it was wrong — and the first version was: it sent `inspect`'s output
+  ;; verbatim, and `#PID<0.42.0>` is not what `:erlang.list_to_pid/1` takes. `k` could
+  ;; never have killed anything, and the command said "killed …" regardless.
+  (test "the pid's `#PID` decoration comes off — list_to_pid does not take it"
+    (assert= (beam/beam-kill-expr "#PID<0.42.0>")
+      "Process.exit(:erlang.list_to_pid(~c\"<0.42.0>\"), :kill)"))
+
+  (test "a charlist SIGIL, not a single-quoted literal, which is deprecated and warns"
+    (is (includes? (beam/beam-kill-expr "#PID<0.1.0>") "~c\""))
+    (is (not (includes? (beam/beam-kill-expr "#PID<0.1.0>") "'"))))
+
+  (test "an already-bare pid is left alone"
+    (is (includes? (beam/beam-kill-expr "<0.7.0>") "~c\"<0.7.0>\"")))
+
+  ;; The outcome is reported rather than assumed: a kill is an ordinary evaluation and the
+  ;; node can refuse it.
+  (test "a failed kill says so instead of claiming success"
+    (let (m (assoc-in (m-of "") [:beam :killing] [9 "#PID<0.42.0>"])
+          m1 (beam/beam-reply m {:id 9 :ok false :error "** (ArgumentError)"} 1))
+      (is (includes? (:echo m1) "could not kill"))
+      (is (nil? (get-in m1 [:beam :killing])))))
+
+  (test "a successful kill is reported and stops waiting on that request"
+    (let (m (assoc-in (m-of "") [:beam :killing] [9 "#PID<0.42.0>"])
+          m1 (beam/beam-reply m {:id 9 :ok true :value "true"} 1))
+      (is (includes? (:echo m1) "killed #PID<0.42.0>"))
+      (is (nil? (get-in m1 [:beam :killing]))))))
+
+(describe "the restart path"
+  ;; A restart answers everything in flight `{:timeout true}` before respawning, so this is
+  ;; the ordinary route through `M-x elixir-playground-restart` — not a fault, and not
+  ;; worth a sentence in the echo area every time.
+  (test "a timeout from a restart is forgotten quietly, not reported as a failure"
+    (let (m (assoc-in (m-open) [:beam :pending] 3)
+          m1 (beam/beam-reply m {:id 3 :ok false :timeout true} 1))
+      (is (nil? (get-in m1 [:beam :pending])))
+      (is (not (includes? (or (:echo m1) "") "could not be observed")))))
+
+  ;; A request sent before the ready banner QUEUES in the worker and flushes when the child
+  ;; is up, so asking again on ready would throw the earlier answer away for nothing.
+  (test "ready does not ask again when a request is already in flight"
+    (let (m (assoc-in (m-open) [:beam :pending] 3))
+      (assert= (get-in (beam/beam-ready m 1 {:ready true}) [:beam :pending]) 3))))
+
+(describe "a reply that outlived its buffer"
+  ;; `ed-show-named` would bring the buffer back — a window reopening on its own a quarter
+  ;; second after the reader closed it. The same rule the `workings` pane follows.
+  (test "a snapshot arriving after the buffer was killed does not reopen it"
+    (let (m (assoc-in (m-of "") [:beam :pending] 3)
+          m1 (beam/beam-reply m {:id 3 :ok true :processes [(row)]} 1))
+      (is (nil? (model/ed-buffer-index-by-name m1 beam/*buffer-name*)))
+      (is (nil? (get-in m1 [:beam :pending]))))))
+
+(describe "the process list shares the playground's node"
+  (test "it is registered against the Elixir session, not a second one"
+    (let (client (seq/find sandbox-events/*clients*
+                   (fn (c) (includes? (->string (get c :reply)) "beam/"))))
+      (is (not (nil? client)))
+      (assert= (get client :session) :elixir-sandbox)))
+
+  (test "opening it without an editor to answer into says so rather than hanging"
+    ;; headless: a fire-and-forget request has nowhere to come back to
+    (is (string? (:echo (beam/cmd-beam-processes (m-of "") :none))))))
+
+;; ---- the live node ----------------------------------------------------------------------
+
+(when (elixir-sandbox/elixir-available?)
+  (describe "observing a real node"
+    :isolated (test "OBSERVE comes back with the processes actually running in the VM"
+      (let (_ (proc/register :editor (self))
+            _ (elixir-sandbox/elixir-start "/tmp")
+            _ (receive
+                ((record session/session-ready {}) :ready)
+                (after 60000 :timed-out))
+            _ (elixir-sandbox/elixir-observe 1 "processes")
+            reply (receive
+                    ((record session/session-reply {:reply r}) :when
+                      (= (get r :id) 1)
+                      r)
+                    (after 30000 nil)))
+        (is (not (nil? reply)))
+        (assert= (get reply :ok) true)
+        (let (rows (get reply :processes))
+          ;; a bare VM runs dozens; the exact number is the VM's business
+          (is (> (count rows) 10))
+          ;; every row carries what the renderer reads
+          (is (every? rows (fn (p) (string/starts-with? (get p :pid "") "#PID<"))))
+          (is (every? rows (fn (p) (int? (get p :reductions)))))
+          ;; and the names are OTP's own, not `:proc_lib` for everything it started
+          (is (any? rows (fn (p) (= (get p :name) ":init")))))
+        (elixir-sandbox/elixir-shutdown)))
+
+    ;; The expression is built for Elixir's parser, so only Elixir can say whether it is
+    ;; right. It was not: the first version sent `inspect`'s `#PID<…>` straight through and
+    ;; could not kill anything at all.
+    :isolated (test "the kill expression actually kills a process in the node"
+      (let (_ (proc/register :editor (self))
+            _ (elixir-sandbox/elixir-start "/tmp")
+            _ (receive
+                ((record session/session-ready {}) :ready)
+                (after 60000 :timed-out))
+            await (fn (id)
+                    (receive
+                      ((record session/session-reply {:reply r}) :when
+                        (= (get r :id) id)
+                        r)
+                      (after 30000 nil)))
+            ;; something long-lived to kill, named so it can be looked up again
+            _ (elixir-sandbox/elixir-eval 1
+                "victim = spawn(fn -> :timer.sleep(120_000) end); Process.register(victim, :bt_victim); inspect(victim)"
+                10000)
+            printed (get (await 1) :value))
+        ;; `inspect` inside the node produced `"#PID<0.x.0>"`, which arrives quoted
+        (is (includes? printed "#PID<"))
+        (let (pid (string/replace printed "\"" "")
+              _ (elixir-sandbox/elixir-eval 2 (beam/beam-kill-expr pid) 10000)
+              killed (await 2))
+          (assert= (get killed :ok) true)
+          (elixir-sandbox/elixir-eval 3 "Process.whereis(:bt_victim) == nil" 10000)
+          (assert= (get (await 3) :value) "true"))
+        (elixir-sandbox/elixir-shutdown)))
+
+    ;; A timeout kills the evaluating process, which never gets to tell its trace collector
+    ;; to stand down — so an unlinked collector waits in its receive forever and the node
+    ;; leaks one process per timed-out evaluation. Measured at 58 → 61 over three.
+    :isolated (test "a timed-out evaluation leaves no process behind"
+      (let (_ (proc/register :editor (self))
+            _ (elixir-sandbox/elixir-start "/tmp")
+            _ (receive
+                ((record session/session-ready {}) :ready)
+                (after 60000 :timed-out))
+            await (fn (id)
+                    (receive
+                      ((record session/session-reply {:reply r}) :when
+                        (= (get r :id) id)
+                        r)
+                      (after 30000 nil)))
+            count-of (fn (id)
+                       (do
+                         (elixir-sandbox/elixir-eval id "length(Process.list())" 10000)
+                         (string/->number (get (await id) :value))))
+            before (count-of 1)
+            _ (doseq (i (range 3))
+                (do
+                  (elixir-sandbox/elixir-eval (+ 10 i) ":timer.sleep(30_000)" 300)
+                  (is (get (await (+ 10 i)) :timeout))))
+            after-count (count-of 2))
+        ;; exactly equal is the contract; a margin would let the leak back in one at a time
+        (assert= after-count before)
+        (elixir-sandbox/elixir-shutdown)))))
+
+;; ---- attaching to a node bedit did not start ----------------------------------------
+;; The feature that turns this from a view of a project into a view of a RUNNING system,
+;; and the one whose whole risk is forgetting which VM you are on. So: the outcome is
+;; reported rather than assumed, and the mode line says so for as long as it lasts.
+(describe "attaching the session to another node"
+  (test "a successful attach names the node, and everything after it goes there"
+    (let (m (assoc-in (m-of "") [:beam :attaching] 9)
+          m1 (beam/beam-reply m {:id 9 :ok true :node "app@host"} 1))
+      (assert= (beam/attached-node m1) "app@host")
+      (is (includes? (:echo m1) "app@host"))
+      (is (includes? (:echo m1) "runs THERE"))
+      (is (nil? (get-in m1 [:beam :attaching])))))
+
+  (test "a failed attach says so and leaves you where you were"
+    ;; an attach that silently did not happen leaves you evaluating locally while believing
+    ;; you are not — the one failure this must never have
+    (let (m (assoc-in (m-of "") [:beam :attaching] 9)
+          m1 (beam/beam-reply m {:id 9 :ok false :error "could not connect to app@host"} 1))
+      (is (nil? (beam/attached-node m1)))
+      (is (includes? (:echo m1) "could not attach"))
+      (is (includes? (:echo m1) "could not connect"))))
+
+  (test "detaching clears the node"
+    (let (m (assoc (assoc-in (m-of "") [:beam :attaching] 9) :beam {:attaching 9 :attached "app@host"})
+          m1 (beam/beam-reply m {:id 9 :ok true :node nil} 1))
+      (is (nil? (beam/attached-node m1)))
+      (is (includes? (:echo m1) "detached"))))
+
+  (test "the mode line names the node while it lasts, and says nothing otherwise"
+    ;; on the bar of whatever you are editing, not only in *BEAM Processes*
+    (let (m (m-of ""))
+      (assert= (view/ed-beam-node-label m) "")
+      (assert= (view/ed-beam-node-label (assoc-in m [:beam :attached] "app@host")) "⇄ app@host")))
+
+  (test "detaching when nothing is attached is a sentence, not a request"
+    (is (includes? (:echo (beam/cmd-beam-detach (m-of "") :key)) "not attached")))
+
+  ;; The cookie is OFFERED, never used silently: reading a credential out of the filesystem
+  ;; on someone's behalf without their saying so is how you find out afterwards which
+  ;; machine bedit connected to.
+  (test "the default cookie is read from ~/.erlang.cookie, or is nil"
+    (let (c (elixir-sandbox/default-cookie))
+      (is (or (nil? c) (and (string? c) (not (= c ""))))))))
+
+;; The failure this feature must not have: the chip naming a node while evaluations have
+;; quietly gone back to running locally. A respawn — a watchdog kill, a crash, an explicit
+;; restart — is a FRESH VM that has never heard of the node you were on.
+(describe "an attachment does not outlive the node that held it"
+  (test "a ready banner means a new child, so the attachment is gone"
+    ;; the reliable signal: a successful respawn emits no `:down` at all, only the banner
+    ;; from the child that replaced the old one
+    (let (m (assoc (m-of "") :beam {:attached "app@host"})
+          m1 (beam/beam-ready m 7 {:ready true}))
+      (is (nil? (beam/attached-node m1)))
+      (is (includes? (:echo m1) "no longer attached to app@host"))))
+
+  (test "a child that went away takes the attachment with it"
+    (let (m (assoc (m-of "") :beam {:attached "app@host"})
+          m1 (beam/beam-down m 1))
+      (is (nil? (beam/attached-node m1)))
+      (is (includes? (:echo m1) "no longer attached to app@host"))))
+
+  (test "and it is not silently re-attached — you are asked to mean it again"
+    ;; reconnecting to somebody's production node on its behalf after a crash is worse than
+    ;; making you type the node twice
+    (let (m (assoc (m-of "") :beam {:attached "app@host"})
+          m1 (beam/beam-ready m 7 {:ready true}))
+      (is (nil? (get-in m1 [:beam :attaching])))
+      (is (includes? (:echo (beam/cmd-beam-detach m1 :key)) "not attached"))))
+
+  (test "a plain restart with nothing attached still says what it always said"
+    ;; …and only where the buffer is open: a node dying behind a closed *BEAM Processes* is
+    ;; not news
+    (let (m (m-open))
+      (is (includes? (:echo (beam/beam-down m 1)) "went away"))
+      (is (includes? (:echo (beam/beam-down m :spawn-failed)) "elixir"))))
+
+  (test "the mode line stops naming it"
+    (let (m (assoc (m-of "") :beam {:attached "app@host"}))
+      (assert= (view/ed-beam-node-label m) "⇄ app@host")
+      (assert= (view/ed-beam-node-label (beam/beam-ready m 7 {:ready true})) ""))))

@@ -1,0 +1,402 @@
+(defmodule beam
+  "**The editor as `:observer`** — what is actually running in the BEAM node bedit is
+attached to (`M-x beam-processes`, `C-c b p`).
+
+`M-x list-processes` already shows this runtime's own processes: id, name, status, mailbox
+backlog, memory, reductions and reductions/second, read-only, `g` to refresh and `k` to
+kill. This is the same buffer, the same columns and the same keys for the OTHER runtime —
+the one your application is running in — answered by the agent `elixir-sandbox` already
+keeps there.
+
+**The same session as the playground's, deliberately.** The value of observing from inside
+the node is that it is YOUR node: `mix run` compiled and started your application, so what
+this lists is your supervision tree, your Ecto pool, your LiveView processes. A second
+agent would be a second VM and would show you nothing you care about.
+
+**REDS/S is the column worth the round trip.** Reductions are the scheduler's own measure
+of work done, so a single snapshot says only how much a process has done since it started —
+which tells you almost nothing. The DIFFERENCE between two snapshots is who is busy *now*,
+which is the question you open a process list to ask. So the list keeps the previous
+snapshot on the model and rates the next one against it (`commands/ed-rate-procs`, shared
+with the native list): `-` on the first show, a real rate on every `g` after.
+
+Sorted by that rate, then by reductions — a runaway process sorts itself to the top, where
+in pid order it would be one of four hundred rows."
+  (:use model) ; message / ed-current-buf / ed-headless? / ed-buffer-index-by-name
+  (:use commands) ; ed-show-named / ed-rate-procs — the shared snapshot rating
+  (:use interactive) ; defcommand — M-x beam-processes
+  (:use editor/buffer) ; buffer-line-at / buffer-current-line — the row under point
+  (:use editor/keymap) ; keymap-bind — the buffer's own keys
+  (:use editor/layers) ; register-type-layers
+  (:use elixir-sandbox)) ; elixir-start / elixir-observe / elixir-available?
+;; modes and projects are referenced qualified below — each `mod/name` auto-loads its module.
+
+(def *buffer-name* "*BEAM Processes*")
+(def *state-key* :beam) ; where the pending request and the last snapshot live on the model
+
+;; ---- the rows -----------------------------------------------------------------------
+
+(defn- clip (s n)
+  "`s` cut to `n` characters. A module name in a real application is routinely longer than
+its column, and a row that wraps stops being a row."
+  (let (s (str s))
+    (if (> (string/length s) n) (string/substring s 0 n) s)))
+
+(defn- beam-row (p)
+  "One `*BEAM Processes*` row. The PID stays flush-left, because that is what the kill key
+parses back out of the line — there is no side table to go stale.
+
+CURRENT is the column the native list has no equivalent of and the one that pays for
+itself: a process sitting in `GenServer.loop/3` is idle, and one sitting in your own
+`MyApp.Worker.crunch/2` is the thing you were looking for."
+  (str (string/pad-right (get p :pid "-") 16)
+    " "
+    (string/pad-right (clip (get p :name "-") 22) 22)
+    " "
+    (string/pad-right (get p :status "-") 9)
+    " "
+    (string/pad-left (str (get p :mailbox 0)) 7)
+    " "
+    (string/pad-left (humanize/byte-size (get p :memory 0)) 8)
+    " "
+    (string/pad-left (str (get p :reductions 0)) 12)
+    " "
+    (string/pad-left (let (r (get p :reds-rate)) (if (nil? r) "-" (str r))) 8)
+    " "
+    (string/pad-left (str (get p :monitored_by 0)) 4)
+    " "
+    (clip (get p :current "-") 40)))
+
+(defn- beam-header ()
+  (str (string/pad-right "PID" 16)
+    " "
+    (string/pad-right "NAME" 22)
+    " "
+    (string/pad-right "STATUS" 9)
+    " "
+    (string/pad-left "MAILBOX" 7)
+    " "
+    (string/pad-left "MEM" 8)
+    " "
+    (string/pad-left "REDS" 12)
+    " "
+    (string/pad-left "REDS/S" 8)
+    " "
+    (string/pad-left "MON" 4)
+    " "
+    "CURRENT"))
+
+(defn- beam-busiest (rows)
+  "Busiest first: by reductions/second where there is one, else by total reductions.
+
+Order is the whole usefulness of this list. A node runs hundreds of processes and all but a
+handful are parked in a receive; pid order buries the one that is spinning somewhere in the
+middle, and nothing about the columns tells you where to look."
+  (reverse (sort-by rows (fn (p) [(or (get p :reds-rate) 0) (get p :reductions 0)]))))
+
+(defn beam-text (rows)
+  "The `*BEAM Processes*` buffer text for an already-rated snapshot."
+  (if (empty? rows)
+    (str (beam-header) "\n\n  (waiting for the node…)\n")
+    (str (beam-header) "\n" (string/join (map (beam-busiest rows) beam-row) "\n") "\n")))
+
+;; ---- asking the node ------------------------------------------------------------------
+
+(defn- beam-snapshot-reds (rows)
+  ;; pid -> reductions, for rating the NEXT snapshot against this one
+  (reduce rows {} (fn (acc p) (assoc acc (get p :pid) (get p :reductions 0)))))
+
+(defn beam-live-buffer? (m)
+  "Is *BEAM Processes* on screen — i.e. does this client still want a session? One of the
+`sandbox-events` client hooks."
+  (not (nil? (ed-buffer-index-by-name m *buffer-name*))))
+
+(defn beam-request (m)
+  "Ask the node for a fresh snapshot, remembering the request id so the reply can be told
+from the playground's. Answers the model unchanged when the session is not running — the
+reply would never come, and a request recorded as pending that cannot be answered is a
+buffer that never refreshes again."
+  (let (id (sandbox/sandbox-next-id m)
+        sent (elixir-observe id "processes"))
+    (if (not sent)
+      m
+      (assoc-in (sandbox/sandbox-ids-used m (inc id)) [*state-key* :pending] id))))
+
+(defn beam-show (m rows)
+  "Render `rows` into the buffer, rated against the previous snapshot, and record this one
+for the next rating."
+  (let (at (os/now)
+        prev (get-in m [*state-key* :snapshot])
+        rated (ed-rate-procs (get prev :reds) (get prev :at) rows at :pid)
+        m1 (ed-show-named m *buffer-name* (beam-text rated) :beam-menu))
+    (assoc-in m1 [*state-key* :snapshot] {:at at :reds (beam-snapshot-reds rows)})))
+
+;; ---- the session client hooks (registered in `sandbox-events/*clients*`) ----------------
+
+(defn beam-ready (m gen banner)
+  "The agent announced itself: ask it what is running, so a buffer opened during a compile
+fills in the moment the node is up rather than waiting for a keypress.
+
+Unless one is already on its way. A request sent before the banner QUEUES in the worker and
+flushes the moment the child is up, so on a first open both would be in flight and the
+earlier answer would be thrown away for no reason."
+  (let (was (attached-node m)
+        ;; A ready banner means a NEW child, whatever brought it about — a watchdog
+        ;; respawn, a crash, `M-x elixir-playground-restart`. It has never heard of the node
+        ;; you were attached to, so the attachment is gone and the chip must stop claiming
+        ;; it. This is the reliable place to notice: a successful respawn emits no `:down`
+        ;; at all (`evalsession/session-respawn`), only the banner from the child that
+        ;; replaced the old one.
+        m1 (assoc-in (assoc-in m [*state-key* :gen] gen) [*state-key* :attached] nil)
+        m2 (if was (message m1 (str "a fresh node — no longer attached to " was)) m1))
+    (cond
+      (not (beam-live-buffer? m2)) m2
+      (get-in m2 [*state-key* :pending]) m2
+      else (beam-request m2))))
+
+(defn- beam-kill-reply (m reply)
+  "Report what a kill actually did, then re-read the list. The reply is an ordinary
+evaluation's, so `:ok false` is the node refusing — a pid that no longer exists, an
+expression it could not parse."
+  (let ([_ pid] (get-in m [*state-key* :killing])
+        m1 (assoc-in m [*state-key* :killing] nil))
+    (if (get reply :ok)
+      (message (beam-request m1) (str "killed " pid))
+      (message m1 (str "could not kill " pid ": " (get reply :error "unknown error"))))))
+
+(defn beam-reply (m reply gen)
+  "One reply. Anything this buffer did not ask for is somebody else's — the playground's
+evaluation, a straggler from a superseded child — and is left alone, which is the rule that
+lets one session serve several clients with no owner tag on the wire.
+
+Every branch clears the id it matched: it is the last thing that will ever be said about
+that request, and an id left pending that can never be answered is a buffer that never
+refreshes again."
+  (let (pending (get-in m [*state-key* :pending])
+        killing (first (or (get-in m [*state-key* :killing]) [nil nil]))
+        attaching (get-in m [*state-key* :attaching]))
+    (cond
+      (and attaching (= attaching (get reply :id))) (beam-attach-reply m reply)
+      (and killing (= killing (get reply :id))) (beam-kill-reply m reply)
+      (nil? pending) m
+      (not (= pending (get reply :id))) m
+      ;; A restart answers everything in flight `{:timeout true}` before respawning, so this
+      ;; is the ordinary path through `M-x elixir-playground-restart` and not a fault worth
+      ;; a sentence. Forget the id and say nothing; the ready that follows asks again.
+      (get reply :timeout) (assoc-in m [*state-key* :pending] nil)
+      (not (get reply :ok))
+        (message (assoc-in m [*state-key* :pending] nil)
+          (str "the node could not be observed: " (get reply :error "unknown error")))
+      ;; The buffer may have been killed while this was in flight, and `ed-show-named`
+      ;; would bring it back — a window reopening on its own, a quarter second after the
+      ;; reader closed it. The snapshot is still worth keeping for the next open.
+      (not (beam-live-buffer? m)) (assoc-in m [*state-key* :pending] nil)
+      else
+        (beam-show (assoc-in m [*state-key* :pending] nil) (or (get reply :processes) [])))))
+
+(defn beam-down (m code)
+  "The child went away. Whatever else this means, it means the ATTACHMENT is gone: the
+respawn that follows is a fresh VM that has never heard of the node you were on.
+
+Cleared here rather than left for the next attach, because the alternative is the one
+failure this feature must not have — the chip still naming a node while your evaluations
+quietly run locally again. Not re-attached either: silently reconnecting to somebody's
+production node after a crash is worse than making you ask twice."
+  (let (was (attached-node m)
+        m1 (assoc-in m [*state-key* :attached] nil))
+    (cond
+      was (message m1 (str "the node went away — no longer attached to " was))
+      (not (beam-live-buffer? m1)) m1
+      else
+        (message m1
+          (if (= code :spawn-failed)
+            "could not start the Elixir session (is `elixir` on PATH?)"
+            "the Elixir node went away — M-x elixir-playground-restart")))))
+
+;; ---- the buffer's own keys -------------------------------------------------------------
+
+(def beam-menu-keymap
+  (-> {}
+    ;; `g` to refresh and `k` to kill, the same two keys the native process list uses —
+    ;; a reader who has used one already knows this one.
+    (keymap-bind ["g"] 'beam/cmd-beam-refresh)
+    (keymap-bind ["k"] 'beam/cmd-beam-kill)
+    (keymap-bind ["d"] 'beam/cmd-beam-kill)
+    (keymap-bind ["x"] 'beam/cmd-beam-kill)))
+
+(def beam-menu-layer
+  {:name 'beam-menu
+   :keymap beam/beam-menu-keymap
+   :commands '("beam-refresh" "beam-kill")
+   :no-line-numbers true})
+
+(register-type-layers :beam-menu
+  (list 'beam/beam-menu-layer 'modes/special-mode-layer 'modes/text-mode-layer))
+
+(defn beam-kill-expr (pid)
+  "The expression that kills the process a row names.
+
+`inspect` prints a pid as `#PID<0.42.0>` and `:erlang.list_to_pid/1` wants `<0.42.0>` —
+the `#PID` is Elixir's own decoration, not part of the term's textual form — so the prefix
+has to come off. Sent as a charlist sigil rather than a single-quoted literal, which is
+deprecated and warns on every kill.
+
+This is a function so it can be asserted on: it is a string built for another language's
+parser, and nothing in the editor could have told us it was wrong."
+  (str "Process.exit(:erlang.list_to_pid(~c\""
+    (if (string/starts-with? pid "#PID") (string/substring pid 4 (string/length pid)) pid)
+    "\"), :kill)"))
+
+(defn- beam-pid-at-point (m)
+  "The pid printed at the start of the current line, or nil when point is not on a row.
+Parsed back out of the LINE rather than kept in a side table, so it cannot go stale against
+a buffer that has since been refreshed."
+  (let (buf (ed-current-buf m)
+        line (string/trim (buffer-line-at buf (buffer-current-line buf))))
+    (when (string/starts-with? line "#PID<") (first (string/split line " ")))))
+
+;; ---- the commands ------------------------------------------------------------------------
+
+(defcommand cmd-beam-processes
+  (m key)
+  "What is running in the BEAM node (M-x beam-processes, C-c b p): every process in the VM
+your application is running in — name, status, mailbox backlog, memory, reductions,
+reductions per second, and what each one is executing right now.
+
+Busiest first, so a process that is spinning sorts itself to the top. `g` refreshes (and
+only the second reading can show a rate, since a rate is a difference); `k` kills the
+process on the current line.
+
+The node is the playground's — `mix run` in your project root, application started — so
+this is your supervision tree and not a demonstration."
+  (cond
+    (missing-tool (or (:project-root m) (projects/project-root (file/cwd))))
+      (message m (str (missing-tool (or (:project-root m) (projects/project-root (file/cwd))))
+                   " — there is no node to observe"))
+    (ed-headless?) (message m "*BEAM Processes* needs a running editor to receive the node's reply")
+    else
+      (do
+        (sandbox-events/ensure) ; the UiEvent impls live there; loading it IS registering them
+        (elixir-start (or (:project-root m) (projects/project-root (file/cwd))))
+        ;; Show the buffer at once with whatever the last snapshot said (nothing, the first
+        ;; time) and fill it when the reply lands. A command that waited would block the
+        ;; editor for as long as a cold `mix` compile takes.
+        (message (beam-request (ed-show-named m
+                                 *buffer-name*
+                                 (beam-text (or (get-in m [*state-key* :rows]) []))
+                                 :beam-menu))
+          "asking the node what is running…"))))
+
+(defcommand cmd-beam-refresh
+  (m key)
+  "Ask the node for a fresh snapshot (`g`). The second and later readings carry REDS/S —
+who is busy *now* — because a rate is a difference and the first reading has nothing to
+differ from."
+  (message (beam-request m) "refreshing…"))
+
+(defcommand cmd-beam-kill
+  (m key)
+  "Kill the process on the current line (`k`, `d`, `x`) — `Process.exit(pid, :kill)` in the
+node — then refresh.
+
+Evaluated in the session like any other expression, which is the honest implementation: the
+agent has no privileged kill, and a process list that could reach further into the node than
+the playground beside it would be a second, quieter API to audit."
+  (let (pid (beam-pid-at-point m))
+    (if (nil? pid)
+      (message m "not on a process line")
+      (let (id (sandbox/sandbox-next-id m)
+            sent (elixir-eval id (beam-kill-expr pid) 5000))
+        (if (not sent)
+          (message m "the node is not running")
+          ;; Pended, so the outcome is REPORTED. Announcing the kill here and refreshing
+          ;; would say "killed …" whether or not anything died — and the first version of
+          ;; this command could not kill anything at all, because the expression it sent
+          ;; was malformed and nothing was listening for the error it came back with.
+          (message (assoc-in (sandbox/sandbox-ids-used m (inc id)) [*state-key* :killing] [id pid])
+            (str "killing " pid "…")))))))
+
+;; ---- attaching to a node that is already running ----------------------------------------
+;;
+;; Everything above observes the node bedit started. `M-x beam-attach` points the same
+;; session at one it did not: your `iex -S mix phx.server`, a release on this machine, or —
+;; over an SSH tunnel — one that is not. The process list, the playground and the spy pane
+;; all follow, because they all speak to the one agent and the agent is what moves.
+;;
+;; It is guarded, and the guards are the feature rather than paperwork around it:
+;;
+;;   * the node is TYPED, never discovered. A list of reachable nodes with RET to attach is
+;;     one keystroke from evaluating on production.
+;;   * the cookie is ASKED FOR. `~/.erlang.cookie` is offered as the default because it is
+;;     usually right, but reading a credential on someone's behalf without their saying so
+;;     is how you find out afterwards which machine you connected to.
+;;   * the mode line NAMES the node while you are attached (`statusbar`'s `beam` segment),
+;;     because the whole risk here is forgetting.
+
+(defn attached-node (m)
+  "The node this editor's session is currently routed to, or nil for its own. What the
+status bar reads."
+  (get-in m [*state-key* :attached]))
+
+(defn- beam-attach-reply (m reply)
+  "Report what an attach or detach actually did. Reported rather than assumed, because an
+attach that silently did not happen leaves you evaluating locally while believing you are
+not — the one failure this must never have."
+  (let (m1 (assoc-in m [*state-key* :attaching] nil)
+        node (get reply :node))
+    (cond
+      (not (get reply :ok))
+        (message (assoc-in m1 [*state-key* :attached] nil)
+          (str "could not attach: " (get reply :error "unknown error")))
+      (nil? node) (message (assoc-in m1 [*state-key* :attached] nil) "detached — back on bedit's own node")
+      else
+        (message (beam-request (assoc-in m1 [*state-key* :attached] node))
+          (str "attached to " node " — every evaluation now runs THERE")))))
+
+(defn- beam-ask-attach (m node cookie)
+  (let (id (sandbox/sandbox-next-id m)
+        sent (elixir-sandbox/elixir-attach id node cookie))
+    (if (not sent)
+      (message m "the node is not running — M-x elixir-playground starts one")
+      (message (assoc-in (sandbox/sandbox-ids-used m (inc id)) [*state-key* :attaching] id)
+        (str "connecting to " node "…")))))
+
+(defcommand cmd-beam-attach
+  (m key)
+  "Attach the Elixir session to a node that is already running (M-x beam-attach): prompts
+for the node name, then for its cookie.
+
+After it, `M-x beam-processes` lists THAT node's processes and the playground evaluates
+THERE — which is the point, and is also why the mode line says so for as long as it lasts.
+`M-x beam-detach` goes back.
+
+The node is typed rather than picked from a list on purpose: a menu of reachable nodes is
+one keystroke away from evaluating on production."
+  (if (not (elixir-running?))
+    (message m "no Elixir session to attach — M-x elixir-playground starts one")
+    (assoc m
+      :minibuffer
+        {:edit (ed-mb-edit "Attach to node: " "")
+         :on-complete
+           (fn (m1 node)
+            (if (= (string/trim node) "")
+              (message m1 "no node named")
+              (assoc m1
+                :minibuffer
+                  {:edit (ed-mb-edit (str "Cookie for " (string/trim node) ": ")
+                            (or (elixir-sandbox/default-cookie) ""))
+                   :on-complete
+                     (fn (m2 cookie)
+                       (beam-ask-attach m2 (string/trim node) (string/trim cookie)))})))})))
+
+(defcommand cmd-beam-detach
+  (m key)
+  "Route the Elixir session back to bedit's own node (M-x beam-detach)."
+  (if (nil? (attached-node m))
+    (message m "not attached to anything")
+    (let (id (sandbox/sandbox-next-id m)
+          sent (elixir-sandbox/elixir-detach id))
+      (if (not sent)
+        (message m "the node is not running")
+        (message (assoc-in (sandbox/sandbox-ids-used m (inc id)) [*state-key* :attaching] id)
+          "detaching…")))))
