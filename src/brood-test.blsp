@@ -1,0 +1,143 @@
+(defmodule brood-test
+  "**The Brood suite, in a child that has already loaded the project.**
+
+`C-c t` in a Brood project spawns `nest run` on a generated script, and that child loads
+the project before it can run a thing. Measured in this repo: 1.21 s for one 27-test file,
+of which 435 ms is loading sixty modules and ~250 ms is the tests. You pay it again every
+time you press the key.
+
+Held open, the project is loaded once: 166–240 ms per run afterwards. Same numbers, same
+rows, same margin verdicts — the run is what changes, not the report.
+
+**The child is std's `eval-server`**, the one the Brood eval sandbox already talks to, in a
+session of its own answering `:test` requests ([[editor/evalsession]]'s streaming protocol
+— one `:more` reply per finished test, then a summary). Its own session and not the
+playground's, for the reason `elixir-test` keeps a second node: a suite resets the test
+registry and rolls back globals per unit, and doing that under the buffer someone is
+evaluating in would be a playground that forgets what you defined whenever you ran the
+tests.
+
+**It notices when you change `src/`.** Every run first reloads the project sources whose
+mtime has moved since this image loaded them (`project/reload-changed`) — about a
+millisecond of `stat` when nothing has, which is the common case. That is not a nicety: a
+warm runner that skipped it would be wrong in the direction that costs most, reporting
+green for a function you have already broken and red for one you have already fixed. It
+was, and the measurement is in that function's docstring.
+
+`M-x brood-test-restart` is therefore rare — for a changed `project.blsp` or a dependency,
+not for the code you are editing. And `C-c t` keeps the cold runner for whenever this
+session is not up: the cold path is always correct, and this one is always fast.")
+;; No imports: spoken to by `testrun`, speaks only to `session` / `sandbox` and the kernel.
+
+;; The events are `session`'s, carrying the name below — a third session, so a `down` from
+;; it says nothing about the sandbox the playground evaluates in.
+(def *session* :brood-test)
+
+;; Its own script, written and removed independently of the eval sandbox's, though the
+;; program is the same two lines: this is `eval-server`, in a second child.
+(def *script-path* (str (path/temp "bedit-brood-test-") ".blsp"))
+
+;; A Brood child announces itself in well under a second even in a large project — it is
+;; the same boot the eval sandbox pays, and that one asks for twenty.
+(def *boot-timeout-ms* 20000)
+
+;; A suite is the one request that can legitimately run for minutes, and each streamed
+;; verdict pushes this out again, so it bounds the gap BETWEEN tests rather than the run.
+(def *default-timeout-ms* 120000)
+
+(def- child-program
+  ;; `nest test`'s own bootstrap, then the server. Quoted forms rather than a string, the
+  ;; way `testrun`'s generated runner is built — no escaping, and the two scripts stay
+  ;; visibly the same bootstrap.
+  ;;
+  ;; The eager `load-sources` is the point twice over. It is what is paid ONCE instead of
+  ;; per run — the 435 ms this project spends loading sixty modules. And it is what makes
+  ;; the warm runner agree with the cold one: `nest run` sets a project up lazily, so
+  ;; without it the child's image holds only what the test file transitively pulled in, and
+  ;; a test that asks what is LOADED gets a different answer than it does under `nest test`.
+  ;; Measured: `tests/complete_test.blsp`'s "a loaded global completes through the mode
+  ;; source" failed in the warm child and passed cold, because `string/starts-with?` was
+  ;; not in the image yet.
+  (list '(project/load-config)
+    '(let (root (project/find-root (file/cwd)))
+       (when root
+         (project/setup root)
+         (project/load-sources root)))
+    ;; the modest batch `testrun`'s runner uses, and for its reason: the editor may live in
+    ;; a small container, and `nest run` sets no test memory ceiling
+    '(def *parallel-batch* 2)
+    '(eval-server/run)))
+
+(defn spawn-child (root &optional (attempt 0))
+  "`evalsession`'s `:spawn` hook: write the child's program out and start a runtime on it,
+rooted in the project — which is what puts the project's sources on its load path, and so
+what makes every run after the first one fast.
+
+Reuses `sandbox`'s runtime discovery (PATH, then beside this binary) rather than repeating
+it: the question \"what can host an eval-server?\" has one answer and it is not this
+module's to hold a second copy of."
+  ;; check-allow :discarded-catch — every failure here is "no child", which is the contract
+  (check-allow :discarded-catch
+    (try
+      (do
+        (file/spit *script-path* (string/join (map child-program pr-str) "\n"))
+        (sandbox/spawn-runtime-on *script-path* root))
+      (catch e
+        (do (log/warn (str "brood-test: could not start a child: " (error-message e))) nil)))))
+
+(defn encode-request (id timeout-ms payload)
+  "`evalsession`'s `:encode` hook — one `eval-server` request line. `payload` is
+`{:specs [[file line-or-nil] …]}` for a run (empty specs = the whole project suite), or
+`{:teststop true}` to abandon the one in flight."
+  (if (:teststop payload)
+    (eval-server/evsrv-encode-teststop id)
+    (eval-server/evsrv-encode-test id (or (:specs payload) []) timeout-ms)))
+
+(defn emit (sink kind payload gen name)
+  "`evalsession`'s `:emit` hook — [[session/emit-after-script]] over this backend's script."
+  (session/emit-after-script *script-path* sink kind payload gen name))
+
+(def *spec*
+  ;; The decoder is the eval sandbox's: both children are Brood speaking `eval-server`'s
+  ;; pr-str wire, and a reply is a reply whichever request kind produced it.
+  {:spawn 'brood-test/spawn-child
+   :encode 'brood-test/encode-request
+   :decode 'sandbox/decode-reply
+   :emit 'brood-test/emit
+   :boot-timeout-ms brood-test/*boot-timeout-ms*
+   :default-timeout-ms brood-test/*default-timeout-ms*})
+
+;; ---- the client API -------------------------------------------------------------
+
+(defn brood-test-running? ()
+  "Is the Brood test session's worker alive?"
+  (session/running? *session*))
+
+(defn brood-test-start (root &optional (sink nil))
+  "Ensure the session is up, its child rooted in Brood project `root`. Idempotent."
+  (session/start *session* *spec* root sink))
+
+(defn brood-test-run (id specs)
+  "Run `specs` — a list of `[file line-or-nil]` pairs, empty for the whole suite — in the
+warm child under request `id`.
+
+Answers whether the request was ACCEPTED; false means the session is not running and no
+verdict for this id will ever arrive, which the caller must treat as \"use the cold
+runner\" rather than as a run in progress."
+  (session/request *session* id *default-timeout-ms* {:specs specs}))
+
+(defn brood-test-stop (id)
+  "Ask the child to abandon the run in progress. Answers whether the request was accepted.
+
+The child answers TWICE — once for the abandoned run, once for this — because a client that
+has recorded a run as in flight is otherwise waiting on a reply that is never coming."
+  (session/request *session* id 10000 {:teststop true}))
+
+(defn brood-test-reset ()
+  "Restart the session: a fresh child that reloads the project. What you run after changing
+`src/` — a warm child holds the code it booted with."
+  (session/reset *session*))
+
+(defn brood-test-shutdown ()
+  "Kill the child and stop the worker. A no-op when it is not running."
+  (session/shutdown *session*))

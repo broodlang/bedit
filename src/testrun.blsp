@@ -169,8 +169,18 @@ first decoded line does not."
                              "…"
                              (if unsaved? "  (unsaved changes — testing the file as saved)" "")))
       *tests-buffer*
-      (str "-*- tests: " label " -*-\n\n")
+      (tests-header label "cold")
       :test-menu)))
+
+(defn tests-header (label mode)
+  "The `*Tests*` banner: what was run, and by WHICH runner.
+
+Saying which is not decoration. The two runners differ in ways a reader has to be able to
+account for — one starts a runtime and one reuses a session — and when the warm one was
+silently testing the code it booted with, the only symptom was a verdict that disagreed
+with the file on screen, with nothing anywhere to suggest where to look. A word in the
+banner is the cheapest possible answer to \"which of these am I reading?\"."
+  (str "-*- tests: " label (if mode (str "  ·  " mode) "") " -*-\n\n"))
 
 ;; ---- rendering + folds ----------------------------------------------------------
 
@@ -478,6 +488,278 @@ superseded run (rapid re-runs) is dropped so it can't corrupt the fresh report."
           (str "test runner exited " code " — see " *tests-buffer*))
         m))))
 
+;; ---- the warm node: the same suite, without the VM boot ---------------------------
+;; An Elixir run costs a VM start and a compile before its first verdict — a second and a
+;; half in a small project, fifteen in a Phoenix one — and you pay it again every time you
+;; press the key, for a suite you are running every few seconds while you fix one test.
+;;
+;; `elixir-test` keeps a `MIX_ENV=test` node up (see that module for why it is a SECOND
+;; node and not the playground's). When it is up and ready, `C-c t` sends it the files and
+;; the verdicts stream back as `:more` replies, one per test. Everything downstream is
+;; unchanged: the same `testadapter` vocabulary, the same rows, the same margin marks, the
+;; same RET.
+;;
+;; The cold runner is never removed and never slower: a run with no warm node uses it AND
+;; starts one, so the first `C-c t` in a project behaves exactly as it always did and every
+;; one after it is fast.
+
+(defdyn *warm-tests* true)
+;; Whether `C-c t` may keep a test session warm at all. Set false on a machine where a
+;; resident runtime per project is not a trade worth making — the cold runner is what you
+;; get, which is what every other editor gives you.
+
+(defdyn *warm-backends*
+  ;; One row per language that has a warm test session. A LANGUAGE IS A ROW: everything
+  ;; below is written against these fields, so the next one (a warm pytest, a cargo-test
+  ;; watcher) is an entry here rather than another branch.
+  ;;
+  ;;   :adapter   the `testadapter` id this applies to (`toolchain/adapter-id`)
+  ;;   :session   the `evalsession` name — what its events are scoped by
+  ;;   :applies?  (m root) -> is this project actually one? (tools present, markers right)
+  ;;   :specs     (m specs) -> the run request's payload, in the backend's own spelling
+  ;;   :running? / :start / :run / :stop / :reset — the backend's client API
+  ;;   :restart   what to tell the reader to run when the session has to be replaced
+  ;;
+  ;; Symbols, resolved at call time: every backend here is a DEFERRED module, and naming
+  ;; them eagerly would load a BEAM agent into an editor that never opens an Elixir file.
+  [{:adapter :exunit
+    :session :elixir-test
+    :applies? 'testrun/warm-elixir-applies?
+    :specs 'testrun/warm-elixir-specs
+    :running? 'elixir-test/elixir-test-running?
+    :start 'elixir-test/elixir-test-start
+    :run 'elixir-test/elixir-test-run
+    :stop 'elixir-test/elixir-test-stop
+    :reset 'elixir-test/elixir-test-reset
+    :restart "M-x elixir-test-restart"}
+    {:adapter :brood
+     :session :brood-test
+     :applies? 'testrun/warm-brood-applies?
+     :specs 'testrun/warm-brood-specs
+     :running? 'brood-test/brood-test-running?
+     :start 'brood-test/brood-test-start
+     :run 'brood-test/brood-test-run
+     :stop 'brood-test/brood-test-stop
+     :reset 'brood-test/brood-test-reset
+     :restart "M-x brood-test-restart"}])
+
+(defn- warm-call (backend key args fallback)
+  ;; Call one of a backend's late-bound hooks, or answer `fallback` when its module is not
+  ;; loaded — the keymap idiom. A backend nothing has touched is not a backend yet.
+  (let (sym (get backend key))
+    (if (or (nil? sym) (not (bound? sym))) fallback (apply (reflect/eval sym) args))))
+
+(defn warm-elixir-applies? (m root)
+  "A mix project, with the tools to start a test node in it."
+  (and (nil? (elixir-sandbox/missing-tool root)) (elixir-sandbox/elixir-project? root)))
+
+(defn warm-brood-applies? (m root)
+  "A Brood project. Nothing else to check: the child is the same runtime bedit is running
+under, so if the editor started, something can host the session."
+  (not (nil? root)))
+
+(defn- warm-relative (root file)
+  "`file` relative to the project root when it is inside it, else unchanged."
+  (if (and root file (string/starts-with? file (str root "/")))
+    (string/substring file (string/length (str root "/")))
+    (or file "")))
+
+(defn warm-elixir-specs (m specs)
+  "`[\"path\"]` / `[\"path:line\"]`, project-relative — how ExUnit addresses a test and how
+`mix test` is spelled on a command line. The whole suite is `test`, ExUnit's own default
+directory, rather than an empty list."
+  (let (root (testrun-root m))
+    (if (empty? specs)
+      ["test"]
+      (into []
+        (map specs
+          (fn (s)
+            (let (rel (warm-relative root (get s :file)))
+              (if (get s :line) (str rel ":" (get s :line)) rel))))))))
+
+(defn warm-brood-specs (m specs)
+  "`[[file line-or-nil] …]` — what `eval-server`'s TEST request carries. ABSOLUTE paths,
+because the child resolves `reflect/load` against its own working directory and a relative
+path that happens to work is a coincidence rather than a contract. Empty means the whole
+project suite."
+  (into [] (map specs (fn (s) [(get s :file) (get s :line)]))))
+
+(defn warm-backend (m)
+  "The warm test backend for this project, or nil when it has none — no row for its
+toolchain, the tools missing, or warm sessions switched off."
+  (if (not *warm-tests*)
+    nil
+    (let (id (toolchain/adapter-id m)
+          root (testrun-root m)
+          row (seq/find *warm-backends* (fn (b) (= (get b :adapter) id))))
+      (when (and row (warm-call row :applies? (list m root) false)) row))))
+
+(defn warm-ready? (m)
+  "Whether this project's warm session is up AND past its own boot — the only state in
+which sending it a run beats starting a cold one. A worker that is merely alive would QUEUE
+the request behind that boot, which is the cold wait with none of the cold feedback."
+  (let (backend (warm-backend m))
+    (and backend
+      (get-in m [:warm-tests (get backend :session) :ready])
+      (warm-call backend :running? '() false))))
+
+(defn- warm-prime (m)
+  "Start this project's test session in the background if it could have one and has not got
+one yet. Called on a COLD run, never on opening a file: a resident runtime per project is a
+real commitment, and asking for a test run at least once is the signal that you want it."
+  (let (backend (warm-backend m))
+    (if (or (nil? backend) (ed-headless?) (warm-call backend :running? '() false))
+      m
+      (do (warm-call backend :start (list (testrun-root m)) nil) m))))
+
+(defn testrun-start-warm (m specs root label)
+  "Run `specs` in the warm test node. Same model state as a cold run — the generation, the
+counters, the cleared marks, the *Tests* buffer — so everything downstream cannot tell the
+two apart, which is the point.
+
+Falls back to the cold runner when the session declines the request: a backend's `:run`
+answers false when its session is not running, and a run that was never accepted must not
+be left looking like one in progress."
+  (let (backend (warm-backend m)
+        id (inc (or (:warm-test-id m) 0))
+        sent? (and backend
+                (warm-call backend :run (list id (warm-call backend :specs (list m specs) [])) false)))
+    (if (not sent?)
+      (testrun-start m specs root label)
+      (ed-show-named-aside (message (assoc (testrun-clear-marks m)
+                                      :warm-test-id id
+                                      :testrun
+                                        {:specs specs
+                                         :root root
+                                         :label label
+                                         :gen (inc (or (get-in m [:testrun :gen]) 0))
+                                         :warm-id id
+                                         :warm-session (get backend :session)
+                                         :warm-restart (get backend :restart)
+                                         :passed 0
+                                         :failed 0
+                                         :last-group nil
+                                         :adapter-id (get backend :adapter)
+                                         :decoder nil})
+                             (str "testing " label "… (warm)"))
+        *tests-buffer*
+        (tests-header label (str "warm · " (->string (get backend :session))))
+        :test-menu))))
+
+(defn- warm-current? (m reply)
+  "Whether `reply` belongs to the run the model is showing. Matched on the request id
+rather than the generation: the node answers the question it was asked, and a reply from a
+superseded run is one the reader has already moved past."
+  (= (get reply :id) (get-in m [:testrun :warm-id])))
+
+(defn- warm-summary (s)
+  "A session's summary in the vocabulary `testrun-apply-summary` reads. A backend reports
+what it counted; `passed` is worked out here rather than in each session, so two runners'
+summaries cannot drift — except where a backend reports it itself (Brood's runner does),
+which is believed."
+  (let (total (or (get s :total) 0)
+        failed (or (get s :failed) 0)
+        skipped (or (get s :skipped) 0))
+    {:total total
+     :failed failed
+     :passed (or (get s :passed) (- total failed skipped))
+     :ms (or (get s :ms) 0)
+     :reloaded (or (get s :reloaded) 0)}))
+
+(defn- warm-reload-note (summary)
+  "The line that says this run had to pick the project up first, or `\"\"` when the session
+was already current.
+
+Worth a line because the one thing a warm runner must never let you wonder is whether the
+answer is about the code in front of you. It now always is — the session reloads what
+moved before it runs — and saying so is how that becomes something you can see rather than
+something you have to trust."
+  (let (n (get summary :reloaded 0))
+    (if (= n 0)
+      ""
+      (str "  (reloaded " n " source" (if (= n 1) "" "s") " first)\n"))))
+
+(defn testrun-warm-reply (m reply cols rows)
+  "Fold one reply from a warm session: a `:more` chunk is one finished test, and the final
+one is the summary (or the reason there is not going to be one)."
+  (let (restart (get-in m [:testrun :warm-restart] "the restart command for this language"))
+    (cond
+      (not (warm-current? m reply)) m
+      ;; a chunk is one finished test, or one `spy` entry from inside one — the same two
+      ;; things the cold runner's stdout carries, through the same `testrun-apply-event`
+      (and (get reply :more) (get reply :spy))
+        (testrun-apply-event m [:spy (get reply :spy)] cols rows)
+      (get reply :more) (testrun-apply-event m [:test (get reply :test)] cols rows)
+      (get reply :ok)
+        (let (summary (warm-summary (get reply :summary {})))
+          (testrun-apply-summary (ed-append-named m *tests-buffer* (warm-reload-note summary))
+            summary
+            cols
+            rows))
+      ;; You asked for this one. `cmd-test-stop` normally forgets the run before its
+      ;; replies land, so this is the ordering where they beat it — and a run you stopped
+      ;; must not be reported as a run that failed.
+      (get reply :stopped) (message m "test run stopped")
+      ;; `{:timeout true}` is the session's own answer for a child that stopped talking
+      (get reply :timeout)
+        (message (ed-append-named m *tests-buffer* "\n[the test session stopped answering]\n")
+          (str "test session stopped answering — " restart))
+      else
+        (message (ed-append-named m
+                   *tests-buffer*
+                   (str "\n[" (or (get reply :error) "the run failed") "]\n"))
+          (str "tests: " (or (get reply :error) "the run failed"))))))
+
+;; ---- the warm node's client hooks (registered in `sandbox-events/*clients*`) ----------
+;; A row in that list, like the playground and the process list, rather than `UiEvent`
+;; impls of its own. It had its own impls while each session carried its own event records;
+;; once the session's NAME started riding on the event there was nothing left for a private
+;; vocabulary to distinguish, and one router serves every session the editor keeps.
+
+(defn warm-live-of? (session m)
+  "Does anything still want `session`? `*Tests*` has to exist — it is what a run fills — AND
+this project has to be one that session serves.
+
+Both halves matter. The buffer alone kept the WRONG session alive: with `*Tests*` open, an
+editor that had run an Elixir suite and then moved to a Brood project answered \"yes,
+somebody is watching\" for the Elixir node, so its death was followed by a respawn — which
+in a mix project recompiles the whole thing, in the background, for a project the reader
+has left."
+  (and (not (nil? (ed-buffer-index-by-name m *tests-buffer*)))
+    (= session (get (warm-backend m) :session))))
+
+(defn warm-live-elixir? (m) (warm-live-of? :elixir-test m))
+(defn warm-live-brood? (m) (warm-live-of? :brood-test m))
+
+(defn warm-ready-of (session m gen)
+  "`session` announced itself: it is past its own boot and will answer at once, which is the
+only state in which sending it a run beats starting a cold one. Keyed BY SESSION, because
+an editor open on a Brood project and an Elixir one at the same time has two of these and
+neither is evidence about the other."
+  (assoc-in m [:warm-tests session :ready] gen))
+
+(defn warm-down-of (session m)
+  "`session` went away. A respawn usually follows, but until its banner lands nothing may be
+sent to it — so the next run takes the cold path rather than queueing behind a boot it
+cannot see."
+  (assoc-in m [:warm-tests session :ready] nil))
+
+(defn warm-reply (m reply gen)
+  "One reply from a warm session, with the frame the router stamped — a streaming buffer
+follows its own tail only in a pane already at the bottom, and that is a question about
+panes rather than about the reply. Shared by every session: a run's id says which one it
+belongs to, and only one runs at a time."
+  (let ([cols rows] (or (sandbox-events/frame-of m) [80 24]))
+    (testrun-warm-reply m reply cols rows)))
+
+;; One pair of one-liners per session rather than a session argument on every hook in the
+;; router: the two rows in `sandbox-events/*clients*` name these, and the shape underneath
+;; is shared. Two lines per language is cheaper than four arities across six clients.
+(defn warm-ready-elixir (m gen banner) (warm-ready-of :elixir-test m gen))
+(defn warm-down-elixir (m code) (warm-down-of :elixir-test m))
+(defn warm-ready-brood (m gen banner) (warm-ready-of :brood-test m gen))
+(defn warm-down-brood (m code) (warm-down-of :brood-test m))
+
 ;; ---- the commands ----------------------------------------------------------------
 
 (defn- testrun-root (m)
@@ -493,7 +775,12 @@ superseded run (rapid re-runs) is dropped so it can't corrupt the fresh report."
 
 (defn- testrun-go (m specs label fallback)
   (cond
-    (toolchain/adapter-id m) (testrun-start m specs (testrun-root m) label)
+    ;; a session that is up and past its boot answers at once — the same rows, without the
+    ;; runtime start (see the warm-session section above; `warm-ready?` asks the backend)
+    (warm-ready? m) (testrun-start-warm m specs (testrun-root m) label)
+    ;; …and a cold run in a project that could have one starts it, so this is the last slow
+    ;; run rather than every run
+    (toolchain/adapter-id m) (warm-prime (testrun-start m specs (testrun-root m) label))
     (nil? fallback) (message m (str "no test command for a " (toolchain/name-of m) " project"))
     else (compile/compile-run m fallback)))
 
@@ -543,13 +830,60 @@ lowers the parallel batch.)"
 (defcommand cmd-test-stop
   (m key)
   "Stop a running test suite (C-c t k) — kills the runner subprocess (an infinite
-loop in a test, a slow suite). A no-op when nothing is running."
-  (let (proc (proc/whereis :testrun))
-    (if (nil? proc)
-      (message m "no test run in progress")
-      (do
-        (send proc [:shutdown])
-        (message m "test run stopped")))))
+loop in a test, a slow suite). A no-op when nothing is running.
+
+A warm run is stopped by asking the node to abandon it rather than by killing anything: the
+node is the expensive thing and the run inside it is not, so ending the run must not cost
+the compile that made it fast."
+  (let (warm (get-in m [:testrun :warm-id])
+        proc (proc/whereis :testrun))
+    (cond
+      warm
+        (let (id (inc (or (:warm-test-id m) 0))
+              backend (warm-backend m))
+          ;; ASK the session to abandon it — both backends can, and neither is killed for
+          ;; it: the session is the expensive thing and the run inside it is not, so ending
+          ;; a run must not cost the boot that made it fast.
+          (warm-call backend :stop (list id) false)
+          ;; …and forget it here too. Its stragglers are already on the way, and a verdict
+          ;; for a run you stopped should not keep filling the buffer.
+          (message (assoc (update m :testrun dissoc :warm-id) :warm-test-id id)
+            "test run stopped"))
+      (nil? proc) (message m "no test run in progress")
+      else
+        (do
+          (send proc [:shutdown])
+          (message m "test run stopped")))))
+
+(defn- warm-restart (m)
+  "Restart (or first start) this project's warm test session, forgetting that it was ready.
+
+Rarely what you want: a run already picks up changed sources by itself (Brood reloads what
+moved, the Elixir node recompiles), so this is for what that cannot reach — a changed
+`project.blsp` or `mix.exs`, a dependency, a `config/` the environment was built from."
+  (let (backend (warm-backend m))
+    (cond
+      (nil? backend) (message m "no warm test session for this project")
+      (not (warm-call backend :running? '() false))
+        (do
+          (warm-call backend :start (list (testrun-root m)) nil)
+          (message (warm-down-of (get backend :session) m) "starting the test session…"))
+      else
+        (do
+          (warm-call backend :reset '() nil)
+          (message (warm-down-of (get backend :session) m) "restarting the test session…")))))
+
+(defcommand cmd-elixir-test-restart
+  (m key)
+  "Restart the warm Elixir test node (M-x elixir-test-restart): a fresh `MIX_ENV=test` VM.
+For a changed `config/` or `mix.exs` — `lib/` is recompiled on every run already."
+  (warm-restart m))
+
+(defcommand cmd-brood-test-restart
+  (m key)
+  "Restart the warm Brood test session (M-x brood-test-restart): a fresh child.
+For a changed `project.blsp` or a dependency — `src/` is reloaded on every run already."
+  (warm-restart m))
 
 ;; ---- the :test-menu buffer type ----------------------------------------------
 

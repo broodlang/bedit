@@ -1,0 +1,121 @@
+(defmodule elixir-test
+  "**The suite, in a node that is already warm.**
+
+`C-c t` in a mix project runs `mix test --trace` in a subprocess, and every run pays for
+a VM boot and a compile before the first verdict appears — a second and a half in a small
+project, fifteen in a Phoenix one. That cost is not the tests; it is the runtime starting
+up to run them, over and over, for a suite you are running every few seconds while you
+work on one failing case.
+
+This is the same suite run inside a node bedit keeps. A second [[editor/evalsession]]
+child, booted `MIX_ENV=test mix run`, loads `test/test_helper.exs` once and then answers
+`TEST` requests by requiring the named files and calling `ExUnit.run/0`. The verdicts
+stream back one per test as they land (`:more` replies — see evalsession's protocol
+contract), so the *Tests* buffer fills while the suite runs, and the second run of a file
+costs a recompile of that file and nothing else.
+
+**Why a SECOND child and not the playground's.** `:dev` and `:test` are different
+environments and not by convention: different `config/`, a different database, an Ecto
+sandbox that only exists in one of them, and a `test_helper.exs` whose whole job is to set
+that up. Running the suite in the playground's `:dev` node would either fail on the first
+`Repo` call or, worse, run the tests against the database you are developing against.
+
+**It compiles your application first.** Every run recompiles in the node before loading the
+test files — what `recompile` does in `iex -S mix` — so a test sees `lib/` as it is on disk
+rather than as it was when this node booted. Measured on a small project: 14 ms when
+nothing changed, 28 ms to pick up a change. Without it the node was a trap rather than a
+shortcut, reporting green for a function you had already broken.
+
+`M-x elixir-test-restart` is therefore rare — for a changed `config/` or `mix.exs`, not for
+the code you are editing. And `C-c t` keeps the subprocess runner for whenever this session
+is not up: the cold path is always correct, and this one is always fast.")
+;; No imports: spoken to by `testrun`, speaks only to `evalsession` and the kernel.
+
+;; The events are `session`'s, carrying the name below. Its own SESSION though, not the
+;; playground's: these are deliberately different VMs in different environments, and a
+;; `down` from one must never read as a `down` from the other. That is what the name on the
+;; event is for, and it is why it stopped needing records of its own to say it.
+
+(def *session* :elixir-test)
+
+;; The same agent program as the playground's — it is one agent that can do several
+;; things, and the `TEST` verb is one of them. Its own path, because the two children are
+;; written out and removed independently.
+(def *agent-path* (str (path/temp "bedit-elixir-test-agent-") ".exs"))
+
+;; A cold `MIX_ENV=test mix run` compiles the project for the test environment, which in a
+;; Phoenix app is the whole dependency tree again. Same budget as the playground's boot and
+;; for the same reason: being wrong low declares a healthy project dead.
+(def *boot-timeout-ms* 180000)
+
+;; A suite is the one request that can legitimately take minutes, and each streamed verdict
+;; pushes this out again (evalsession's `:more` handling), so it bounds the gap BETWEEN
+;; tests rather than the run.
+(def *default-timeout-ms* 120000)
+
+(defn spawn-child (root &optional (attempt 0))
+  "`evalsession`'s `:spawn` hook: write the agent out and start it under `MIX_ENV=test`.
+
+`mix run` and not `--no-start` on the first attempt, because a test suite generally needs
+the application started — the Ecto sandbox is checked out of a running Repo, and
+`test_helper.exs` assumes one. The `--no-start` retry is still there for the project whose
+application refuses to start, where the tests that do not need it can still run."
+  ;; check-allow :discarded-catch — every failure here is "no child", which is the contract
+  (check-allow :discarded-catch
+    (try
+      (do
+        (file/spit *agent-path* elixir-sandbox/*agent-source*)
+        (let (args (if (= attempt 0) ["run" *agent-path*] ["run" "--no-start" *agent-path*]))
+          (os/spawn "mix" args {:cwd root :env {"MIX_ENV" "test"}})))
+      (catch e
+        (do (log/warn (str "elixir-test: could not start the agent: " (error-message e))) nil)))))
+
+(defn emit (sink kind payload gen name)
+  "`evalsession`'s `:emit` hook — [[session/emit-after-script]] over this backend's agent."
+  (session/emit-after-script *agent-path* sink kind payload gen name))
+
+(def *spec*
+  ;; The wire is the playground's — same agent, same framing — so `:encode` and `:decode`
+  ;; are shared rather than copied. Only how the child is STARTED and where its events go
+  ;; differ, which is exactly the shape a backend spec is for.
+  {:spawn 'elixir-test/spawn-child
+   :encode 'elixir-sandbox/encode-request
+   :decode 'elixir-sandbox/decode-reply
+   :emit 'elixir-test/emit
+   :boot-timeout-ms elixir-test/*boot-timeout-ms*
+   :default-timeout-ms elixir-test/*default-timeout-ms*})
+
+;; ---- the client API -------------------------------------------------------------
+
+(defn elixir-test-running? ()
+  "Is the test session's worker alive?"
+  (session/running? *session*))
+
+(defn elixir-test-start (root &optional (sink nil))
+  "Ensure the test session is up, rooted in mix project `root`. Idempotent. Answers its pid.
+
+Worth calling the moment a project is known to be Elixir: the boot is a compile, and all
+of it can happen while the reader is still reading."
+  (session/start *session* *spec* root sink))
+
+(defn elixir-test-run (id specs)
+  "Run `specs` — a list of `\"path\"` or `\"path:line\"` strings, relative to the project
+root — in the warm node under request `id`.
+
+Answers whether the request was ACCEPTED; false means the session is not running and no
+verdict for this id will ever arrive, which the caller must treat as \"use the cold
+runner\" rather than as a run in progress."
+  (session/request *session* id *default-timeout-ms* {:verb "TEST" :src (string/join specs "\n")}))
+
+(defn elixir-test-stop (id)
+  "Ask the node to abandon the run in progress. Answers whether the request was accepted."
+  (session/request *session* id 10000 {:verb "TESTSTOP" :src ""}))
+
+(defn elixir-test-reset ()
+  "Restart the session: a fresh VM in the test environment, recompiled. What you run after
+changing `lib/`, since a warm node holds the code it booted with."
+  (session/reset *session*))
+
+(defn elixir-test-shutdown ()
+  "Kill the test agent and stop the worker. A no-op when it is not running."
+  (session/shutdown *session*))
