@@ -43,8 +43,9 @@
   (test "rows-from lays lines out row by row, stopping at the limit"
     (let (buf (make-buffer "short\nthe quick brown fox\nx\n"))
       (assert= (rows-from buf 0 10 10)
-        [[0 0 5] [1 0 10] [1 10 19] [2 0 1] [3 0 0]])
-      (assert= (rows-from buf 1 10 2) [[1 0 10] [1 10 19]])
+        ;; the 4th field is the INLAY text — nil for a row of the buffer's own text
+        [[0 0 5 nil] [1 0 10 nil] [1 10 19 nil] [2 0 1 nil] [3 0 0 nil]])
+      (assert= (rows-from buf 1 10 2) [[1 0 10 nil] [1 10 19 nil]])
       (assert= (row-count buf 0 3 10) 4))))
 
 (describe "a wrapped pane paints, places the cursor, and maps a click by the same rows"
@@ -72,15 +73,15 @@
           ops (ed-view (assoc m2 :blink-on? true) 30 6)
           c (seq/find ops (fn (op) (and (vector? op) (= (first op) :cursor)))))
       (assert= (nth c 1) 1) ; row 1
-      (assert= (nth c 2) (+ 5 5)))) ; gutter + 5
+      (assert= (nth c 2) (+ 6 5)))) ; gutter + 5
   (test "a click on a continuation row lands in that row's slice of the line"
     (let (m (wrapped long-line)
           pane (first (:panes (ed-body-layout m 30 6))))
       (assert= (ed-pane-line-at pane (cur m) 1) 0) ; row 1 is still line 0
       (assert= (ed-pane-row-hscroll pane (cur m) 1) 20) ; …its second segment
       (assert= (ed-pane-line-at pane (cur m) 2) nil) ; nothing below the one line
-      ;; the press: row 1, screen col 5+5 → offset 25
-      (let (m2 (ed-update m [:mouse :press :left 1 10 [] 1] 30 6))
+      ;; the press: row 1, screen col 6+5 → offset 25
+      (let (m2 (ed-update m [:mouse :press :left 1 11 [] 1] 30 6))
         (assert= (buffer-point (cur m2)) 25))))
   (test "no sideways scroll while wrapping: point at the line's end keeps hscroll 0"
     (let (m (press (wrapped long-line) [:alt->]))
@@ -98,4 +99,116 @@
       (is (> (ed-current-top at-end) 0))
       (let (pane (first (:panes (ed-body-layout at-end 30 6)))
             rows (ed-pane-rows pane (cur at-end)))
-        (is (any? rows (fn ([line f t]) (= line 3))))))))
+        (is (any? rows (fn ([line f t inlay]) (= line 3))))))))
+
+;; ---- inlay rows: a screen row that is not buffer text -------------------------------
+;; A type signature against an already-indented `def` has a couple of dozen columns to live
+;; in, so the half that identifies the function is the half that gets cut. Above the `def`,
+;; on a row of its own, it has the whole width — which is where a signature goes in every
+;; language that writes one down. The row has to be IN the table: every row↔line question
+;; in the editor reads it, and a row drawn "between" two others without being in it is one
+;; the cursor walks through and the scroll clamp cannot see.
+(describe "inlay rows sit in the row table, above the line they describe"
+  ;; the store is keyed by OWNER — `{owner-key -> [{:line :text} …]}` — so one producer
+  ;; rebuilding its rows leaves a sibling's alone; `results/inlay-lines` flattens it
+  (defn inlaid (text rows) (annotate (make-buffer text) :inlay-lines {:owner rows}))
+
+  (test "an inlay row comes before its line's text rows"
+    (let (buf (make-buffer "one\ntwo\nthree\n"))
+      (assert= (rows-from buf 0 20 10 {1 ["two/0 : integer()"]})
+        [[0 0 3 nil] [1 0 nil "two/0 : integer()"] [1 0 3 nil] [2 0 5 nil] [3 0 0 nil]])))
+
+  (test "several inlays on one line keep their order"
+    (let (buf (make-buffer "a\nb\n"))
+      (assert= (map (rows-from buf 0 20 10 {0 ["first" "second"]}) (fn (r) (nth r 3)))
+        (list "first" "second" nil nil nil))))
+
+  (test "no inlays is the table it always was"
+    (let (buf (make-buffer "a\nb\n"))
+      (assert= (rows-from buf 0 20 10) (rows-from buf 0 20 10 {}))))
+
+  (test "the limit counts inlay rows — a pane shows as many rows as it has"
+    (let (buf (make-buffer "a\nb\nc\n"))
+      (assert= (count (rows-from buf 0 20 3 {0 ["x" "y"]})) 3)))
+
+  (test "row-count sees them, or the scroll clamp is short by exactly that many"
+    (let (buf (make-buffer "a\nb\nc\n"))
+      (assert= (row-count buf 0 3 20) 3)
+      (assert= (row-count buf 0 3 20 {1 ["sig"]}) 4)
+      (assert= (row-count buf 0 3 20 {0 ["a"] 2 ["b" "c"]}) 6)))
+
+  (test "a pane builds a table for inlays even when the buffer does not wrap"
+    ;; the two are the same fact: the pane's rows are no longer one per line, from the top
+    (let (plain (m-of "a\nb\nc\n")
+          with-inlay (ed-set-buf plain
+                       (annotate (cur plain) :inlay-lines {:owner [{:line 1 :text "sig"}]}))
+          pane (fn (mm) (first (:panes (ed-body-layout mm 40 10)))))
+      (is (nil? (ed-pane-rows (pane plain) (cur plain))))
+      (is (not (nil? (ed-pane-rows (pane with-inlay) (cur with-inlay)))))))
+
+  (test "an inlay row is NOT one of its line's text rows"
+    ;; `ed-rows-line-rows` answers \"which rows does this line's text occupy?\" — a caller
+    ;; that got the inlay too would fill a region through a signature, or put the cursor on
+    ;; a row that has no columns to be at
+    (let (rows (rows-from (make-buffer "a\nb\n") 0 20 10 {1 ["sig"]}))
+      (assert= (count (ed-rows-line-rows rows 0 1 0)) 1)
+      (assert= (second (first (ed-rows-line-rows rows 0 1 0))) 0)))
+
+  (test "a click on an inlay row lands on the line it describes"
+    (let (rows (rows-from (make-buffer "a\nb\n") 0 20 10 {1 ["sig"]}))
+      ;; row 1 is the inlay; it belongs to line 1
+      (assert= (first (nth rows 1)) 1)
+      (assert= (nth (nth rows 1) 3) "sig"))))
+
+(describe "a malformed inlay store costs a row, not the window"
+  ;; An annotation is DATA, and this is read while painting a frame. The cost of raising
+  ;; here is the whole window — every subsequent frame — for one bad entry.
+  (test "entries that are not {:line :text} are skipped"
+    (let (buf (annotate (make-buffer "a\nb\n")
+                :inlay-lines {:owner ["a bare string" {:line 1 :text "good"} {:no :line}]}))
+      (assert= (results/inlay-lines buf) {1 ["good"]})))
+
+  (test "a store that is not even a map of lists answers empty"
+    (is (empty? (results/inlay-lines (annotate (make-buffer "a\n") :inlay-lines {:owner "nope"}))))))
+
+(describe "an inlay row is painted where the table puts it"
+  ;; The model tests above say the ROW is in the table. This says the frame actually has
+  ;; it, above the line it describes and in the hint voice — the half no row-table
+  ;; assertion can reach.
+  (defn text-ops (frame)
+    (seq/keep frame
+      (fn (op) (when (and (vector? op) (= (first op) :text)) [(nth op 1) (nth op 2) (nth op 3)]))))
+  (defn at-col (frame col)
+    (seq/keep (text-ops frame) (fn ([row c t]) (when (= c col) [row t]))))
+
+  (test "the signature takes the row above its def, and the def moves down one"
+    (let (src "defmodule Foo do\n  def bar(x) do\n    x + 1\n  end\nend\n"
+          m0 (m-of src)
+          buf (results/set-note (cur m0) 0
+                {:kind :info :text "=> Foo" :hint ": Foo"
+                 :inlays [{:line 1 :text "bar/1 : (integer()) -> integer()"}]}
+                5 0)
+          frame (ed-view (ed-set-buf m0 buf) 60 12)
+          body (at-col frame 6))
+      (assert= (nth body 0) [0 "defmodule Foo do"])
+      (assert= (nth body 1) [1 "  bar/1 : (integer()) -> integer()"])
+      (assert= (nth body 2) [2 "  def bar(x) do"])))
+
+  (test "an inlay row gets no line number — it is not a line of the buffer"
+    (let (m0 (m-of "a\nb\nc\n")
+          buf (results/set-note (cur m0) 0
+                {:kind :info :text "x" :inlays [{:line 1 :text "sig"}]} 2 0)
+          frame (ed-view (ed-set-buf m0 buf) 40 10)
+          numbers (map (seq/filter (at-col frame 0) (fn ([row t]) (includes? t "2"))) first))
+      ;; line 2's number is on row 2, not row 1 — the inlay took row 1
+      (assert= numbers (list 2))))
+
+  (test "the inlay is painted in the hint voice, never as code"
+    (let (m0 (m-of "a\nb\n")
+          buf (results/set-note (cur m0) 0
+                {:kind :info :text "x" :inlays [{:line 1 :text "sig"}]} 1 0)
+          frame (ed-view (ed-set-buf m0 buf) 40 10)
+          op (seq/find frame
+               (fn (o) (and (vector? o) (= (first o) :text) (includes? (str (nth o 3 "")) "sig")))))
+      (is (:italic (nth op 4 {})))))
+)

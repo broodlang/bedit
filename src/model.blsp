@@ -337,6 +337,35 @@ the previous newline (0 at the first line). Tail-recursive."
 ;; (brood-mode → the in-process type checker); buffers whose mode offers none never pay.
 
 (sig ed-diag-index ((or nil (list diagnostic)) -> (map int (list diagnostic))))
+;; ---- a diagnostic's position, converted in ONE place --------------------------------
+;; A diagnostic carries 1-BASED `:line` and `:col` — the Brood checker emits them that way
+;; and `lsp/lsp-diagnostic` shifts a server's 0-based range to match. Everything that
+;; PLACES one works in 0-based buffer coordinates, so the conversion happens at every
+;; crossing: the line index, the token underline, the `*Diagnostics*` row, the row's jump
+;; target. Four `dec`/`inc`s written out four times, and the one that was written without a
+;; floor turned a `:col 0` into column -1 and took the whole frame down with a
+;; `string/substring: range [-1, 0)` — a render error, every frame, for one odd number from
+;; a language server.
+;;
+;; Data from a server is data: it is clamped here rather than trusted, and it is clamped
+;; once.
+
+(defn ed-diag-line0 (d)
+  "A diagnostic's 0-based line, or nil when it names none (which is what makes it
+unplaceable — see [[ed-diag-index]])."
+  (let (ln (:line d)) (when (int? ln) (math/max 0 (dec ln)))))
+
+(defn ed-diag-col0 (d)
+  "A diagnostic's 0-based column, floored at 0. A missing or out-of-range column means the
+start of the line, which is where a finding about a whole line belongs anyway."
+  (let (c (:col d)) (if (int? c) (math/max 0 (dec c)) 0)))
+
+(defn ed-diag-line1 (line0)
+  "The 1-based line number a reader sees, from a 0-based one — [[ed-diag-line0]]'s inverse,
+named so the two sides of the convention are stated together rather than as two bare
+arithmetic ops in different files."
+  (inc line0))
+
 (defn ed-diag-index (diags)
   "`diags` (`{:line :col :message}`, 1-based lines) as `{0-based line -> (the diagnostics
 on it, in order)}` — the shape the view reads. Built ONCE, when a check's result lands
@@ -352,10 +381,10 @@ producer bedit has (the checker, every language server) gives a line."
   (fold diags
     {}
     (fn (acc d)
-      (let (ln (:line d))
+      (let (ln (ed-diag-line0 d))
         (if (nil? ln)
           acc
-          (assoc acc (dec ln) (append (get acc (dec ln) '()) (list d))))))))
+          (assoc acc ln (append (get acc ln '()) (list d))))))))
 
 (defn ed-call-deferred (m sym fallback)
   "Call `sym` — a `(model) -> model` hook in a DEFERRED module — if that module has been
@@ -1810,16 +1839,20 @@ mode's `:visual-line` facet (markdown wraps by default). The break rule is
   (let (own (:visual-line buf))
     (if (nil? own) (= true (ed-mode-service buf :visual-line)) (= true own))))
 
-(sig ed-wrap-top-for (buffer int int int int int -> int))
-(defn- ed-wrap-top-for (buf line seg-row w budget floor)
-  "The highest scroll top that still shows point's row of a wrapped buffer within
-`budget` rows from the top: from `line` (whose rows through point's, `seg-row + 1`, are
-already spent) walk up a line at a time while the line above fits — never above
-`floor`. Tail-recursive over the lines above."
+(sig ed-wrap-top-for (buffer int int int int int &optional map -> int))
+(defn- ed-wrap-top-for (buf line seg-row w budget floor &optional (inlays {}))
+  "The highest scroll top that still shows point's row within `budget` rows from the top:
+from `line` (whose rows through point's, `seg-row + 1`, are already spent) walk up a line
+at a time while the line above fits — never above `floor`. Tail-recursive over the lines
+above.
+
+A line above point costs its wrapped segments PLUS its inlay rows: both occupy rows, and a
+walk that counted only the segments would stop one line too high for every inlay it passed."
   (let (step (fn (t used)
                (if (<= t floor)
                  t
-                 (let (above (count (wrap/line-segments buf (dec t) w)))
+                 (let (above (+ (count (wrap/line-segments buf (dec t) w))
+                               (count (get (or inlays {}) (dec t) []))))
                    (if (> (+ used above) budget)
                      t
                      (step (dec t) (+ used above)))))))
@@ -1846,8 +1879,12 @@ text width the loop last stored (`:view-cols`); the margin above stays in lines.
         [rtop rbot] (if restrict (ed-restrict-lines buf restrict) [0 (dec (buffer-line-count buf))])
         mintop rtop
         w (or (:view-cols m) 0)
-        wrap? (and (ed-wrap? buf) (> w 0))
-        ;; wrapped: the top that puts the last (restricted) line's last row on the bottom row
+        ;; INLAY rows make a pane row-wise exactly as wrapping does: its rows stop being
+        ;; one per line, in order, from the top. The clamp has to count what is on screen,
+        ;; and both put more rows there than there are lines.
+        inlays (results/inlay-lines buf)
+        wrap? (and (> w 0) (or (ed-wrap? buf) (not (empty? inlays))))
+        ;; row-wise: the top that puts the last (restricted) line's last row on the bottom row
         maxtop (math/max rtop
                  (if wrap?
                    (ed-wrap-top-for buf
@@ -1855,7 +1892,8 @@ text width the loop last stored (`:view-cols`); the margin above stays in lines.
                      (dec (count (wrap/line-segments buf rbot w)))
                      w
                      textrows
-                     rtop)
+                     rtop
+                     inlays)
                    (math/min (ed-max-top buf textrows) (math/max 0 (- (inc rbot) textrows)))))
         lo (+ top mgn) ; first comfortable line (margin below top)
         hi (- (+ top textrows) 1 mgn) ; last comfortable line (margin above bottom)
@@ -1866,9 +1904,10 @@ text width the loop last stored (`:view-cols`); the margin above stays in lines.
                ;; point's row below the top: the rows of the lines above it plus its
                ;; own segment; past the comfortable last row, raise the top just enough
                  (let (seg-row (wrap/row-of (wrap/line-segments buf line w) (buffer-column buf))
-                       r (+ (wrap/row-count buf top line w) seg-row))
+                       r (+ (wrap/row-count buf top line w inlays) seg-row))
                    (if (> r (- textrows 1 mgn))
-                     (math/max top (ed-wrap-top-for buf line seg-row w (- textrows mgn) mintop))
+                     (math/max top
+                       (ed-wrap-top-for buf line seg-row w (- textrows mgn) mintop inlays))
                      top))))
     (ed-set-top m (math/max mintop (math/min maxtop want)))))
 
