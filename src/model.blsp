@@ -438,7 +438,7 @@ in-image task, which sees only the editor's own image."
   "Somebody still wants the sandbox for checks: the current buffer's mode checks remotely."
   (not (nil? (ed-mode-service (ed-current-buf m) :check-remote))))
 
-(defn ed-diag-sandbox-ready (m gen)
+(defn ed-diag-sandbox-ready (m gen banner)
   "The child came up (or back): nothing to do — a queued check flushes on its own."
   m)
 
@@ -646,6 +646,48 @@ offers no eldoc never pay. (Point-move covers typing too, since inserting moves 
     (and (ed-mode-service buf :eldoc)
       (not (= (buffer-point buf) (:eldoc-point m))))))
 
+(defn ed-signature-stale? (m)
+  "True when the LSP argument hint (`textDocument/signatureHelp`) is due a refresh — a
+server is connected, point or the text has moved since the last one was asked for
+(`:signature-at`), and the buffer's mode does not answer for itself.
+
+The mode's own `:eldoc` service wins where there is one, and not by seniority: it is
+local, instant and always right about the language it was written for, whereas this costs
+a round-trip. They share the `:eldoc` slot, so letting both write it would make the hint
+depend on which reply landed last."
+  (let (buf (ed-current-buf m))
+    (and (:lsp m)
+      (nil? (ed-mode-service buf :eldoc))
+      (not (= [(buffer-point buf) (buffer-rope buf)] (:signature-at m))))))
+
+(defn ed-preview-stale? (m)
+  "True when the inline completion preview needs recomputing — point moved, or the text
+did, since the cached one was made. Keyed on both because a preview is about the word
+before point and both of those change it."
+  (let (buf (ed-current-buf m))
+    (not (= [(buffer-point buf) (buffer-rope buf)] (:completion-preview-at m)))))
+
+(defn ed-refresh-preview (m)
+  "Recompute the inline completion preview (`:completion-preview`), stamped with the point
+and rope it was computed for so the view can tell a live one from a stale one.
+
+A no-op unless [[ed-preview-stale?]] — not (only) for the cost, but because the preview
+carries a CHOICE: M-n/M-p cycle which candidate it shows, and recomputing a preview the
+text has not changed under would silently walk it back to the first one while your hands
+were off the keys.
+
+Deferred-module guarded and late-bound like every other idle-beat client: a preview is a
+nicety, and a model that could not be built without it would be the wrong shape."
+  (if (or (not (bound? 'complete-at-point/completion-preview)) (not (ed-preview-stale? m)))
+    m
+    (let (buf (ed-current-buf m))
+      (assoc m
+        :completion-preview
+          ;; a source that raises must cost the reader a missing suggestion, never the frame
+          (check-allow :discarded-catch
+            (try ((reflect/eval 'complete-at-point/completion-preview) m) (catch _ nil)))
+        :completion-preview-at [(buffer-point buf) (buffer-rope buf)]))))
+
 (defn ed-launch-eldoc (m)
   "Refresh the eldoc hint OFF the loop (the diagnostics pattern): with a live `:editor`
 process, run the mode's `:eldoc` service in a spawned task — recording its handle on
@@ -762,6 +804,57 @@ input, then the idle `:cursor-blink` timer takes over once you stop."
               :top (if buf (math/min snapped (math/max top (ed-max-top buf 1))) snapped)
               :scroll-frac 0.0)))))))
 
+;; ---- the live-evaluating buffers ---------------------------------------------
+;; A buffer that runs as you type — the tutorial's lesson boxes, the Brood playground,
+;; the Elixir playground — is three hooks and a timer, and the three are identical in
+;; shape for every one of them:
+;;
+;;   :stale?    O(1) — has this buffer moved since its last launch?  (arms the timer)
+;;   :launch    the debounce landed: re-evaluate what the edit could have changed
+;;   :reanchor  the keystroke itself: move the existing notes with the text
+;;
+;; A TABLE rather than three hardcoded pairs, because there were two and now there are
+;; three, and the second language was the moment the copy-paste became the design. The
+;; timer names differ so each buffer's debounce arms and fires on its own; everything else
+;; is the same fold. Symbols are resolved late and `bound?`-guarded: every one of these
+;; modules is deferred-loaded, so an unopened playground simply is not a client yet.
+(def *live-eval-clients*
+  [{:timer :tutor-eval
+    :stale? 'tutor/ed-tutor-stale?
+    :launch 'tutor/ed-tutor-launch
+    :reanchor 'tutor/ed-tutor-reanchor}
+    {:timer :playground-eval
+     :stale? 'playground/ed-playground-stale?
+     :launch 'playground/ed-playground-launch
+     :reanchor 'playground/ed-playground-reanchor}
+    {:timer :elixir-playground-eval
+     :stale? 'elixir-playground/ed-elixir-playground-stale?
+     :launch 'elixir-playground/ed-elixir-playground-launch
+     :reanchor 'elixir-playground/ed-elixir-playground-reanchor}])
+
+(defn- ed-live-eval-call (m sym fallback)
+  ;; Call a deferred client's hook if its module is loaded, else answer `fallback`.
+  (if (bound? sym) ((reflect/eval sym) m) fallback))
+
+(defn ed-live-eval-stale? (m client)
+  "Has `client`'s buffer moved since its last launch — i.e. should its debounce be armed?
+False for a client whose module has never been loaded, which is every one of them until
+somebody opens the buffer."
+  (ed-live-eval-call m (:stale? client) false))
+
+(defn ed-live-eval-launch (m timer)
+  "Run the launch of whichever live-eval client owns `timer`, or leave `m` alone when no
+client does. What `input/ed-timer-fire` calls, so the set of languages that evaluate as
+you type is one table and not a chain of `cond` arms."
+  (let (client (seq/find *live-eval-clients* (fn (c) (= (:timer c) timer))))
+    (if client (ed-live-eval-call m (:launch client) m) m)))
+
+(defn ed-live-eval-reanchor (m)
+  "Move every live-evaluating buffer's notes with the text — on the EDIT itself, not the
+debounce, since a note is stored with the line it sits on and the whole set hides the
+moment the line count changes. O(1) per client until that client's own notes go stale."
+  (fold *live-eval-clients* m (fn (acc client) (ed-live-eval-call acc (:reanchor client) acc))))
+
 (defn ed-sync-timers (m)
   "Reconcile `:timers` (ADR-102) with the model after each event — the declarative
 replacement for the old arm-the-tick cascade. `:cursor-blink` is always present; the
@@ -782,27 +875,27 @@ flag once no prefix is pending (what `ed-which-key-arm` used to do)."
         recompute? (or (ed-gitdiff-stale? m)
                      (ed-web-dirty? m)
                      (and (not held)
-                       (or (ed-eldoc-stale? m) (ed-diag-stale? m) (mb-cands-stale? m))))
-        ;; the tutorial's eval-on-type debounce (its own timer, tunable apart from
-        ;; :idle-recompute); tutor is deferred-loaded — bound?-guarded + late-bound
-        ;; (`reflect/eval`), the keymap idiom, so this core file never links it eagerly
-        tutor-stale? (and (not held)
-                       (bound? 'tutor/ed-tutor-stale?)
-                       ((reflect/eval 'tutor/ed-tutor-stale?) m))
-        ;; the playground's eval-on-type, the tutorial's twin — same debounce, same
-        ;; deferred-module guard (src/playground.blsp)
-        playground-stale? (and (not held)
-                            (bound? 'playground/ed-playground-stale?)
-                            ((reflect/eval 'playground/ed-playground-stale?) m))
+                       (or (ed-eldoc-stale? m)
+                         (ed-signature-stale? m)
+                         (ed-diag-stale? m)
+                         (mb-cands-stale? m)
+                         (ed-preview-stale? m))))
+        ;; Every live-evaluating buffer's eval-on-type debounce, one timer each so they arm
+        ;; and fire independently (`*live-eval-clients*`). Each is deferred-loaded —
+        ;; bound?-guarded + late-bound (`reflect/eval`), the keymap idiom — so this core
+        ;; file never links any of them eagerly.
+        live-eval (fold *live-eval-clients*
+                    {}
+                    (fn (acc client)
+                      (if (and (not held) (ed-live-eval-stale? m client))
+                        (assoc acc (:timer client) {:after *tutor-eval-debounce-ms* :idle? true})
+                        acc)))
         idle (merge (if recompute? {:idle-recompute {:after *diag-debounce-ms* :idle? true}} {})
                ;; a pane resting between lines snaps once the scroll deltas stop
                (if (ed-any-pane-fractional? m)
                  {:scroll-settle {:after *scroll-settle-ms* :idle? true}}
                  {})
-               (if tutor-stale? {:tutor-eval {:after *tutor-eval-debounce-ms* :idle? true}} {})
-               (if playground-stale?
-                 {:playground-eval {:after *tutor-eval-debounce-ms* :idle? true}}
-                 {})
+               live-eval
                (if held
                  {}
                  (merge (if (and (:pending m) (not (:which-key m)))
@@ -816,9 +909,14 @@ flag once no prefix is pending (what `ed-which-key-arm` used to do)."
         ;; is pending — that drop is what RE-ARMS it. A one-shot the loop has already fired
         ;; is dead until its entry is recreated, so a managed timer missing from this list
         ;; fires once and never again.
-        kept (dissoc (or (:timers m) {})
-               :cursor-blink :idle-recompute :which-key :undo-pause :tutor-eval :playground-eval
-               :scroll-settle))
+        kept (apply dissoc
+               (or (:timers m) {})
+               :cursor-blink
+               :idle-recompute
+               :which-key
+               :undo-pause
+               :scroll-settle
+               (map *live-eval-clients* :timer)))
     (assoc m :timers (merge kept managed))))
 
 ;; ---- overlay scrollbar fade (macOS-style auto-hide) -------------------------
@@ -1074,9 +1172,7 @@ blinks at rest. Finally refreshes the open minibuffer's memoized candidate list
         ;; the live-evaluating buffers' notes follow the text on the edit itself (the
         ;; debounce only EVALUATES) — the same deferred-module guard as their stale? probes
         ;; above, and both are O(1) until their own buffer's notes go stale
-        m2 (fold ['playground/ed-playground-reanchor 'tutor/ed-tutor-reanchor]
-             m2
-             (fn (acc sym) (if (bound? sym) ((reflect/eval sym) acc) acc)))
+        m2 (ed-live-eval-reanchor m2)
         mb (:minibuffer m2))
     ;; Refresh the memoized candidate list. A small source re-ranks every keystroke (snappy).
     ;; A large source (`mb-debounce?`) re-ranks only its *initial* list here and defers later

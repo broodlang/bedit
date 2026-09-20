@@ -1,27 +1,34 @@
 (defmodule sandbox-events
-  "Where the shared eval sandbox's events land — the router between one sandbox and its
-several clients.
+  "**The router between the editor's evaluation sessions and everything that listens to
+them** — four sessions now, and one set of folds for all of them.
 
-`sandbox` is deliberately consumer-blind: it emits `sandbox-ready-event` /
-`sandbox-reply-event` / `sandbox-down-event` as plain records and says nothing about who
-asked. For a long time the `UiEvent` impls for those three records lived in `tutor`, which
-was fine while the tutorial was the only client and wrong the moment it wasn't: an `impl`
-is per record type, so a second client could not add one, and the tutorial would have had
-to route replies for a feature it knows nothing about.
+Every backend is consumer-blind: it knows how to spawn a child and put a request on its
+wire, and nothing about a model. What it emits is `session`'s three records — `ready`,
+`reply`, `down` — each carrying the session's own NAME, and the three `UiEvent` impls here
+fan each one out to the clients of THAT session in [[*clients*]].
 
-So the impls live HERE and fan each event out to every client in [[*clients*]]. Fanning out
-rather than addressing one client is what lets the sandbox stay blind: a reply carries an
-`:id`, and every client already drops an id it did not send (`tutor-apply-reply`'s
-`(nil? pend)` branch, and the playground's). \"Not mine\" is therefore already a no-op on
-every path, and the router needs no owner tag on the wire to get a reply to the right place.
+Three things that shape this file:
 
-The one event that genuinely needs a decision rather than a fan-out is `down` with a dead
-UI: the old code shut the sandbox down when the *Tutorial* buffer was gone, which with two
-clients would kill the sandbox out from under an open playground. That is now a question
-about ALL clients — [[any-client-live?]] — which is exactly the kind of question no single
-client can answer about itself."
+**The impls cannot live with a client.** An `impl` is per record type, so while they sat in
+`tutor` a second client could not add one, and the tutorial routed replies for features it
+knows nothing about.
+
+**Nor can they live per backend.** Each session used to carry its own three records purely
+so these folds could tell whose event they were holding — a fact the session already knows
+about itself. Once the name rode on the event, six impls became three and three backends
+stopped carrying an event vocabulary at all.
+
+**Fanning out beats addressing.** A reply carries an `:id`, ids are minted from one counter
+for every session, and every client already drops an id it did not send — so \"not mine\" is
+a no-op on every path and the wire needs no owner tag.
+
+The one event that needs a decision rather than a fan-out is `down` with nothing watching:
+the sandbox used to be shut down when the *Tutorial* buffer was gone, which with two clients
+would have killed it out from under an open playground. That is a question about ALL of that
+session's clients — [[any-client-live?]] — which is exactly what no single client can
+answer about itself."
   (:use model) ; the model the folds thread
-  (:use sandbox)) ; the three event records + sandbox-shutdown
+  (:use session)) ; the three event records + the shared shutdown
 ;; Each client, as the symbols naming its four hooks. Symbols, resolved at fold time:
 ;; `tutor` and `playground` are both DEFERRED modules (loaded on first use), so a
 ;; registration call at load time would either force them eager or arrive too late. A
@@ -29,25 +36,77 @@ client can answer about itself."
 ;; command, and it means an unloaded client simply isn't a client yet.
 ;;
 ;; Adding a client is one entry here. Its hooks:
-;;   :live?  (m)            -> is this client's buffer on screen? (does it still want a sandbox)
-;;   :ready  (m gen)        -> the child announced itself; the session is empty again
-;;   :reply  (m reply gen)  -> one decoded reply; MUST ignore an id it didn't send
-;;   :down   (m code)       -> the child went away (a respawn usually follows)
+;;   :session                    -> which session's events it wants (`:sandbox`, `:elixir-test`, …)
+;;   :live?  (m)                 -> is this client's buffer on screen? (does it still want a session)
+;;   :ready  (m gen banner)      -> the child announced itself; the session is empty again
+;;   :reply  (m reply gen)       -> one decoded reply; MUST ignore an id it didn't send
+;;   :down   (m code)            -> the child went away (a respawn usually follows)
+;;
+;; The BANNER on `:ready` is the child's own first word about itself. A Brood sandbox's says
+;; only that it is up; the Elixir agent's says which application started and which Elixir is
+;; running, which nothing on this side could work out. Clients that do not care ignore it.
+;;
+;; `:session` arrived with the second one. A reply is safe to fan out blindly — ids are
+;; minted from one counter for every session and a client drops an id it did not send — but
+;; `ready` and `down` are facts about a PARTICULAR child, and fanning those out blindly told
+;; the Brood playground its sandbox had died whenever the Elixir agent did. Worse, it
+;; answered "is anyone still watching?" with a yes from a client of the other session, which
+;; would have kept a dead Elixir agent respawning behind an open Brood playground — and in a
+;; mix project each of those respawns recompiles the project.
 (def *clients*
-  [{:live? 'tutor/tutor-live-buffer?
+  [{:session :sandbox
+    :live? 'tutor/tutor-live-buffer?
     :ready 'tutor/tutor-sandbox-ready
     :reply 'tutor/tutor-sandbox-reply
     :down 'tutor/tutor-sandbox-down}
-    {:live? 'playground/playground-live-buffer?
+    {:session :sandbox
+     :live? 'playground/playground-live-buffer?
      :ready 'playground/playground-sandbox-ready
      :reply 'playground/playground-sandbox-reply
      :down 'playground/playground-sandbox-down}
+    ;; The Elixir playground is a client of a DIFFERENT session, whose child is a BEAM node
+    ;; rather than a Brood runtime. Same list, same hooks, same discipline.
+    {:session :elixir-sandbox
+     :live? 'elixir-playground/elixir-playground-live-buffer?
+     :ready 'elixir-playground/elixir-playground-ready
+     :reply 'elixir-playground/elixir-playground-reply
+     :down 'elixir-playground/elixir-playground-down}
+    ;; *BEAM Processes* shares the playground's agent rather than starting a second one:
+    ;; the point of observing from inside the node is that it is the node your application
+    ;; is running in, and a second child would be a second VM with nothing in it.
+    {:session :elixir-sandbox
+     :live? 'beam/beam-live-buffer?
+     :ready 'beam/beam-ready
+     :reply 'beam/beam-reply
+     :down 'beam/beam-down}
     ;; the model itself: a brood buffer's diagnostics are `:check` requests to the child
     ;; rooted in the buffer's project (`model/ed-launch-diag`)
-    {:live? 'model/ed-diag-client-live?
+    {:session :sandbox
+     :live? 'model/ed-diag-client-live?
      :ready 'model/ed-diag-sandbox-ready
      :reply 'model/ed-diag-sandbox-reply
-     :down 'model/ed-diag-sandbox-down}])
+     :down 'model/ed-diag-sandbox-down}
+    ;; …and the warm TEST node, which is a third session: its own VM, in its own
+    ;; environment, so a `down` from it says nothing about the playground's. `testrun`
+    ;; folded its events with impls of its own until the name started riding on them; now
+    ;; it is a row here like everything else.
+    {:session :elixir-test
+     :live? 'testrun/warm-live-elixir?
+     :ready 'testrun/warm-ready-elixir
+     :reply 'testrun/warm-reply
+     :down 'testrun/warm-down-elixir}
+    ;; …and the Brood one, which is the same story in the language the editor is written
+    ;; in: a `nest test` of one file spends most of its second loading the project, not
+    ;; running tests, and a session pays that once.
+    {:session :brood-test
+     :live? 'testrun/warm-live-brood?
+     :ready 'testrun/warm-ready-brood
+     :reply 'testrun/warm-reply
+     :down 'testrun/warm-down-brood}])
+
+(defn clients-of (session)
+  "The registered clients of `session` — what every fold below is scoped to."
+  (seq/filter *clients* (fn (client) (= (get client :session) session))))
 
 (defn ensure ()
   "Force this module to load, registering the three `UiEvent` impls with it. Call it wherever
@@ -66,38 +125,77 @@ exactly too late. A qualified call is the load; the nil is incidental."
     fallback
     (try (apply (reflect/eval sym) args) (catch _ fallback))))
 
-(defn fan-out (m hook args)
-  "Thread `m` through every loaded client's `hook` (`:ready` / `:reply` / `:down`), each
-called with `m` followed by `args`. A client that isn't loaded, or whose fold raises, is
-skipped with the model untouched."
-  (fold *clients* m (fn (acc client) (call-hook (get client hook) (cons acc args) acc))))
+(defn frame-of (m)
+  "The frame size as of the last session event, `[cols rows]`, or nil before one.
 
-(defn any-client-live? (m)
-  "True while at least one client still has its buffer on screen — i.e. somebody still wants
-a sandbox. What decides whether a dead child is restarted or let go: with one client that
-was \"is the tutorial open?\", and with two it can only be asked of all of them."
-  (any? *clients* (fn (client) (call-hook (get client :live?) (list m) false))))
+A client hook is handed a model and its own payload, deliberately — none of them lays
+anything out, they render into named buffers and let the view do the geometry. One does
+need it: a STREAMING result buffer follows its own tail only in a pane already at the
+bottom (`results/ed-append-follow`), and that is a question about panes. Stamped here, in
+the one place that has the frame, rather than widening every hook's arity for the one
+client in five that asks."
+  (:session-frame m))
+
+(defn- with-frame (m cols rows)
+  (assoc m :session-frame [cols rows]))
+
+(defn fan-out (session m hook args)
+  "Thread `m` through every loaded client of `session` for `hook` (`:ready` / `:reply` /
+`:down`), each called with `m` followed by `args`. A client that isn't loaded, or whose
+fold raises, is skipped with the model untouched."
+  (fold (clients-of session)
+    m
+    (fn (acc client) (call-hook (get client hook) (cons acc args) acc))))
+
+(defn any-client-live? (session m)
+  "True while at least one client of `session` still has its buffer on screen — i.e.
+somebody still wants that child. What decides whether a dead one is restarted or let go:
+with a single client it was \"is the tutorial open?\", and it can only be asked of all of
+that session's clients — and only of THAT session's, or an open Brood playground would keep
+a dead Elixir agent respawning forever."
+  (any? (clients-of session) (fn (client) (call-hook (get client :live?) (list m) false))))
 
 (impl UiEvent
-  sandbox/sandbox-ready-event
+  session/session-ready
+  ;; The BANNER travels alongside the generation, always. A Brood sandbox's says only that
+  ;; it is up; the Elixir agent's says which application started and which Elixir is
+  ;; running — facts only the child can know. A client that does not care ignores the
+  ;; argument; the ones that do could not be told any other way.
   (ui-event-fold [e m textrows cols rows]
-    (fan-out m :ready (list (sandbox-ready-event-gen e)))))
+    (fan-out (session/session-ready-session e)
+      m
+      :ready
+      (list (session/session-ready-gen e) (session/session-ready-banner e)))))
 
 (impl UiEvent
-  sandbox/sandbox-reply-event
+  session/session-reply
   ;; The generation travels to each client rather than being checked here: a superseded
   ;; child's straggler is only droppable against the generation the CLIENT last saw, and
   ;; two clients can be a reset apart.
   (ui-event-fold [e m textrows cols rows]
-    (fan-out m :reply (list (sandbox-reply-event-reply e) (sandbox-reply-event-gen e)))))
+    (fan-out (session/session-reply-session e)
+      (with-frame m cols rows)
+      :reply
+      (list (session/session-reply-reply e) (session/session-reply-gen e)))))
 
 (impl UiEvent
-  sandbox/sandbox-down-event
-  ;; The child (or the whole worker) went away. If nobody is watching any more, stop the
-  ;; loop for good — a respawn must not outlive every UI that wanted it. Otherwise each
-  ;; client says its own piece about the restart.
+  session/session-down
+  ;; The child (or the whole worker) went away. If nobody is watching that session any
+  ;; more, stop it for good — a respawn must not outlive every UI that wanted it, and for
+  ;; the Elixir sessions it is not merely a spare process: respawning one in a mix project
+  ;; recompiles the project. Otherwise each client says its own piece about the restart.
   (ui-event-fold [e m textrows cols rows]
-    (let (code (sandbox-down-event-code e))
-      (if (not (any-client-live? m))
-        (do (sandbox-shutdown) m)
-        (fan-out m :down (list code))))))
+    (let (name (session/session-down-session e)
+          code (session/session-down-code e)
+          ;; Every client hears it either way. A `:down` hook is not a notification that
+          ;; your buffer is open — it is the fact that the child holding your state is
+          ;; gone, and a client with its buffer closed is exactly the one that would
+          ;; otherwise keep believing a dead session was ready (or still attached to
+          ;; somebody's node).
+          m1 (fan-out name m :down (list code)))
+      (if (any-client-live? name m1)
+        m1
+        ;; …and with nobody watching, stop it for good: a respawn must not outlive every
+        ;; UI that wanted it, and for the Elixir sessions it is not merely a spare
+        ;; process — respawning one in a mix project recompiles the project.
+        (do (session/shutdown name) m1)))))

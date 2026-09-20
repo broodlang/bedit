@@ -1,0 +1,104 @@
+(defmodule session
+  "**One event vocabulary for every evaluation session the editor keeps.**
+
+bedit runs several `std/editor/evalsession` children at once — the Brood eval sandbox,
+the Elixir agent the playground and `*BEAM Processes*` share, the `MIX_ENV=test` node
+`C-c t` runs suites in — and more will follow (a Ruby session, a Python one; each is a
+backend and nothing else).
+
+Each of those is a BACKEND: how to spawn its child, how to put a request on its wire, how
+to take a reply off it. None of them is an event vocabulary, and for a while all three
+carried one anyway — three `-ready-event` / `-reply-event` / `-down-event` records, three
+`emit` functions casing over the same three kinds, three sets of `UiEvent` impls — for the
+sole purpose of letting the router tell whose event it was holding.
+
+That fact is one the session already knows about itself, so it travels on the event:
+`evalsession` hands its `:emit` hook the session's registered NAME, and the three records
+below carry it. One emit ([[session-emit]]) serves every backend, one set of `UiEvent`
+impls (in `sandbox-events`) folds every session's events, and a new language is a spec
+plus its own verbs — which is all a backend ever should have been.
+
+`ready` carries the child's whole BANNER as well as the generation. A Brood sandbox's
+banner says only that it is up; the Elixir agent's says which application started and
+which Elixir it is running. Clients that do not care ignore the argument; the ones that
+do could not be told any other way, because only the child knows."
+  (:use model)) ; UiEvent — these three records are folded by the loop
+;; `editor/evalsession` is referenced qualified below (the `mod/name` reference loads it).
+
+;; ---- the events ----------------------------------------------------------------
+;; `:session` is the registered name of the worker the event came from (`:sandbox`,
+;; `:elixir-sandbox`, `:elixir-test`, …) — what scopes every fold in `sandbox-events`.
+;; Without it a `down` from one child reads as a `down` from another, which in a mix
+;; project means respawning a VM that recompiles the world because a different language's
+;; session died.
+
+(defrecord session-ready (session gen banner)) ; the child announced itself; the session is empty
+(defrecord session-reply (session reply gen)) ; one decoded reply map
+(defrecord session-down (session code gen)) ; the child went away (a respawn usually follows)
+
+(defn session-emit (sink kind payload gen name)
+  "`evalsession`'s `:emit` hook for every backend in this editor — turn a session event
+into the `UiEvent` record the `ui-run` loop folds and send it to `sink` (the registered
+`:editor` when a client did not name one).
+
+The one place the supervision touches the editor, which is what lets the session itself
+stay in `std` knowing nothing about a loop, a model or a frame. A backend names this
+symbol in its spec and writes no event code at all."
+  (let (target (or sink :editor))
+    (case kind
+      :ready (send target (session-ready name gen payload))
+      :reply (send target (session-reply name payload gen))
+      :down (send target (session-down name payload gen))
+      nil)))
+
+(defn forget-script (path)
+  "Remove the temporary program a backend spat for its child, once the child has read it.
+
+Every session here is started by writing a script to an unguessable path and pointing a
+runtime at it, and the ready banner is the proof the file has done its job. Best-effort on
+purpose: a respawn re-writes it, and failing to delete costs a stray file rather than a
+session."
+  (try
+    (when (and path (file/exists? path)) (file/rm path))
+    (catch e (log/warn (str "session: could not remove " path ": " (error-message e))))))
+
+(defn emit-after-script (path sink kind payload gen name)
+  "[[session-emit]], preceded by forgetting the child's script on the ready banner — the
+`:emit` hook for a backend that spits one. The whole of what those three backends' own
+emits were once the event vocabulary stopped being per-session."
+  (when (= kind :ready) (forget-script path))
+  (session-emit sink kind payload gen name))
+
+;; ---- the client API ------------------------------------------------------------
+;; Thin over `evalsession`, and thin on purpose: what these add is that a caller names a
+;; SESSION rather than repeating the shape of one. A backend module keeps only the verbs
+;; that are its own — `sandbox-check`, `elixir-observe`, `elixir-attach`, `test-run` — and
+;; the four below stop being written out per language.
+
+(defn running? (name)
+  "Is the session's worker alive?"
+  (editor/evalsession/session-running? name))
+
+(defn start (name spec &optional (root nil) (sink nil))
+  "Ensure session `name` is up with backend `spec`, its child rooted in `root`. Idempotent;
+a session already running elsewhere is re-rooted. Answers its pid.
+
+Call it as early as a feature knows it will want one: a runtime's startup — in a mix
+project, a whole compile — then happens while the reader is still reading."
+  (editor/evalsession/session-start name spec root (or sink :editor)))
+
+(defn request (name id timeout-ms payload)
+  "Fire-and-forget: put request `id` on session `name`'s wire. Answers whether it was
+ACCEPTED — false means the session is not running and no reply for this id will ever
+arrive, which the caller must not record as in flight."
+  (editor/evalsession/session-request name id timeout-ms payload))
+
+(defn reset (name)
+  "Restart the session: a fresh child, an empty session. In a project that compiles this is
+a real pause, which is why it is a command someone asks for and never something the editor
+does on its own."
+  (editor/evalsession/session-reset name))
+
+(defn shutdown (name)
+  "Kill the child and stop the worker. A no-op when it is not running."
+  (editor/evalsession/session-shutdown name))
