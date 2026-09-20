@@ -150,7 +150,73 @@ suppressed (no false red) rather than scanning the rest of the buffer."
             (def *bracket-cache* [rope pt result])
             result))))))
 
+(sig ed-overrides-by-line (any any -> map))
+(defn ed-overrides-by-line (rope overrides)
+  "Flat `[pos face]` `overrides` grouped by the line each position falls on — `{line ->
+([pos face] …)}`, `{}` for none.
+
+This exists for the **memo**, not for the painting. Every visible row is a memoised
+fragment (`ed-visible-lines`, ADR-336) whose deps name what its ops read; handing each
+row the whole pane's override list made `overrides` a dep that changes whenever ANY of
+them does — and the bracket-match half changes on every cursor move, so one `C-n`
+invalidated all forty-nine rows and the memo cost more than it saved (measured: `view`
+2.92 ms with every fragment hitting, 6.53 ms after a motion, 5.62 ms with no memo at
+all). Grouped, a row's dep is only what lands on that row, so a motion re-renders the
+two lines the bracket pair moved between and nothing else.
+
+Each line's list keeps the order it had in `overrides` — the tiler merges later-wins, so
+a diagnostic underline on the same character as a bracket face must still come second."
+  (fold (reverse overrides)
+    {}
+    (fn (acc o)
+      (let (line (text/char->line rope (first o)))
+        (assoc acc line (cons o (or (get acc line) '())))))))
+
+;; ---- the span band, sliced per line ----------------------------------------
+;; `fontify-runs` (native `%span-runs`) reads its whole `spans` argument into a vector
+;; before it tiles anything — so handing every row the whole pane's band makes painting a
+;; pane O(rows × band) rather than O(band). Nobody noticed on ordinary source, where the
+;; band is a couple of thousand spans; on a file of 12,000-character lines the visible
+;; text is half a megabyte, the band is enormous, and one frame measured **199 ms**.
+;;
+;; Slicing it once per pane and giving each row only its own spans makes that O(band + rows)
+;; — a win at every file size, not a special case for long lines. The band stays in ABSOLUTE
+;; offsets (what `ed-slice-ops` and `fontify-runs` already speak), so nothing downstream
+;; changes; a span straddling lines appears on each line it covers.
+
+(defn- ed-span-skip (spans n i lo)
+  "The first index at or after `i` whose span has not already ended by `lo`. The cursor only
+moves forward, which is what makes the whole walk one pass rather than one per line."
+  (if (and (< i n) (<= (second (nth spans i)) lo)) (ed-span-skip spans n (inc i) lo) i))
+
+(defn- ed-span-take (spans n i hi acc)
+  "The spans from `i` that start before `hi`, in order."
+  (if (or (>= i n) (>= (first (nth spans i)) hi))
+    (reverse acc)
+    (ed-span-take spans n (inc i) hi (cons (nth spans i) acc))))
+
+(defn ed-spans-by-line (buf spans top last-line)
+  "The lexer `spans` (ascending, non-overlapping, absolute offsets) grouped by the line each
+covers — `{line -> (span …)}` over `top`..`last-line`; `{}` when there are none. One co-walk
+of the lines and the band."
+  (if (or (nil? spans) (empty? spans))
+    {}
+    (let (v (into [] spans)
+          n (count v)
+          rope (buffer-rope buf)
+          walked (fold (range (math/max 0 top) (inc (math/max 0 last-line)))
+                   [0 {}]
+                   (fn (state line)
+                     (let ([i acc] state
+                           lo (text/line->char rope line)
+                           hi (+ lo (string/length (ed-line-text buf line)))
+                           i2 (ed-span-skip v n i lo)
+                           got (ed-span-take v n i2 hi '()))
+                       [i2 (if (empty? got) acc (assoc acc line got))]))))
+      (second walked))))
+
 (def ed-face-diagnostic {:underline true}) ; merged onto the token's syntax face
+
 (defn- ed-word-end (text i)
   (if (and (< i (string/length text)) (complete-word-char? (string/char-at text i)))
     (ed-word-end text (inc i))
@@ -313,23 +379,51 @@ unwrapped pane's row: `ed-slice-ops` over `[hscroll, end)` (long lines scroll, n
 and is `w` wide: one buffer line per row from line `top`, scrolled `hscroll` columns
 left — or, with a row table `rows` (`panes/ed-pane-rows`, a wrapped buffer), one
 `[line from to]` segment per row. `hl-ranges` `[lo hi face]` highlight the
-region/overlays, `spans` syntax-colour (with `overrides`).
+region/overlays, `spans` syntax-colour, and `overrides` is the bracket/diagnostic face
+table **grouped by line** (`ed-overrides-by-line`) — each row is handed only its own.
 
 With `memo?`, each row is a memoised fragment (`editor/ui/ui-memo`, ADR-336) keyed by
 its screen cell `[:line x row]`: its ops are reused from the previous turn while the
-rope, the line, the slice, the width, the span band and the highlights are `=` — all of
-them values the model keeps between turns, so a cursor blink, a mouse move or a motion
-that touches no bracket re-renders no line at all. Off (the default) outside the loop
-and for a scaled pane, whose ops are transformed after this."
+rope, the line, the slice, the width, the span band, the highlights and **that line's**
+overrides are `=` — all of them values the model keeps between turns, so a cursor blink,
+a mouse move or a motion that touches no bracket re-renders no line at all. (The per-line
+grouping of the overrides is what makes that true — see `ed-overrides-by-line`.) Off (the
+default) outside the loop and for a scaled pane, whose ops are transformed after this.
+
+**An EDIT re-renders every visible row**, because the rope and the span band are both deps
+and both change. Making them per-line — the line's own text, and the spans rebased to where
+the line starts, so a line that merely shifted still hits — was written and MEASURED, and
+it lost: building those deps (a rope slice and a span walk per line, every frame) cost more
+than the re-render it saved. `view` went 1.66 → 2.83 ms on a frame where everything hits
+and 2.60 → 3.93 ms after a motion, to take a typing frame from 4.86 → 3.98 ms. The frames
+it made worse are the common ones. Whatever fixes this has to make a row's identity cheap
+to compute, not merely precise."
   (let (rope (buffer-rope buf)
+        last-line (math/min (dec (buffer-line-count buf)) (dec (+ top textrows)))
+        ;; the band sliced per line, ONCE — `fontify-runs` reads its whole `spans` argument
+        ;; before tiling, so handing every row the whole band is O(rows × band). The rows
+        ;; a wrapped pane draws are the same LINES, so the slice covers both shapes.
+        by-line (ed-spans-by-line buf
+                  spans
+                  top
+                  (if (nil? rows) last-line (fold (map (take rows textrows) first) top math/max)))
         row-op (fn (k line from to)
-                 (if memo?
-                   (ui-memo [:line x (+ y k)]
-                     [rope line w from to spans hl-ranges overrides]
-                     (fn () (ed-slice-ops buf line (+ y k) x w hl-ranges spans overrides from to)))
-                   (ed-slice-ops buf line (+ y k) x w hl-ranges spans overrides from to))))
+                 (let (ovs (or (get overrides line) '())
+                       ls (get by-line line))
+                   (if memo?
+                     ;; The dep names THIS LINE'S spans, not the whole band. Naming the band
+                     ;; is only O(1) while it is the same heap cell; the moment it is rebuilt
+                     ;; — any edit, any scroll past the margin — `=` walks it once per row,
+                     ;; which is O(rows × band). On a file of 12,000-character lines that
+                     ;; made the memo THIRTY TIMES SLOWER than no memo at all: `view` 27 ms
+                     ;; without it, 822 ms with. The slice is already built for the thunk, it
+                     ;; is a few spans, and it is strictly more exact.
+                     (ui-memo [:line x (+ y k)]
+                       [rope line w from to ls hl-ranges ovs]
+                       (fn () (ed-slice-ops buf line (+ y k) x w hl-ranges ls ovs from to)))
+                     (ed-slice-ops buf line (+ y k) x w hl-ranges ls ovs from to)))))
     (if (nil? rows)
-      (let (last-line (math/min (dec (buffer-line-count buf)) (dec (+ top textrows))))
+      (let ()
         (mapcat (range top (inc last-line))
           (fn (line) (row-op (- line top) line hscroll nil))))
       (mapcat (range (math/min textrows (count rows)))
@@ -1262,9 +1356,13 @@ frac = 0 the ops are emitted flat (no region wrapper) for test-compatibility and
         ;; line→row question below goes through it, so the text, the cursor, the bands and
         ;; the notes land on the same rows
         rows (ed-pane-rows pane buf)
+        ;; grouped by line for the row memo — a bracket move must invalidate the two
+        ;; lines its pair sits on, not every row on screen (`ed-overrides-by-line`)
         overrides (if (:selected pane)
-                    (append (ed-bracket-overrides buf) (ed-diagnostic-overrides m buf top render-h))
-                    '())
+                    (ed-overrides-by-line (buffer-rope buf)
+                      (append (ed-bracket-overrides buf)
+                        (ed-diagnostic-overrides m buf top render-h)))
+                    {})
         hl-ranges (append (ed-hl-ranges m buf (:selected pane))
                     ;; other participants' selections, tinted in their colour
                     (ed-remote-selection-ranges m pane)

@@ -1,0 +1,71 @@
+;; Tests for the per-line render memo (ADR-336 applied to `ed-visible-lines`).
+;;
+;; The regression these pin: every visible row is a memoised fragment whose deps name what
+;; its ops read. Handing each row the WHOLE pane's bracket/diagnostic override list made
+;; `overrides` a dep that changed whenever any of them did — and the bracket half changes
+;; on every cursor move — so one `C-n` invalidated all forty-nine rows and the memo cost
+;; more than it saved (`view` 2.92 ms all-hit, 6.53 ms after a motion, 5.62 ms with no memo
+;; at all; `tools/profile-turn.blsp`). Grouped per line, a row's dep is only what lands on
+;; that row.
+(defmodule view-memo-test
+  (:use model)
+  (:use view)
+  (:use editor/buffer)
+  (:use test))
+;; `*ui-memo*` (the previous turn's fragment table) is earmuffed, so it is ambient rather
+;; than namespaced — `view`'s own `(:use editor/ui)` is what puts it in the image.
+
+(defn vm-rope (text) (buffer-rope (make-buffer text)))
+
+(defn vm-markers (buf overrides prev)
+  "The `[:ui/memo key deps ops]` markers `ed-visible-lines` emits for the first 3 rows of
+`buf`, rendered with the previous turn's memo table `prev` in scope."
+  (binding (*ui-memo* prev)
+    (ed-visible-lines buf 0 3 0 0 40 '() nil overrides 0 true nil)))
+
+(defn vm-table (markers)
+  "The markers as the table the next turn reads — `{key -> [deps ops]}`."
+  (fold markers {} (fn (acc mk) (assoc acc (nth mk 1) [(nth mk 2) (nth mk 3)]))))
+
+(defn vm-deps (markers key) (first (get (vm-table markers) key)))
+
+(describe "ed-overrides-by-line"
+  (test "groups flat [pos face] overrides by the line each position falls on"
+    (let (rope (vm-rope "abc\ndef\nghi") ; lines start at 0, 4, 8
+          by-line (ed-overrides-by-line rope (list [1 {:bold true}] [5 {:bold true}] [6 {:bold true}])))
+      (assert= (list 1) (map (get by-line 0) first))
+      (assert= (list 5 6) (map (get by-line 1) first))
+      (is (nil? (get by-line 2)))))
+  (test "an empty override list groups to an empty map"
+    (assert= {} (ed-overrides-by-line (vm-rope "abc") '())))
+  (test "a line's entries keep their input order — the tiler merges later-wins"
+    ;; the bracket face is appended before the diagnostic one, so a diagnostic underline
+    ;; on the same character must still come second
+    (let (rope (vm-rope "abc")
+          by-line (ed-overrides-by-line rope (list [1 {:bg "#bracket"}] [1 {:underline true}])))
+      (assert= (list {:bg "#bracket"} {:underline true}) (map (get by-line 0) second)))))
+
+(describe "ed-visible-lines — the per-line memo"
+  (test "a row with no overrides keeps its deps when an override moves to another line"
+    (let (buf (make-buffer "aaa\nbbb\nccc")
+          face {:bg "#f00"}
+          ;; the same override on line 1, then on line 2 — a bracket pair moving under the
+          ;; cursor, which is what a plain motion does
+          before (vm-markers buf {1 (list [4 face])} {})
+          after (vm-markers buf {2 (list [8 face])} (vm-table before)))
+      ;; the untouched row: same deps, so the memo hits and its ops are reused
+      (assert= (vm-deps before [:line 0 0]) (vm-deps after [:line 0 0]))
+      ;; the two rows the override left and arrived on: deps differ, so they re-render
+      (is (not (= (vm-deps before [:line 0 1]) (vm-deps after [:line 0 1]))))
+      (is (not (= (vm-deps before [:line 0 2]) (vm-deps after [:line 0 2]))))))
+  (test "a row's deps carry only its own overrides, never the whole pane's"
+    (let (buf (make-buffer "aaa\nbbb\nccc")
+          face {:bg "#f00"}
+          markers (vm-markers buf {1 (list [4 face])} {}))
+      (is (not (includes? (vm-deps markers [:line 0 0]) (list [4 face]))))
+      (is (includes? (vm-deps markers [:line 0 1]) (list [4 face])))))
+
+  (test "an empty override list on a line leaves that row with none"
+    (let (buf (make-buffer "aaa\nbbb")
+          markers (vm-markers buf {} {}))
+      (is (not (nil? (vm-deps markers [:line 0 0])))))))

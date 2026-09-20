@@ -318,7 +318,78 @@ single source of the viewport height the fontify window and its cache key are bu
 ;; equality — so no separate revision counter is needed.
 
 (def ed-fontify-backscan 200) ; max lines of lead-in above a window for a safe restart
-(def ed-fontify-margin 32) ; lines lexed above & below the viewport, reused on scroll
+(def ed-fontify-margin 32) ; most lines lexed above & below a viewport, reused on scroll
+
+(defn ed-pane-margin (vrows)
+  "The fontify margin for a pane `vrows` tall: `ed-fontify-margin`, but never more than the
+pane itself shows.
+
+The margin exists so a small scroll reuses the band, and \"small\" is relative to the pane.
+A flat 32 each side is two thirds of a full-height pane and FOUR TIMES a third-height one —
+so splitting into three lexed 237 lines to show 45, and every pane paid its own copy of that.
+Scaling it means a split costs about what one pane costs, which is what a reader expects
+from dividing the same screen up."
+  (math/max 4 (math/min ed-fontify-margin vrows)))
+
+;; ---- long lines: lex what is SHOWN, not what is there -----------------------
+;; The window above is bounded in LINES, which is the right bound only while a line is
+;; roughly a screenful wide. A minified file, a JSON blob, a long log line — 12,000
+;; characters a line — makes a 49-row window 700 KB of text to lex, in order to paint the
+;; ~10 KB the pane can actually show. Measured on such a file: a keystroke cost **360 ms**,
+;; a page-down 535 ms. The same file opened as plain text (no `:fontify` at all) costs 5 ms,
+;; which is the whole proof of where the time goes.
+;;
+;; So past `*fontify-line-cap*` the band is lexed PER LINE, each line clipped to the cap.
+;; Colour stays correct for every column a pane can display (no pane is 1,000 columns wide)
+;; and is simply absent past it. What is lost is cross-line lexer state — a string opened on
+;; one enormous line and closed on the next is mis-coloured — which is the trade every editor
+;; makes here, and it is confined to files whose lines are already beyond reading.
+
+(defdyn *fontify-line-cap* 1000)
+;; How long ONE line has to be before its pane leaves the whole-window path. Deliberately
+;; well past any pane width: on the per-line path a mode loses its cross-line state, so an
+;; ordinary file with a 300-character line must not be pushed onto it — only one whose lines
+;; are past reading. Set it huge to keep whole-window lexing always.
+
+(def ed-fontify-edge-slack 64)
+;; Characters lexed past the right edge on the per-line path, so a token straddling the edge
+;; is still coloured by the rule that actually applies to it.
+
+(defn ed-fontify-clip (pane)
+  "How many characters of one line the per-line path lexes for `pane`: everything it could
+possibly show — its horizontal scroll plus its width — plus `ed-fontify-edge-slack`. A pane
+213 columns wide has no use for the thousandth character of a line, and lexing to the
+`*fontify-line-cap*` regardless was most of what the long-line path still cost."
+  (let ([px py pw ph] (or (:rect pane) [0 0 80 24]))
+    (+ (ed-pane-hscroll pane) (math/max 80 pw) ed-fontify-edge-slack)))
+
+(sig ed-line-length (any int int int -> int))
+(defn- ed-line-length (rope nlines total line)
+  "Characters in `line` including its newline — two rope lookups, no text materialised."
+  (if (>= (inc line) nlines) (- total (text/line->char rope line))
+    (- (text/line->char rope (inc line)) (text/line->char rope line))))
+
+(defn- ed-long-lines? (buf lo hi)
+  "Whether any line in `[lo, hi)` is longer than `*fontify-line-cap*`."
+  (let (rope (buffer-rope buf)
+        nlines (buffer-line-count buf)
+        total (buffer-length buf))
+    (any? (range (math/max 0 lo) (math/min nlines hi))
+      (fn (line) (> (ed-line-length rope nlines total line) *fontify-line-cap*)))))
+
+(sig ed-clipped-line-spans (buffer any int int int -> seqable))
+(defn- ed-clipped-line-spans (buf fontify lo hi clip)
+  "Spans for lines `[lo, hi)` lexed ONE LINE AT A TIME, each clipped to `clip` characters,
+in absolute coordinates. The long-line path."
+  (let (rope (buffer-rope buf)
+        nlines (buffer-line-count buf)
+        total (buffer-length buf))
+    (mapcat (range (math/max 0 lo) (math/min nlines hi))
+      (fn (line)
+        (let (bol (text/line->char rope line)
+              len (ed-line-length rope nlines total line)
+              end (+ bol (math/min len clip)))
+          (shift-spans (fontify (text/slice rope bol end)) bol))))))
 (sig ed-window-src (buffer any int int -> any))
 (defn- ed-window-src (buf restart lo hi)
   "The `[src base]` the mode's `fontify` runs over for lines `lo`..`hi-1`: a text/slice of
@@ -347,12 +418,15 @@ markdown per-lex cost is addressed by speeding `markdown-spans`, not by shrinkin
         src (if (= rel 0) chunk (string/substring chunk rel (string/length chunk))))
     [src base]))
 
-(defn ed-window-spans (buf fontify restart lo hi)
+(defn ed-window-spans (buf fontify restart lo hi &optional (clip 1000))
   "Absolute `[start end face]` syntax spans covering buffer lines `lo`..`hi-1` of `buf` —
 `fontify` run over the windowed `ed-window-src` (not the whole buffer), the spans shifted
-into absolute coordinates (`highlight/shift-spans`) so the per-line renderer needs no change."
-  (let ([src base] (ed-window-src buf restart lo hi))
-    (shift-spans (fontify src) base)))
+into absolute coordinates (`highlight/shift-spans`) so the per-line renderer needs no change.
+A window holding a line past `*fontify-line-cap*` takes the per-line path instead."
+  (if (ed-long-lines? buf lo hi)
+    (ed-clipped-line-spans buf fontify lo hi clip)
+    (let ([src base] (ed-window-src buf restart lo hi))
+      (shift-spans (fontify src) base))))
 
 (defn- ed-band-covers? (entry buf top vrows restart)
   "True if cached span `entry` still serves a pane showing `buf` at scroll `top` over
@@ -373,22 +447,37 @@ one of hundreds of appended lines."
         (= [(:src entry) (:base entry)]
           (ed-window-src buf restart (:blo entry) (:bhi entry)))))))
 
-(sig ed-band-for (buffer any any int int -> map))
-(defn- ed-band-for (buf fontify restart top vrows)
+(sig ed-band-for (buffer any any int int int -> map))
+(defn- ed-band-for (buf fontify restart top vrows clip)
   "A fresh `:span-cache` entry for `buf`'s viewport `[top, top+vrows)`: spans lexed over
-that window widened by `ed-fontify-margin` lines each side (so a later small scroll
-reuses it), tagged with the rope, the `[blo bhi)` lines they cover, and the exact fontify
-input (`:src`/`:base`) so `ed-band-covers?` can revalidate cheaply after an off-band edit."
+that window widened by `ed-pane-margin` lines each side (so a later small scroll reuses
+it), tagged with the rope, the `[blo bhi)` lines they cover, and the exact fontify input
+(`:src`/`:base`) so `ed-band-covers?` can revalidate cheaply after an off-band edit."
   (let (nlines (buffer-line-count buf)
-        blo (math/max 0 (- top ed-fontify-margin))
-        bhi (math/min nlines (+ top vrows ed-fontify-margin))
-        [src base] (ed-window-src buf restart blo bhi))
-    {:rope (buffer-rope buf)
-     :blo blo
-     :bhi bhi
-     :src src
-     :base base
-     :spans (shift-spans (fontify src) base)}))
+        margin (ed-pane-margin vrows)
+        blo (math/max 0 (- top margin))
+        bhi (math/min nlines (+ top vrows margin))
+        long? (ed-long-lines? buf top (+ top vrows)))
+    (if long?
+      ;; The long-line path keeps no `:src`, so `ed-band-covers?`'s off-band-edit shortcut
+      ;; does not apply and any rope change re-lexes. That is the right trade here: the
+      ;; re-lex is bounded by what the pane can SHOW rather than by the line, and comparing
+      ;; a several-hundred-kilobyte fontify input would cost more than redoing the work.
+      ;; The margin is dropped too — it exists to make a small scroll free, and on this path
+      ;; a re-lex is cheap while lexing 64 lines nobody is looking at is not.
+      {:rope (buffer-rope buf)
+       :blo top
+       :bhi (math/min nlines (+ top vrows))
+       :src nil
+       :base 0
+       :spans (ed-clipped-line-spans buf fontify top (+ top vrows) clip)}
+      (let ([src base] (ed-window-src buf restart blo bhi))
+        {:rope (buffer-rope buf)
+         :blo blo
+         :bhi bhi
+         :src src
+         :base base
+         :spans (shift-spans (fontify src) base)}))))
 
 (sig ed-pane-spans (model pane buffer int int -> any))
 (defn ed-pane-spans (m pane buf top vrows)
@@ -411,7 +500,7 @@ markup is gone — serves those instead: absolute already, valid as long as the 
               restart (ed-mode-service buf :fontify-restart))
           (if (ed-band-covers? entry buf top vrows restart)
             (:spans entry)
-            (ed-window-spans buf fontify restart top (+ top vrows)))))))
+            (ed-window-spans buf fontify restart top (+ top vrows) (ed-fontify-clip pane)))))))
 
 (sig ed-layout-now (model -> (or nil layout)))
 (defn ed-layout-now (m)
@@ -441,48 +530,46 @@ both dimensions, so `ed-update` doesn't pay for two independent layout traversal
 ;; chunk lists, pure data — no render ops, so no view dependency) are cached per pane
 ;; path and reconciled here; `view/ed-gutter-ops` just positions them.
 
-(defn- ed-gutter-key (buf gw)
-  "Everything a single line's gutter cell depends on BESIDES its line number. Two
-buffers producing equal keys produce equal cells for the same line: the number column
-is a function of `gw`/line-count and file-backing (a file buffer prepends the diff
-bar), the bar of the git line-status cache, and the margin marks of the break/test/
-describe/eol-note annotations — plus the buffer's CURRENT rope, which is what makes a
-mark's staleness part of the key: an annotation's own stamp is frozen at annotation
-time, so without the live rope an edit that dims a verdict would leave the cached
-bright cell on screen (the mark function dims, the cache never asks again).
+(defn- ed-gutter-key (buf gw ctx)
+  "Everything a single line's gutter cell depends on BESIDES its line number. Two buffers
+producing equal keys produce equal cells for the same line: the number column is a function
+of `gw` / line-count / file-backing (a file buffer prepends the diff bar), and everything
+else the cell reads is the gutter CONTEXT `ctx` (`modes/gutter-ctx`) — the change-bar map
+and each margin mark's value paired with whether it is stale.
+
+`ctx`, not the buffer's ROPE. The rope was here because a mark dims once the text moves past
+it and an annotation's own stamp is frozen at annotation time — but staleness is a boolean
+that flips ONCE, and keying on the rope rebuilt the whole column on every character typed
+(~2 ms a keystroke on a 49-row pane, re-deriving marks that had not changed). The context
+carries the boolean, so the first keystroke after a test run rebuilds and the rest reuse.
+
 Deliberately EXCLUDES the viewport (`top`/`vh`): cells are per absolute line, so a
 scroll reuses the overlap of the previous window (`ed-gutter-cells`) instead of
 recomputing every visible cell per scrolled line — the held-C-n case."
-  [gw
-    (buffer-line-count buf)
-    (and (buffer-file buf) true)
-    ;; the annotations the margin draws — a NEW verdict/bar/note changes its stamp…
-    (:git-line-status buf)
-    (:debug-break-lines buf)
-    (:test-marks buf)
-    (:describe-marks buf)
-    (:eol-notes buf)
-    ;; …and the live rope, so an EDIT that dims one (staleness is annotation-vs-now)
-    ;; invalidates the cell too. Cheap: a rope handle compare, like everywhere else.
-    (buffer-rope buf)])
+  [gw (buffer-line-count buf) (and (buffer-file buf) true) ctx])
 
-(defn- ed-gutter-cells (buf cell top vh gw old)
+(defn- ed-gutter-cells (buf cell top vh gw old ctx)
   "The mode's `:gutter-cell` chunks for each visible line `top`..`top+vh-1` (clamped
 to EOF), as a vector in line order — the expensive per-line work the cache holds. An
 `old` entry with the same content key (`ed-gutter-key`, checked by the caller) donates
 the cells its window shares with this one — a scroll recomputes only the lines that
-slid into view, not the whole column."
+slid into view, not the whole column.
+
+`ctx` is the gutter context the cells read (`modes/gutter-ctx`), bound for the whole column
+— the buffer's marks and change bars are a fact about the BUFFER, and asking them per line
+allocated a map and counted the buffer's lines some three hundred times per rebuild."
   (let (last-line (math/min (dec (buffer-line-count buf)) (dec (+ top vh)))
         otop (or (:top old) 0)
         ocells (or (:cells old) [])
         on (count ocells))
-    (into []
-      (map (range top (inc last-line))
-        (fn (line)
-          (let (oi (- line otop))
-            (if (and (>= oi 0) (< oi on))
-              (nth ocells oi)
-              (cell buf line gw))))))))
+    (binding (*gutter-ctx* ctx)
+      (into []
+        (map (range top (inc last-line))
+          (fn (line)
+            (let (oi (- line otop))
+              (if (and (>= oi 0) (< oi on))
+                (nth ocells oi)
+                (cell buf line gw)))))))))
 
 (defn ed-pane-gutter-cells (m pane buf top vh gw)
   "The gutter cells for `pane`'s viewport — from the model's `:gutter-cache` when its
@@ -492,13 +579,14 @@ mode offers none."
   (let (cell (ed-mode-service buf :gutter-cell))
     (if (or (<= gw 0) (nil? cell))
       nil
-      (let (entry (get-in m [:gutter-cache (:path pane)]))
+      (let (entry (get-in m [:gutter-cache (:path pane)])
+            ctx (modes/gutter-ctx buf))
         (if (and entry
               (= (:top entry) top)
               (= (:vh entry) vh)
-              (= (:key entry) (ed-gutter-key buf gw)))
+              (= (:key entry) (ed-gutter-key buf gw ctx)))
           (:cells entry)
-          (ed-gutter-cells buf cell top vh gw nil))))))
+          (ed-gutter-cells buf cell top vh gw nil ctx))))))
 
 (defn ed-refresh-spans (m cols rows)
   "Refresh the fontify `:span-cache` (and the `:gutter-cache`) for every visible pane —
@@ -534,14 +622,15 @@ pure `view` just reads the result; also caches the layout as `:_lc`."
                                    key
                                      (if (ed-band-covers? entry buf top vrows restart)
                                        entry
-                                       (ed-band-for buf fontify restart top vrows)))))
+                                       (ed-band-for buf fontify restart top vrows (ed-fontify-clip pane))))))
                          cell (ed-mode-service buf :gutter-cell)
                          gw (ed-gutter-width buf (ed-gutter-shown? buf pane))
                          gc2 (if (or (<= gw 0) (nil? cell))
                                gc
                                (let (top (ed-pane-top pane buf)
                                      vh (ed-pane-vrows pane buf)
-                                     gkey (ed-gutter-key buf gw)
+                                     gctx (modes/gutter-ctx buf)
+                                     gkey (ed-gutter-key buf gw gctx)
                                      gentry (get oldg key)
                                      same? (and gentry (= (:key gentry) gkey)))
                                  (assoc gc
@@ -558,7 +647,8 @@ pure `view` just reads the result; also caches the layout as `:_lc`."
                                                  top
                                                  vh
                                                  gw
-                                                 (if same? gentry nil))})))))
+                                                 (if same? gentry nil)
+                                                 gctx)})))))
                      [sc2 gc2]))))
     (assoc m
       :span-cache (first caches)

@@ -104,15 +104,13 @@ dims all three."
         ["◔" (if stale modes/gutter-face-test-stale modes/gutter-face-describe-partial)]
       else ["✓" (if stale modes/gutter-face-test-stale modes/gutter-face-test-pass)])))
 
-(defn- mark-line-keyed (buf key line)
-  ;; The value a line-keyed annotation holds for `line`, plus whether it predates the
-  ;; current text — `nil` when the annotation is missing or no longer positionally
-  ;; current (lines shifted, so it would point at the wrong ones). Every gutter
-  ;; source below is this same question; `std/editor/buffer`'s `annotation` owns the
-  ;; currency/staleness pairing so none of them re-derives it.
-  (let (a (editor/buffer/annotation buf key))
-    (when (and a (:current? a) (contains? (:value a) line))
-      {:at (get (:value a) line) :stale? (:stale? a)})))
+(defn- mark-line-keyed (value line)
+  ;; `{:at <what the annotation holds for `line`>}`, or nil when it holds nothing there.
+  ;; WRAPPED, not returned bare: a failing test's verdict is `false`, which is a mark and
+  ;; not an absence — returning it raw made `✗` vanish from the margin. The currency and
+  ;; staleness that used to ride along come from the source's annotation, read once per
+  ;; buffer (`gutter-marks-ctx`) rather than once per line per source.
+  (when (contains? value line) {:at (get value line)}))
 
 (defn- mark-eol-note (buf line)
   ;; The eol-note anchored on `line` (notes are keyed by owner, with `:line` inside —
@@ -121,11 +119,8 @@ dims all three."
   ;; verdict about a line, and a `·` beside every typed form is margin noise. Of the rest —
   ;; a line can carry more than one — the first in reading order glyphs the margin, which is
   ;; all one cell can say.
-  (let (a (editor/buffer/annotation buf :eol-notes))
-    (when (and a (:current? a))
-      (let (hit (first (seq/filter (results/notes-on-line buf line)
-                         (fn (n) (not (= (:kind n) :hint))))))
-        (when hit {:at hit :stale? (:stale? a)})))))
+  (let (hit (first (seq/filter (results/notes-on-line buf line) (fn (n) (not (= (:kind n) :hint))))))
+    (when hit {:at hit})))
 
 (defn- mark-verdict-glyph (verdict stale)
   ;; a test verdict: pass / fail / skipped, dimmed when it predates the text
@@ -165,44 +160,105 @@ dims all three."
       else ["⚠" modes/gutter-face-warn])))
 
 (def gutter-mark-sources
-  ;; The margin's sources in PRECEDENCE order. Each is `{:reader :glyph :on-click}`: the
-  ;; reader answers `{:at value :stale? bool}` for a line, the glyph turns that into
-  ;; `[text face]`, and `:on-click` is the command symbol a CLICK on that mark runs.
-  ;; Adding a source (an inline eval result, an LSP hint) is one row here, not another
-  ;; branch that re-implements the staleness dance.
+  ;; The margin's sources in PRECEDENCE order. Each is
+  ;; `{:annotation :lookup :glyph :on-click}`: `:annotation` is the buffer annotation the
+  ;; source reads, `:lookup` answers `{:at <hit>}` for one line (`(value line buf)`, nil
+  ;; when that line has none — WRAPPED, since a hit can legitimately BE `false`: that is a
+  ;; FAILING test's verdict), `:glyph` turns it into `[text face]`, and `:on-click` is the
+  ;; command symbol a CLICK on that mark runs. Adding a source (an inline eval result, an
+  ;; LSP hint) is one row here, not another branch that re-implements the staleness dance.
+  ;;
+  ;; Naming the ANNOTATION rather than hiding it inside a reader is what lets the column be
+  ;; built with five annotation reads instead of five per line — see `gutter-marks-ctx`.
   ;;
   ;; The click lives beside the glyph deliberately: the margin shows one mark per line,
   ;; and resolving the click through the same table is what makes pressing it do the thing
   ;; you can see. A row with no `:on-click` leaves the click to the mode's own
   ;; `:gutter-click` — as does a line with no mark at all, which is how a breakpoint gets
   ;; SET on a bare line rather than only cleared from a marked one.
-  [{:reader (fn (buf line) (mark-line-keyed buf :debug-break-lines line))
+  [{:annotation :debug-break-lines
+    :lookup (fn (value line _) (mark-line-keyed value line))
     :glyph (fn (_ _) ["●" modes/gutter-face-breakpoint])
     :on-click nil} ; brood-mode's `:gutter-click` toggles it — setting and clearing are one command
-   {:reader (fn (buf line) (mark-line-keyed buf :test-marks line))
+   {:annotation :test-marks
+    :lookup (fn (value line _) (mark-line-keyed value line))
     :glyph (fn (verdict stale) (mark-verdict-glyph verdict stale))
     :on-click nil}
-   {:reader (fn (buf line) (mark-line-keyed buf :describe-marks line))
+   {:annotation :describe-marks
+    :lookup (fn (value line _) (mark-line-keyed value line))
     :glyph (fn (tally stale) (describe-rollup-mark tally stale))
     :on-click nil}
-   {:reader (fn (buf line) (mark-eol-note buf line))
+   {:annotation :eol-notes
+    :lookup (fn (_ line buf) (mark-eol-note buf line))
     :glyph (fn (note stale) (mark-note-glyph note stale))
     :on-click nil}
    ;; last: a line that already carries a verdict keeps it. A playground form that RAISED
    ;; says ✗ about what it did, which outranks an advisory about what it might do.
-   {:reader (fn (buf line) (mark-line-keyed buf :diagnostic-lines line))
+   {:annotation :diagnostic-lines
+    :lookup (fn (value line _) (mark-line-keyed value line))
     :glyph (fn (ds stale) (mark-diagnostic-glyph ds stale))
     :on-click 'diagnostics/open-from-margin}])
 
+;; ---- the gutter context: the buffer's answers, read once per COLUMN --------
+;; `editor/buffer/annotation` allocates a `{:value :current? :stale?}` map and calls
+;; `buffer-line-count` on every call, and every mark source asked it PER LINE — as did the
+;; change bar. A 49-row gutter therefore did ~300 of each, per rebuild, and a rebuild was
+;; every keystroke: the cache key carried the live rope, because a mark dims once the text
+;; moves past it. Together that was ~2 ms of a 5.5 ms typing turn, spent asking the same six
+;; questions forty-nine times over.
+;;
+;; The answers are per BUFFER, not per line, so they are read once into a context and the
+;; per-line work becomes a map lookup. The context travels on a dynvar rather than through
+;; `:gutter-cell`'s arguments because the column is built through a MODE SERVICE, whose
+;; contract is `(buf line gw)` and is not this concern's to widen; each reader falls back to
+;; asking the buffer itself when no column is being built (a click, a test).
+;;
+;; It is also the cache KEY (`panes/ed-gutter-key`), which is the other half of the fix: a
+;; mark's staleness is a BOOLEAN that flips once, so keying on it rebuilds the column on the
+;; first keystroke after a test run and reuses it on every one after — where keying on the
+;; rope rebuilt on all of them.
+
+(defdyn *gutter-ctx* nil)
+;; The gutter context in force while a column is built — nil outside one.
+
+(defn gutter-ctx (buf)
+  "Everything a gutter cell reads about the BUFFER rather than about its line, read once:
+`:bars` — the diff-hl change-bar map, only while positionally current — and `:marks`, each
+`gutter-mark-sources` row's annotation as `{:value :stale?}` (nil where the source has
+nothing, or where lines have shifted and it would now point at the wrong ones)."
+  {:bars (editor/buffer/annotation-value buf :git-line-status)
+   :marks
+     (into []
+       (map gutter-mark-sources
+         (fn (source)
+           (let (a (editor/buffer/annotation buf (:annotation source)))
+             ;; An EMPTY annotation is recorded as absent, not as an empty-and-stale one.
+             ;; It marks no line, so its staleness cannot change a single cell — but it
+             ;; flips on every edit, and this context is the cache key, so leaving it in
+             ;; rebuilt the whole column on every keystroke over a clean file. (A checker
+             ;; that finds nothing still stamps `:diagnostic-lines {}`, which is exactly
+             ;; the common case.)
+             (when (and a (:current? a) (not (empty? (:value a))))
+               {:value (:value a) :stale? (:stale? a)})))))})
+
+(defn gutter-bars (buf)
+  "The change-bar map for `buf` — from the column's context when one is in force."
+  (let (ctx *gutter-ctx*)
+    (if ctx (:bars ctx) (editor/buffer/annotation-value buf :git-line-status))))
+
 (defn- gutter-hit (buf line)
-  ;; `[source found]` for the first source with something to say about `line`, or nil.
-  ;; `keep` then `first`: each source's reader runs at most ONCE per line (a `find`
-  ;; followed by re-reading the winner ran it twice — two annotation lookups and two
-  ;; staleness comparisons per line per frame).
-  (first (seq/keep gutter-mark-sources
-           (fn (source)
-             (let (found ((:reader source) buf line))
-               (when found [source found]))))))
+  ;; `[source {:at :stale?}]` for the first source with something to say about `line`, or
+  ;; nil. Reads the column's context when one is in force, else builds one for this line —
+  ;; so a single-line caller (a click, a test) needs no ceremony.
+  (let (ctx (:marks (or *gutter-ctx* (gutter-ctx buf))))
+    (first
+      (seq/keep (range (count gutter-mark-sources))
+        (fn (i)
+          (let (ann (nth ctx i))
+            (when ann
+              (let (source (nth gutter-mark-sources i)
+                    found ((:lookup source) (:value ann) line buf))
+                (when found [source {:at (:at found) :stale? (:stale? ann)}])))))))))
 
 (defn gutter-mark-for (buf line)
   "The `[glyph face]` margin mark for `line`, or nil: the first source in
@@ -271,7 +327,7 @@ would land on the wrong line; we blank the bars until the idle recompute lands a
       [(string/pad-right (string/pad-left (str (inc line)) (- gw modes/line-number-right-margin))
          gw)
         modes/gutter-face-line-number]
-      (let (bars (editor/buffer/annotation-value buf :git-line-status)
+      (let (bars (gutter-bars buf)
             status (when bars (get bars line)))
         ;; a file buffer's bar takes column 0; the number chunk fills the remaining `gw-1`,
         ;; again with `line-number-right-margin` trailing spaces before the text.
