@@ -163,7 +163,13 @@ so it is a Brood file first and a playground second."
 ;; ---- the sandbox client hooks (registered in `sandbox-events/*clients*`) --------------
 
 (defn playground-sandbox-ready (m gen banner) (playground-core/sandbox-ready *spec* m gen))
-(defn playground-sandbox-reply (m reply gen) (playground-core/sandbox-reply *spec* m reply gen))
+(defn playground-sandbox-reply (m reply gen)
+  ;; An attach/detach answer is this module's too — it is the only registered client of the
+  ;; Brood session that owns a command which asks one — so it is taken here before the
+  ;; playground's own fold, which would drop an id it did not send.
+  (if (attach-reply? m reply)
+    (brood-attach-reply m reply)
+    (playground-core/sandbox-reply *spec* m reply gen)))
 (defn playground-sandbox-down (m code) (playground-core/sandbox-down *spec* m code))
 
 ;; ---- the pane follows the cursor -------------------------------------------------------
@@ -288,3 +294,79 @@ has the same command on `C-c C-k`; both drive the same shared child."
         (sandbox-events/ensure) ; the UiEvent impls live there; loading it IS registering them
         (if (sandbox-running?) (sandbox-reset) (sandbox-start))))
     (message m "restarting the playground sandbox…")))
+
+;; ---- attaching the Brood session to a node that is already running ------------------------
+;; The mirror of `beam-attach`, and for the same reason: the session is an ordinary Brood
+;; runtime, so pointing it at a peer turns the editor from a view of a PROJECT into a view
+;; of a RUNNING SYSTEM. Evaluation routes there (`node/spawn-sync` in the child — see
+;; `eval-server`), so the playground, `C-x C-e` and the tutorial all follow it.
+;;
+;; Brood asks one thing of the target that the BEAM does not: it must have called
+;; `(node/serve-spawns)`. That is the opt-in, and it is a better default than the BEAM's —
+;; an editor cannot reach into a program that has not said it may be reached into.
+
+(defn attached-node (m)
+  "The node this editor's Brood session is routed to, or nil for its own."
+  (get-in m [:sandbox :attached]))
+
+(defn- brood-attach-reply (m reply)
+  "Report what an attach or detach actually did. Reported rather than assumed: an attach
+that silently did not happen leaves you evaluating locally while believing you are not."
+  (let (m1 (assoc-in m [:sandbox :attaching] nil)
+        node (get reply :node))
+    (cond
+      (not (get reply :ok))
+        (message (assoc-in m1 [:sandbox :attached] nil)
+          (str "could not attach: " (get reply :error "unknown error")))
+      (nil? node)
+        (message (assoc-in m1 [:sandbox :attached] nil) "detached — back on bedit's own runtime")
+      else
+        (message (assoc-in m1 [:sandbox :attached] node)
+          (str "attached to " node " — every evaluation now runs THERE")))))
+
+(defn attach-reply? (m reply)
+  "Is this reply the answer to an attach/detach this editor asked for?"
+  (and (get-in m [:sandbox :attaching]) (= (get-in m [:sandbox :attaching]) (get reply :id))))
+
+(defcommand cmd-brood-attach
+  (m key)
+  "Attach the Brood session to a node that is already running (M-x brood-attach): prompts
+for the node, then for its cookie.
+
+After it, the playground and `C-x C-e` evaluate THERE — which is the point, and is why the
+mode line says so for as long as it lasts. `M-x brood-detach` goes back.
+
+The node is typed rather than picked from a list on purpose: a menu of reachable nodes is
+one keystroke away from evaluating on production. `\"name\"` dials a local node over its
+Unix socket; `\"name@host:port\"` dials one over TCP."
+  (if (not (sandbox-running?))
+    (message m "no Brood session to attach — open a playground or evaluate something first")
+    (assoc m
+      :minibuffer
+        {:edit (ed-mb-edit "Attach to node: " "")
+         :on-complete
+           (fn (m1 spec)
+             (if (= (string/trim spec) "")
+               (message m1 "no node named")
+               (assoc m1
+                 :minibuffer
+                   {:edit (ed-mb-edit (str "Cookie for " (string/trim spec) ": ") "")
+                    :on-complete
+                      (fn (m2 cookie)
+                        (let (id (sandbox-next-id m2)
+                              sent (sandbox-attach id (string/trim spec) (string/trim cookie)))
+                          (if (not sent)
+                            (message m2 "the session is not running")
+                            (message (assoc-in (sandbox-ids-used m2 (inc id)) [:sandbox :attaching] id)
+                              (str "connecting to " (string/trim spec) "…")))))})))})))
+
+(defcommand cmd-brood-detach
+  (m key)
+  "Route the Brood session back to bedit's own runtime (M-x brood-detach)."
+  (if (nil? (attached-node m))
+    (message m "not attached to anything")
+    (let (id (sandbox-next-id m)
+          sent (sandbox-detach id))
+      (if (not sent)
+        (message m "the session is not running")
+        (message (assoc-in (sandbox-ids-used m (inc id)) [:sandbox :attaching] id) "detaching…")))))
