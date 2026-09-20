@@ -1,0 +1,155 @@
+;; help_test.blsp — the C-h map: describe-bindings, describe-mode, where-is, apropos,
+;; lossage. Pure model/text tests — no window.
+;;
+;; The one these exist for is SHADOWING. bedit composes a buffer's mode layers over the
+;; model's profile layers, and the merge is shallow, so a mode that binds one key under a
+;; prefix takes the whole prefix with it. Help that reported per-leaf shadowing would list
+;; bindings that dispatch can never reach — and be believed. Every binding report here is
+;; asserted against what `input/ed-active-keymap` actually resolves.
+(defmodule help-test
+  (:use test)
+  (:use model)
+  (:use help)
+  (:use editor/buffer)
+  (:use editor/layers)
+  (:use-internals bedit/input)) ; ed-ensure-layers / ed-active-keymap — the test asserts help
+  ; against the DISPATCHER's own keymap, which is the whole point of it
+
+(defn- ht-model ()
+  "A fresh editor model with layers installed, as the dispatcher would see it."
+  (input/ed-ensure-layers (ed-init (make-buffer ""))))
+
+(defn- ht-entries (m)
+  "`scope-bindings` over the model's real scope — buffer layers over model layers."
+  (scope-bindings (list (ed-current-buf m) m)))
+
+(defn- ht-find (entries sequence)
+  (seq/find entries (fn (e) (= (get e :sequence) sequence))))
+
+;; ---- what help reports is what dispatch does --------------------------------
+
+(describe "the binding report agrees with the dispatcher"
+  (test "every binding help calls in force resolves through the active keymap"
+    (let (m (ht-model)
+          km (input/ed-active-keymap m)
+          live (seq/filter (ht-entries m) (fn (e) (nil? (get e :shadowed-by))))
+          ;; the property: follow each in-force sequence through the composed keymap and
+          ;; arrive at the same command. A disagreement here is help lying about a key.
+          wrong (seq/filter live
+                  (fn (e)
+                    (not (= (get-in km (vec (get e :sequence))) (get e :command))))))
+      (assert= (map wrong (fn (e) (ed-keys-label (get e :sequence)))) '())))
+  (test "and nothing it calls shadowed resolves to that command"
+    (let (m (ht-model)
+          km (input/ed-active-keymap m)
+          dead (seq/filter (ht-entries m) (fn (e) (get e :shadowed-by)))
+          reachable (seq/filter dead
+                      (fn (e) (= (get-in km (vec (get e :sequence))) (get e :command)))))
+      (assert= (map reachable (fn (e) (ed-keys-label (get e :sequence)))) '())))
+  (test "a real binding is found, with the layer that owns it"
+    ;; C-x C-f is the emacs profile's, and nothing in a scratch buffer shadows it
+    (let (e (ht-find (ht-entries (ht-model)) [:ctrl-x :ctrl-f]))
+      (assert= [(get e :command) (get e :shadowed-by)] ['commands/cmd-find-file nil]))))
+
+;; ---- the *Bindings* text ----------------------------------------------------
+
+(describe "describe-bindings"
+  (test "the report names each layer and counts its bindings"
+    (let (text (help-bindings-text
+                 [{:sequence [:ctrl-x "s"] :command 'commands/cmd-save :layer 'emacs
+                   :shadowed-by nil}]))
+      (assert= (includes? text "emacs layer  (1 binding)") true)
+      (assert= (includes? text "C-x s") true)
+      (assert= (includes? text "save") true)))
+  (test "a shadowed binding is listed AND says who shadowed it"
+    ;; listed, not filtered: a binding that silently vanished is the hardest thing to
+    ;; debug about a layered keymap, and this line is the answer
+    (let (text (help-bindings-text
+                 [{:sequence [:ctrl-x "k"] :command 'commands/cmd-kill-buffer :layer 'emacs
+                   :shadowed-by 'dired}]))
+      (assert= (includes? text "C-x k") true)
+      (assert= (includes? text "(shadowed by dired)") true)))
+  (test "layers keep precedence order, highest first"
+    (let (text (help-bindings-text
+                 [{:sequence ["a"] :command 'commands/cmd-one :layer 'high :shadowed-by nil}
+                  {:sequence ["b"] :command 'commands/cmd-two :layer 'low :shadowed-by nil}]))
+      (assert= (< (index-of text "high layer") (index-of text "low layer")) true)))
+  (test "the command runs on a real model and produces the buffer"
+    (let (m (help/cmd-describe-bindings (ht-model) nil))
+      (assert= (:name (ed-current-buf m)) "*Bindings*")
+      (assert= (includes? (buffer-text (ed-current-buf m)) "emacs layer") true))))
+
+;; ---- describe-mode ----------------------------------------------------------
+
+(describe "describe-mode"
+  (test "a layer's :doc is its description"
+    (let (text (help-mode-text [{:name 'special :doc "A generated, read-only buffer."}] []))
+      (assert= (includes? text "special — A generated, read-only buffer.") true)))
+  (test "a layer with no :doc falls back to what it binds, not to a blank"
+    (let (text (help-mode-text [{:name 'bare :keymap {"a" 'commands/cmd-one}}] []))
+      (assert= (includes? text "bare — 1 binding") true)))
+  (test "only the bindings actually in force are listed under a layer"
+    (let (text (help-mode-text [{:name 'mode :doc "d"}]
+                 [{:sequence ["a"] :command 'commands/cmd-live :layer 'mode :shadowed-by nil}
+                  {:sequence ["b"] :command 'commands/cmd-dead :layer 'mode
+                   :shadowed-by 'above}]))
+      (assert= (includes? text "live") true)
+      (assert= (includes? text "dead") false)))
+  (test "the command runs and names the buffer's layers"
+    (let (m (help/cmd-describe-mode (ht-model) nil))
+      (assert= (:name (ed-current-buf m)) "*Modes*"))))
+
+;; ---- apropos ----------------------------------------------------------------
+
+(describe "apropos-command"
+  (test "matches a substring of the command name, case-insensitively"
+    (assert= (count (help-apropos-rows ["find-file" "save-buffer"] [] "FIND")) 1))
+  (test "a row carries the key when the command is bound"
+    (let (rows (help-apropos-rows ["find-file"]
+                 [{:sequence [:ctrl-x :ctrl-f] :command (interactive/command-sym "find-file")
+                   :layer (quote emacs) :shadowed-by nil}]
+                 "find-file"))
+      (assert= (includes? (first rows) "C-x C-f") true)))
+  (test "a shadowed binding is NOT offered as the way to run it"
+    ;; compared against the unshadowed row rather than searched for the key text:
+    ;; `cmd-find-file`'s own docstring says "(C-x C-f)", so a substring test here passes
+    ;; whatever the code does — which is how a green test comes to assert nothing
+    (let (entry {:sequence [:ctrl-x :ctrl-f]
+                 :command (interactive/command-sym "find-file")
+                 :layer 'emacs}
+          live (first (help-apropos-rows ["find-file"] [(assoc entry :shadowed-by nil)] "find-file"))
+          dead (first (help-apropos-rows ["find-file"] [(assoc entry :shadowed-by 'dired)] "find-file")))
+      (assert= (> (string/length live) (string/length dead)) true)))
+  (test "no match is no rows, not an empty report"
+    (assert= (count (help-apropos-rows ["find-file"] [] "zzz")) 0)))
+
+;; ---- lossage ----------------------------------------------------------------
+
+(describe "view-lossage"
+  (test "keys are recorded in press order"
+    (let (m (fold [:ctrl-a "x" :ctrl-e] (ht-model) (fn (acc k) (lossage-record acc k))))
+      (assert= (:lossage m) [:ctrl-a "x" :ctrl-e])))
+  (test "the ring is capped, keeping the most recent"
+    (let (m (fold (range (+ *lossage-max* 5)) (ht-model) (fn (acc n) (lossage-record acc (str n)))))
+      (assert= (count (:lossage m)) *lossage-max*)
+      (assert= (last (:lossage m)) (str (+ *lossage-max* 4)))))
+  (test "dispatching a key records it — including one no keymap binds"
+    ;; the whole point of C-h l: a key that did nothing is still in the list, which is
+    ;; the only place the evidence exists
+    (let (m (input/ed-dispatch (ht-model) :f13))
+      (assert= (last (:lossage m)) :f13)))
+  (test "an empty ring says so rather than showing an empty buffer"
+    (let (m (help/cmd-view-lossage (ht-model) nil))
+      (assert= (includes? (buffer-text (ed-current-buf m)) "No keys recorded") true))))
+
+;; ---- describe-key names the layer ------------------------------------------
+
+(describe "describe-key"
+  (test "a bound key reports the layer it came from"
+    (assert= (binding-layer (ht-model) [:ctrl-x :ctrl-f]) 'emacs))
+  (test "an unbound key has no layer rather than a wrong one"
+    (assert= (binding-layer (ht-model) [:f13]) nil))
+  (test "C-h k says the layer in its echo line"
+    (let (asked (input/ed-route-transient (input/ed-route-transient (ht-model) :ctrl-h) "k")
+          told (input/ed-route-transient asked :ctrl-a))
+      (assert= (includes? (:echo told) "(emacs layer)") true))))

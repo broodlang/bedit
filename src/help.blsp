@@ -1,0 +1,297 @@
+;; help.blsp — the C-h map: what is bound, what is on, what a name means.
+;;
+;; bedit registers 382 interactive commands and composes its keymap from a buffer's mode
+;; layers over the model's profile layers. Before this file there was no way to see either
+;; from inside the editor: C-h bound four keys, and the only route to a command you had
+;; not memorised was guessing at M-x. An editor you are meant to REDEFINE at runtime has to
+;; be able to tell you what it currently does — discoverability is not a nicety here, it is
+;; the precondition for the self-editing story.
+;;
+;; Everything that reports a BINDING goes through `editor/layers/scope-bindings`, which
+;; walks the layer stack in dispatch order and returns each binding with the layer it came
+;; from and what shadows it. That is the point: help derived beside the dispatcher drifts
+;; from it and then lies, and a keymap help that lies is worse than none because it is
+;; believed. `scope-bindings` is the same shallow-merge rule `scope-keymap` dispatches
+;; through, so "in force" here means reachable there, by construction.
+(defmodule help
+  "The help system: `C-h b` every binding grouped by the layer that owns it (shadowed ones
+shown, and marked), `C-h m` the active modes, `C-h w` where a command is bound, `C-h a`
+apropos over the command registry, `C-h l` the keys you last pressed, `C-h ?` the help map
+itself. Reports bindings through `editor/layers/scope-bindings`, so what help says is what
+dispatch does."
+  (:use model) ; message / ed-keys-label / ed-doc / ed-first-line / ed-name-prompt
+  (:use commands) ; ed-show-named — the report buffer
+  (:use interactive) ; defcommand / command-names / command-sym
+  (:use editor/layers)) ; scope-bindings / active-layers — the layer stack with provenance
+
+(def *lossage-max* 100)
+;; How many recent keys `C-h l` remembers (Emacs keeps 300 in a C ring). The model carries
+;; them as a plain vector, so the cap is what stops a long session growing a field without
+;; bound — and it is read at trim time, not baked in, so raising it takes effect live.
+
+(sig lossage-record (model any -> model))
+(defn lossage-record (m key)
+  "`m` with `key` appended to the lossage ring, trimmed to `*lossage-max*`. Called by the
+dispatcher for every key that reaches it — including the ones no keymap binds, because
+\"nothing happened\" is exactly what you press C-h l to explain."
+  (let (ring (or (:lossage m) [])
+        grown (conj ring key))
+    (assoc m
+      :lossage
+        ;; `into []` is load-bearing: `seq/take-last` answers a LIST, and `conj` inserts at
+        ;; each kind's natural point — the head of a list. Left as one, the ring silently
+        ;; reversed itself the moment it first overflowed, and `C-h l` showed the hundred
+        ;; keys before the last hundred, newest last. It stays a vector so `conj` appends.
+        (if (> (count grown) *lossage-max*) (into [] (seq/take-last grown *lossage-max*)) grown))))
+
+;; ---- the binding report ----------------------------------------------------
+
+(defn- help-count-label (n what)
+  "`\"1 binding\"` / `\"3 bindings\"` — a count with its noun agreeing. Help is prose, and
+\"1 bindings\" in a report whose whole claim is precision reads as carelessness."
+  (str n " " what (if (= n 1) "" "s")))
+
+(defn- help-scope (m)
+  "The scope contexts help reports on, in dispatch precedence: the current buffer's mode
+layers over the model's profile layers. The SAME list `input/ed-active-keymap` composes for
+dispatch — named once here so help cannot come to disagree with it by drifting."
+  (list (ed-current-buf m) m))
+
+(defn- help-binding-row (entry key-width)
+  "One `scope-bindings` entry as a report line: the key sequence, the command's short name,
+and — for a shadowed binding — which layer took the chord away from it."
+  (let (label (ed-keys-label (:sequence entry))
+        pad (string/repeat " " (math/max 1 (- key-width (string/length label))))
+        ;; the M-x name, not the function's — `find-file`, not `cmd-find-file`. A reader who
+        ;; finds a command here wants to be able to type it into M-x, and `cmd-` is the one
+        ;; part of the symbol that would stop them
+        name (command-friendly-name (ed-command-tail (:command entry)))
+        shadow (:shadowed-by entry))
+    (str "  "
+      label
+      pad
+      name
+      (if (nil? shadow) "" (str "   (shadowed by " (->string shadow) ")")))))
+
+(defn- help-by-layer (entries)
+  "`entries` grouped into `[layer-name rows]` pairs, layers in precedence order (highest
+first) and each layer's rows sorted by key label. Grouping is by LAYER rather than by key
+because that is the question being asked: a binding you did not expect is explained by which
+layer owns it, and the layers are already in the order that decides who wins."
+  (let (order (seq/distinct (map entries :layer)))
+    (map order
+      (fn (nm)
+        [nm
+         (sort-by (seq/filter entries (fn (e) (= (:layer e) nm)))
+           (fn (e) (ed-keys-label (:sequence e))))]))))
+
+(sig help-bindings-text (seqable -> string))
+(defn help-bindings-text (entries)
+  "The *Bindings* buffer text for `scope-bindings` `entries`: a section per layer, highest
+precedence first, each row `key   command`, with a shadowed row saying who shadowed it.
+
+Shadowed bindings are LISTED, not filtered out. A binding that silently vanished is the
+single hardest thing to debug about a layered keymap, and the answer — some layer above took
+the whole chord — is exactly what this line says."
+  (let (width (fold entries
+                8
+                (fn (acc e) (math/max acc (+ 2 (string/length (ed-keys-label (:sequence e)))))))
+        groups (help-by-layer entries))
+    (string/join
+      (map groups
+        (fn (group)
+          (let ([nm rows] group)
+            (string/join
+              (cons (str (->string nm) " layer  (" (help-count-label (count rows) "binding") ")")
+                (map rows (fn (e) (help-binding-row e width))))
+              "\n"))))
+      "\n\n")))
+
+(defcommand cmd-describe-bindings
+  (m key)
+  "List every key binding in force, grouped by the layer that owns it (C-h b). Shadowed
+bindings are shown too, marked with the layer that took their chord — Emacs's
+`describe-bindings`, plus the provenance a layered keymap needs it to have."
+  (let (entries (scope-bindings (help-scope m)))
+    (ed-show-named m
+      "*Bindings*"
+      (str "Key bindings in force, highest-precedence layer first.\n"
+        "A shadowed binding is unreachable: some layer above owns its chord.\n\n"
+        (help-bindings-text entries)
+        "\n")
+      :help)))
+
+(sig binding-layer (model vector -> any))
+(defn binding-layer (m sequence)
+  "The name of the layer that binds key `sequence` in force, or nil when nothing does —
+`C-h k`'s \"why this command and not the one I expected\".
+
+Asked of `scope-bindings` rather than worked out from the keymap, for the reason the whole
+file exists: this must be the layer dispatch actually took the binding from, not the layer
+that looks like it should have."
+  (let (hit (seq/find (scope-bindings (help-scope m))
+              (fn (e) (and (nil? (:shadowed-by e)) (= (:sequence e) sequence)))))
+    (if (nil? hit) nil (:layer hit))))
+
+;; ---- the active modes ------------------------------------------------------
+
+(defn- help-layer-doc (layer)
+  "A layer's one-line description for `C-h m`: its `:doc` when it declares one, else the
+count of keys it binds — something true rather than a blank."
+  (let (d (:doc layer))
+    (if (string? d)
+      (ed-first-line d)
+      (help-count-label (count (editor/keymap/keymap-bindings (or (:keymap layer) {}))) "binding"))))
+
+(sig help-mode-text (seqable seqable -> string))
+(defn help-mode-text (layers entries)
+  "The *Modes* buffer text: the active layers highest-precedence first, each with its
+description and the bindings it contributes that are actually in force."
+  (string/join
+    (map layers
+      (fn (layer)
+        (let (nm (:name layer)
+              mine (seq/filter entries
+                     (fn (e) (and (= (:layer e) nm) (nil? (:shadowed-by e)))))
+              width (fold mine
+                      8
+                      (fn (acc e) (math/max acc (+ 2 (string/length (ed-keys-label (:sequence e))))))))
+          (string/join
+            (append (list (str (->string nm) " — " (help-layer-doc layer)))
+              (map (sort-by mine (fn (e) (ed-keys-label (:sequence e))))
+                (fn (e) (help-binding-row e width))))
+            "\n"))))
+    "\n\n"))
+
+(defcommand cmd-describe-mode
+  (m key)
+  "Describe the modes active in this buffer (C-h m): every layer in the stack, highest
+precedence first, with what it is and the keys it contributes that are in force."
+  (let (layers (active-layers {:layers (compose-layers (help-scope m))})
+        entries (scope-bindings (help-scope m)))
+    (ed-show-named m
+      "*Modes*"
+      (str "Active layers for this buffer, highest precedence first.\n\n"
+        (help-mode-text layers entries)
+        "\n")
+      :help)))
+
+;; ---- where-is / apropos ----------------------------------------------------
+
+(defn- help-keys-for (entries name)
+  "Every key sequence bound to the command whose M-x name is `name` and that is in force,
+as labels. Shadowed bindings are left out on purpose: this answers \"how do I run it\",
+and a key that cannot reach the command is not an answer to that.
+
+`name` is resolved to its SYMBOL before comparing, because the two spellings differ — the
+registry keys on the friendly name (`find-file`, `cmd-` stripped by
+`interactive/command-friendly-name`) while a keymap binds `commands/cmd-find-file`.
+Comparing the name to the tail directly never matches, and the failure is silent: every
+command reports as unbound. `plume-command-annotation` resolves the same way."
+  (let (sym (command-sym name)
+        tail (if (nil? sym) nil (ed-command-tail sym)))
+    (if (nil? tail)
+      '()
+      (map (seq/filter entries
+             (fn (e) (and (nil? (:shadowed-by e)) (= (ed-command-tail (:command e)) tail))))
+        (fn (e) (ed-keys-label (:sequence e)))))))
+
+(defcommand cmd-where-is
+  (m key)
+  "Report the keys that run a command (C-h w): prompt for a command name with completion,
+then say where it is bound — or that it is M-x only."
+  (let (entries (scope-bindings (help-scope m)))
+    (assoc m
+      :minibuffer
+        (ed-name-prompt "Where is command: "
+          (command-names)
+          (fn (mm t)
+            (let (keys (help-keys-for entries t))
+              (message mm
+                (if (empty? keys)
+                  (str t " is not on any key (M-x " t ")")
+                  (str t " is on " (string/join keys ", "))))))))))
+
+(sig help-apropos-rows (seqable seqable string -> seqable))
+(defn help-apropos-rows (names entries pattern)
+  "The `C-h a` rows for `pattern`: every command name containing it (case-folded), with its
+keys and the first line of its docstring. Substring, not fuzzy — apropos is for \"what is
+there about buffers\", and a fuzzy match over 382 names answers a different question."
+  (let (needle (string/fold-case pattern))
+    (map (seq/filter names (fn (n) (includes? (string/fold-case n) needle)))
+      (fn (n)
+        (let (keys (help-keys-for entries n)
+              d (ed-doc (command-sym n)))
+          (str "  "
+            n
+            (if (empty? keys) "" (str "   (" (string/join keys ", ") ")"))
+            "\n      "
+            (if (string? d) (ed-first-line d) "(no docstring)")))))))
+
+(defcommand cmd-apropos-command
+  (m key)
+  "List commands whose name matches a pattern (C-h a), with their keys and docstring
+summary — the way into 382 registered commands when you know the noun but not the name."
+  (assoc m
+    :minibuffer
+      {:edit (ed-mb-edit "Apropos command: " "")
+       :on-complete
+         (fn (mm t)
+           (let (rows (help-apropos-rows (command-names) (scope-bindings (help-scope mm)) t))
+            (if (empty? rows)
+              (message mm (str "no command matches: " t))
+              (ed-show-named mm
+                "*Apropos*"
+                (str "Commands matching \"" t "\" (" (count rows) ")\n\n"
+                  (string/join rows "\n")
+                  "\n")
+                :help))))}))
+
+;; ---- lossage ---------------------------------------------------------------
+
+(defcommand cmd-view-lossage
+  (m key)
+  "Show the keys you last pressed (C-h l) — what actually reached the dispatcher, in order.
+The answer to \"what did I just do?\", and to \"why did nothing happen?\": a key that was
+swallowed is in this list, which is the only place it is visible."
+  (let (ring (or (:lossage m) []))
+    (ed-show-named m
+      "*Lossage*"
+      (if (empty? ring)
+        "No keys recorded yet.\n"
+        (str "The last " (count ring) " keys, oldest first:\n\n  "
+          (string/join (map ring ed-key-label) " ")
+          "\n"))
+      :help)))
+
+;; ---- the help map itself ---------------------------------------------------
+
+(def *help-map-rows*
+  ;; `[key what]` for the C-h map, as data — `C-h ?` renders it, and a new help command is
+  ;; a row here rather than a line of prose that goes stale the first time one is added.
+  [["C-h ?" "this list"]
+   ["C-h b" "describe-bindings — every key in force, by layer"]
+   ["C-h m" "describe-mode — the layers active in this buffer"]
+   ["C-h k" "describe-key — what one key runs, and where it is bound"]
+   ["C-h f" "describe-function — a command's docstring"]
+   ["C-h w" "where-is — the keys that run a command"]
+   ["C-h a" "apropos-command — commands matching a pattern"]
+   ["C-h l" "view-lossage — the keys you last pressed"]
+   ["C-h t" "the interactive tutorial"]
+   ["C-h C-a" "about bedit"]])
+
+(defcommand cmd-help-for-help
+  (m key)
+  "List the help map (C-h ?) — what every key under C-h does. The entry point: you get here
+without knowing anything else, and everything else is one key away."
+  (ed-show-named m
+    "*Help*"
+    (str "bedit help\n\n"
+      (string/join
+        (map *help-map-rows*
+          (fn (row)
+            (let ([k what] row)
+              (str "  " k (string/repeat " " (math/max 1 (- 10 (string/length k)))) what))))
+        "\n")
+      "\n")
+    :help))
