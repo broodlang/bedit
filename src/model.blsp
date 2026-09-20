@@ -363,8 +363,8 @@ loaded, else answer `fallback`. The one guard every such call shares: a module n
 opened yet is not a client, and asking it anything is an unbound symbol."
   (if (bound? sym) ((reflect/eval sym) m) fallback))
 
-(sig ed-set-diagnostics (model (or nil (list diagnostic)) any -> model))
-(defn ed-set-diagnostics (m diags rope)
+(sig ed-set-diagnostics (model (or nil (list diagnostic)) any &optional (or nil string) -> model))
+(defn ed-set-diagnostics (m diags rope &optional (for-buffer nil))
   "The model with `diags` as its diagnostics cache, computed for `rope` (`:diag-rope`, the
 staleness key) — and indexed by line (`:diag-by-line`, `ed-diag-index`). The ONE setter,
 so the list and its index cannot disagree: both check paths (`ed-refresh-diagnostics`,
@@ -374,20 +374,22 @@ The index is also stamped on the BUFFER, as the `:diagnostic-lines` annotation. 
 what puts findings in the margin: every other mark there (a breakpoint, a test verdict, a
 result note) is a buffer annotation, and the gutter's cell cache is keyed on the buffer, so
 model state simply cannot reach it. Going through `annotate` also buys the currency std
-already owns — a finding blanks once lines have shifted and dims while the text differs
-from the text that produced it, instead of pointing confidently at the wrong line.
+already owns — a finding dims while the text differs from the text that produced it, and
+blanks once the lines have shifted under it.
 
-The `*Diagnostics*` pane is refreshed from the post-step rather than here, so this stays a
-pure `model -> model`; it no-ops unless the findings actually moved."
+`for-buffer` names the buffer the findings are ABOUT — nil for the synchronous path, which
+is always the current one. The stamp is gated on THAT and not on the rope, and the
+difference is a bug that was here: a check runs in a task, so its reply lands whenever it
+lands, and the rope has usually moved on by then because you kept typing. Gating on the
+rope threw those replies away — including the one that says \"clean now\", so errors you had
+already fixed stayed in the margin and on the mode line until some later check happened to
+land on an untouched buffer. Buffer identity is the question actually being asked (\"are
+these findings about this buffer?\"); how far the text has moved since is `annotate`'s, and
+it answers it by dimming."
   (let (index (ed-diag-index diags)
         m1 (assoc m :diagnostics diags :diag-rope rope :diag-by-line index)
         buf (ed-current-buf m1))
-    ;; …but only onto the buffer the findings are ABOUT. The check runs in a task and the
-    ;; reply folds in whenever it lands (`ed-apply-diag`), by which time the current buffer
-    ;; may be a different one — stamping that one would put this buffer's findings in
-    ;; another buffer's margin, at its line numbers. The rope the check was computed for is
-    ;; the identity test, and it is already the staleness key.
-    (if (= (buffer-rope buf) rope)
+    (if (= (or for-buffer (buffer-name buf)) (buffer-name buf))
       (ed-set-buf m1 (editor/buffer/annotate buf :diagnostic-lines index))
       m1)))
 
@@ -458,9 +460,10 @@ in-image task, which sees only the editor's own image."
             (assoc (sandbox/sandbox-ids-used m (inc id))
               :diag-req id
               :diag-sent (os/now)
-              :diag-checking rope)
+              :diag-checking rope
+              :diag-checking-buf (buffer-name buf))
             (let (job (task (fn () (svc text))))
-              (assoc m :diag-proc job :diag-checking rope)))))))
+              (assoc m :diag-proc job :diag-checking rope :diag-checking-buf (buffer-name buf))))))))
 
 ;; ---- the sandbox's diagnostics client (registered in `sandbox-events`) --------
 
@@ -484,7 +487,7 @@ is another client's, untouched."
       ;; loaded a large project overran) or a checker error: keep the old cache and
       ;; leave `:diag-rope` as it was, so the buffer stays stale and the next idle beat
       ;; sends again — `ed-apply-diag` would record the rope as checked
-      (dissoc m :diag-req :diag-checking))
+      (dissoc (dissoc m :diag-req :diag-checking) :diag-checking-buf))
     m))
 
 (defn ed-diag-sandbox-down (m code)
@@ -493,7 +496,7 @@ or never will), so the next idle beat re-sends. A worker that GAVE UP (`:gave-up
 the child died three times in a row, e.g. a project whose manifest it cannot load —
 or `:spawn-failed`) turns the sandbox off for this model's checks (`:diag-sandbox-off`):
 they run in-image from then on rather than respawning a doomed child on every idle beat."
-  (let (m1 (dissoc m :diag-req :diag-checking))
+  (let (m1 (dissoc (dissoc m :diag-req :diag-checking) :diag-checking-buf))
     (if (or (= code :gave-up) (= code :spawn-failed)) (assoc m1 :diag-sandbox-off true) m1)))
 
 (defdyn *warm-tree-min*
@@ -549,9 +552,10 @@ the buffer moved on while it ran, `ed-tree-warm-stale?` fires again on the next 
 errored / timed out) into the model: store it against the rope it was computed for
 (`:diag-checking` → `:diag-rope`) and clear the in-flight handle. `ed-diag-stale?` then
 re-fires iff the buffer moved on while the check ran, so the next idle tick relaunches."
-  (assoc (ed-set-diagnostics m (or result '()) (:diag-checking m))
+  (assoc (ed-set-diagnostics m (or result '()) (:diag-checking m) (:diag-checking-buf m))
     :diag-proc nil
-    :diag-checking nil))
+    :diag-checking nil
+    :diag-checking-buf nil))
 
 ;; ---- diff-hl annotation, off the loop (mirrors the diagnostics pair) ---------
 ;; Diffing a buffer against its HEAD blob is `std/diff` over the whole file. On a large
@@ -1202,6 +1206,11 @@ blinks at rest. Finally refreshes the open minibuffer's memoized candidate list
         ;; the *Diagnostics* pane, if one is up, follows the findings — free unless they
         ;; moved (`diagnostics/refresh` compares the staleness key before it renders)
         m2 (ed-call-deferred m2 'diagnostics/refresh m2)
+        ;; …and a completion popup that no longer describes where point is closes. The
+        ;; overlays dismiss it for a key it does not own, but a MOUSE click never reaches
+        ;; them (`ed-mouse` folds it directly), so clicking away left the list on screen
+        ;; anchored to a line you had left
+        m2 (ed-call-deferred m2 'complete-at-point/close-stale-popup m2)
         ;; the live-evaluating buffers' notes follow the text on the edit itself (the
         ;; debounce only EVALUATES) — the same deferred-module guard as their stale? probes
         ;; above, and both are O(1) until their own buffer's notes go stale
