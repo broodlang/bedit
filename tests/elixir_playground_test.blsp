@@ -613,3 +613,80 @@ no fourth field is an error here — which is what a malformed request is."
         ;; and the session is still the same session after all of it
         (assert= (get (ask 13 "survivor") :value) ":yes")
         (elixir-sandbox/elixir-shutdown)))))
+
+;; ---- the warm TEST node, end to end -----------------------------------------------
+;; The Brood half of this has a test that drives a real child through the model; this is
+;; the Elixir half, which until now was verified only by hand. Gated on `mix`, and slow by
+;; nature (the fixture compiles), so it is one test covering the whole chain: boot, the
+;; recompile that keeps it honest, a streamed verdict per test, and the summary.
+(def elixir-mix? (not (nil? (os/which "mix"))))
+
+(defn ept-fixture (dir)
+  (file/mkdir dir)
+  (file/mkdir (path/join dir "lib"))
+  (file/mkdir (path/join dir "test"))
+  (file/spit (path/join dir "mix.exs")
+    (str "defmodule Fix.MixProject do\n"
+      "  use Mix.Project\n"
+      "  def project, do: [app: :fix, version: \"0.1.0\", elixir: \"~> 1.14\", deps: []]\n"
+      "  def application, do: []\n" "end\n"))
+  (file/spit (path/join dir "lib/fix.ex") "defmodule Fix do\n  def add(a, b), do: a + b\nend\n")
+  (file/spit (path/join dir "test/test_helper.exs") "ExUnit.start()\n")
+  (file/spit (path/join dir "test/fix_test.exs")
+    (str "defmodule FixTest do\n" "  use ExUnit.Case\n"
+      "  test \"adds\" do\n    assert Fix.add(1, 2) == 3\n  end\n"
+      "  test \"is wrong\" do\n    assert Fix.add(1, 2) == 4\n  end\n" "end\n")))
+
+(defn ept-await (want deadline)
+  "Drain this session's events until `want` says one is the awaited event, answering it."
+  (letrec (go (fn ()
+                (receive
+                  (e (if (want e) e (go)))
+                  (after (math/max 0 (- deadline (os/now))) nil))))
+    (go)))
+
+(defn ept-reply? (e) (= (get e :__id__) :bedit/session/session-reply))
+
+(when elixir-mix?
+  (describe "the warm Elixir test node, end to end"
+    :isolated (test "it boots, streams a verdict per test, and recompiles a changed lib"
+      (let (dir (str "/tmp/bedit-ex-warm-" (:id (proc/info (self)))))
+        (ept-fixture dir)
+        (elixir-test/elixir-test-start dir (self))
+        ;; the banner is the barrier — a request before it queues behind the compile
+        (let (ready (ept-await (fn (e) (= (get e :__id__) :bedit/session/session-ready))
+                      (+ (os/now) 240000)))
+          (is (not (nil? ready)))
+          ;; one verdict per test, streamed as chunks rather than held to the end
+          (elixir-test/elixir-test-run 1 ["test/fix_test.exs"])
+          (letrec (collect (fn (names summary)
+                             (if summary
+                               [names summary]
+                               (let (e (ept-await ept-reply? (+ (os/now) 120000)))
+                                 (if (nil? e)
+                                   [names nil]
+                                   (let (r (get e :reply))
+                                     (cond
+                                       (get r :more)
+                                         (collect (cons (get (get r :test) :name) names) nil)
+                                       (get r :ok) (collect names (get r :summary))
+                                       else (collect names nil))))))))
+            (let ([names summary] (collect '() nil))
+              (assert= (get summary :total) 2)
+              (assert= (get summary :failed) 1)
+              (is (includes? (into [] names) "adds"))
+              ;; a fresh node has nothing to pick up
+              (assert= (get summary :reloaded) 0)))
+          ;; …and the reason a warm node is not a trap: change lib/ and the verdicts SWAP
+          (file/spit (path/join dir "lib/fix.ex")
+            "defmodule Fix do\n  def add(a, b), do: a + b + 1\nend\n")
+          (elixir-test/elixir-test-run 2 ["test/fix_test.exs"])
+          (letrec (final (fn ()
+                           (let (e (ept-await ept-reply? (+ (os/now) 120000)))
+                             (if (nil? e)
+                               nil
+                               (let (r (get e :reply)) (if (get r :more) (final) (get r :summary)))))))
+            (let (summary (final))
+              (assert= (get summary :failed) 1) ; still one, but the OTHER one
+              (assert= (get summary :reloaded) 1))))
+        (elixir-test/elixir-test-shutdown)))))

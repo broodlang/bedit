@@ -247,7 +247,14 @@ src/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e), and
                             drops its prompt, so os/spawn-pty is what makes it possible
 src/git.blsp                git porcelain: C-x g status buffer, diff/log/commit, C-x v = vc-diff
 src/gitdiff.blsp            diff-hl change gutter: per-line added/modified/deleted vs HEAD
-src/beam.blsp               M-x beam-processes (C-c b p): the editor as `:observer` — every process in
+src/beam.blsp               the BEAM, from the editor. C-c b p processes · C-c b s the SUPERVISION
+                            TREE (indented by depth, supervisors marked) · C-c b e ETS
+                            (biggest first — where the memory went) · C-c b t trace a named
+                            function into *BEAM Spy* · C-c b B BREAK on one (suspends the
+                            caller; *BEAM Debug* lists it, `r` resumes) · C-c b a/d attach.
+                            Three observations and a debugger over one `*views*` table and
+                            one session, so a fourth is a row rather than new plumbing.
+                            M-x beam-processes (C-c b p): every process in
                             the node your app runs in (name, mailbox, memory, reductions/sec,
                             current function), busiest first, `g` refresh `k` kill, over the
                             SAME agent the playground evaluates in. C-c b a ATTACHES that
