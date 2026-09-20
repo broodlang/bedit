@@ -110,24 +110,79 @@
       (is (= (count cands) 2))
       (assert= (mb-text (:minibuffer hovered)) (nth cands 1)) ; the hovered dir, not (nth cands 0)
       (is (string/ends-with? (mb-text (:minibuffer hovered)) "/"))))) ; a directory → ready to expand
-;; ---- completion debounce: a large candidate source re-ranks on idle, not per keystroke
-(describe "completion debounce (universal, large sources only)"
-  (test "a large rank-source is debounced — a keystroke doesn't re-rank; the idle timer does"
-    (let (big (into [] (map (range 3000) (fn (i) (str "file" i)))) ; > *complete-debounce-min*
-          mb (ed-name-prompt "Find: " big (fn (mm t) mm) 20)
-          m0 (assoc (m-of "x") :minibuffer mb)
-          m1 (ed-update m0 "a" 80 24) ; first key seeds the initial cache (for "a")
-          m2 (ed-update m1 "b" 80 24))
-      ; second key is debounced — cache NOT refreshed to "ab"
-      (assert= (get-in m2 [:minibuffer :cand-cache :for]) "a") ; stale (debounced)
-      (let (fired (ed-update m2 [:timer :idle-recompute] 80 24))
-        ; pause → idle re-ranks
-        (assert= (get-in fired [:minibuffer :cand-cache :for]) "ab"))))
-  (test "a small rank-source re-ranks every keystroke (no debounce, stays instant)"
+;; ---- ranking off the loop: a big candidate source is ASKED, not ranked here -----
+;; What this replaces: a large source used to be DEBOUNCED onto the idle beat — ranked here,
+;; just later — which showed a stale list while you typed and then paid the whole cost in
+;; one lump (163 ms on the idle beat, 210 ms on a single ↓, on a 27k-file project). It is a
+;; ranking SESSION now (std/fuzzy's `ranker`, ADR-374): the keystroke asks and the answer
+;; folds in when it arrives. Tests are headless — there is no loop for a reply to land in —
+;; so a session is never started here and the fold is driven directly, which is exactly the
+;; seam the live editor uses.
+(describe "minibuffer candidates — the ranking session"
+  (test "a small rank-source ranks on the keystroke, instantly"
     (let (small (into [] (map (range 50) (fn (i) (str "f" i))))
           mb (ed-name-prompt "Find: " small (fn (mm t) mm) 20)
           m2 (ed-update (ed-update (assoc (m-of "x") :minibuffer mb) "a" 80 24) "b" 80 24))
-      (assert= (get-in m2 [:minibuffer :cand-cache :for]) "ab")))) ; always fresh
+      (assert= (get-in m2 [:minibuffer :cand-cache :for]) "ab")))
+  (test "a session's answer folds into the cache; one from another session is dropped"
+    (let (mb (assoc (ed-name-prompt "Find: " ["file1" "file2"] (fn (mm t) mm) 20) :ranker :session-a)
+          m0 (assoc (m-of "x") :minibuffer mb)
+          landed (ed-apply-ranked m0 :session-a "fi" (list "file1" "file2"))
+          stale (ed-apply-ranked m0 :session-b "zz" (list "nonsense")))
+      (assert= {:for "fi" :cands (list "file1" "file2")} (get-in landed [:minibuffer :cand-cache]))
+      ;; a reply from a session this prompt does not own must never repopulate it — that is
+      ;; what a prompt closing and another opening while an answer is in flight looks like
+      (is (nil? (get-in stale [:minibuffer :cand-cache])))))
+  (test "a prompt with a session shows the last answer rather than ranking inline"
+    ;; `mb-candidates` is read by the view every frame and by every selection move; ranking
+    ;; there is what cost 210 ms per ↓, so with a session it must return the cache as-is
+    (let (mb (assoc (ed-name-prompt "Find: " ["file1" "file2"] (fn (mm t) mm) 20)
+               :ranker :session-a
+               :cand-cache {:for "f" :cands (list "file1")}
+               :edit (ed-mb-set-text (:edit (ed-name-prompt "Find: " [] (fn (mm t) mm) 20)) "fi")))
+      (assert= (list "file1") (mb-candidates mb))))
+  (test "ask, receive, fold — the whole round trip against a real session"
+    ;; The only test here that runs the actual mechanism: `rank-async` replies to `(self)`,
+    ;; which in a test IS the test process, so the editor's own seams can be driven in order.
+    (let (session (fuzzy/ranker ["src/view.blsp" "src/model.blsp" "README.md"])
+          mb (assoc (ed-name-prompt "Find: " ["src/view.blsp" "src/model.blsp" "README.md"]
+                      (fn (mm t) mm)
+                      20)
+               :ranker session)
+          m0 (assoc (m-of "x") :minibuffer mb)
+          typed (assoc m0
+                  :minibuffer (assoc mb :edit (ed-mb-set-text (:edit mb) "view")))
+          asked (ed-cache-mb-candidates typed))
+      ;; the keystroke ASKED and moved on — no ranking happened on this path
+      (assert= "view" (get-in asked [:minibuffer :asked]))
+      (is (nil? (get-in asked [:minibuffer :cand-cache])))
+      ;; a timeout becomes a query nobody asked for, so the assertion below names it rather
+      ;; than indexing into a keyword
+      (let (raw (receive ([:fuzzy-ranked ^session query hits] [query hits]) (after 5000 :timeout))
+            [query hits] (if (vector? raw) raw ["<the session never answered>" '()]))
+        (do
+          (assert= "view" query)
+          (let (folded (ed-apply-ranked asked session query hits))
+            (assert= (list "src/view.blsp") (mb-candidates (:minibuffer folded))))))
+      (fuzzy/ranker-stop session)))
+  (test "the idle beat re-asks when an answer never arrived"
+    ;; `:asked` is what keeps one keystroke to one question; without clearing it, a reply
+    ;; lost to a dead session would leave the list stale until the reader retyped
+    (let (session (fuzzy/ranker ["file1"])
+          mb (assoc (ed-name-prompt "Find: " ["file1"] (fn (mm t) mm) 20)
+               :ranker session
+               :asked "fi"
+               :edit (ed-mb-set-text (:edit (ed-name-prompt "Find: " [] (fn (mm t) mm) 20)) "fi"))
+          m0 (assoc (m-of "x") :minibuffer mb))
+      (do
+        (is (mb-cands-stale? m0))
+        ;; nothing would ask again: the stamp says the question is already out
+        (assert= m0 (ed-cache-mb-candidates m0))
+        ;; the idle beat drops the stamp and asks afresh, so an answer is now coming
+        (ed-mb-reask m0)
+        (assert= ["fi" (list "file1")]
+          (receive ([:fuzzy-ranked ^session query hits] [query hits]) (after 5000 :timeout)))
+        (fuzzy/ranker-stop session)))))
 ;; ---- the new line/word editing commands -------------------------------------
 (describe "editor case-region / whitespace / read-only / file commands"
   (test "C-x C-u upper-cases the region"
@@ -316,19 +371,28 @@
     ;; find-file is bound on the emacs profile, declares the command contract, and has a
     ;; docstring; all three appear, in that order
     (let (km (editor/layers/scope-keymap (list (ed-current-buf (m-of "x")) (m-of "x")))
-          a (plume/plume-annotation {:category :command :anno-keymap km} "find-file"))
+          a (plume/plume-annotation {:category :command :anno-keymap km} "find-file")
+          ;; the same answer from the PRECOMPUTED table the prompt actually carries — the
+          ;; two must agree, since one of them walks the keymap and the other is a lookup
+          t (plume/plume-annotation {:category :command :anno-keys (ed-key-table km)} "find-file"))
       (is (string? a))
       (is (string/starts-with? a "C-x C-f  ·  model any → model  ·  "))
       (is (includes? a "file path to open"))
-      ;; no keymap on the prompt: the key is simply absent
+      (assert= a t)
+      ;; no keymap and no table on the prompt: the key is simply absent
       (is (string/starts-with? (plume/plume-annotation {:category :command} "find-file")
             "model any → model  ·  "))
       ;; a name that is no command annotates as nothing
       (assert= (plume/plume-annotation {:category :command} "no-such-command-xyz") "")))
-  (test "the M-x prompt declares the :command category with the buffer's live keymap"
+  (test "the M-x prompt declares the :command category with the keys already inverted"
+    ;; `:anno-keys`, not `:anno-keymap`: the marginalia is drawn per visible row per frame,
+    ;; and asking the keymap there walked the whole map twice a row (48 ms a keystroke)
     (let (mb (:minibuffer (cmd-execute-extended-command (m-of "x") nil)))
       (assert= (:category mb) :command)
-      (is (map? (:anno-keymap mb)))))
+      (is (map? (:anno-keys mb)))
+      ;; the SEQUENCE, not its label — labelling every binding cost 6 ms at open to render
+      ;; fifteen rows, so the rows label their own
+      (assert= [:ctrl-x :ctrl-f] (get (:anno-keys mb) "cmd-find-file"))))
   (test "C-h f describes a command by name from the registry"
     (let (m (cmd-describe-function (m-of "x") nil)
           done (ed-update (assoc m

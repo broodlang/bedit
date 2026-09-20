@@ -50,12 +50,6 @@ pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
 ;; settles, and a real keystroke forces the caret solid (`ed-real-input?`). Idle, so
 ;; the caret stays solid while you type and only blinks at rest.
 
-(defdyn *complete-debounce-min* 800)
-;; A minibuffer completion source larger than this is **debounced**: its candidate list is
-;; re-ranked only after you pause (the idle `:idle-recompute` timer), not on every keystroke
-;; — so a large project stays responsive while typing. Small sources (M-x, buffer/project
-;; lists, small find-file) re-rank synchronously per keystroke — instant, no lag.
-
 (def *diag-debounce-ms* 120)
 ;; The tutorial's eval-on-type debounce (`:tutor-eval`): a shade slower than the diag
 ;; beat — each firing round-trips the whole lesson to the sandbox subprocess, so it
@@ -1017,20 +1011,37 @@ view omits the thumb entirely."
 ;; turn a keymap key into an Emacs-style label and a binding (a command symbol or a
 ;; prefix sub-keymap) into a short command name, and read a command's docstring.
 
+(def- ed-key-modifiers
+  ;; A keyword-name prefix and its Emacs spelling, LONGEST FIRST so `ctrl-meta-` is seen
+  ;; before `ctrl-`. The list is the whole modifier vocabulary; add a row to add one.
+  [["ctrl-meta-" "C-M-"] ["ctrl-" "C-"] ["meta-" "M-"] ["alt-" "M-"] ["shift-" "S-"]])
+
+;; check-allow: deliberately non-tail — depth = the number of modifiers on one key (C-M-S-x
+;; is three), not any input size.
+(check-allow :non-tail-recursion
+  (defn- ed-key-name-label (n)
+  "The Emacs spelling of a key keyword's NAME — its modifier prefixes replaced one at a
+time, innermost last, and a bare space as `SPC`.
+
+This was seven chained `string/replace` passes over every key, each one scanning and
+allocating whether or not it matched. That is ~40 µs a key, and inverting a keymap labels a
+few hundred of them: 7.5 ms, paid to render fifteen rows of `M-x` marginalia. A prefix test
+costs one comparison and the recursion is at most as deep as the modifiers a key carries."
+  (let (hit (seq/find ed-key-modifiers (fn (p) (string/starts-with? n (first p)))))
+    (cond
+      (= n " ") "SPC"
+      (nil? hit) n
+      :else
+        (let ([prefix spelling] hit)
+          (str spelling
+            (ed-key-name-label (string/substring n (string/length prefix) (string/length n)))))))))
+
 (defn ed-key-label (k)
   "An Emacs-style label for a keymap key: `:ctrl-e` → `C-e`, `:alt-g` → `M-g`,
 `:ctrl-meta-i` → `C-M-i`, `(keyword \"alt- \")` → `M-SPC`, a 1-char string as itself."
   (cond
     (string? k) (if (= k " ") "SPC" k)
-    (keyword? k)
-      (-> (->string k)
-        (string/replace "ctrl-meta-" "C-M-")
-        (string/replace "ctrl-" "C-")
-        (string/replace "meta-" "M-")
-        (string/replace "alt-" "M-")
-        (string/replace "shift-" "S-")
-        (string/replace "C- " "C-SPC")
-        (string/replace "M- " "M-SPC"))
+    (keyword? k) (ed-key-name-label (->string k))
     :else (str k)))
 
 (defn ed-cmd-label (v)
@@ -1068,19 +1079,49 @@ map's hash order happens to yield."
         best (first (sort-by labels (fn (l) [(count (string/split l " ")) l]))))
     (or best fallback)))
 
+(defn ed-command-tail (command)
+  "A command symbol's last segment — `bedit/commands/cmd-find-file` → `cmd-find-file`. The
+registry keeps a command qualified where it was defined (package root and all) while a
+keymap binds it as `commands/cmd-find-file`; the two name the same command, and the tail is
+what `M-x` names are keyed by, so it is unique among commands."
+  (last (string/split (->string command) "/")))
+
+(defn ed-key-table (km)
+  "`{command-tail -> key-sequence}` for every command `km` binds — the whole keymap inverted
+in ONE walk (`keymap-index`), each command taking its best binding by `ed-where-is`'s rule
+(shortest chord, then the alphabetically-first label).
+
+For a caller that needs the key beside MANY commands. `ed-where-is-named` answers for one,
+and walks the keymap twice to do it — fine for a help line, ruinous for a list: `M-x`'s
+marginalia did that per visible row per frame, which measured 48 ms a keystroke. Build this
+once for the prompt and each row is a map lookup.
+
+It holds the SEQUENCE, not the label. Labelling is ~25 µs a key in Brood and a keymap binds
+a few hundred; labelling them all here put 6 ms on opening `M-x` to render fifteen rows.
+`ed-keys-label` at the row is the same answer for the rows that actually exist."
+  (fold (editor/keymap/keymap-index km)
+    {}
+    (fn (acc entry)
+      (let ([command seqs] entry
+            ;; one binding is the overwhelming case, and it needs no ordering at all — the
+            ;; sort is only there to make a CHOICE deterministic when there are several, and
+            ;; it is the only place a label is built here
+            best (if (nil? (rest seqs))
+                   (first seqs)
+                   (first (sort-by seqs (fn (s) [(count s) (ed-keys-label s)])))))
+        (if (nil? best) acc (assoc acc (ed-command-tail command) best))))))
+
 (sig ed-where-is-named (map any &optional any -> (or nil string)))
 ;; check-allow: `ed-where-is` reads the keymap's binding table (std's data), so the label is
 ;; unknown to the checker; it is a string or the fallback
 (check-allow :trusted
   (defn ed-where-is-named (km command &optional fallback)
     "[[ed-where-is]] for a command known by a symbol that may be spelled differently in
-the keymap: the registry keeps `bedit/commands/cmd-find-file` (qualified where it was
-defined, package root and all) while a keymap binds `commands/cmd-find-file`. The two
-name the same command, and both are found by their LAST segment — `cmd-find-file` —
-which is what M-x names are keyed by, so it is unique among commands."
-    (let (tail (last (string/split (->string command) "/"))
+the keymap — matched by `ed-command-tail`. For one command; for a list of them build an
+`ed-key-table` instead, which inverts the keymap once rather than twice per command."
+    (let (tail (ed-command-tail command)
           bound (seq/find (editor/keymap/keymap-commands km)
-                  (fn (c) (= tail (last (string/split (->string c) "/")))))
+                  (fn (c) (= tail (ed-command-tail c))))
           label (if (nil? bound) nil (ed-where-is km bound)))
       (or label fallback))))
 
@@ -1245,15 +1286,11 @@ blinks at rest. Finally refreshes the open minibuffer's memoized candidate list
         ;; above, and both are O(1) until their own buffer's notes go stale
         m2 (ed-live-eval-reanchor m2)
         mb (:minibuffer m2))
-    ;; Refresh the memoized candidate list. A small source re-ranks every keystroke (snappy).
-    ;; A large source (`mb-debounce?`) re-ranks only its *initial* list here and defers later
-    ;; refreshes to the idle `:idle-recompute` timer — so typing fast doesn't re-rank tens of
-    ;; thousands of candidates per keystroke (the completion debounce). `mb-candidates` returns
-    ;; the cached list meanwhile; a deliberate Tab/↑/↓/Enter forces a fresh refresh.
-    (cond
-      (or (nil? mb) (not (mb-source? mb))) m2
-      (and (mb-debounce? mb) (:cand-cache mb)) m2
-      :else (ed-cache-mb-candidates m2))))
+    ;; Bring the candidate list up to date with the typed text: a small source ranks here on
+    ;; the keystroke (instant), a large one ASKS its ranking session and folds the answer
+    ;; when it arrives (`ed-cache-mb-candidates`). Either way this is O(1) on the event when
+    ;; the text has not changed, which is every frame, tick and selection move.
+    (if (or (nil? mb) (not (mb-source? mb))) m2 (ed-cache-mb-candidates m2))))
 
 ;; ---- the minibuffer (a one-line prompt over lineedit's pure editor core) -----
 ;; The `:minibuffer` field is `{:edit <lineedit-state> :on-complete :complete-fn
@@ -1341,38 +1378,107 @@ fresh."
     (cond
       ;; a fresh hit (the cache is for the current text) — the common case
       (and cache (= (:for cache) (mb-text mb))) (:cands cache)
-      ;; a large source whose cache is stale: return it as-is — re-ranking is *debounced*
-      ;; onto the idle timer, so typing fast doesn't re-rank tens of thousands of candidates
-      (and cache (mb-debounce? mb)) (:cands cache)
+      ;; a big source being ranked OFF the loop: show what the session last answered. Never
+      ;; rank inline here — this is called from the view and from every selection move, and
+      ;; ranking on either is what made holding ↓ cost 210ms a step on a 27k-file project.
+      (and cache (:ranker mb)) (:cands cache)
       ;; otherwise (small source, or no cache yet) recompute now — instant, and what the
       ;; per-keystroke and direct-text-set paths rely on
       :else (mb-rank mb (mb-text mb)))))
 
-(defn- mb-debounce? (mb)
-  "Whether minibuffer `mb`'s candidate ranking should be debounced — a fixed `:rank-source`
-larger than `*complete-debounce-min*` (a `:candidates-fn` prompt computes its own way)."
+;; ---- ranking a big candidate set off the loop (std/fuzzy's `ranker`, ADR-374) ----
+;; A prompt over a whole project hands its candidates to a ranking SESSION — a process that
+;; owns the set — and then asks it a query per keystroke instead of ranking here. The loop
+;; sends and returns; the answer arrives as a `[:fuzzy-ranked …]` event and folds into the
+;; cache like any other async reply (`input/ed-ev-ranked`).
+;;
+;; This replaces a debounce, which is what the same problem looked like while the ranking
+;; still had to happen HERE: defer it to the idle beat, show a stale list meanwhile, and pay
+;; the whole cost in one lump the moment typing paused (measured 163 ms on the idle beat, and
+;; 210 ms on a single ↓, which forced a fresh rank). Off the loop there is nothing to defer:
+;; every keystroke asks, the session drops the queries it has been overtaken on, and the
+;; newest answer lands when it lands. Typing is never blocked by finding — which is the
+;; distinction the whole thing turns on.
+
+(defdyn *mb-session-min* 800)
+;; A `:rank-source` bigger than this gets a ranking session; smaller ones rank inline on the
+;; keystroke, where a session's process + the copy of the set would cost more than it saves.
+
+(defn mb-session? (mb)
+  "Whether minibuffer `mb`'s candidate source is big enough to rank off the loop — a fixed
+`:rank-source` past `*mb-session-min*` (a `:candidates-fn` prompt computes its own way)."
   (let (src (:rank-source mb))
-    (and src (> (count src) *complete-debounce-min*))))
+    (and src (> (count src) *mb-session-min*))))
+
+(defn ed-mb-ensure-ranker (m)
+  "Give the open minibuffer a `fuzzy/ranker` session over its `:rank-source` if it wants one
+and has none. Lazy, and on the per-event path rather than at every prompt's call site: a
+prompt is a plain map built in a dozen places (`commands`, `mincomplete`, `interactive`), and
+none of them should have to know about sessions to get one. A small source, a prompt that
+computes its own candidates, or a headless model (a test, a `--headless` daemon — nowhere for
+the reply to land) gets none and keeps ranking inline."
+  (let (mb (:minibuffer m))
+    (if (or (nil? mb) (:ranker mb) (not (mb-session? mb)) (ed-headless?))
+      m
+      (assoc m :minibuffer (assoc mb :ranker (fuzzy/ranker (:rank-source mb)))))))
+
+(defn ed-mb-stop-ranker (m)
+  "Stop the open minibuffer's ranking session, if it has one. Called wherever the prompt
+closes (`input/mb-close`), so a session never outlives the prompt that owns it."
+  (let (session (get-in m [:minibuffer :ranker]))
+    (do (when session (fuzzy/ranker-stop session)) m)))
+
+(defn ed-apply-ranked (m session query hits)
+  "Fold a ranking session's reply into the open minibuffer's `:cand-cache`. Dropped unless
+`session` is the prompt's own — a reply from a session whose prompt has already closed (or
+been replaced) must not overwrite the new one's list. The session answers only the newest
+query it was asked, so `query` is stamped as what the cache is FOR: if the reader has typed
+on since, `ed-cache-mb-candidates` sees the mismatch on the next event and asks again."
+  (if (not (= (get-in m [:minibuffer :ranker]) session))
+    m
+    (assoc-in m [:minibuffer :cand-cache] {:for query :cands hits})))
 
 (defn mb-cands-stale? (m)
   "True if an open candidate prompt's cached list is for a different input than the current
-text — a recompute is due. Drives the idle (`:idle-recompute`) debounce timer for a large
-source; a small source is kept current synchronously, so it's never stale here."
+text — an answer is outstanding. With a session that means one has been asked for and not
+arrived; without one it is never true, since an inline source is kept current on the event."
   (let (mb (:minibuffer m))
     (and mb
       (mb-source? mb)
       (not (= (get-in mb [:cand-cache :for]) (mb-text mb))))))
 
+(defn ed-mb-reask (m)
+  "Re-ask the ranking session for the current text if an answer is still outstanding — the
+idle beat's safety net. Everything else here assumes a question gets an answer; this is the
+one place that does not, so a reply lost to a dead session (or a prompt that somehow asked
+before its session existed) recovers on the next quiet moment rather than showing a stale
+list until the reader gives up and retypes. A no-op when the cache is current."
+  (if (mb-cands-stale? m)
+    (ed-cache-mb-candidates (assoc m :minibuffer (dissoc (:minibuffer m) :asked)))
+    m))
+
 (defn ed-cache-mb-candidates (m)
-  "Refresh the open minibuffer's `:cand-cache` (`{:for <text> :cands …}`) when its input
-text changed since the last computation — so `mb-candidates` returns a memoized list rather
-than re-ranking the candidate set per frame / selection move / tick. Run once per event by
-`ed-post-step`; a no-op with no minibuffer, no candidate source, or unchanged text."
-  (let (mb (:minibuffer m))
-    (if (or (nil? mb) (not (mb-source? mb)) (= (get-in mb [:cand-cache :for]) (mb-text mb)))
-      m
-      (assoc m
-        :minibuffer (assoc mb :cand-cache {:for (mb-text mb) :cands (mb-rank mb (mb-text mb))})))))
+  "Bring the open minibuffer's `:cand-cache` (`{:for <text> :cands …}`) up to date with the
+typed text — by ASKING its ranking session when it has one (the answer folds in later,
+`ed-apply-ranked`), else by ranking inline. Run once per event by `ed-post-step`; a no-op
+with no minibuffer, no candidate source, or unchanged text.
+
+The `:asked` stamp is what keeps one keystroke to one question: the session already drops a
+query it has been overtaken on, but without this the view and every selection move would
+re-ask for the same text while the first answer was still in flight."
+  (let (m1 (ed-mb-ensure-ranker m)
+        mb (:minibuffer m1)
+        text (if (nil? mb) nil (mb-text mb)))
+    (cond
+      (or (nil? mb) (not (mb-source? mb))) m1
+      (= (get-in mb [:cand-cache :for]) text) m1
+      (:ranker mb)
+        (if (= (:asked mb) text)
+          m1
+          (do
+            (fuzzy/rank-async (:ranker mb) text (or (:rank-cap mb) 20))
+            (assoc m1 :minibuffer (assoc mb :asked text))))
+      :else (assoc m1 :minibuffer (assoc mb :cand-cache {:for text :cands (mb-rank mb text)})))))
 
 (sig ed-set-buf-at (model int buffer -> model))
 (defn ed-set-buf-at (m i buf)

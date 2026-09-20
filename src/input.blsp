@@ -328,23 +328,32 @@ no-op. The post-step `ed-scroll` then brings the previewed point into view."
   (let (hook (get-in m [:minibuffer :on-preview]))
     (if (or (nil? hook) (nil? cand)) m (hook m cand))))
 
+(defn- mb-close (m)
+  "The model with the minibuffer closed — the ONE place a prompt goes away, so the things a
+prompt owns are released exactly once. Today that is its ranking session
+(`model/ed-mb-stop-ranker`): a process that outlives its prompt is a leak, and a prompt is
+closed from four places (abort, Enter on a selection, Enter on the typed text, lineedit's
+own `:submit`), which is three too many to remember it in."
+  (assoc (ed-mb-stop-ranker m) :minibuffer nil))
+
 (defn- mb-abort (m)
   "Close the minibuffer, first firing its optional `:on-abort` hook so a previewing prompt
 can restore the position it started from (the imenu cancel-returns-home behaviour)."
   (let (hook (get-in m [:minibuffer :on-abort])
         m2 (if (nil? hook) m (hook m)))
-    (assoc m2 :minibuffer nil :echo "quit")))
+    (assoc (mb-close m2) :echo "quit")))
 
 (defn minibuffer-handle (m input)
   "Fold one key into the active minibuffer. Tab replaces the text with the
 `:complete-fn` of the input; Esc / C-g abort (firing `:on-abort`); moving the selection
 fires `:on-preview`; every other key drives lineedit's pure editor (`lineedit-handle`) —
 on `:submit` (Enter) run `:on-complete` with the text, on `:cancel` close."
-  (let (m (if (and (get-in m [:minibuffer :accept-selection])
-                (includes? [:tab :enter :ctrl-n :ctrl-p :up :down (keyword "alt-<") (keyword "alt->")] input))
-            (ed-cache-mb-candidates m) ; a deliberate candidate action forces a fresh list (a
-            m) ; large debounced source may be showing a stale one)
-        mb (:minibuffer m)
+  ;; No forced re-rank on Tab/Enter/↑/↓ any more. It existed because a large source was
+  ;; DEBOUNCED onto the idle beat and could be showing a stale list when you acted on it —
+  ;; so a selection move ranked the whole set synchronously, which on a 27k-file project
+  ;; cost 210 ms per ↓ and made holding it useless. A session ranks off the loop, so the
+  ;; list is never more than one in-flight answer behind and a selection move is free.
+  (let (mb (:minibuffer m)
         sel? (:accept-selection mb) ; Vertico-style prompts (M-x, C-x b, C-x p f)
         cands (if sel? (mb-candidates mb) ())
         n (count cands)
@@ -398,14 +407,14 @@ on `:submit` (Enter) run `:on-complete` with the text, on `:cancel` close."
       ;; the typed text (find-file, or no candidates).
       (= input :enter)
         (if (and sel? (> n 0))
-          ((:on-complete mb) (assoc m :minibuffer nil)
+          ((:on-complete mb) (mb-close m)
             (nth cands (math/min cur (dec n))))
-          ((:on-complete mb) (assoc m :minibuffer nil) (mb-text mb)))
+          ((:on-complete mb) (mb-close m) (mb-text mb)))
       else
         (let (edit (editor/lineedit/lineedit-handle (:edit mb) input)
               done (:done edit))
           (cond
-            (= done :submit) ((:on-complete mb) (assoc m :minibuffer nil) (:text edit))
+            (= done :submit) ((:on-complete mb) (mb-close m) (:text edit))
             (nil? done) (assoc m :minibuffer (assoc mb :edit edit :sel 0))
             ; typing resets the selection
             else (mb-abort m))))))
@@ -560,7 +569,25 @@ dispatched normally (Emacs' dismiss-and-process)."
 ;; there the terminal's own key repeat still applies, and we never engage (and so
 ;; never run away with no release to stop us).
 
-(defdyn *repeat-delay-ms* 220) ; initial pause before a held key starts repeating (typematic)
+;; The typematic numbers are the DESKTOP's, not ours. Every window system ships the same
+;; pair of defaults — 500 ms before a held key starts repeating, ~30 ms between repeats
+;; (X11's `xset r rate`, GNOME's `org.gnome.desktop.peripherals.keyboard delay` /
+;; `repeat-interval`, KDE's the same) — and an editor that picks its own is the one thing
+;; on the screen that behaves differently from the rest of it.
+;;
+;; This was 220 ms, which is less than half the platform's. That is short enough that a
+;; DELIBERATE single press which lingers — routine, and more so while you are waiting on a
+;; busy machine — crosses it and fires one repeat: press once, move twice. Nothing in the
+;; loop double-dispatches a tap (tools/probe-repeat.blsp drives the real `ui-run` over a
+;; scripted display at 0/120/300/600 ms frames and a tap moves exactly once every time);
+;; the delay itself was the whole of it.
+;;
+;; Brood cannot ask the window system for these yet — winit surfaces no repeat info to the
+;; GUI backend (only its own unreliable `ke.repeat` flag, ADR-086), so reading Wayland's
+;; `wl_keyboard.repeat_info` would mean going below winit. The platform DEFAULT is the
+;; honest stand-in until `std/gui` can answer it; `:repeat-delay` / `:repeat-rate` in
+;; init.blsp override both for anyone who has tuned their own.
+(defdyn *repeat-delay-ms* 500) ; initial pause before a held key starts repeating (typematic)
 (defdyn *repeat-rate-ms* 30) ; interval between repeats once it has started
 (defn ed-repeat-delay (m)
   "The hold-before-repeat delay for this model: the init file's `:repeat-delay` when
@@ -728,9 +755,9 @@ group); `:cursor-blink` toggles the caret. An unknown name is a no-op."
     ;; first structural query does not pay for it. Same reason the diff and the
     ;; diagnostics are here rather than on the keypress.
       (let (m0 (ed-lsp-push-text (ed-lsp-autostart (ed-refresh-preview m)))
-            m1 (if (bound? 'git/git-cache-status)
-                 (git/git-cache-status (ed-launch-tree-warm (ed-launch-gitdiff (ed-cache-mb-candidates (ed-run-diag (ed-launch-signature (ed-launch-eldoc m0)))))))
-                 (ed-launch-tree-warm (ed-launch-gitdiff (ed-cache-mb-candidates (ed-run-diag (ed-launch-signature (ed-launch-eldoc m0)))))))
+            m1 (if (bound? 'git/git-launch-status)
+                 (git/git-launch-status (ed-launch-tree-warm (ed-launch-gitdiff (ed-mb-reask (ed-run-diag (ed-launch-signature (ed-launch-eldoc m0)))))))
+                 (ed-launch-tree-warm (ed-launch-gitdiff (ed-mb-reask (ed-run-diag (ed-launch-signature (ed-launch-eldoc m0)))))))
             ;; files another writer changed: auto-revert the clean ones, warn on the rest
             m2 (ed-on-idle-hooks (ed-revert-changed-files (ed-auto-save! m1))))
         (if (and (ed-web-dirty? m2) (bound? 'web/web-publish!))
@@ -798,6 +825,14 @@ stale/cancelled reply and is dropped, so it can't clobber a newer one."
       (= (:diag-proc m) h) (ed-apply-diag m (if (= (first input) :task-done) (nth input 2) '()))
       (= (:gitdiff-proc m) h)
         (ed-apply-gitdiff m (if (= (first input) :task-done) (nth input 2) '()))
+      ;; the status-bar git summary (`git/git-launch-status`) — four subprocesses, so it is
+      ;; asked for off the loop and folded here like every other async recompute
+      (= (:git-proc m) h)
+        (git/git-apply-status m (if (= (first input) :task-done) (nth input 2) nil))
+      ;; the project file walk behind the find-file-in-project prompt — `git ls-files` in a
+      ;; subprocess, so the prompt opens empty and its list fills when this lands
+      (= (:project-scan m) h)
+        (ed-apply-project-scan m (if (= (first input) :task-done) (nth input 2) '()))
       (= (:eldoc-proc m) h) (ed-apply-eldoc m (if (= (first input) :task-done) (nth input 2) nil))
       ;; the tree warm has no result to fold — the cache it filled lives in the runtime,
       ;; so the reply exists only to record which rope is parsed and free the slot
@@ -973,6 +1008,12 @@ the repeat. Other releases just keep the flag set."
       (ed-repeat-clear m1)
       m1)))
 
+(defn- ed-ev-ranked (m input textrows cols rows)
+  "A ranking session's answer (`[:fuzzy-ranked <session> query hits]`, std/fuzzy's `ranker`):
+fold it into the open minibuffer's candidate cache. Dropped unless it came from THIS prompt's
+own session — a reply arriving after its prompt closed must not repopulate the next one."
+  (ed-apply-ranked m (nth input 1) (nth input 2) (nth input 3)))
+
 (def- ed-event-handlers
   ;; `[:tag …]` -> the handler's SYMBOL, resolved at dispatch (`(reflect/eval …)`, below) — the
   ;; same late binding keys get: redefine a handler in the running editor and the next
@@ -982,6 +1023,7 @@ the repeat. Other releases just keep the flag set."
   ;; rebinds the global that a captured value has already bypassed).
   {:io/write 'input/ed-ev-io-write
    :key-up 'input/ed-ev-key-up
+   :fuzzy-ranked 'input/ed-ev-ranked
    :task-done 'input/ed-ev-task-reply
    :task-error 'input/ed-ev-task-reply
    :task-timeout 'input/ed-ev-task-reply

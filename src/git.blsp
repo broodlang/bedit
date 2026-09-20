@@ -16,7 +16,8 @@ lines) so commands read the current row without re-parsing text. Git runs synchr
   (:use commands) ; ed-show-named / ed-default-dir / ed-goto-line / cmd-kill-buffer
   (:use interactive) ; defcommand
   (:use statusbar) ; `seg` — build the branch + working-tree status-bar segments
-  (:use editor/buffer)) ; buffer-current-line / buffer-text
+  (:use editor/buffer) ; buffer-current-line / buffer-text
+  (:use task)) ; task — the status summary's four git subprocesses, off the loop
 ;; `theme` (a project source module, loaded with the image) provides the *green* / *red* /
 ;; *blue* / *yellow* / *subtext* dynamic-var colour globals this file reads bare.
 ;; ---- syntax highlighting for the diff / log / status buffers ----------------
@@ -385,20 +386,74 @@ working tree (tooltip: the counts; click: `C-x g`), then colour-coded **+staged 
                   (git-count-seg :git-untracked "?" (:untracked summary) git-face-untracked))
       (fn (s) (not (nil? s))))))
 
+;; ---- the status summary, off the loop ---------------------------------------
+;; `git-summary` is FOUR `git` subprocesses — `rev-parse --show-toplevel`, `status
+;; --porcelain -z`, `rev-parse --abbrev-ref HEAD` and `rev-list --left-right --count` — and
+;; it ran on the loop process on every idle beat. On a 27,310-file repo `git status` alone
+;; measures 40 ms, and each spawn is a few more: fifty-odd milliseconds of frozen editor
+;; every time typing settled, which is exactly when a reader looks up and notices. It also
+;; scales with the repo rather than with anything the editor is doing.
+;;
+;; So it runs in a spawned task and folds its answer back like every other async recompute
+;; (`model/ed-launch-gitdiff`, `ed-launch-diag`, `ed-launch-eldoc` — same shape, same reply
+;; route).
+;;
+;; Note what travels: a KEY, not a root. Resolving the root is itself `git rev-parse
+;; --show-toplevel`, so asking for the root on the loop — and asking again when the answer
+;; lands, to check it is still the right one — would have left two of the four subprocesses
+;; exactly where they were. The key is what the editor already knows (the git buffer's root
+;; if it has one, the current buffer's directory, whether it is file-backed), it is free to
+;; compute, and comparing it is how a stale answer is recognised.
+
+(defn git-status-key (m)
+  "What the status-bar summary is ABOUT, as a value the loop can compute for nothing:
+`[git-root default-dir file-backed?]`. Resolving that to a repo root is a subprocess, so it
+happens in the task; this is what is compared to tell a stale answer from a current one.
+
+A **fileless** buffer (*scratch*, *Playground*, a report) that is not itself a git buffer
+carrying `:git-root` has nothing to describe: it only *inherits* a `:dir` from wherever it
+was created, and one that cannot be saved has no working-tree relationship for a branch +
+dirty-state indicator to be about."
+  [(:git-root m) (commands/ed-default-dir m) (and (buffer-file (ed-current-buf m)) true)])
+
+(defn git-status-summary (key)
+  "The working-tree summary for a `git-status-key`, or nil when there is nothing to describe.
+Resolves the repo root and runs `git-summary` — five subprocesses all told, which is why
+this is what the task runs and nothing on the loop calls it directly."
+  (let ([git-root dir file?] key)
+    (if (not (or git-root file?)) nil (git-summary (or git-root (git-toplevel dir))))))
+
 (defn git-cache-status (m)
   "Recompute the cached git status-bar segments (`:git-segments`) + summary (`:git-summary`)
-off the loop: resolve the repo root, and in a repo rebuild the summary + segments, else clear
-them. Called on the idle beat (`input`), so the branch + working-tree indicator track edits
-and git actions a beat after they settle. Outside a repo the segments are `()` (nothing shows).
-A **fileless** buffer (*scratch*, *Playground*, a report) shows nothing either, unless it is a
-git buffer carrying `:git-root`: it only *inherits* a `:dir` from wherever it was created, and
-a buffer that cannot be saved has no working-tree relationship for a branch + dirty-state
-indicator to describe."
-  (let (root (if (or (:git-root m) (buffer-file (ed-current-buf m))) (git-resolve-root m) nil)
-        summary (git-summary root))
+**synchronously**. The headless path, and the one the tests drive; a live editor goes through
+`git-launch-status` instead."
+  (let (summary (git-status-summary (git-status-key m)))
     (if (= summary (:git-summary m))
       m
       (assoc m :git-summary summary :git-segments (git-statusbar-segments summary)))))
+
+(defn git-launch-status (m)
+  "Recompute the status-bar git summary OFF the loop when nothing is already in flight.
+Headless (no loop for a reply to land in) falls back to the synchronous `git-cache-status`,
+so tests and a `--headless` daemon behave exactly as before."
+  (cond
+    (:git-proc m) m
+    (ed-headless?) (git-cache-status m)
+    :else
+      (let (key (git-status-key m)
+            job (task (fn () (git-status-summary key))))
+        (assoc m :git-proc job :git-checking key))))
+
+(defn git-apply-status (m summary)
+  "Fold a finished summary into `:git-summary` + `:git-segments` and free the in-flight slot.
+An answer about a buffer the reader has since left is dropped — the next idle beat asks about
+the one they are in now."
+  (let (asked (:git-checking m)
+        m1 (dissoc m :git-proc :git-checking))
+    (cond
+      (not (= asked (git-status-key m1))) m1
+      (= summary (:git-summary m1)) m1
+      :else (assoc m1 :git-summary summary :git-segments (git-statusbar-segments summary)))))
 
 ;; ---- pure: render the status buffer (text + parallel per-line rows) ---------
 
