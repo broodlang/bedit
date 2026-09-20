@@ -1896,13 +1896,15 @@ Emacs `dired-flag-file-deletion`). `x` deletes every flagged entry after a confi
   "Toggle all marks — every unmarked entry becomes marked and vice versa, excluding
 `.`/`..` (t)."
   (let (all (seq/reject (:dired-names m) (fn (n) (or (= n ".") (= n ".."))))
-        marked (or (:dired-marks m) '())
-        flagged (or (:dired-flags m) '()))
+        ;; sets: a directory listing is unbounded, and this tests every row against every
+        ;; mark and every flag
+        marked (into #{} (or (:dired-marks m) '()))
+        flagged (into #{} (or (:dired-flags m) '())))
     ;; a flagged row keeps its D — one mark cell per row, so it is neither marked nor
     ;; unmarked by the toggle
     (ed-show-dired (assoc m
                      :dired-marks
-                       (seq/reject all (fn (n) (or (includes? marked n) (includes? flagged n)))))
+                       (seq/reject all (fn (n) (or (contains? marked n) (contains? flagged n)))))
       (:dired-dir m)
       (inc (buffer-current-line (ed-current-buf m))))))
 
@@ -3229,6 +3231,32 @@ working dir. Nil when there's no project anywhere."
     (:project-root m)
     (project-root (file/cwd))))
 
+(defn- ed-project-prompt (root files)
+  "The find-file-in-project minibuffer spec over `files` (root-relative paths). Separate from
+the command because the file list arrives LATE: the prompt opens over `()` and this same
+shape is rebuilt around the real list when the walk lands (`ed-apply-project-scan`), so the
+two can never describe different things."
+  {:edit (assoc (ed-mb-edit "Find file in project: " "") :word-mode :path) ; M-b/M-f by folder
+   :on-complete (fn (mm t)
+                  ;; a Vertico selection is a real project file → open it; a
+                  ;; typed string with no selection falls back to a prefix match.
+                  (if (includes? files t)
+                    (ed-find-file mm (path/join root t))
+                    (let (ms (project-matches t files))
+                      (if (empty? ms)
+                        (message mm (str "no project file matching \"" t "\""))
+                        (ed-find-file mm (path/join root (first ms)))))))
+   ;; Tab completes the typed path one component at a time — the identical
+   ;; `complete-prefix` action as find-file's Tab, over the project files that
+   ;; start with what's typed (prefix, so Tab only ever extends, never shrinks).
+   :complete-fn (fn (t) (complete-prefix t (project-matches t files)))
+   ;; default order: most-recently-visited (per project) first, then by last-written
+   :rank-source (sort-project-files root files) ; narrowed incrementally as you type
+   :rank-cap 20
+   :category :file ; marginalia per row …
+   :anno-base root ; … the candidate is project-root-relative, so resolve from here
+   :accept-selection true})
+
 (defn ed-find-file-in-project (m root)
   "Open the find-file-in-project minibuffer over the files under `root` (recursive,
 root-relative; Tab narrows, Enter opens the first match). The shared core of `C-x p f`
@@ -3241,30 +3269,28 @@ lists the files of the project it switched to, not wherever the current buffer s
     ;; progress are. Ungated, ANY model reached this: a pure model test would rewrite the
     ;; developer's real `~/.config/bedit/state/projects.blsp` with its /tmp fixtures,
     ;; which is why `panes_projects_test` used to save and restore that file by hand.
-    (let (_ (when (:recent-files m) (remember-project! root))
-          files (project-files root))
-      (assoc m
-        :minibuffer
-          {:edit (assoc (ed-mb-edit "Find file in project: " "") :word-mode :path) ; M-b/M-f by folder
-           :on-complete (fn (mm t)
-                          ;; a Vertico selection is a real project file → open it; a
-                          ;; typed string with no selection falls back to a prefix match.
-                          (if (includes? files t)
-                            (ed-find-file mm (path/join root t))
-                            (let (ms (project-matches t files))
-                              (if (empty? ms)
-                                (message mm (str "no project file matching \"" t "\""))
-                                (ed-find-file mm (path/join root (first ms)))))))
-           ;; Tab completes the typed path one component at a time — the identical
-           ;; `complete-prefix` action as find-file's Tab, over the project files that
-           ;; start with what's typed (prefix, so Tab only ever extends, never shrinks).
-           :complete-fn (fn (t) (complete-prefix t (project-matches t files)))
-           ;; default order: most-recently-visited (per project) first, then by last-written
-           :rank-source (sort-project-files root files) ; narrowed incrementally as you type
-           :rank-cap 20
-           :category :file ; marginalia per row …
-           :anno-base root ; … the candidate is project-root-relative, so resolve from here
-           :accept-selection true}))))
+    (let (_ (when (:recent-files m) (remember-project! root)))
+      (if (ed-headless?)
+        (assoc m :minibuffer (ed-project-prompt root (project-files root)))
+        ;; The prompt opens NOW and the list arrives when the walk does. `project-files` is
+        ;; `git ls-files` in a subprocess — 35 ms on a 27,310-file project — and every
+        ;; millisecond of it was spent between pressing `C-x p f` and the prompt appearing.
+        (let (job (task (fn () (project-files root))))
+          (assoc m
+            :minibuffer (assoc (ed-project-prompt root '()) :scanning root)
+            :project-scan job))))))
+
+(defn ed-apply-project-scan (m files)
+  "Fill the open find-file-in-project prompt with the files the walk found, keeping whatever
+the reader has typed in the meantime. Dropped unless a prompt is still open and still waiting
+(`:scanning`) — closing it, or opening another, must not be overwritten by a walk that was
+already running."
+  (let (mb (:minibuffer m)
+        m1 (dissoc m :project-scan))
+    (if (or (nil? mb) (nil? (:scanning mb)))
+      m1
+      (assoc m1
+        :minibuffer (assoc (ed-project-prompt (:scanning mb) files) :edit (:edit mb) :sel 0)))))
 
 (defcommand cmd-project-find-file
   (m key)
@@ -3281,14 +3307,65 @@ file under the project you're in. Reports when not in a project."
 
 (def *project-search-buf* "*Project Search*")
 
+;; Which searcher runs is a TABLE, not a branch: a row is the program, whether it has to be
+;; on PATH, when it applies, and how to spell "regexp" and "literal" for it. Adding one is a
+;; row. The order is preference order.
+;;
+;; `rg` first, and by a distance — it walks the tree in parallel, skips what `.gitignore`
+;; skips, skips binaries, and is not limited to a repository the way `git grep` is. On a
+;; 27k-file project it is several times `git grep` and an order over `grep -r`. The other two
+;; stay because a searcher has to exist on a machine that has neither: `git grep` inside a
+;; repository (it at least honours the ignore rules), plain `grep -r` anywhere.
+(def *project-searchers*
+  [{:program "rg"
+    :on-path? true
+    :applies (fn (root) true)
+    :args (fn (pattern literal?)
+            ;; `--no-heading` keeps the `file:line:text` shape every row parser here reads;
+            ;; `-uu` is NOT passed, so .gitignore and hidden files are respected as Emacs's
+            ;; `project-find-regexp` respects them. NO `-I`: that is "ignore binary files" to
+            ;; grep and `--no-filename` to ripgrep, which silently drops the file from every
+            ;; row and leaves a results buffer nothing can navigate. rg skips binaries anyway.
+            (into ["--no-heading" "--line-number" "--with-filename" "--color" "never"]
+              (append (if literal? ["--fixed-strings"] []) ["-e" pattern "--" "."])))}
+   {:program "git"
+    :on-path? false
+    :applies (fn (root) (file/dir? (path/join root ".git")))
+    :args (fn (pattern literal?)
+            (into ["grep" "-n" "-I" (if literal? "-F" "-E")] ["-e" pattern "--" "."]))}
+   {:program "grep"
+    :on-path? false
+    :applies (fn (root) true)
+    :args (fn (pattern literal?)
+            [(if literal? "-rnIF" "-rnIE") "--exclude-dir=.git" "-e" pattern "."])}])
+
+(defn- on-path? (program)
+  "Whether `program` is runnable — `command -v`, best-effort (a failure is a no)."
+  (check-allow :discarded-catch
+    (try (= 0 (:exit (os/cmd "sh" ["-c" (str "command -v " program " >/dev/null 2>&1")] "/")))
+      (catch e false))))
+
+(defn project-searcher (root)
+  "The first `*project-searchers*` row that applies at `root` and is actually installed."
+  ;; The last row is plain `grep`: it applies anywhere and is not gated on PATH, so the
+  ;; `find` cannot come back empty. Saying so is what makes the program a string downstream
+  ;; rather than a maybe-string every caller has to guard.
+  (or (seq/find *project-searchers*
+        (fn (s) (and ((:applies s) root) (or (not (:on-path? s)) (on-path? (:program s))))))
+    (error "project-searcher: no searcher applies at " root)))
+
+(defn project-search-command (root pattern literal?)
+  "The command line the search will run, as a `[program args]` pair — what the results
+buffer's header shows, so a reader can copy it into a shell and get the same answer."
+  (let (s (project-searcher root))
+    [(:program s) ((:args s) pattern literal?)]))
+
 (defn- project-grep-run (root pattern literal?)
-  "Run the project's grep for `pattern` — `git grep` under a repository, `grep -rn`
-otherwise — as an extended regexp, or as a fixed string when `literal?`. The raw result
-map; `project-grep` decides what an exit code means."
-  (let (mode (if literal? "-F" "-E"))
-    (if (file/dir? (path/join root ".git"))
-      (os/cmd "git" ["grep" "-n" "-I" mode "-e" pattern "--" "."] root)
-      (os/cmd "grep" ["-rnI" mode "--exclude-dir=.git" "-e" pattern "."] root))))
+  "Run the project's searcher for `pattern` — ripgrep where it exists, else `git grep` in a
+repository, else `grep -r` — as a regexp, or as a fixed string when `literal?`. The raw
+result map; `project-grep` decides what an exit code means."
+  (let ([program args] (project-search-command root pattern literal?))
+    (os/cmd program args root)))
 
 (defn project-grep (root pattern)
   "The `file:line:text` rows for `pattern` over the project at `root`, as one string (each
@@ -3325,27 +3402,132 @@ with `-F`, and only a pattern that fails BOTH ways is an error worth reporting."
             ;; caller asked for and the one whose message says something
             :else (error "project-grep: " (string/trim (str (:stderr r) " " out))))))))
 
+(defn project-search-rows (rows)
+  "The searcher's stdout as clean `file:line:text` rows — blank lines dropped and the `./`
+`grep -r` prefixes its paths with removed, so a row reads `a.txt:3:…` whichever searcher
+produced it."
+  (map (seq/reject (string/split rows "\n") (fn (l) (= l "")))
+    (fn (l) (if (string/starts-with? l "./") (string/substring l 2 (string/length l)) l))))
+
 (defn project-search-text (root pattern rows &optional (literal? false))
-  "The results buffer's text: a header naming the pattern, the root and the count, then
-the rows. `literal?` (the pattern wasn't a valid regexp, so it was searched as text) is
-said in the header — the count is never silently about a different search than the one the
-header claims."
-  (let (lines (seq/reject (string/split rows "\n") (fn (l) (= l "")))
-        ;; grep prints `./a.txt:3:…`; strip the `./` so the row is `a.txt:3:…`
-        clean (map lines
-                (fn (l)
-                  (if (string/starts-with? l "./") (string/substring l 2 (string/length l)) l)))
-        n (count clean))
-    (str ";; "
-      n
-      (if (= n 1) " match" " matches")
-      " for "
-      (if literal? (str "\"" pattern "\" (literal)") (str "/" pattern "/"))
-      " in "
-      root
+  "The results buffer's text, in Emacs `grep-mode`'s shape: the mode/directory line, the
+command that actually ran, the `file:line:text` rows, and a closing count.
+
+Looking like `grep-mode` is not decoration. The three things a reader wants from a search
+buffer are *where did this run*, *what exactly did it run*, and *did it finish or is it
+still going* — Emacs puts all three on screen, and bedit used to show only a count. The
+command line especially: a search that finds nothing is a question about the pattern, and
+the answer is the line you can paste into a shell.
+
+`literal?` (the pattern wasn't a valid regexp, so it was searched as text) is said in the
+header — the count is never silently about a different search than the one it claims."
+  (let (clean (project-search-rows rows)
+        n (count clean)
+        [program args] (project-search-command root pattern literal?)
+        shown (if literal? (str "\"" pattern "\" (literal)") (str "/" pattern "/")))
+    (str "-*- mode: grep; default-directory: \"" root "\" -*-\n"
+      "Search started for " shown "\n"
+      "\n"
+      program
+      " "
+      (string/join args " ")
+      "\n"
       "\n"
       (string/join clean "\n")
-      (if (= n 0) "" "\n"))))
+      (if (= n 0) "" "\n")
+      "\n"
+      "Search finished ("
+      n
+      (if (= n 1) " match" " matches")
+      " found)\n")))
+
+;; ---- the search buffer, coloured like Emacs's grep-mode ---------------------
+;; `*Project Search*` had no `:fontify` at all: a wall of `file:line:text` in one colour,
+;; which is a lot of rows to read with nothing telling the eye where a row starts. Emacs
+;; colours three things and they are the three that matter — the FILE, the LINE NUMBER, and
+;; the MATCH — so a reader scans down the left edge for the file and across for the hit.
+
+(def grep-face-meta {:fg *overlay0* :italic true}) ; the -*- line, the started/finished lines
+(def grep-face-command {:fg *subtext*}) ; the command line, copyable into a shell
+(def grep-face-file {:fg *blue* :bold true}) ; the file a row is in
+(def grep-face-line {:fg *green*}) ; its line number
+(def grep-face-match {:fg *base* :bg *yellow*}) ; the text that matched — isearch's colours
+
+(defdyn *project-search-highlight* nil)
+;; `[pattern literal?]` for the rows currently in `*Project Search*`, or nil. A `:fontify`
+;; service is `(text) -> spans` — it gets no buffer — and the match can only be found by the
+;; pattern that produced it, so the live search parks it here. One search buffer, one global;
+;; the same one-entry-cache shape as `view/*bracket-cache*`.
+
+(defn- grep-match-spans (text off pattern literal?)
+  "Spans over `text` (at buffer offset `off`) for every occurrence of `pattern` — as a
+regexp, or literally when `literal?`. A regexp that will not compile marks nothing rather
+than failing the whole fontify: the rows are still readable without the highlight."
+  (check-allow :discarded-catch
+    (try
+      (if literal?
+        (let (n (string/length pattern))
+          (if (= n 0)
+            '()
+            (letrec (go (fn (from acc)
+                          (let (i (index-of text pattern from))
+                            (if (< i 0)
+                              (reverse acc)
+                              (go (+ i n) (cons [(+ off i) (+ off i n) grep-face-match] acc))))))
+              (go 0 '()))))
+        (map (regex/find-all pattern text)
+          (fn (mm)
+            [(+ off (:start mm)) (+ off (:end mm)) grep-face-match])))
+      (catch e '()))))
+
+(defn project-search-line-spans (line off)
+  "Spans for one `*Project Search*` line starting at offset `off`: a header/footer line in
+the meta voice, the command line in its own, and a `file:line:text` row with its file and
+line number coloured and every match in it highlighted."
+  (let (n (string/length line)
+        colon (index-of line ":")
+        colon2 (if (< colon 0) -1 (index-of line ":" (inc colon)))
+        number (if (< colon2 0) "" (string/substring line (inc colon) colon2))
+        row? (and (> colon 0)
+               (> colon2 colon)
+               (not (= number ""))
+               (nil? (seq/find (string/->list number) (fn (c) (< (index-of "0123456789" c) 0)))))
+        [pattern literal?] (or *project-search-highlight* [nil false]))
+    (cond
+      (or (string/starts-with? line "-*-")
+        (string/starts-with? line "Search started")
+        (string/starts-with? line "Search finished"))
+        (list [off (+ off n) grep-face-meta])
+      row?
+        (append (list [off (+ off colon) grep-face-file]
+                  [(+ off (inc colon)) (+ off colon2) grep-face-line])
+          (if (nil? pattern)
+            '()
+            (grep-match-spans (string/substring line (inc colon2) n) (+ off colon2 1) pattern literal?)))
+      (= line "") '()
+      ;; anything else at the top of the buffer is the command line
+      :else (list [off (+ off n) grep-face-command]))))
+
+(defn project-search-fontify (src)
+  "The `:fontify` service for `*Project Search*` — `[start end face]` spans over `src`,
+line by line (`project-search-line-spans`). Line-structural, so the windowed slice the view
+hands it colours correctly wherever it starts."
+  (let (lines (string/split src "\n"))
+    (reverse
+      (second
+        (fold lines
+          [0 '()]
+          (fn (state line)
+            (let ([off acc] state)
+              [(+ off (string/length line) 1)
+                (fold (project-search-line-spans line off) acc (fn (a s) (cons s a)))])))))))
+
+(def project-search-layer
+  ;; the mode layer `:project-search` stacks: the grep colouring and nothing else — the
+  ;; jumping, the read-only-ness and the gutter come from the layers under it
+  {:name 'project-search
+   :keymap {}
+   :fontify 'commands/project-search-fontify})
 
 (defn- ed-symbol-at-point (m)
   "The symbol under point in the current buffer, or nil — the search prompt's default."
@@ -3359,11 +3541,16 @@ header claims."
 says `(literal)` when the pattern wasn't a valid regexp and was searched as plain text."
   (let ([rows literal?] (project-grep root pattern)
         text (project-search-text root pattern rows literal?)
-        n (dec (count (seq/reject (string/split text "\n") (fn (l) (= l "")))))
+        n (count (project-search-rows rows))
         shown (if literal? (str "\"" pattern "\" (literal)") (str "/" pattern "/"))
+        ;; what the rows matched, for the fontify to highlight — see
+        ;; `*project-search-highlight*` on why this is a global and not a buffer field
+        _ (def *project-search-highlight* [pattern literal?])
         m1 (ed-show-named (assoc m :project-root root) *project-search-buf* text :project-search)
         m2 (ed-set-buf m1 (assoc (ed-current-buf m1) :dir root))
-        m3 (ed-apply m2 (fn (b) (ed-goto-line b 2))))
+        ;; point on the FIRST result row — past the `-*-` line, the started line, the blank,
+        ;; the command and its blank (Emacs lands on the first match too)
+        m3 (ed-apply m2 (fn (b) (ed-goto-line b (if (= n 0) 1 6)))))
     (message m3
       (if (= n 0)
         (str "no matches for " shown)
@@ -3393,40 +3580,79 @@ when not in a project."
                                 (ed-project-search mm root pat)
                                 (catch e (message mm (str "search failed: " (error-message e))))))))}))))
 
-(defn- ed-projects-to-switch (current projs)
-  "`projs` minus the `current` project — the switch-project candidates. You're already in
-the current project, so `C-x p p` never offers it as a target."
-  (seq/reject projs (fn (p) (= p current))))
+;; ---- C-x p p: pick a project, then say what to DO in it ---------------------
+;; Emacs `project-switch-project` is two steps, and the second one is the part that makes it
+;; a project switcher rather than a find-file with extra keys: having chosen a project it
+;; shows `project-switch-commands` — a menu of what you might want to do there — and one
+;; keystroke picks. bedit used to skip it and force find-file, which is only ever right when
+;; find-file is what you wanted.
+
+(def *project-switch-commands*
+  ;; `[key label command-symbol]` per row — Emacs's `project-switch-commands` as DATA. The
+  ;; symbol is resolved at the keystroke (`reflect/eval`), exactly like a keymap binding, so
+  ;; a redefined command hot-swaps and a deferred module (git, bshell, compile) loads when
+  ;; its row is chosen rather than at startup. Adding an entry is a row.
+  [["f" "Find file" 'commands/cmd-project-find-file]
+   ["g" "Find regexp" 'commands/cmd-project-find-regexp]
+   ["d" "Dired" 'commands/cmd-project-dired]
+   ["v" "VC status" 'git/cmd-git-status]
+   ["e" "Shell" 'bshell/cmd-project-bshell]
+   ["r" "REPL" 'bshell/cmd-project-repl]
+   ["c" "Compile" 'compile/cmd-compile]])
+
+(defn project-switch-label ()
+  "The dispatch menu as one echo-area line — `[f] Find file  [g] Find regexp  …`. Built from
+`*project-switch-commands*`, so the menu can never disagree with what the keys do."
+  (string/join (map *project-switch-commands* (fn ([key label _]) (str "[" key "] " label))) "  "))
+
+(defn ed-project-switch-to (m root)
+  "The model moved INTO project `root`: the current buffer's directory becomes the root and
+`:project-root` is set, so every project command — which resolves the project live from the
+buffer's directory (`ed-project-root`) — acts on the project just switched to rather than on
+the one the buffer still sits in. Emacs binds `default-directory` around the dispatched
+command for the same reason. Also records `root` as most-recently-used, gated on
+`:recent-files` like every other on-disk cache write."
+  (let (m1 (assoc m :project-root (if (:recent-files m) (remember-project! root) root)))
+    (ed-set-buf m1 (assoc (ed-current-buf m1) :dir root))))
+
+(defn ed-project-switch-dispatch (m root)
+  "Show the `project-switch-commands` menu for `root` and route the next key through it: a
+listed key runs its command with `root` in force, anything else (Esc, C-g, a key with no
+row) cancels. One keystroke, no minibuffer — the Emacs shape."
+  (ed-read-char (ed-project-switch-to m root)
+    (str (path/basename root) " — " (project-switch-label))
+    (fn (mm key)
+      (let (row (seq/find *project-switch-commands* (fn ([k _ _]) (= k key))))
+        (if (nil? row)
+          (message mm (str "not a project command: " (ed-key-label key)))
+          ((reflect/eval (nth row 2)) mm key))))))
 
 (defcommand cmd-project-switch
   (m key)
-  "Switch to a known project (C-x p p): pick from the remembered project roots (a Vertico
-list, most-recently-used first), then find a file in it — Emacs `project-switch-project`.
-Projects are discovered by using `C-x p f` / opening one; reports when none are known."
-  (let (projs (ed-projects-to-switch (ed-project-root m) (known-projects)))
-    (if (empty? projs)
-      (message m "no other known projects — open one with C-x p f first")
-      (assoc m
-        :minibuffer
-          {:edit (assoc (ed-mb-edit "Switch to project: " "") :word-mode :path)
-           :on-complete (fn (mm root)
-                          (if (file/dir? root)
-                            ;; make it current (and bump it to front of the cache), then find a file
-                            ;; in *that* project — pass the chosen root explicitly, since the current
-                            ;; buffer still sits in the old project (ed-project-root resolves live).
-                            ;; same gate as above; `remember-project!` returns the root it
-                            ;; recorded, so the ungated path stays value-identical
-                            (ed-find-file-in-project (assoc mm
-                                                       :project-root
-                                                         (if (:recent-files mm)
-                                                           (remember-project! root)
-                                                           root))
-                              root)
-                            (message mm (str "no such project: " root))))
-           :complete-fn (fn (t) (ed-complete-name t projs))
-           :rank-source projs
-           :rank-cap 20
-           :accept-selection true}))))
+  "Switch to a known project (C-x p p) — Emacs `project-switch-project`: pick a project root
+(a Vertico list of every remembered one, most-recently-used first; Tab completes, and a
+directory you type that is not on the list yet is accepted and remembered), then choose what
+to do there from the dispatch menu — find file, find regexp, dired, VC status, shell, REPL,
+compile. Projects are remembered as you open them."
+  (let (projs (known-projects))
+    (assoc m
+      :minibuffer
+        {:edit (assoc (ed-mb-edit "Switch to project: " "") :word-mode :path)
+         :on-complete (fn (mm root)
+                        (let (dir (path/absolute (string/trim root)))
+                          (if (file/dir? dir)
+                            (ed-project-switch-dispatch mm dir)
+                            (message mm (str "no such directory: " dir)))))
+         ;; Tab completes a typed PATH once it looks like one (so an unlisted project is
+         ;; reachable by typing it), and otherwise the remembered roots.
+         :complete-fn (fn (t)
+                        (if (or (string/starts-with? t "/") (string/starts-with? t "~"))
+                          (ed-complete-path t)
+                          (ed-complete-name t projs)))
+         :rank-source projs
+         :rank-cap 20
+         :category :file
+         :accept-selection true})))
 
 (defcommand cmd-project-dired
   (m key)
@@ -3449,9 +3675,12 @@ history is **persisted across restarts** via the same recentf mechanism (`recent
 / `remember-command!`), floated by the shared `projects/float-recent`."
   (let (buf (ed-current-buf m)
         active-cmds (apply append (ed-active-mode-commands buf))
-        owned (ed-all-layer-commands)
+        ;; a SET, not the list: `includes?` is O(n) and this rejects every command name
+        ;; against every layer-owned one, which is a few hundred against a few hundred —
+        ;; 26 ms to open M-x, all of it here
+        owned (into #{} (ed-all-layer-commands))
         all-names (sort (append (seq/reject (interactive/command-names)
-                                  (fn (n) (includes? owned n)))
+                                  (fn (n) (contains? owned n)))
                           active-cmds)))
     (assoc m
       :minibuffer
@@ -3474,7 +3703,7 @@ history is **persisted across restarts** via the same recentf mechanism (`recent
           ;; marginalia per row: the key bound to the command in THIS buffer's live keymap,
           ;; its declared contract, its docstring's first line (`plume/plume-command-annotation`)
           :category :command
-          :anno-keymap (editor/layers/scope-keymap (list buf m))))))
+          :anno-keys (ed-key-table (editor/layers/scope-keymap (list buf m)))))))
 ;; ---- fuzzy in-buffer line search (M-s) --------------------------------------
 ;; The same Vertico minibuffer the other completers use, ranking the buffer's own lines
 ;; (consult-line / swiper style): you fuzzy-type, the list narrows, Enter jumps to the
