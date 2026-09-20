@@ -110,7 +110,15 @@ src/format.blsp             M-x format-buffer + format-on-save: the language's o
                             and run over the FILE, so a failing formatter costs nothing
 src/complete-at-point.blsp  completion-at-point (the in-buffer Tab popup) — multi-source merge
                             (named to dodge std's `tool/complete`, which shadows a bare `complete`)
-src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, goto-def/references, hover, rename, format, imenu
+src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, goto-def/references,
+                            hover, rename, format, imenu, and `publishDiagnostics` folded into
+                            the model's diagnostics, so every language gets the underline / ⚠ note
+                            / gutter mark the Brood checker used to have to itself. Answers
+                            server->client requests too (`client/registerCapability` — a server
+                            BLOCKS on that reply) and starts the server IN the project root, which
+                            is how one that builds the project finds it. Elixir is Expert
+                            (expert-lsp.org), which narrates its own startup — forwarded to
+                            *Messages*, because it answers nothing until its engine is up
 src/lsp-requests.blsp       the LSP request-kind records + `LspRequest` ability — the shape/fold vocabulary
                             shared by lsp (connection side) and commands (model side); eager-loaded so
                             commands can register fold impls while lsp stays deferred
@@ -123,7 +131,26 @@ src/debugger.blsp           the editor as the debugger (ADR-174/184): C-c d sess
                             wire protocol and forwards UiEvent records to the loop
 src/testrun.blsp            native test runs (C-c t): a dedicated nest subprocess streams per-test
                             JSON (std's *test-report-sink*) into the *Tests* buffer — never
-                            in-image (%isolate would revert the editor's globals + kill its pids)
+                            in-image (%isolate would revert the editor's globals + kill its pids).
+                            A project with a WARM test session uses it instead (`*warm-backends*`,
+                            one row per language: Elixir's `MIX_ENV=test` node, Brood's
+                            eval-server child) — same rows, same marks, without the runtime
+                            start. A warm run RECOMPILES / RELOADS what changed first, so it
+                            never reports on the code the session booted with, and says so
+                            when it had to. The cold path stays and is never slower: a run
+                            with no warm session uses it AND starts one
+src/session.blsp            ONE event vocabulary for every evalsession the editor keeps
+                            (`session-ready` / `session-reply` / `session-down`, each carrying
+                            the session's NAME) plus the shared emit and client API. Each
+                            backend used to carry its own three records and its own emit
+                            purely so the router could tell whose event it was — a fact the
+                            session already knows, and now says
+src/brood-test.blsp         C-c t in a Brood project without the project load: an eval-server
+                            child answering `:test` / `:teststop`, streaming per-test
+                            verdicts AND the spy entries a test traces.
+                            Measured here — 1.21s cold (435ms of it loading sixty modules)
+                            against ~200ms warm, and it reloads changed src/ per run
+                            (project/reload-changed), so it is never stale
 src/apprun.blsp             run the project (C-c r): nest run in a subprocess with debug taps —
                             app output + spy/trace traffic into *Run*; live stats on a statusbar chip
 src/hosted.blsp             THE FLIP: every pool buffer backed by its own process (hosted-reconcile)
@@ -139,14 +166,48 @@ src/wrap.blsp              visual-line-mode: the pure break rule (a line → `[f
                             by default (a `:visual-line` mode facet); M-x visual-line-mode toggles
 src/isearch.blsp            incremental search + query-replace (C-s/C-r/M-%) modal mini-loops
 src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
-src/sandbox.blsp            the persistent eval sandbox: one `nest run` child on std's
-                            eval-server (ADR-198), pr-str-line protocol, watchdog + respawn
+src/sandbox.blsp            the Brood eval session's BACKEND over std's `editor/evalsession`:
+                            find a runtime, start it on a generated eval-server script
+                            (ADR-198), the pr-str-line codec, and session events -> UiEvent
+                            records. The supervision (queue-until-ready, id-matched replies,
+                            the watchdog, strikes, respawn) is std's and shared with Elixir
 src/liveeval.blsp           the live-evaluating buffer as a VOCABULARY, shared by tutor +
                             playground: parse-state, result/type/timing notes, spy cascade
 src/sandbox-events.blsp     routes the shared sandbox's UiEvents to every client that wants
                             them (an `impl` is per record type, so one client can't own them)
+src/playground-core.blsp    the live-evaluating buffer as a MECHANISM, parameterised by a
+                            language spec: form diffing, the marker-anchored notes, the
+                            launch plan, the reply fold, the pane following the cursor —
+                            everything about a playground that is not about a language
 src/playground.blsp         M-x brood-playground: a free-text Brood buffer that runs as you
                             type — results as ghost text, *Playground Spy* pane beside it
+                            (the Brood half of playground-core: how Brood text splits into
+                            forms, what its deps are, where to send one)
+src/elixir-sandbox.blsp     the Elixir session: one `mix run` child (the project COMPILED and
+                            STARTED, so the playground can call your contexts and hit your
+                            Repo), supervised by std's `editor/evalsession`, speaking a
+                            base64/JSON line protocol to `elixir/bedit_agent.exs`
+src/elixir-playground.blsp  M-x elixir-playground (C-c p e): the second client of
+                            playground-core — tree-sitter form splitting,
+                            `editor/treesit/parse-state` for mid-typing vs broken, a
+                            defmodule/binding dependency rule, and the term's type as the
+                            hint (the BEAM computes it; no checker can)
+src/elixir-test.blsp        C-c t without the VM boot: a SECOND agent, booted
+                            `MIX_ENV=test mix run` (`:dev` and `:test` are different
+                            environments — different config, different database, an Ecto
+                            sandbox in only one), answering `TEST` by requiring the named
+                            files and calling `ExUnit.run/1`. Verdicts stream back one per
+                            test (evalsession's `:more` replies) into the same *Tests*
+                            buffer the cold runner fills. The cold path stays and is never
+                            slower: a run with no warm node uses it AND starts one
+elixir/bedit_agent.exs      bedit's agent ON the BEAM: a session (binding + modules across
+                            requests), IO capture, per-request timeout, `:erlang.trace`
+                            over the modules the SESSION defined (the spy cascade), and the
+                            ExUnit formatter that streams a warm run's verdicts. An
+                            ordinary .exs file, spliced in by `include-str` at compile time
+                            because a release bundle carries code and no assets (ADR-038).
+                            Needs Elixir 1.14+ (`dbg/2`'s `:dbg_callback`); below that it
+                            still evaluates and says so once (`elixir-sandbox/version-notice`)
 src/tutor.blsp              the interactive Brood tutorial (C-h t): playground boxes that
                             eval-on-type in the sandbox — ✓/✗ gutter, ghost results, prose guard
 src/aside.blsp              the ASIDE pane: a named buffer shown beside the page, refreshed in
@@ -186,13 +247,21 @@ src/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e), and
                             drops its prompt, so os/spawn-pty is what makes it possible
 src/git.blsp                git porcelain: C-x g status buffer, diff/log/commit, C-x v = vc-diff
 src/gitdiff.blsp            diff-hl change gutter: per-line added/modified/deleted vs HEAD
+src/beam.blsp               M-x beam-processes (C-c b p): the editor as `:observer` — every process in
+                            the node your app runs in (name, mailbox, memory, reductions/sec,
+                            current function), busiest first, `g` refresh `k` kill, over the
+                            SAME agent the playground evaluates in. C-c b a ATTACHES that
+                            agent to a node bedit did not start (`Node.connect/1`, then
+                            `:erpc` for every eval and observation) — node typed not
+                            discovered, cookie asked for not assumed, and the mode line
+                            names the node the whole time, because the risk is forgetting
 src/web.blsp                live HTTP mirror of the selected buffer (C-x w)
 src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclient model over node links
 src/collab.blsp             shared-buffer collaboration: presence carets, delta merges, follow/mirror
 tests/*_test.blsp           pure model/view tests, one suite per area (no window needed)
 tests/strict_ratchet_test   the `nest check --strict` ceiling: the count may only shrink —
                             a new function that adds a finding declares its contract instead
-tools/drive*.py            live pty drivers: run the real editor, assert on what it paints —
+tools/drive*               live drivers: run the real editor, assert on what it paints —
                            the wiring the model tests can't see (`make drive`, tools/README.md)
 assets/                     the desktop identity: the icon (SVG) + the .desktop entry the
                             window's `:app-id` is matched against (`make install` places both)
