@@ -1,0 +1,163 @@
+;; render_fuzz_test.blsp — the view must never raise, whatever state it is handed.
+;;
+;; `ed-view` catches its own exceptions and paints a `render error: …` echo row instead of
+;; a frame, so a raise here does not kill the process — it replaces the whole editor with
+;; one red line, which is worse than a crash because it looks like the editor's fault
+;; rather than a bug's. Two of those shipped today:
+;;
+;;   %rope-char->line: index 179 out of bounds   (a diagnostic that outlived its text)
+;;   text/line->char rejects an out-of-range line (a report pane's point past EOF)
+;;
+;; Both were the SAME class — derived state (a diagnostic, a note, a scroll offset, a
+;; point) outliving the text it was computed against — and both were fixed where they were
+;; found. This file is the systemic version: build adversarially stale models and assert
+;; the view paints something. It is a fuzz, so it is seeded and deterministic; a failure
+;; prints the seed and the shape that produced it.
+(defmodule render-fuzz-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use-internals view) ; ed-view — the function under test
+  (:use-internals input)) ; ed-ensure-layers — a buffer needs its mode layers to paint
+
+(defn- rf-error? (frame)
+  "Whether `frame` is the view's failure frame rather than a rendered one."
+  (any? frame
+    (fn (op)
+      (and (vector? op) (= (first op) :text) (includes? (str (nth op 3 "")) "render error")))))
+
+(defn- rf-text (n)
+  "A buffer of `n` lines, varied enough that wrapping, tabs and wide glyphs all occur."
+  (string/join
+    (map (range n)
+      (fn (i)
+        (case (math/mod i 5)
+          0 (str "line " i " plain")
+          1 (str "  indented " i "\twith a tab")
+          2 (str "(defn f-" i " (x) (+ x " i "))")
+          3 (string/repeat (str "wide-" i " ") 30)
+          "")))
+    "\n"))
+
+;; ---- the adversarial dimensions ---------------------------------------------
+;; Each is a real shape the editor produces, not a hypothetical: an annotation computed
+;; against longer text, a pane scrolled past a buffer that shrank, a report buffer whose
+;; point outlived its rows, a pane one cell wide.
+
+(defn- rf-stale-diagnostics (m over)
+  "Diagnostics naming lines and columns `over` past the end — an async check whose reply
+landed after the buffer shrank."
+  (let (buf (ed-current-buf m)
+        n (buffer-line-count buf))
+    (ed-set-diagnostics m
+      (map (range 3) (fn (i) {:line (+ n over i) :col (+ 400 i) :message "stale finding"}))
+      (buffer-rope buf))))
+
+(defn- rf-stale-annotation (m key over value)
+  "A `{line -> mark}` buffer annotation pointing past EOF — a test verdict or a breakpoint
+left behind by an edit that deleted the lines it marked.
+
+`value` is passed in because each source's value has its OWN shape and the renderer reads
+it: a breakpoint is `true`, a test verdict is a bool, a diagnostic line is a LIST of
+findings. Feeding the wrong shape tests nothing real — only bedit writes these — and a
+failure from it is a bug in the fuzz that looks like a bug in the editor. This one cost a
+round trip: `{line -> true}` under `:diagnostic-lines` made the glyph call `empty?` on a
+bool, which is a state the editor cannot produce."
+  (let (buf (ed-current-buf m)
+        n (buffer-line-count buf))
+    (ed-set-buf m
+      (annotate buf key (fold (range 3) {} (fn (acc i) (assoc acc (+ n over i) value)))))))
+
+(defn- rf-scrolled-past (m over)
+  "Every pane scrolled `over` lines past the end of its buffer."
+  (ed-map-panes m (fn (w) (assoc w :top (+ (buffer-line-count (ed-current-buf m)) over)))))
+
+(defn- rf-hscrolled (m n)
+  (ed-map-panes m (fn (w) (assoc w :hscroll n))))
+
+(defn- rf-point-past (m over)
+  "The pane's window-point past the end of the text — the report-pane shape that made
+`text/line->char` raise."
+  (ed-map-panes m (fn (w) (assoc w :point (+ (buffer-length (ed-current-buf m)) over)))))
+
+(defn- rf-narrowed (m lo hi)
+  (ed-map-panes m (fn (w) (assoc w :restrict [lo hi]))))
+
+(def- rf-mutations
+  ;; `[name (model -> model)]`. A fuzz case applies a random SUBSET, because the bugs of
+  ;; this class come from combinations — a stale annotation on a pane that is also
+  ;; scrolled past the end reaches code that neither alone does.
+  [["stale-diagnostics" (fn (m) (rf-stale-diagnostics m 5))]
+   ["diagnostics-just-past" (fn (m) (rf-stale-diagnostics m 1))]
+   ["stale-test-marks" (fn (m) (rf-stale-annotation m :test-marks 3 false))]
+   ["stale-breakpoints" (fn (m) (rf-stale-annotation m :debug-break-lines 1 true))]
+   ["stale-diagnostic-lines"
+    (fn (m)
+      (rf-stale-annotation m :diagnostic-lines 7 (list {:line 99 :col 3 :message "gone"})))]
+   ["scrolled-past-end" (fn (m) (rf-scrolled-past m 12))]
+   ["scrolled-one-past" (fn (m) (rf-scrolled-past m 1))]
+   ["hscrolled-far" (fn (m) (rf-hscrolled m 5000))]
+   ["hscrolled-negative" (fn (m) (rf-hscrolled m -3))]
+   ["point-past-eof" (fn (m) (rf-point-past m 25))]
+   ["point-one-past" (fn (m) (rf-point-past m 1))]
+   ["narrowed-past-end" (fn (m) (rf-narrowed m 900 1000))]
+   ["narrowed-inverted" (fn (m) (rf-narrowed m 80 10))]
+   ["no-view-rows" (fn (m) (dissoc m :view-rows))]
+   ["visual-line" (fn (m) (ed-set-buf m (annotate (ed-current-buf m) :visual-line true)))]
+   ["empty-buffer" (fn (m) (ed-set-buf m (make-buffer "")))]
+   ["one-char" (fn (m) (ed-set-buf m (make-buffer "x")))]
+   ["no-trailing-newline" (fn (m) (ed-set-buf m (make-buffer "a\nb\nc")))]])
+
+(def- rf-sizes
+  ;; Viewports that have each broken something at some point: one cell, one column, one
+  ;; row, and an ordinary window for the control.
+  [[1 1] [1 24] [80 1] [2 3] [80 24] [213 49]])
+
+(def- rf-bases
+  ;; Built ONCE, at three lengths. `ed-ensure-layers` attaches a buffer's mode layers and
+  ;; is not free; building a fresh model per case made the fuzz spend all its time on
+  ;; setup rather than on rendering, and a test slow enough to be skipped is a test that
+  ;; is not run.
+  (map [1 12 40] (fn (n) (input/ed-ensure-layers (ed-init (make-buffer (rf-text n)))))))
+
+(defn- rf-case (seed)
+  "One fuzz case from `seed`: `[names model cols rows]` — a subset of the mutations
+applied to one of the base models, at one of the viewports."
+  (let ([pick s1] (rand/int seed 1000000)
+        [sz s2] (rand/int s1 (count rf-sizes))
+        [which _] (rand/int s2 (count rf-bases))
+        base (nth rf-bases which)
+        chosen (seq/keep (range (count rf-mutations))
+                 (fn (i) (if (= 1 (math/mod (math/quot pick (math/pow 2 i)) 2))
+                           (nth rf-mutations i)
+                           nil)))
+        [cols rows] (nth rf-sizes sz))
+    [(map chosen first)
+      (fold chosen base (fn (acc mut) ((second mut) acc)))
+      cols
+      rows]))
+
+(describe "the view paints a frame, whatever stale state it is handed"
+  (test "300 seeded combinations of stale annotations, scrolls and viewports"
+    (let (bad (seq/keep (range 300)
+                (fn (n)
+                  (let ([names m cols rows] (rf-case (rand/seed n))
+                        frame (ed-view m cols rows))
+                    (if (rf-error? frame)
+                      (str "seed " n " (" cols "x" rows "): " (string/join names " + "))
+                      nil)))))
+      ;; the names are in the failure so the shape is reproducible without re-running
+      (assert= bad '())))
+  (test "each mutation alone renders at an ordinary size"
+    ;; the combinations above can mask a single-cause bug by never selecting it alone
+    (let (bad (seq/keep rf-mutations
+                (fn (mut)
+                  (let (m ((second mut) (input/ed-ensure-layers (ed-init (make-buffer (rf-text 12))))))
+                    (if (rf-error? (ed-view m 80 24)) (first mut) nil)))))
+      (assert= bad '())))
+  (test "each mutation alone renders in a one-cell pane"
+    (let (bad (seq/keep rf-mutations
+                (fn (mut)
+                  (let (m ((second mut) (input/ed-ensure-layers (ed-init (make-buffer (rf-text 12))))))
+                    (if (rf-error? (ed-view m 1 1)) (first mut) nil)))))
+      (assert= bad '()))))
