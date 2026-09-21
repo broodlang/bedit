@@ -1,6 +1,6 @@
 ;; help.blsp — the C-h map: what is bound, what is on, what a name means.
 ;;
-;; bedit registers 382 interactive commands and composes its keymap from a buffer's mode
+;; bedit registers several hundred interactive commands and composes its keymap from a buffer's mode
 ;; layers over the model's profile layers. Before this file there was no way to see either
 ;; from inside the editor: C-h bound four keys, and the only route to a command you had
 ;; not memorised was guessing at M-x. An editor you are meant to REDEFINE at runtime has to
@@ -52,38 +52,54 @@ dispatcher for every key that reaches it — including the ones no keymap binds,
   (str n " " what (if (= n 1) "" "s")))
 
 (defn- help-scope (m)
-  "The scope contexts help reports on, in dispatch precedence: the current buffer's mode
-layers over the model's profile layers. The SAME list `input/ed-active-keymap` composes for
-dispatch — named once here so help cannot come to disagree with it by drifting."
-  (list (ed-current-buf m) m))
+  "The scope contexts help reports on — `input/ed-scope`, the very list the dispatcher
+resolves through, asked rather than restated.
+
+This file first spelled the list out again here, under a comment claiming it could not
+drift. Two copies is exactly how it drifts: add a third scope to dispatch and help keeps
+reporting on two, confidently and wrongly. The claim only becomes true by calling the
+dispatcher's own accessor."
+  (input/ed-scope m))
+
+(defn- help-decorate (entries)
+  "`entries` with `:label` (the key sequence as an Emacs label) and `:name` (the command's
+M-x name) computed ONCE each.
+
+Not a micro-optimisation. Both are derived per entry and were being recomputed at three
+sites — the sort key, the column width and the row itself — with `sort-by` re-deriving its
+key per comparison on top. `model/ed-key-table`'s docstring already records the price
+(labelling is ~25 µs a key, and `M-x`'s marginalia measured 48 ms a keystroke doing it per
+row); formatting 223 bindings measured **77 ms** this way. Derive a display value once,
+where you have the list — never inside the formatter."
+  (map entries
+    (fn (e)
+      (assoc e
+        :label (ed-keys-label (:sequence e))
+        ;; the M-x name, not the function's — `find-file`, not `cmd-find-file`. A reader
+        ;; who finds a command here wants to type it into M-x, and `cmd-` is the one part
+        ;; of the symbol that would stop them
+        :name (command-friendly-name (ed-command-tail (:command e)))))))
 
 (defn- help-binding-row (entry key-width)
-  "One `scope-bindings` entry as a report line: the key sequence, the command's short name,
-and — for a shadowed binding — which layer took the chord away from it."
-  (let (label (ed-keys-label (:sequence entry))
+  "One DECORATED entry as a report line: the key sequence, the command's M-x name, and —
+for a shadowed binding — which layer took the chord away from it."
+  (let (label (:label entry)
         pad (string/repeat " " (math/max 1 (- key-width (string/length label))))
-        ;; the M-x name, not the function's — `find-file`, not `cmd-find-file`. A reader who
-        ;; finds a command here wants to be able to type it into M-x, and `cmd-` is the one
-        ;; part of the symbol that would stop them
-        name (command-friendly-name (ed-command-tail (:command entry)))
         shadow (:shadowed-by entry))
     (str "  "
       label
       pad
-      name
+      (:name entry)
       (if (nil? shadow) "" (str "   (shadowed by " (->string shadow) ")")))))
 
 (defn- help-by-layer (entries)
-  "`entries` grouped into `[layer-name rows]` pairs, layers in precedence order (highest
-first) and each layer's rows sorted by key label. Grouping is by LAYER rather than by key
-because that is the question being asked: a binding you did not expect is explained by which
-layer owns it, and the layers are already in the order that decides who wins."
+  "DECORATED `entries` grouped into `[layer-name rows]` pairs, layers in precedence order
+(highest first) and each layer's rows sorted by key label. Grouping is by LAYER rather than
+by key because that is the question being asked: a binding you did not expect is explained
+by which layer owns it, and the layers are already in the order that decides who wins."
   (let (order (seq/distinct (map entries :layer)))
     (map order
-      (fn (nm)
-        [nm
-         (sort-by (seq/filter entries (fn (e) (= (:layer e) nm)))
-           (fn (e) (ed-keys-label (:sequence e))))]))))
+      (fn (nm) [nm (sort-by (seq/filter entries (fn (e) (= (:layer e) nm))) :label)]))))
 
 (sig help-bindings-text (seqable -> string))
 (defn help-bindings-text (entries)
@@ -93,10 +109,11 @@ precedence first, each row `key   command`, with a shadowed row saying who shado
 Shadowed bindings are LISTED, not filtered out. A binding that silently vanished is the
 single hardest thing to debug about a layered keymap, and the answer — some layer above took
 the whole chord — is exactly what this line says."
-  (let (width (fold entries
+  (let (decorated (help-decorate entries)
+        width (fold decorated
                 8
-                (fn (acc e) (math/max acc (+ 2 (string/length (ed-keys-label (:sequence e)))))))
-        groups (help-by-layer entries))
+                (fn (acc e) (math/max acc (+ 2 (string/length (:label e))))))
+        groups (help-by-layer decorated))
     (string/join
       (map groups
         (fn (group)
@@ -147,21 +164,19 @@ count of keys it binds — something true rather than a blank."
 (defn help-mode-text (layers entries)
   "The *Modes* buffer text: the active layers highest-precedence first, each with its
 description and the bindings it contributes that are actually in force."
-  (string/join
-    (map layers
-      (fn (layer)
-        (let (nm (:name layer)
-              mine (seq/filter entries
-                     (fn (e) (and (= (:layer e) nm) (nil? (:shadowed-by e)))))
-              width (fold mine
-                      8
-                      (fn (acc e) (math/max acc (+ 2 (string/length (ed-keys-label (:sequence e))))))))
-          (string/join
-            (append (list (str (->string nm) " — " (help-layer-doc layer)))
-              (map (sort-by mine (fn (e) (ed-keys-label (:sequence e))))
-                (fn (e) (help-binding-row e width))))
-            "\n"))))
-    "\n\n"))
+  (let (decorated (help-decorate entries))
+    (string/join
+      (map layers
+        (fn (layer)
+          (let (nm (:name layer)
+                mine (seq/filter decorated
+                       (fn (e) (and (= (:layer e) nm) (nil? (:shadowed-by e)))))
+                width (fold mine 8 (fn (acc e) (math/max acc (+ 2 (string/length (:label e)))))))
+            (string/join
+              (append (list (str (->string nm) " — " (help-layer-doc layer)))
+                (map (sort-by mine :label) (fn (e) (help-binding-row e width))))
+              "\n"))))
+      "\n\n")))
 
 (defcommand cmd-describe-mode
   (m key)
@@ -183,18 +198,33 @@ precedence first, with what it is and the keys it contributes that are in force.
 as labels. Shadowed bindings are left out on purpose: this answers \"how do I run it\",
 and a key that cannot reach the command is not an answer to that.
 
-`name` is resolved to its SYMBOL before comparing, because the two spellings differ — the
-registry keys on the friendly name (`find-file`, `cmd-` stripped by
+The index is keyed on the M-x name, not the symbol tail, because the two spellings differ:
+the registry keys on the friendly name (`find-file`, `cmd-` stripped by
 `interactive/command-friendly-name`) while a keymap binds `commands/cmd-find-file`.
-Comparing the name to the tail directly never matches, and the failure is silent: every
-command reports as unbound. `plume-command-annotation` resolves the same way."
-  (let (sym (command-sym name)
-        tail (if (nil? sym) nil (ed-command-tail sym)))
-    (if (nil? tail)
-      '()
-      (map (seq/filter entries
-             (fn (e) (and (nil? (:shadowed-by e)) (= (ed-command-tail (:command e)) tail))))
-        (fn (e) (ed-keys-label (:sequence e)))))))
+Comparing a name against a tail never matches, and the failure is silent — every command
+reports as unbound. `plume-command-annotation` bridges the same gap the same way.
+
+For ONE command only. A caller with a list of them builds `help-key-index` itself and
+looks up, or it pays for rebuilding the index per row."
+  (get (help-key-index entries) name '()))
+
+(defn- help-key-index (entries)
+  "`{M-x name -> (key label …)}` for every binding in force — the whole entry list inverted
+in ONE walk.
+
+For a caller that needs the keys beside MANY commands, which is every caller here.
+Scanning `entries` per row instead is O(rows × bindings): `C-h a` on a short pattern
+matched 296 of 369 commands and rescanned 223 entries for each, and measured **629 ms** —
+a visible freeze on a keystroke. This is `model/ed-key-table`'s lesson (\"ruinous for a
+list: M-x's marginalia did that per visible row per frame\") in the one other place that
+needed it."
+  (fold entries
+    {}
+    (fn (acc e)
+      (if (:shadowed-by e)
+        acc
+        (let (nm (command-friendly-name (ed-command-tail (:command e))))
+          (assoc acc nm (append (get acc nm '()) (list (ed-keys-label (:sequence e))))))))))
 
 (defcommand cmd-where-is
   (m key)
@@ -216,22 +246,32 @@ then say where it is bound — or that it is M-x only."
 (defn help-apropos-rows (names entries pattern)
   "The `C-h a` rows for `pattern`: every command name containing it (case-folded), with its
 keys and the first line of its docstring. Substring, not fuzzy — apropos is for \"what is
-there about buffers\", and a fuzzy match over 382 names answers a different question."
-  (let (needle (string/fold-case pattern))
-    (map (seq/filter names (fn (n) (includes? (string/fold-case n) needle)))
-      (fn (n)
-        (let (keys (help-keys-for entries n)
-              d (ed-doc (command-sym n)))
-          (str "  "
-            n
-            (if (empty? keys) "" (str "   (" (string/join keys ", ") ")"))
-            "\n      "
-            (if (string? d) (ed-first-line d) "(no docstring)")))))))
+there about buffers\", and a fuzzy match over the whole registry answers a different
+question.
+
+An EMPTY pattern matches nothing rather than everything. Every row costs a `reflect/eval`
+for its docstring, so \"all of them\" is ~700 ms of frozen loop to answer a question nobody
+asked — `C-h b` is the list-everything command, and it is the one that is cheap."
+  (if (= (string/trim pattern) "")
+    '()
+    (let (needle (string/fold-case pattern)
+          ;; ONE walk for the keys of every command (see `help-key-index`), not a rescan
+          ;; of `entries` per row
+          keys-of (help-key-index entries))
+      (map (seq/filter names (fn (n) (includes? (string/fold-case n) needle)))
+        (fn (n)
+          (let (keys (get keys-of n '())
+                d (ed-doc (command-sym n)))
+            (str "  "
+              n
+              (if (empty? keys) "" (str "   (" (string/join keys ", ") ")"))
+              "\n      "
+              (if (string? d) (ed-first-line d) "(no docstring)"))))))))
 
 (defcommand cmd-apropos-command
   (m key)
   "List commands whose name matches a pattern (C-h a), with their keys and docstring
-summary — the way into 382 registered commands when you know the noun but not the name."
+summary — the way into the whole command registry when you know the noun but not the name."
   (assoc m
     :minibuffer
       {:edit (ed-mb-edit "Apropos command: " "")
@@ -249,6 +289,22 @@ summary — the way into 382 registered commands when you know the noun but not 
 
 ;; ---- lossage ---------------------------------------------------------------
 
+(def *lossage-per-row* 12)
+;; Keys per line in the `C-h l` report. The whole ring on one line is a line a hundred
+;; keys long, and a `:help` buffer does not wrap — so the tail of what you just pressed,
+;; which is the part you came to read, sits off the right edge behind a horizontal scroll.
+
+(sig lossage-text (seqable -> string))
+(defn lossage-text (ring)
+  "The key ring as indented rows of `*lossage-per-row*` labels, oldest first."
+  ;; `chunk-every`, not `partition`: partition DROPS a trailing partial chunk, and the
+  ;; trailing chunk here is the last few keys you pressed — the ones you opened C-h l to
+  ;; look at. A report that silently omits its own point.
+  (string/join
+    (map (seq/chunk-every (map ring ed-key-label) *lossage-per-row*)
+      (fn (row) (str "  " (string/join row " "))))
+    "\n"))
+
 (defcommand cmd-view-lossage
   (m key)
   "Show the keys you last pressed (C-h l) — what actually reached the dispatcher, in order.
@@ -259,8 +315,8 @@ swallowed is in this list, which is the only place it is visible."
       "*Lossage*"
       (if (empty? ring)
         "No keys recorded yet.\n"
-        (str "The last " (count ring) " keys, oldest first:\n\n  "
-          (string/join (map ring ed-key-label) " ")
+        (str "The last " (help-count-label (count ring) "key") ", oldest first:\n\n"
+          (lossage-text ring)
           "\n"))
       :help)))
 
