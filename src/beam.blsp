@@ -193,6 +193,33 @@ which table is holding the memory."
                   :type :beam-apps-menu}
    :ets {:what "ets" :buffer "*BEAM ETS*" :key :tables :type :beam-ets-menu}})
 
+;; ---- auto-refresh: a live view is one that stays live -------------------------------
+;; A process list is a measurement, and a measurement you have to keep asking for is a
+;; snapshot pretending to be a monitor. REDS/S in particular is a rate between two
+;; snapshots — press `g` once and every row reads `-`; press it twice, slowly, and the
+;; rate is averaged over however long you took to press it again. On a timer the column
+;; finally means what it says.
+;;
+;; Three rules keep it from being a nuisance, and they are the whole design:
+;;   * only while the buffer is ON SCREEN (`ed-buffer-displayed?`) — a buried observer
+;;     costs the node a round trip per tick for nothing;
+;;   * never while a request is already in flight, so a slow node makes the list lag
+;;     rather than queue;
+;;   * refilled in place, keeping your line and your pane (`beam-refill`).
+
+(def *refresh-ms* 2000)
+;; How often a displayed view re-asks the node. Two seconds: fast enough that REDS/S is a
+;; live reading, slow enough that it is one round trip per tick over an already-open
+;; session. `nil` (or `M-x beam-auto-refresh`) turns it off.
+
+(def *auto-refresh* true)
+;; The default for new sessions; `:beam-auto-refresh` on the model is the live toggle.
+
+(defn auto-refresh? (m)
+  "Whether the views should re-ask on a timer — the model's toggle, defaulting to
+`*auto-refresh*`, and off entirely when `*refresh-ms*` is not a number."
+  (and (int? *refresh-ms*) (get m :beam-auto-refresh *auto-refresh*)))
+
 (defn view-of (m)
   "The view the CURRENT buffer is, or `:processes` when it is none of them — which is what
 `g` refreshes and what a reply fills."
@@ -239,17 +266,91 @@ readings of the same counter, and neither a supervision tree nor a table list ha
   (let (at (os/now)
         prev (get-in m [*state-key* :snapshot])
         rated (ed-rate-procs (get prev :reds) (get prev :at) rows at :pid)
-        m1 (ed-show-named m *buffer-name* (beam-text rated) :beam-menu))
+        m1 (if (ed-buffer-displayed? m *buffer-name*)
+             (beam-refill m *buffer-name* (beam-text rated) :beam-menu)
+             (ed-show-named m *buffer-name* (beam-text rated) :beam-menu)))
     (assoc-in m1 [*state-key* :snapshot] {:at at :reds (beam-snapshot-reds rows)})))
 
+(defn displayed-view (m)
+  "The view whose buffer is on screen, or nil — the one the refresh timer should ask about.
+The SELECTED buffer's view wins when it is one of them, so with the process list and the
+ETS table side by side the timer follows the one you are reading."
+  (let (mine (seq/filter (%map-pairs *views*)
+               (fn ([_ v]) (ed-buffer-displayed? m (get v :buffer))))
+        here (buffer-name (ed-current-buf m))
+        sel (seq/find mine (fn ([_ v]) (= (get v :buffer) here))))
+    (cond
+      sel (first sel)
+      (empty? mine) nil
+      :else (first (first mine)))))
+
+(defn beam-tick (m)
+  "The refresh timer fired: re-ask the node about whichever view is on screen.
+
+Silent about everything that could go wrong — no displayed view, auto-refresh off, a
+request already in flight, no session. A timer that reports its own no-ops fills the echo
+area with news of nothing happening."
+  (if (or (not (auto-refresh? m)) (not (nil? (get-in m [*state-key* :pending]))))
+    m
+    (let (view (displayed-view m))
+      (if (nil? view) m (beam-request m view)))))
+
+(defcommand cmd-beam-auto-refresh
+  (m key)
+  "Toggle the BEAM views' auto-refresh (M-x beam-auto-refresh, or `a` in one of them).
+
+Off, `g` is the only thing that moves them — which is what you want while you are reading
+a row carefully, or attached to a node over a link you would rather not poll."
+  (let (on (not (auto-refresh? m)))
+    (message (assoc m :beam-auto-refresh on)
+      (if on
+        (str "BEAM auto-refresh on (every " (math/quot *refresh-ms* 1000) "s)")
+        "BEAM auto-refresh off — g to refresh"))))
+
+(defn beam-refill (m nm text type)
+  "Put `text` in the buffer named `nm`, KEEPING the reader's line, and without touching the
+layout or the selection.
+
+`ed-show-named` is wrong for a refresh. It re-displays the buffer, which selects it — fine
+when you pressed `g`, wrong when a timer fired while you were typing in another pane, and
+it rebuilds the buffer from scratch so point returns to line 0. Watching the busiest
+process on row 40 means nothing if every refresh throws you back to the top.
+
+So: `ed-upsert-named` for the text (pool only — layout and selection untouched), and the
+line restored, clamped to the new length. The LINE, not the character offset: these are
+tables that re-sort on every snapshot, and a row number is the only thing that survives a
+re-sort meaningfully — the same choice `top` on a process list makes."
+  (let (idx (ed-buffer-index-by-name m nm)
+        line (if (nil? idx) 0 (buffer-current-line (ed-buf-at m idx)))
+        m1 (ed-upsert-named m nm text type)
+        i2 (ed-buffer-index-by-name m1 nm))
+    (if (nil? i2)
+      m1
+      (let (buf (ed-buf-at m1 i2)
+            want (math/max 0 (math/min line (dec (buffer-line-count buf)))))
+        (update m1
+          :buffers
+          assoc
+          i2
+          (goto-char buf (text/line->char (buffer-rope buf) want)))))))
+
 (defn beam-show-view (m view reply)
-  "Render an arrived observation into the buffer its view names."
+  "Render an arrived observation into the buffer its view names.
+
+A view buffer already on screen is REFILLED in place (`beam-refill`) rather than
+re-displayed: the reply may be the answer to a `g` you pressed, or to the refresh timer
+firing while you were somewhere else entirely, and only one of those should move you."
   (let (spec (get *views* view)
-        rows (or (get reply (get spec :key)) []))
+        rows (or (get reply (get spec :key)) [])
+        nm (get spec :buffer)
+        show (fn (mm text)
+               (if (ed-buffer-displayed? mm nm)
+                 (beam-refill mm nm text (get spec :type))
+                 (ed-show-named mm nm text (get spec :type)))))
     (case view
       :processes (beam-show m rows)
-      :applications (ed-show-named m (get spec :buffer) (apps-text rows) (get spec :type))
-      :ets (ed-show-named m (get spec :buffer) (ets-text rows) (get spec :type))
+      :applications (show m (apps-text rows))
+      :ets (show m (ets-text rows))
       m)))
 
 ;; ---- the session client hooks (registered in `sandbox-events/*clients*`) ----------------
@@ -356,6 +457,9 @@ production node after a crash is worse than making you ask twice."
     ;; `g` to refresh and `k` to kill, the same two keys the native process list uses —
     ;; a reader who has used one already knows this one.
     (keymap-bind ["g"] 'beam/cmd-beam-refresh)
+    ;; `a` toggles the refresh timer — off while you read a row closely, or over a link
+    ;; you would rather not poll
+    (keymap-bind ["a"] 'beam/cmd-beam-auto-refresh)
     (keymap-bind ["k"] 'beam/cmd-beam-kill)
     (keymap-bind ["d"] 'beam/cmd-beam-kill)
     (keymap-bind ["x"] 'beam/cmd-beam-kill)))
@@ -363,7 +467,7 @@ production node after a crash is worse than making you ask twice."
 (def beam-menu-layer
   {:name 'beam-menu
    :keymap beam/beam-menu-keymap
-   :commands '("beam-refresh" "beam-kill")
+   :commands '("beam-refresh" "beam-auto-refresh" "beam-kill")
    :no-line-numbers true})
 
 (register-type-layers :beam-menu
@@ -372,12 +476,15 @@ production node after a crash is worse than making you ask twice."
 ;; The other two views get `g` but not `k`: a supervision tree and a table list are things
 ;; to READ, and killing a supervised process from a tree view would be asking the
 ;; supervisor to put it back — a confusing way to do nothing.
-(def beam-read-keymap (-> {} (keymap-bind ["g"] 'beam/cmd-beam-refresh)))
+(def beam-read-keymap
+  (-> {}
+    (keymap-bind ["g"] 'beam/cmd-beam-refresh)
+    (keymap-bind ["a"] 'beam/cmd-beam-auto-refresh)))
 
 (def beam-read-layer
   {:name 'beam-read
    :keymap beam/beam-read-keymap
-   :commands '("beam-refresh")
+   :commands '("beam-refresh" "beam-auto-refresh")
    :no-line-numbers true})
 
 (register-type-layers :beam-apps-menu

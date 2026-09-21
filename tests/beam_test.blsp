@@ -571,3 +571,75 @@
     (is (beam/beam-live-buffer?
           (commands/ed-show-named (m-of "") "*BEAM Debug*" "" :beam-debug-menu)))
     (is (not (beam/beam-live-buffer? (m-of ""))))))
+
+;; ---- auto-refresh: a live view stays live ------------------------------------
+;; REDS/S is a rate between two snapshots, so a list you have to keep pressing `g` on is a
+;; snapshot pretending to be a monitor. The rules that keep the timer from being a
+;; nuisance are the design, and these are them.
+
+(defn- bt-showing (nm)
+  "A model with `nm` open AND displayed in the selected pane."
+  (commands/ed-show-named (m-of "") nm "rows\nhere\n" :beam-menu))
+
+(describe "the refresh timer only asks about a view that is on screen"
+  (test "no BEAM buffer open — nothing to ask about"
+    (assert= (beam/displayed-view (m-of "")) nil))
+  (test "the displayed view is the one found"
+    (assert= (beam/displayed-view (bt-showing "*BEAM Processes*")) :processes))
+  (test "a view merely OPEN but not displayed is not refreshed"
+    ;; `ed-upsert-named` puts it in the pool without giving it a pane — a buried observer
+    ;; costs the node a round trip per tick for nothing
+    (let (m (commands/ed-upsert-named (m-of "") "*BEAM ETS*" "x\n" :beam-ets-menu))
+      (assert= (beam/displayed-view m) nil)))
+  (test "with two on screen, the one you are reading wins"
+    (let (m (commands/ed-show-named (bt-showing "*BEAM ETS*")
+              "*BEAM Processes*" "p\n" :beam-menu))
+      (assert= (beam/displayed-view m) :processes)))
+  (test "a tick with nothing displayed changes nothing at all"
+    (let (m (m-of "")) (assert= (beam/beam-tick m) m)))
+  (test "a tick with a request already in flight does not queue a second"
+    ;; a slow node should make the list LAG, never pile up round trips
+    (let (m (assoc-in (bt-showing "*BEAM Processes*") [:beam :pending] 7))
+      (assert= (beam/beam-tick m) m)))
+  (test "auto-refresh off means the tick is a no-op even with a view on screen"
+    (let (m (assoc (bt-showing "*BEAM Processes*") :beam-auto-refresh false))
+      (assert= (beam/beam-tick m) m)))
+  (test "the toggle reports which way it went and is readable back"
+    (let (on (bt-showing "*BEAM Processes*")
+          off (beam/cmd-beam-auto-refresh on nil))
+      (assert= (beam/auto-refresh? off) false)
+      (is (includes? (:echo off) "off"))
+      (let (back (beam/cmd-beam-auto-refresh off nil))
+        (assert= (beam/auto-refresh? back) true)
+        (is (includes? (:echo back) "on"))))))
+
+;; ---- a refresh must not move you --------------------------------------------
+
+(describe "a refresh keeps your place and your pane"
+  (test "the reader's line survives the refill"
+    (let (m0 (commands/ed-show-named (m-of "") "*BEAM Processes*" "a\nb\nc\nd\ne\n" :beam-menu)
+          m1 (commands/ed-apply m0 (fn (b) (commands/ed-goto-line b 4)))
+          before (buffer-current-line (ed-current-buf m1))
+          m2 (beam/beam-refill m1 "*BEAM Processes*" "v\nw\nx\ny\nz\n" :beam-menu))
+      (assert= before 3)
+      (assert= (buffer-current-line (ed-current-buf m2)) 3)))
+  (test "a line past the end of the new text is clamped, not left out of range"
+    ;; the node shed two hundred processes between snapshots; point cannot follow a row
+    ;; that is gone, and must not point past EOF either
+    (let (m0 (commands/ed-show-named (m-of "") "*BEAM Processes*" "a\nb\nc\nd\ne\n" :beam-menu)
+          m1 (commands/ed-apply m0 (fn (b) (commands/ed-goto-line b 5)))
+          m2 (beam/beam-refill m1 "*BEAM Processes*" "one\n" :beam-menu))
+      (is (< (buffer-current-line (ed-current-buf m2)) 2))))
+  (test "the refill does not steal the selection from another pane"
+    ;; the timer fires while you are typing somewhere else — the observer must not
+    ;; yank the pane out from under you
+    (let (m0 (commands/ed-show-named (m-of "") "*BEAM Processes*" "a\nb\n" :beam-menu)
+          m1 (commands/cmd-split-pane-below m0 nil)
+          m2 (commands/ed-show-named m1 "notes" "typing here\n" nil)
+          selected (:name (ed-current-buf m2))
+          m3 (beam/beam-refill m2 "*BEAM Processes*" "c\nd\n" :beam-menu))
+      (assert= (:name (ed-current-buf m3)) selected)
+      ;; …and the text really did change in the buffer nobody is looking at
+      (let (i (or (ed-buffer-index-by-name m3 "*BEAM Processes*")
+                (error "the refill dropped the buffer")))
+        (is (includes? (buffer-text (ed-buf-at m3 i)) "c"))))))
