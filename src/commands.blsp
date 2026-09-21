@@ -2232,13 +2232,13 @@ outside your selection are simply not applied."
 break. Repeated M-/ keeps redoing."
   (ed-undo-step m 'commands/cmd-redo "No further redo" "redo"))
 
-(defcommand cmd-repeat-complex-command
+(defcommand cmd-repeat
   (m key)
   "Re-run the last command (C-x z). After the first C-x z, tap `z` to keep repeating
 — repeat-mode keeps the last-command pointing at the original command, not this one,
 so `z` re-invokes the original rather than recursing."
   (let (to-repeat (:last-command m))
-    (if (or (nil? to-repeat) (= to-repeat 'commands/cmd-repeat-complex-command))
+    (if (or (nil? to-repeat) (= to-repeat 'commands/cmd-repeat))
       (message m "No previous command to repeat")
       (let (result ((reflect/eval to-repeat) m key))
         (assoc result :this-command to-repeat)))))
@@ -3934,6 +3934,159 @@ you ask before a rename, and the one that changes nothing."
                        (text/slice (buffer-rope (ed-current-buf mm)) lo hi)
                        p))
                (message mm (str n " match" (if (= n 1) "" "es") " for `" p "`")))))}))
+
+;; ---- the small daily set -----------------------------------------------------
+;; Commands Emacs has had forever that bedit had not. Each is a few lines because the
+;; primitives were all here — `ed-map-region-lines` for the line-wise ones,
+;; `ed-replace-span` for the text-wise ones — which is the argument for having built
+;; those seams rather than one-off loops.
+
+(defcommand cmd-indent-region
+  (m key)
+  "Reindent every line of the region to its mode's column (C-M-\\). With no region, the
+current line — the same rule `indent-line` follows, so the key does something sensible
+either way rather than complaining about the selection you forgot to make."
+  (let (rl (ed-region-lines (ed-current-buf m)))
+    (if (nil? rl)
+      (ed-edit m (fn (b) (ed-reindent-line-at b (buffer-current-line b))))
+      (let ([first last] rl)
+        (ed-edit m
+          (fn (b) (ed-map-region-lines b first last (fn (bb ln) (ed-reindent-line-at bb ln)))))))))
+
+(defn ed-untabify-text (text width)
+  "`text` with each tab expanded to the spaces that reach the next `width` stop.
+
+Column-aware, not a blind `\\t` -> N spaces: a tab advances to the next multiple of
+`width`, so its expansion depends on where in the line it sits. Replacing each tab with a
+fixed run is the version that silently shifts every line containing two of them."
+  (string/join
+    (map (string/split text "\n")
+      (fn (line)
+        (fold (string/->list line)
+          ""
+          (fn (acc ch)
+            (if (= ch "\t")
+              ;; the gap to the next stop, as an int the checker can see — `-` over two
+              ;; ints still reads `number` to it, and `string/repeat` wants an int
+              (let (gap (- width (math/mod (string/length acc) width))
+                    n (if (int? gap) gap width))
+                (str acc (string/repeat " " n)))
+              (str acc ch))))))
+    "\n"))
+
+(defn ed-tabify-text (text width)
+  "`text` with runs of spaces that span a tab stop replaced by tabs — LEADING whitespace
+only.
+
+Emacs tabifies the whole line by default and it is almost always wrong: spaces inside a
+string literal or lining up a trailing comment are spaces on purpose, and turning them
+into tabs changes what the file MEANS in the first case and how it looks everywhere. The
+indentation is the part anyone wants converted."
+  (string/join
+    (map (string/split text "\n")
+      (fn (line)
+        (let (body (string/triml line)
+              lead (- (string/length line) (string/length body))
+              tabs (math/quot lead width)
+              rest (math/mod lead width))
+          (if (= tabs 0)
+            line
+            (str (string/repeat "\t" tabs) (string/repeat " " rest) body)))))
+    "\n"))
+
+(defn- ed-retab (m f verb)
+  "Apply a whitespace transform over `ed-replace-span` and report."
+  (let ([lo hi] (ed-replace-span m)
+        before (text/slice (buffer-rope (ed-current-buf m)) lo hi)
+        after (f before ed-tab-width))
+    (if (= before after)
+      (message m (str "nothing to " verb))
+      (message (ed-edit m (fn (b) (goto-char (replace-region b lo hi after) lo)))
+        (str verb "ed")))))
+
+(defcommand cmd-untabify
+  (m key)
+  "Expand tabs to spaces over the region, or from point (M-x untabify)."
+  (ed-retab m ed-untabify-text "untabify"))
+
+(defcommand cmd-tabify
+  (m key)
+  "Turn leading spaces into tabs over the region, or from point (M-x tabify)."
+  (ed-retab m ed-tabify-text "tabify"))
+
+(defn ed-dedupe-lines (text)
+  "`[text' dropped]` — `text` with CONSECUTIVE duplicate lines collapsed to one.
+
+Consecutive, like `uniq` and like Emacs's own `delete-duplicate-lines` on a sorted
+region. Global dedup would reorder nothing but would quietly delete a line far from the
+one it matched, which is not something you can eyeball afterwards."
+  (let (nl? (string/ends-with? text "\n")
+        body (if nl? (string/substring text 0 (dec (string/length text))) text)
+        lines (string/split body "\n")
+        kept (fold lines
+               []
+               (fn (acc l) (if (= (last acc) l) acc (conj acc l))))
+        out (string/join kept "\n"))
+    [(if (and nl? (not (empty? kept))) (str out "\n") out) (- (count lines) (count kept))]))
+
+(defcommand cmd-delete-duplicate-lines
+  (m key)
+  "Collapse consecutive duplicate lines over the region, or from point (M-x
+delete-duplicate-lines)."
+  (let ([lo hi] (ed-replace-span m)
+        before (text/slice (buffer-rope (ed-current-buf m)) lo hi)
+        [after dropped] (ed-dedupe-lines before))
+    (if (= dropped 0)
+      (message m "no duplicate lines")
+      (message (ed-edit m (fn (b) (goto-char (replace-region b lo hi after) lo)))
+        (str dropped " duplicate line" (if (= dropped 1) "" "s") " deleted")))))
+
+(defn ed-reverse-lines (text)
+  "`text` with its lines in the opposite order, keeping a trailing newline if there was one."
+  (let (nl? (string/ends-with? text "\n")
+        body (if nl? (string/substring text 0 (dec (string/length text))) text)
+        out (string/join (reverse (string/split body "\n")) "\n"))
+    (if nl? (str out "\n") out)))
+
+(defcommand cmd-reverse-region
+  (m key)
+  "Reverse the order of the region's lines (M-x reverse-region)."
+  (let (buf (ed-current-buf m)
+        rb (buffer-region-bounds buf))
+    (if (nil? rb)
+      (message m "no region (set the mark first)")
+      (let ([lo hi] rb
+            before (text/slice (buffer-rope buf) lo hi))
+        (message (ed-edit m
+                   (fn (b) (goto-char (replace-region b lo hi (ed-reverse-lines before)) lo)))
+          "region reversed")))))
+
+(defn ed-cursor-position-text (buf)
+  "The `C-x =` line: the character under point, its codepoint, and where point is.
+
+`what-cursor-position` is the command you run when a file has something invisible in it —
+a non-breaking space, a stray BOM, a tab you cannot tell from spaces — so the CODEPOINT
+is the part that matters, not the character."
+  (let (pos (buffer-point buf)
+        len (buffer-length buf)
+        line (inc (buffer-current-line buf))
+        col (- pos (text/line->char (buffer-rope buf) (buffer-current-line buf)))
+        ch (if (>= pos len) nil (text/slice (buffer-rope buf) pos (inc pos)))
+        pct (if (= len 0) 100 (math/quot (* pos 100) len)))
+    (str (if (nil? ch)
+           "point at end of buffer"
+           (str "char: "
+             (if (= ch "\n") "\\n" ch)
+             "  (U+"
+             (string/upper (string/format "%04x" (first (string/->codepoints ch))))
+             ")"))
+      "   line " line " col " col
+      "   point " pos " of " len " (" pct "%)")))
+
+(defcommand cmd-what-cursor-position
+  (m key)
+  "Describe the character under point and where point is (C-x =)."
+  (message m (ed-cursor-position-text (ed-current-buf m))))
 ;; ---- M-x: run any interactive command by name -------------------------------
 
 (defcommand cmd-execute-extended-command
