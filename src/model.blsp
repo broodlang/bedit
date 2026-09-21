@@ -45,6 +45,8 @@ pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
 ;; decode) are referenced qualified below — each `mod/name` auto-loads its module.
 
 (defdyn *blink-ms* 530)
+(def *spinner-ms* 120) ; the activity-spinner beat — fast enough to read as motion, and
+;; armed only while a job is in flight, so an idle editor still runs one timer, not two
 ;; The cursor-blink half-period (Emacs `blink-cursor-interval` ≈ 0.5s): an idle
 ;; `:cursor-blink` timer (ADR-102) toggles `:blink-on?` this often once typing
 ;; settles, and a real keystroke forces the caret solid (`ed-real-input?`). Idle, so
@@ -807,6 +809,69 @@ process is live, synchronous otherwise) — a no-op when not stale or one is in 
 What the `:idle-recompute` timer (ADR-102) runs once the debounce window has elapsed."
   (ed-launch-diag m))
 
+
+;; ---- the off-loop job table: what is in flight, and what to call it ----------
+;; It lives in `model` rather than in the dispatcher because it is MODEL vocabulary —
+;; which model field holds which handle — and two very different readers need it: the
+;; dispatcher (`input/ed-ev-task-reply`, to route a reply) and the view (the activity
+;; segment, to say what is running). `view` cannot reach into `input`: input already
+;; `(:use view)` for the mode-line hit-tests, so the reverse is a CYCLE, and a cycle here
+;; does not fail loudly — it leaves a half-initialised module and breaks something else
+;; entirely. (It broke the `:on-move` facet, which is nowhere near any of this.)
+(def ed-task-replies
+  ;; The model field a launch parks its task handle on -> `[fold-fn failure-value]`: the
+  ;; function that folds the answer in, and what to fold instead when the task errored or
+  ;; timed out. Resolved at dispatch (`reflect/eval`), like the event handlers above and for
+  ;; the same reason — redefining a fold hot-swaps it, and a deferred module's fold can be
+  ;; named here before its module has loaded.
+  ;;
+  ;; A TABLE, because every row was the same three lines of `cond` with two words changed.
+  ;; Adding an off-the-loop recompute is a launch, a fold and a row — the branch it used to
+  ;; also need was pure ceremony, and the sixth copy of it is how a default gets forgotten.
+  ;;
+  ;; The third element is the LABEL the activity indicator shows while the job is in
+  ;; flight, or nil for the ones not worth announcing (eldoc, the tree warm — they finish
+  ;; in a frame and a chip that flickers on every keystroke is worse than no chip). It
+  ;; lives here so a new off-loop job is still ONE row: a launch, a fold, and what to call
+  ;; it while it runs.
+  ;; The third element is the LABEL the activity indicator shows while the job is in
+  ;; flight, or nil for the ones not worth announcing. It lives here so a new off-loop job
+  ;; is still ONE row: a launch, a fold, and what to call it while it runs.
+  {:diag-proc ['model/ed-apply-diag '() nil]
+   :gitdiff-proc ['model/ed-apply-gitdiff '() nil]
+   :git-proc ['git/git-apply-status nil nil]
+   ;; a git command that can outlast a frame (pull / push / fetch) and the background
+   ;; upstream watch — both network, both therefore tasks, both folded like any other
+   :git-op-proc ['git/git-apply-op nil "git"]
+   :git-fetch-proc ['git/git-apply-fetch nil "fetching"]
+   ;; the *git-status* buffer's eight subprocesses — 17 s on a mix project, so not on the loop
+   :git-status-proc ['git/git-apply-show-status nil "git status"]
+   ;; M-! / M-| — a shell command is arbitrarily long, so it is a task like the rest
+   :shell-proc ['commands/ed-apply-shell nil "shell"]
+   :project-scan ['commands/ed-apply-project-scan '() "scanning"]
+   :eldoc-proc ['model/ed-apply-eldoc nil nil]
+   ;; the tree warm has nothing to fold — the cache it filled lives in the runtime, so the
+   ;; reply exists only to record which rope is parsed and free the slot
+   :tree-warm-proc ['model/ed-apply-tree-warm nil nil]})
+
+;; Which jobs get a label, and why the rest do not: eldoc, the diagnostics check, the
+;; diff-hl gutter, the status-bar git summary and the tree warm all finish inside a frame
+;; or two and fire on the IDLE BEAT, i.e. constantly while you work. A chip that flickers
+;; on every keystroke is worse than no chip — it trains you to ignore the one place the
+;; editor tells you something is happening. Labelled are the jobs that can take seconds
+;; and that you asked for: a pull, a fetch, a status on a big repo, a shell command, a
+;; project scan.
+
+(defn ed-activity (m)
+  "The labels of every announced job currently in flight, in table order — what the
+activity indicator shows. `()` when the editor is idle or only doing its own upkeep."
+  (seq/keep (%map-pairs ed-task-replies)
+    (fn ([slot row])
+      (let (label (nth row 2 nil))
+        (if (and label (not (nil? (get m slot)))) label nil)))))
+
+(defn ed-busy? (m)
+  (not (empty? (ed-activity m))))
 ;; ---- named timers (ADR-102): the model declares time-driven work as `:timers` ----
 ;; `ed-sync-timers` reconciles `:timers` with the model state after each event (the
 ;; declarative replacement for the old "shorten :tick-ms" arming cascade); the per-timer
@@ -985,6 +1050,10 @@ flag once no prefix is pending (what `ed-which-key-arm` used to do)."
         ;; an idle one-shot — the point is that it fires while you are working, so you
         ;; hear about a remote that moved without having to stop and ask. Armed only when
         ;; git is loaded and the watch is switched on.
+        ;; The spinner frame, ticking ONLY while an announced job is in flight. A timer
+        ;; armed unconditionally is an editor that never goes idle — this one appears
+        ;; with the work and drops itself with it, the `:scrollbar-fade` pattern.
+        spin (if (ed-busy? m) {:spinner {:every *spinner-ms*}} {})
         ;; the BEAM views re-ask the node while one of them is on screen (`beam/beam-tick`)
         beam-watch (if (and (bound? 'beam/*refresh-ms*)
                          (int? (reflect/eval 'beam/*refresh-ms*))
@@ -995,7 +1064,7 @@ flag once no prefix is pending (what `ed-which-key-arm` used to do)."
                         (int? (reflect/eval 'git/*git-fetch-every-ms*)))
                     {:git-fetch {:every (reflect/eval 'git/*git-fetch-every-ms*)}}
                     {})
-        managed (merge {:cursor-blink {:every *blink-ms* :idle? true}} git-watch beam-watch idle)
+        managed (merge {:cursor-blink {:every *blink-ms* :idle? true}} spin git-watch beam-watch idle)
         ;; Every managed one-shot is dropped here and re-added by `managed` while its work
         ;; is pending — that drop is what RE-ARMS it. A one-shot the loop has already fired
         ;; is dead until its entry is recreated, so a managed timer missing from this list
@@ -1007,6 +1076,7 @@ flag once no prefix is pending (what `ed-which-key-arm` used to do)."
                :which-key
                :undo-pause
                :git-fetch
+               :spinner
                :beam-refresh
                :scroll-settle
                (map *live-eval-clients* :timer)))
