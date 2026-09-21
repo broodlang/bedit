@@ -362,6 +362,38 @@ only staged (ready to commit) or clean."
   "A colour-coded count segment (e.g. `+3`), or nil when the count is 0 (so it vanishes)."
   (if (= n 0) nil (seg id (str prefix n) {:sep "  " :face face})))
 
+(defn- git-sync-count (s)
+  "An ahead/behind count as an int — they arrive from `git rev-list --count` as strings,
+and a missing upstream leaves them absent entirely."
+  (let (n (if (string? s) (string/->number s) s))
+    (if (int? n) n 0)))
+
+(defn git-sync-seg (summary)
+  "The `↓2 ↑1` upstream segment, or nil when the branch is level with its upstream (or has
+none). What the background fetch is FOR: ahead/behind was already computed for the branch
+tooltip, where you had to hover to find out the remote had moved. On the mode line it is
+the thing you glance at — and `↓` appearing on its own is the notification arriving twice,
+once as a message you might miss and once as a mark that stays."
+  (if (nil? summary)
+    nil
+    (let (behind (git-sync-count (:behind summary))
+          ahead (git-sync-count (:ahead summary))
+          parts (seq/reject (list (if (> behind 0) (str "↓" behind) nil)
+                              (if (> ahead 0) (str "↑" ahead) nil))
+                  nil?))
+      (if (empty? parts)
+        nil
+        (seg :git-sync
+          (string/join parts " ")
+          {:sep "  "
+           ;; behind reads as "there is something to pull" — the colour the unstaged count
+           ;; uses for "you have work to do"; ahead-only is quieter, it is just unpushed
+           :face (if (> behind 0) git-face-unstaged git-face-branch)
+           :on-click 'git/cmd-git-status
+           :tooltip (str (if (> behind 0) (str behind " to pull") "")
+                      (if (and (> behind 0) (> ahead 0)) ", " "")
+                      (if (> ahead 0) (str ahead " to push") ""))})))))
+
 (defn git-statusbar-segments (summary)
   "The git status-bar segments from `summary` (nil ⇒ `()`): a clickable **branch** segment
 (tooltip: repo / upstream / ahead-behind; click: `C-x g`), a **state dot** coloured by the
@@ -381,6 +413,7 @@ working tree (tooltip: the counts; click: `C-x g`), then colour-coded **+staged 
                      :face (git-dot-face summary)
                      :on-click 'git/cmd-git-status
                      :tooltip (git-tree-tooltip summary)})
+                  (git-sync-seg summary)
                   (git-count-seg :git-staged "+" (:staged summary) git-face-staged)
                   (git-count-seg :git-unstaged "~" (:unstaged summary) git-face-unstaged)
                   (git-count-seg :git-untracked "?" (:untracked summary) git-face-untracked))
@@ -798,9 +831,175 @@ on instead of chasing it into another section, while a plain refresh / expand st
               ;; the index is clamped into `ls`, so the default is never taken
               (inc (nth ls (math/min before (dec (count ls))) 0)))))))))
 
+;; ---- git off the loop: no git command ever blocks a keystroke -----------------
+;; Every `git-git` here is a SUBPROCESS, and three of them talk to a network: `pull`,
+;; `push`, `fetch`. Run on the loop, a pull over a slow link freezes the whole editor —
+;; no repaint, no C-g, nothing — for as long as the remote takes. That is not a git
+;; problem; it is the one thing a Brood editor has no excuse for, because the language's
+;; whole answer to blocking work is a process.
+;;
+;; So: a git command that can take longer than a frame goes through `git-launch-op`,
+;; which runs it in a `task` and folds the result when it lands (the same launch / fold /
+;; row shape as every other off-loop recompute — `input/ed-task-replies`). The editor
+;; stays live, the mode line says what is running, and C-g cancels it.
+;;
+;; `ed-headless?` keeps the synchronous path for tests and `--headless`, where there is no
+;; loop for a reply to land in — so every existing git test still exercises real git.
+
+(def *git-op-timeout-ms* 120000)
+;; A network git operation gets two minutes before the task is killed and reported as a
+;; timeout. Unbounded is how a wedged `pull` against an unreachable host becomes a slot
+;; that never frees and a `git` that is "already running" until restart.
+
+(defn git-op-running (m)
+  "The verb of the git operation in flight (`\"pull\"`, `\"push\"`, …), or nil."
+  (get-in m [:git-op :verb]))
+
+;; check-allow: `then` is an opaque caller-supplied `(model result) -> model`, so the
+;; checker cannot see what the last branch returns. ADR-341 names `:trusted` for exactly
+;; this — the declaration is the contract, and every branch here is a `message` or a fold.
+(check-allow :trusted
+  (sig git-launch-op (model string seqable &optional any -> model))
+  (defn git-launch-op (m verb args &optional (then nil))
+  "Run `git args` in the repo root OFF the loop and report when it lands. `then` is an
+optional `(model result) -> model` run after the report — a refresh, usually.
+
+Refuses to start a second operation while one is in flight: two pulls at once is not a
+thing anyone means, and the in-flight slot holds exactly one handle. Headless runs it
+synchronously, because there is no loop to hand the reply to."
+  (let (root (git-resolve-root m))
+    (cond
+      (nil? root) (message m "not in a git repository")
+      (git-op-running m) (message m (str "git " (git-op-running m) " is already running"))
+      (model/ed-headless?)
+        (let (r (git-git root args)
+              m1 (git-report-cmd m verb r))
+          (if (nil? then) m1 (then m1 r)))
+      :else
+        (let (job (task (fn () (git-git root args)) {:timeout *git-op-timeout-ms*}))
+          (assoc (message m (str verb "…"))
+            :git-op-proc job
+            :git-op {:verb verb :root root :then then}))))))
+
+(check-allow :trusted
+  (sig git-apply-op (model any -> model))
+  (defn git-apply-op (m r)
+  "Fold a finished `git-launch-op`: report the outcome and run its `then`. A nil `r` is the
+task having errored or timed out — said plainly, rather than reported as a success with an
+empty output, which is what a bare exit-code check would do with it."
+  (let (op (:git-op m)
+        verb (or (:verb op) "git")
+        m1 (dissoc m :git-op :git-op-proc))
+    (if (nil? r)
+      (message m1 (str verb " failed: no result (timed out after " *git-op-timeout-ms* "ms)"))
+      (let (m2 (git-report-cmd m1 verb r))
+        (if (nil? (:then op)) m2 ((:then op) m2 r)))))))
+
+;; ---- the repo watches itself: a background fetch, and being TOLD ------------
+;; Magit shows you the truth as of the last time you asked it to fetch. You find out the
+;; remote moved by pressing `f f` and looking — which means in practice you find out when
+;; you try to push and are told no.
+;;
+;; bedit fetches on a timer, in a task, and SAYS SO when the answer changes: "origin/main:
+;; 3 new commits (F to pull)". It costs nothing on the loop and it is the difference
+;; between a status buffer you interrogate and a repo that tells you about itself. That is
+;; the whole "better than magit" claim, and it is only possible because the fetch is a
+;; process rather than something you have to stop and wait for.
+;;
+;; `git fetch` is network and can hang; it rides `task` with the same timeout as a pull,
+;; and a fetch already in flight is never started twice.
+
+(def *git-fetch-every-ms* 180000)
+;; How often to fetch in the background (3 minutes). Long enough that a laptop on a phone
+;; tether is not fetching constantly, short enough that "someone pushed" reaches you while
+;; it still matters. `nil` turns the watch off entirely.
+
+(defn git-fetch-key (m)
+  "What a background fetch would be ABOUT — the repo root, or nil when there is no repo to
+watch. Compared on the reply so an answer about a repo you have since left is dropped."
+  (or (:git-root m) (:git-summary-root m) (get-in m [:git-summary :root])))
+
+(defn git-fetch-upstream (root)
+  "Fetch quietly and report the upstream's position afterwards: `{:root :upstream :behind
+:ahead}`, or nil when there is no upstream to watch. Runs in a task — three subprocesses,
+one of them a network round trip."
+  (if (nil? root)
+    nil
+    (let (upstream (git-upstream root))
+      (if (nil? upstream)
+        nil
+        (do
+          ;; the fetch itself; its exit code does not matter here — offline just means the
+          ;; counts below are unchanged, which is exactly the right thing to report
+          (git-git root ["fetch" "--quiet"])
+          (let (ab (git-ahead-behind root))
+            {:root root
+             :upstream upstream
+             :behind (get ab :behind "0")
+             :ahead (get ab :ahead "0")}))))))
+
+(defn git-launch-fetch (m)
+  "Start the background fetch OFF the loop, unless one is in flight, the watch is off, or
+there is no repo. Never runs headless — a test or a daemon has no business reaching the
+network on a timer."
+  (let (root (git-fetch-key m))
+    (cond
+      (not (int? *git-fetch-every-ms*)) m ; the watch switched off (set it to nil)
+      (:git-fetch-proc m) m
+      (nil? root) m
+      (model/ed-headless?) m
+      :else (assoc m :git-fetch-proc (task (fn () (git-fetch-upstream root))
+                                       {:timeout *git-op-timeout-ms*})))))
+
+(defn git-upstream-news (before after)
+  "What to say about the upstream having moved, or nil when there is nothing to say.
+
+Only an INCREASE in `behind` is news. Reporting the count every time would announce the
+same three commits every three minutes until you pulled them, which is how a notification
+becomes something you learn to ignore."
+  (let (was (string/->number (get before :behind "0"))
+        now (string/->number (get after :behind "0"))
+        was (if (int? was) was 0)
+        now (if (int? now) now 0))
+    (if (or (<= now 0) (<= now was))
+      nil
+      (str (:upstream after)
+        ": "
+        (- now was)
+        " new commit"
+        (if (= (- now was) 1) "" "s")
+        (if (> was 0) (str " (" now " behind)") "")
+        " — F to pull"))))
+
+(defn git-apply-fetch (m result)
+  "Fold a finished background fetch: free the slot, remember the upstream position, and say
+so if the remote moved. An answer about a repo the reader has since left is dropped."
+  (let (m1 (dissoc m :git-fetch-proc))
+    (cond
+      (nil? result) m1
+      (not (= (:root result) (git-fetch-key m1))) m1
+      :else
+        (let (news (git-upstream-news (:git-upstream-seen m1) result)
+              m2 (assoc m1 :git-upstream-seen result)
+              ;; a moved upstream also makes the *git-status* Unpulled section stale
+              m3 (if (and news (:git-rows m2)) (git-refresh m2) m2))
+          (if (nil? news) m3 (message m3 news))))))
+
+(defcommand cmd-git-fetch
+  (m key)
+  "Fetch from the remote now (f) — off the loop. The background watch does this on a timer;
+this is for when you know something landed and do not want to wait for it."
+  (if (nil? (git-fetch-key m))
+    (message m "not in a git repository")
+    (message (git-launch-fetch (dissoc m :git-fetch-proc)) "fetching…")))
+
 (defn- git-refresh (m)
   "Refresh `*git-status*` in place, keeping point in its section (`git-stay-in-section`)."
   (git-show-status m (:git-root m) (git-stay-in-section m)))
+
+(defn- git-refresh-if-open (m _r)
+  "Refresh `*git-status*` when it is open — the usual `then` for a `git-launch-op`."
+  (if (nil? (:git-rows m)) m (git-refresh m)))
 
 (defn- git-scan-rows (rows j dir n)
   "From 0-based position `j`, step `dir` (+1 or -1) `n` times, skipping nil (blank/diff-body)
@@ -1095,20 +1294,18 @@ space), or nil when the line is blank or not a commit line."
 
 (defcommand cmd-git-push
   (m key)
-  "Push the current branch (P)."
-  (let (root (git-resolve-root m))
-    (if (nil? root)
-      (message m "not in a git repository")
-      (git-report-cmd m "push" (git-git root ["push"])))))
+  "Push the current branch (P) — off the loop, so the editor stays live while the remote
+thinks about it. The mode line says `push...`; the outcome lands in the echo area."
+  (git-launch-op m "push" ["push"] git-refresh-if-open))
 
 (defcommand cmd-git-pull
   (m key)
-  "Pull the current branch, then refresh status (F)."
-  (let (root (git-resolve-root m))
-    (if (nil? root)
-      (message m "not in a git repository")
-      (let (r (git-git root ["pull" "--ff-only"]))
-        (git-report-cmd (if (nil? (:git-rows m)) m (git-show-status m root)) "pull" r)))))
+  "Pull the current branch, then refresh status (F) — off the loop.
+
+This is the command that froze the editor: a pull is a NETWORK round trip, and it ran on
+the dispatch path, so the window stopped repainting until the remote answered. It now runs
+in a task like everything else that can outlast a frame."
+  (git-launch-op m "pull" ["pull" "--ff-only"] git-refresh-if-open))
 
 ;; ---- stash (z z / z p) -------------------------------------------------------
 

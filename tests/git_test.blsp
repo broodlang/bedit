@@ -336,3 +336,91 @@
     (let (m (assoc (model/ed-init (editor/buffer/make-buffer "x" "notes.txt" "/proj/notes.txt"))
               :git-proc :job-1))
       (assert= m (git/git-launch-status m)))))
+
+
+;; ---- git never blocks the loop ---------------------------------------------
+;; The bug: `F` (pull) is a NETWORK round trip and it ran on the dispatch path, so the
+;; window stopped repainting until the remote answered. Nothing that can outlast a frame
+;; may run there — the language's answer to blocking work is a process, and these assert
+;; that git uses one.
+
+(describe "git operations that can outlast a frame run off the loop"
+  (test "a launch parks a handle and returns immediately, without running git"
+    ;; `ed-headless?` is true under test (no :editor process), so force the async path by
+    ;; registering one — this is the shape the real loop takes
+    (let (me (self)
+          _ (proc/register :editor me)
+          m (git/git-launch-op (assoc (model/ed-init (editor/buffer/make-buffer ""))
+                                 :git-root ".")
+              "pull"
+              ["--version"])
+          _2 (proc/unregister :editor))
+      (assert= (git/git-op-running m) "pull")
+      (is (not (nil? (:git-op-proc m))))))
+  (test "a second launch while one is in flight is refused, not queued"
+    (let (m (assoc (model/ed-init (editor/buffer/make-buffer ""))
+              :git-root "."
+              :git-op {:verb "pull"}
+              :git-op-proc :fake)
+          m2 (git/git-launch-op m "push" ["push"]))
+      (is (includes? (:echo m2) "already running"))
+      ;; the in-flight handle is untouched — the refusal must not clobber the slot
+      (assert= (:git-op-proc m2) :fake)))
+  (test "the fold reports the result and frees the slot"
+    (let (m (assoc (model/ed-init (editor/buffer/make-buffer ""))
+                :git-op {:verb "pull" :root "."} :git-op-proc :fake)
+          done (git/git-apply-op m {:exit 0 :stdout "Already up to date." :stderr ""}))
+      (assert= (:git-op-proc done) nil)
+      (assert= (:git-op done) nil)
+      (is (includes? (:echo done) "Already up to date"))))
+  (test "a timed-out task is reported as a failure, not as a silent success"
+    ;; nil is what a :task-error / :task-timeout folds in; a bare exit-code check would
+    ;; read that as a success with empty output
+    (let (m (assoc (model/ed-init (editor/buffer/make-buffer ""))
+                :git-op {:verb "pull"} :git-op-proc :fake))
+      (is (includes? (:echo (git/git-apply-op m nil)) "pull failed"))))
+  (test "headless still runs git synchronously, so tests and --headless are unchanged"
+    (let (m (git/git-launch-op (model/ed-init (editor/buffer/make-buffer "")) "v" ["--version"]))
+      (assert= (git/git-op-running m) nil)
+      (is (includes? (:echo m) "v")))))
+
+;; ---- the upstream watch ------------------------------------------------------
+
+(describe "the background fetch tells you when the remote moved"
+  (test "a remote that gained commits is news"
+    (is (includes? (git/git-upstream-news {:behind "0"} {:upstream "origin/main" :behind "3"})
+          "3 new commits")))
+  (test "one commit is singular"
+    (is (includes? (git/git-upstream-news {:behind "0"} {:upstream "origin/main" :behind "1"})
+          "1 new commit")))
+  (test "the SAME commits are not news again"
+    ;; announcing the same three every three minutes is how a notification becomes noise
+    (assert= (git/git-upstream-news {:behind "3"} {:upstream "origin/main" :behind "3"}) nil))
+  (test "a branch level with its upstream says nothing"
+    (assert= (git/git-upstream-news {:behind "0"} {:upstream "origin/main" :behind "0"}) nil))
+  (test "pulling (behind goes down) is not news either"
+    (assert= (git/git-upstream-news {:behind "3"} {:upstream "origin/main" :behind "0"}) nil))
+  (test "a further advance names the new ones and the running total"
+    (let (s (git/git-upstream-news {:behind "2"} {:upstream "origin/main" :behind "5"}))
+      (is (includes? s "3 new commits"))
+      (is (includes? s "(5 behind)"))))
+  (test "the fold drops an answer about a repo the reader has left"
+    (let (after (git/git-apply-fetch {:git-root "/elsewhere"}
+                  {:root "/old" :upstream "origin/main" :behind "9"}))
+      (assert= (:git-upstream-seen after) nil)))
+  (test "the watch never fetches headless"
+    (assert= (:git-fetch-proc (git/git-launch-fetch {:git-root "."})) nil)))
+
+;; ---- ahead/behind on the mode line -------------------------------------------
+
+(describe "the mode line shows what the fetch found"
+  (test "behind shows a down arrow"
+    (assert= (:text (git/git-sync-seg {:behind "2" :ahead "0"})) "↓2"))
+  (test "ahead shows an up arrow"
+    (assert= (:text (git/git-sync-seg {:behind "0" :ahead "1"})) "↑1"))
+  (test "both, behind first — what you can do about it comes first"
+    (assert= (:text (git/git-sync-seg {:behind "2" :ahead "1"})) "↓2 ↑1"))
+  (test "level with the upstream shows nothing at all"
+    (assert= (git/git-sync-seg {:behind "0" :ahead "0"}) nil))
+  (test "no upstream shows nothing rather than a zero"
+    (assert= (git/git-sync-seg {}) nil)))
