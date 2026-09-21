@@ -4376,34 +4376,88 @@ a frame's own quit is just its loop, see `frames/cmd-delete-frame`)."
            ((reflect/eval 'frames/frames-close-all) m))
     :done true))
 
+;; ---- map-y-or-n-p: ask about each of a list, y / n / ! / q ------------------
+;; Emacs's `map-y-or-n-p`, and the loop three commands here want. It existed already,
+;; spelled out inside `ed-quit-ask`; `save-some-buffers` needed the same thing and that is
+;; the moment to pull it up rather than write it twice.
+;;
+;; Not a modal overlay: each answer is an `ed-read-char` continuation, so the loop stays
+;; LIVE between questions — the editor still repaints, timers still fire, and a long list
+;; does not freeze anything. It also means the recursion costs no stack: each step returns
+;; to the loop and the next is entered from the keypress.
+
+;; check-allow: `on-yes` and `on-done` are caller-supplied, so the checker cannot see what
+;; the last step returns (ADR-341's `:trusted`, as `git-launch-op`).
+(check-allow :trusted
+  (sig ed-map-y-or-n (model seqable fn fn fn -> model))
+  (defn ed-map-y-or-n (m items label on-yes on-done)
+  "Ask about each of `items` in turn — `y` yes, `n` no, `!` yes to this and all the rest,
+`q` stop asking — then hand the model and the number accepted to `on-done`.
+
+`label` is `(item) -> string`, the question without its key hint. `on-yes` is
+`(model item) -> model`, applied only to the accepted ones. `C-g`/Esc abandons the whole
+run (`ed-read-char` catches them before the continuation), which is what a reader pressing
+it means and why they are not listed as answers."
+  (ed-map-y-or-n-step m (vec items) 0 0 label on-yes on-done)))
+
+(defn- ed-map-y-or-n-step (m items i accepted label on-yes on-done)
+  (if (>= i (count items))
+    (on-done m accepted)
+    (let (item (nth items i)
+          next (fn (mm acc) (ed-map-y-or-n-step mm items (inc i) acc label on-yes on-done)))
+      (ed-read-char m
+        (str (label item) " (y, n, !, q)")
+        (fn (mm k)
+          (cond
+            (or (= k "y") (= k "Y") (= k " ")) (next (on-yes mm item) (inc accepted))
+            ;; `!` — this one and every one after, without asking again. Folded rather
+            ;; than looped through the prompt, so it is one step however many remain.
+            (= k "!")
+              (let (rest-items (drop items i))
+                (on-done (fold rest-items mm (fn (acc it) (on-yes acc it)))
+                  (+ accepted (count rest-items))))
+            (= k "q") (on-done mm accepted)
+            ;; anything else is "no" — Emacs treats an unrecognised key as no rather than
+            ;; re-asking, and re-asking is how you get stuck in a prompt you cannot leave
+            else (next mm accepted)))))))
+
+(defcommand cmd-save-some-buffers
+  (m key)
+  "Save each modified file buffer, asking about each (C-x s, Emacs `save-some-buffers`)."
+  (let (pending (ed-modified-file-indices m))
+    (if (empty? pending)
+      (message m "(no changes need saving)")
+      (ed-map-y-or-n m
+        pending
+        (fn (i) (str "Save file " (buffer-file (ed-buf-at m i)) "?"))
+        (fn (mm i) (ed-save-buf-at mm i))
+        (fn (mm n)
+          (message mm
+            (if (= n 0)
+              "(no buffers saved)"
+              (str "saved " n " buffer" (if (= n 1) "" "s")))))))))
+
 (defn- ed-quit-ask (m pending save-all?)
-  "Emacs `save-buffers-kill-terminal`: for each modified file buffer in `pending` ask
-`Save file …? (y, n, !, q)` — `y` saves it, `n` skips it, `!` saves it and every one
-after without asking, `q` stops asking — then, if anything is still modified, `Modified
-buffers exist; exit anyway? (y or n)`. `C-g` / Esc at any prompt cancels the quit. Each
-answer is a `ed-read-char` continuation, so the loop stays live between questions."
-  (cond
-    (empty? pending)
-      (if (empty? (ed-modified-file-indices m))
-        (ed-quit-now m)
-        (ed-read-char m
-          "Modified buffers exist; exit anyway? (y or n)"
-          (fn (mm k)
-            (if (or (= k "y") (= k "Y"))
-              (ed-quit-now mm)
-              (message mm "quit canceled")))))
-    save-all? (ed-quit-ask (ed-save-buf-at m (first pending)) (rest pending) true)
-    else
-      (let (i (first pending))
-        (ed-read-char m
-          (str "Save file " (buffer-file (ed-buf-at m i)) "? (y, n, !, q)")
-          (fn (mm k)
-            (cond
-              (or (= k "y") (= k "Y")) (ed-quit-ask (ed-save-buf-at mm i) (rest pending) false)
-              (= k "n") (ed-quit-ask mm (rest pending) false)
-              (= k "!") (ed-quit-ask mm pending true)
-              (= k "q") (ed-quit-ask mm '() false)
-              else (message mm "quit canceled")))))))
+  "Emacs `save-buffers-kill-terminal`: ask about each modified file buffer
+(`ed-map-y-or-n`), then — if anything is still modified — `Modified buffers exist; exit
+anyway?`. `C-g` / Esc at any prompt cancels the quit.
+
+`save-all?` skips the asking entirely (the `!` answer, and the caller that already knows)."
+  (let (finish (fn (mm _)
+                 (if (empty? (ed-modified-file-indices mm))
+                   (ed-quit-now mm)
+                   (ed-read-char mm
+                     "Modified buffers exist; exit anyway? (y or n)"
+                     (fn (m2 k)
+                       (if (or (= k "y") (= k "Y"))
+                         (ed-quit-now m2)
+                         (message m2 "quit canceled")))))))
+    (if save-all?
+      (finish (fold pending m (fn (acc i) (ed-save-buf-at acc i))) 0)
+      (ed-map-y-or-n m pending
+        (fn (i) (str "Save file " (buffer-file (ed-buf-at m i)) "?"))
+        (fn (mm i) (ed-save-buf-at mm i))
+        finish))))
 
 (defcommand cmd-quit
   (m key)
