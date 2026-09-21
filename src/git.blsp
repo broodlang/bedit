@@ -733,34 +733,72 @@ The one-viewport margin above and below makes scrolling feel instant."
           (let (i (seq/index-where prev-rows (fn (r) (and r (= (:path r) path)))))
             (or (< i 0) (and (>= i lo) (< i hi)))))))))
 
-(defn- git-show-status (m root &optional (line nil))
-  "Build/refresh `*git-status*` for repo `root`, recording `:git-root`/`:git-rows`. `line`
-places point: a 1-based number, nil (default — the first file row if any, else the top), or a
-function `(rows -> 1-based line)` resolved against the freshly-rendered rows (see
-`git-stay-in-section`). Respects `:git-expanded`, `:git-collapsed-sections`, and — when an
-upstream exists — fetches unpushed/unpulled commits to show at the bottom. Only expands diffs
-for files visible within the current viewport (`ed-current-top` + `:view-rows`), so a repo
-with many expanded files stays fast regardless of how many are off-screen."
-  (let (porcelain (:stdout (git-git root ["status" "--porcelain" "-z"]) "")
-        entries (git-entries porcelain)
-        expanded (:git-expanded m '())
-        collapsed (:git-collapsed-sections m '())
-        top (model/ed-current-top m)
-        vrows (or (:view-rows m) 40)
-        vis-expanded (git-visible-expanded (:git-rows m '()) expanded top vrows)
-        diffs (git-expanded-diffs root entries vis-expanded)
+;; ---- the status buffer's eight subprocesses, off the loop --------------------
+;; `git status --porcelain` is not fast on every repo. Measured on a mix project whose
+;; `.git` is 128 MB: **5.4 seconds** for the status call alone, 17 s for the seven the
+;; status buffer runs — because git walks `_build/` and `deps/` to decide they are
+;; ignored. On the loop that is a 17-second freeze on `C-x g`, and another on every `g`,
+;; `s` and `u` after it.
+;;
+;; The split that makes it fixable: COLLECT (every subprocess, plain data in and out, so
+;; it can cross a process boundary) and RENDER (pure, needs the model). Collect runs in a
+;; task; render folds the answer. Headless collects inline, so tests still drive real git.
+
+(defn git-status-inputs (m root)
+  "Everything the collection needs from the model, as plain data — read on the loop before
+the task starts, because a task cannot see the model and a rope cannot cross to it."
+  {:root root
+   :expanded (:git-expanded m '())
+   :prev-rows (:git-rows m '())
+   :top (model/ed-current-top m)
+   :vrows (or (:view-rows m) 40)})
+
+(defn git-collect-status (inputs)
+  "Every git subprocess the status buffer needs, as one plain-data answer. The whole of
+what used to run on the dispatch path. Safe to run in a task: plain data in, plain data
+out, no model and no rope."
+  (let (root (:root inputs)
+        entries (git-entries (:stdout (git-git root ["status" "--porcelain" "-z"]) ""))
+        vis-expanded (git-visible-expanded (:prev-rows inputs)
+                       (:expanded inputs)
+                       (:top inputs)
+                       (:vrows inputs))
         upstream (git-upstream root)
-        unpushed (if upstream (git-upstream-commits root :unpushed) '())
-        unpulled (if upstream (git-upstream-commits root :unpulled) '())
-        recent (git-recent-commits root)
-        head {:subject (if (empty? recent) "" (:subject (first recent) ""))
-              :upstream upstream
-              :upstream-subject (if upstream
-                                  (let (cs (git-log-commits root ["-1" upstream]))
-                                    (if (empty? cs) "" (:subject (first cs) "")))
-                                  "")}
-        r (git-render (git-branch root)
-            entries expanded diffs collapsed unpushed unpulled recent head)
+        recent (git-recent-commits root))
+    {:root root
+     :branch (git-branch root)
+     :entries entries
+     :diffs (git-expanded-diffs root entries vis-expanded)
+     :unpushed (if upstream (git-upstream-commits root :unpushed) '())
+     :unpulled (if upstream (git-upstream-commits root :unpulled) '())
+     :recent recent
+     :head {:subject (if (empty? recent) "" (:subject (first recent) ""))
+            :upstream upstream
+            :upstream-subject (if upstream
+                                (let (cs (git-log-commits root ["-1" upstream]))
+                                  (if (empty? cs) "" (:subject (first cs) "")))
+                                "")}}))
+
+(defn- git-render-status (m root collected &optional (line nil))
+  "PURE: fold a finished `git-collect-status` into `*git-status*` for repo `root`, recording
+`:git-root`/`:git-rows`. `line` places point: a 1-based number, nil (default — the first
+file row if any, else the top), or a function `(rows -> 1-based line)` resolved against the
+freshly-rendered rows (see `git-stay-in-section`). Respects `:git-expanded` and
+`:git-collapsed-sections`.
+
+No subprocess runs here — that is `git-collect-status`, and keeping the two apart is what
+lets the slow half go in a task."
+  (let (expanded (:git-expanded m '())
+        collapsed (:git-collapsed-sections m '())
+        r (git-render (:branch collected)
+            (:entries collected)
+            expanded
+            (:diffs collected)
+            collapsed
+            (:unpushed collected)
+            (:unpulled collected)
+            (:recent collected)
+            (:head collected))
         rows (:rows r)
         target (cond
                  (fn? line) (line rows)
@@ -782,6 +820,40 @@ with many expanded files stays fast regardless of how many are off-screen."
                (assoc (ed-buf-at m1 gi) :line-links (git-status-line-links rows root)))))
     (ed-apply m2 (fn (b) (commands/ed-goto-line b target)))))
 
+
+(defn- git-show-status (m root &optional (line nil))
+  "Show/refresh `*git-status*` for `root` — collecting OFF the loop.
+
+The editor gets the buffer immediately (the previous contents while a refresh is in
+flight, a `Loading…` placeholder the first time) and the real thing when the eight
+subprocesses land. On a repo where `git status` takes five seconds, the difference is
+between an editor that is frozen for five seconds and one that says so and keeps working.
+
+Headless collects inline: no loop means no reply, and every git test wants the real
+answer synchronously."
+  (if (model/ed-headless?)
+    (git-render-status m root (git-collect-status (git-status-inputs m root)) line)
+    (let (inputs (git-status-inputs m root)
+          job (task (fn () (git-collect-status inputs)) {:timeout *git-op-timeout-ms*})
+          ;; the first open has nothing to show yet; a refresh keeps what is on screen
+          ;; rather than blanking it, because a flicker back to "Loading" on every `g`
+          ;; is worse than a stale half-second
+          m1 (if (nil? (:git-rows m))
+               (ed-show-named (assoc m :git-root root) "*git-status*" "Loading…\n" :git-status)
+               (assoc m :git-root root)))
+      (assoc m1 :git-status-proc job :git-status-line line))))
+
+(defn git-apply-show-status (m collected)
+  "Fold a finished status collection into the buffer. A nil answer (the task errored or
+timed out) says so rather than rendering an empty repo, which is what a blank `entries`
+would look like — a clean working tree, confidently wrong."
+  (let (line (:git-status-line m)
+        m1 (dissoc m :git-status-proc :git-status-line))
+    (cond
+      (nil? collected) (message m1 "git status failed or timed out")
+      ;; an answer about a repo the reader has since left
+      (not (= (:root collected) (:git-root m1))) m1
+      :else (git-render-status m1 (:root collected) collected line))))
 (defn- git-status-line-links (rows root)
   "The 0-based-line → `{:file :line}` map for *git-status*: every plain file row links to its
 file (line 1); section-header / hunk / commit-log rows link to nothing. Read by the shared
