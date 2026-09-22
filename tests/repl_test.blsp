@@ -1,4 +1,6 @@
-;; The project REPL (`C-x p r`): a long-lived interpreter hosted in a buffer.
+;; The project REPL (`C-x p r`): a long-lived interpreter hosted in a terminal buffer in
+;; LINE mode — `src/term.blsp`, with bshell's history and boundary commands over the
+;; same `:input-start` field.
 ;;
 ;; This is the one bedit feature that could not exist before `os/spawn-pty`. On a pipe
 ;; an interpreter asks `isatty`, is told no, and drops its prompt, its line editing and
@@ -10,34 +12,10 @@
   (:use model)
   (:use editor/buffer)
   (:use commands)
+  (:use-internals term)
   (:use-internals bshell)
+  (:use-internals input)
   (:use toolchain))
-
-(defn rt-drain (nm acc want deadline)
-  "Fold `bshell-output-event`s into `acc` until it contains `want`. An interpreter
-never exits and never falls quiet on its own, so waiting for EOF would mean waiting
-out the timeout for an answer that arrived at once."
-  (if (includes? acc want)
-    acc
-    (receive
-      ;; the worker sends `bshell-output-event` RECORDS to whatever is registered as
-      ;; `:editor`, so match the message and read it with its accessor
-      (msg (rt-drain nm
-             (str acc
-               (check-allow :discarded-catch
-                 (try (bshell/bshell-output-event-text msg) (catch _ ""))))
-             want
-             deadline))
-      (after deadline acc))))
-
-;; The worker sends UiEvent records to the process registered as :editor, so a test
-;; that wants to see them registers ITSELF under that name.
-(defn rt-as-editor (f)
-  (let (previous (proc/whereis :editor))
-    (proc/register :editor (self))
-    (let (out (f))
-      (when previous (proc/register :editor previous))
-      out)))
 
 (describe "the REPL runs the toolchain's command, not a hardcoded one"
   (test "each project type names its own"
@@ -53,171 +31,136 @@ out the timeout for an answer that arrived at once."
       ;; no toolchain recognised at /tmp, so no REPL command
       (is (nil? (repl-command m1))))))
 
-;; `sh -i` stands in for `iex`/`nest repl` here: it is an interpreter, it prompts, and
-;; it is present on every machine this suite runs on. What is being tested is the
-;; hosting — that a line typed in the buffer reaches the child and its answer comes
-;; back — and that is identical whichever interpreter it is.
+;; ---- line mode over a synthetic screen ---------------------------------------------
+;; The REPL buffer is a term buffer in line mode: the program's screen up to its cursor,
+;; then bedit's input region. These fold screens the way the worker sends them.
+
+(def repl-name (term/term-buffer-name "repl" "/tmp"))
+
+(defn repl-model ()
+  "A model whose current buffer is a /tmp REPL in line mode, as `cmd-project-repl` makes
+it — no worker."
+  (let (buf (assoc (editor/layers/set-buffer-type (make-buffer "" repl-name) :term)
+              :dir "/tmp"
+              :term-proc nil
+              :term-size [80 24]
+              :term-hstart 0
+              :term-hspans []
+              :face-spans []
+              :term-line-mode true
+              :term-label "repl"
+              :input-start 0
+              :bshell-history []
+              :bshell-hist-idx nil
+              :bshell-draft nil))
+    (ed-open-buffer (ed-init (make-buffer "")) buf)))
+
+(defn screen (text cursor)
+  {:text text :spans [] :cursor cursor :cursor-visible true :cursor-style :block})
+
+(defn fold-screen (m scr)
+  (term/ed-ev-term-screen m (term/term-screen-event repl-name [] scr) 24 80 24))
+
+(defn repl-buf (m) (ed-buf-at m (ed-buffer-index-by-name! m repl-name)))
+(defn repl-text (m) (buffer-text (repl-buf m)))
+(defn repl-point (m) (buffer-point (ed-current-buf m)))
+(defn type-keys (m keys) (fold keys m (fn (mm k) (ed-update mm k 80 24))))
+
+(describe "line mode: the buffer is the program's screen up to its cursor, then yours"
+  (test "the screen's blank rows below the prompt are not shown; input begins at the prompt"
+    (let (m (fold-screen (repl-model) (screen "iex(1)> \n\n\n" 8)))
+      (assert= (repl-text m) "iex(1)> ")
+      (assert= (:input-start (repl-buf m)) 8)
+      (assert= (repl-point m) 8)))
+  (test "typing goes into the buffer, not to the program, and RET sends it whole"
+    (let (m0 (ed-set-buf (fold-screen (repl-model) (screen "iex(1)> " 8))
+               (assoc (ed-current-buf (fold-screen (repl-model) (screen "iex(1)> " 8))) :term-proc (self)))
+          typed (type-keys m0 (list "1" " " "+" " " "1"))
+          sent (ed-update typed :enter 80 24))
+      (assert= (repl-text typed) "iex(1)> 1 + 1")
+      (receive ([:term-line line] (assert= line "1 + 1")) (after 500 (is (= :sent "RET sent nothing"))))
+      ;; the region is cleared — the program's echo will replace it
+      (assert= (repl-text sent) "iex(1)> ")
+      (is (includes? (:bshell-history (repl-buf sent)) "1 + 1"))))
+  (test "a redraw while typing keeps what was typed, after the new prompt"
+    (let (m0 (fold-screen (repl-model) (screen "iex(1)> " 8))
+          typed (type-keys m0 (list "a" "b"))
+          redrawn (fold-screen typed (screen "iex(1)> \nlog line\niex(1)> " 26)))
+      (assert= (repl-text redrawn) "iex(1)> \nlog line\niex(1)> ab")
+      (assert= (:input-start (repl-buf redrawn)) 26)
+      (assert= (repl-point redrawn) 28)))
+  (test "the boundary holds: backspace and C-a stop at the prompt"
+    (let (m0 (fold-screen (repl-model) (screen "iex(1)> " 8))
+          typed (type-keys m0 (list "x"))
+          m1 (type-keys typed (list :backspace :backspace :backspace)))
+      (assert= (repl-text m1) "iex(1)> ")
+      (assert= (repl-point (type-keys (type-keys m1 (list "y" "z")) (list :ctrl-a))) 8)))
+  (test "↑ recalls history into the input"
+    (let (m0 (ed-set-buf (fold-screen (repl-model) (screen "> " 2))
+               (assoc (ed-current-buf (fold-screen (repl-model) (screen "> " 2))) :bshell-history ["first" "second"]))
+          m (type-keys m0 (list :up)))
+      (assert= (repl-text m) "> second")))
+  (test "the keys are the editor's in line mode: the term overlay stands aside"
+    (let (m (fold-screen (repl-model) (screen "> " 2))
+          o (seq/find input/ed-transient-handlers (fn (o) (= (:__id__ o) :bedit/input/term-overlay))))
+      (is (not (editor/ui/overlay-active? o m))))))
+
+(describe "switching modes"
+  (test "C-c C-k hands the keys to the program; C-c C-j takes them back"
+    (let (m0 (fold-screen (repl-model) (screen "> " 2))
+          char (type-keys m0 (list :ctrl-c :ctrl-k))
+          o (seq/find input/ed-transient-handlers (fn (o) (= (:__id__ o) :bedit/input/term-overlay))))
+      (is (not (:term-line-mode (repl-buf char))))
+      (is (editor/ui/overlay-active? o char))
+      (is (read-only? (repl-buf char)))
+      ;; from char mode, C-c belongs to the program: C-x c is the way to its map
+      (let (line (type-keys char (list :ctrl-x "c" :ctrl-j)))
+        (is (:term-line-mode (repl-buf line)))
+        (assert= (:input-start (repl-buf line)) 2))))
+  (test "the mode line chip names the program and the mode"
+    (let (m (fold-screen (repl-model) (screen "> " 2)))
+      (assert= (term/term-modeline m (repl-buf m)) "● repl · line")
+      (assert= (term/term-modeline m (assoc (repl-buf m) :term-exited true)) "○ exited"))))
+
+;; ---- a real interpreter -------------------------------------------------------------
+;; `sh -i` stands in for `iex`/`nest repl`: it is an interpreter, it prompts, and it is
+;; present on every machine this suite runs on. What is being tested is the hosting —
+;; that a line typed in the buffer reaches the child and its answer comes back — and
+;; that is identical whichever interpreter it is.
+
+(defn rt-await-screen (want deadline)
+  (receive
+    (msg
+      (let (text (check-allow :discarded-catch
+                   (try (:text (term/term-screen-event-screen msg)) (catch _ nil))))
+        (if (and text (includes? text want)) msg (rt-await-screen want deadline))))
+    (after deadline nil)))
+
+(defn rt-as-editor (f)
+  (let (previous (proc/whereis :editor))
+    (proc/register :editor (self))
+    (let (out (f))
+      (when previous (proc/register :editor previous))
+      out)))
+
+(defn rt-has-vt? ()
+  (check-allow :discarded-catch (try (do (vt/make 1 1) true) (catch _ false))))
+
 (describe "a hosted interpreter answers what the buffer sends it"
-  :isolated (test "a line reaches the child and its output comes back"
-    (rt-as-editor
-      (fn ()
-        (let (nm "*repl: test*"
-              pid (bshell/bshell-connect-repl nm "/tmp" "sh -i")
-              _ (send pid [:bshell-run "echo forty-two"])
-              out (rt-drain nm "" "forty-two" 8000))
-          (bshell/bshell-shutdown pid)
-          ;; the child echoed the line AND ran it — neither happens on a pipe
-          (is (includes? out "forty-two"))))))
-
-  :isolated (test "the session is LONG-LIVED: a second line goes to the same child"
-    (rt-as-editor
-      (fn ()
-        (let (nm "*repl: test2*"
-              pid (bshell/bshell-connect-repl nm "/tmp" "sh -i")
-              _ (send pid [:bshell-run "X=99"])
-              _ (rt-drain nm "" "X=99" 8000)
-              _ (send pid [:bshell-run "echo value-is-$X"])
-              out (rt-drain nm "" "value-is-99" 8000))
-          (bshell/bshell-shutdown pid)
-          ;; a variable set by the first line survives into the second — which is the
-          ;; whole difference between a REPL and `sh -c` per line
-          (is (includes? out "value-is-99")))))))
-
-;; The plain project shell rides the same worker, and the same latent bug: it built its
-;; `bshell-output-event` by BARE name inside a spawned closure, where only the qualified
-;; name resolves, so the worker died with "unbound symbol" the first time it had anything
-;; to say. Nothing caught it because the folds were tested directly and the worker never
-;; was — so this drives it, for both kinds of session.
-(describe "the project shell rides the same worker"
-  :isolated (test "a command runs and its output comes back"
-    (rt-as-editor (fn ()
-                    (let (nm "*shell: test*"
-                          pid (bshell/bshell-connect nm "/tmp")
-                          _ (send pid [:bshell-run "echo hello-there"])
-                          out (rt-drain nm "" "hello-there" 8000))
-                      (bshell/bshell-shutdown pid)
-                      (is (includes? out "hello-there")))))))
-
-;; A REPL that has exited still has a buffer, and that buffer still takes input. Writing
-;; to the dead child raises and the raise is swallowed, so before this the buffer
-;; accepted line after line and did nothing, with nothing said.
-(describe "a REPL that has exited says so"
-  :isolated (test "input after the child is gone is answered, not ignored"
-    (rt-as-editor
-      (fn ()
-        (let (nm "*repl: gone*"
-              ;; a REPL that exits immediately
-              pid (bshell/bshell-connect-repl nm "/tmp" "exit 0")
-              ;; wait for the child's exit to land; there is no marker to look for, so
-              ;; this drains until the timeout on purpose
-              _ (rt-drain nm "" "no-such-marker" 1500)
-              _ (send pid [:bshell-run "anything"])
-              out (rt-drain nm "" "has exited" 4000))
-          (bshell/bshell-shutdown pid)
-          (is (includes? out "has exited")))))))
-
-;; ---- terminal output is applied, not stripped -------------------------------
-;; A REPL redraws. `iex` echoes what you typed, then moves up a line, erases, and
-;; prints the line again with its prompt — so stripping the escapes leaves BOTH copies
-;; and the buffer shows the input twice. `ansi/render` applies them instead, which has
-;; to happen on the editor side because it needs the buffer's existing text.
-(describe "a REPL buffer renders its child's redraw"
-  (defn rt-esc (s) (str (string/int->char 27) s))
-
-  ;; the exact bytes a real `iex` writes for `1 + 41`
-  (def rt-iex-chunk
-    (str
-      "1 + 41
-"
-      (rt-esc "[A")
-      (rt-esc "[J")
-      "iex(1)> 1 + 41
-"
-      (rt-esc "[33m")
-      "42"
-      (rt-esc "[0m")
-      "
-iex(2)> "))
-
-  (defn rt-repl-model ()
-    (let (buf (assoc (editor/layers/set-buffer-type (make-buffer "" "*repl: r*") :bshell)
-                :bshell-repl true
-                :bshell-input-start 0))
-      (ed-open-buffer (ed-init (make-buffer "" "scratch" "scratch")) buf)))
-
-  (test "the echo is replaced, not doubled"
-    (let (m (ed-ev-bshell-output (rt-repl-model)
-              (bshell/bshell-output-event "*repl: r*" rt-iex-chunk)
-              24
-              80
-              24)
-          i (ed-buffer-index-by-name! m "*repl: r*")
-          text (buffer-text (ed-buf-at m i)))
-      (assert= text "iex(1)> 1 + 41\n42\niex(2)> ")
-      ;; the input appears once, under the prompt that redrew it
-      (assert= (count (seq/filter (string/split text "\n") (fn (l) (includes? l "1 + 41")))) 1)))
-
-  (test "and typing still begins after whatever the child last printed"
-    (let (m (ed-ev-bshell-output (rt-repl-model)
-              (bshell/bshell-output-event "*repl: r*" rt-iex-chunk)
-              24
-              80
-              24)
-          i (ed-buffer-index-by-name! m "*repl: r*")
-          b (ed-buf-at m i))
-      (assert= (:bshell-input-start b) (string/length (buffer-text b)))))
-
-  ;; A shell buffer is append-only output and keeps the cheaper strip — the same chunk
-  ;; there is text, not layout.
-  (test "a plain shell buffer is unaffected"
-    (let (buf (assoc (editor/layers/set-buffer-type (make-buffer "" "*shell: s*") :bshell)
-                :bshell-input-start 0)
-          m (ed-open-buffer (ed-init (make-buffer "" "scratch" "scratch")) buf)
-          m1 (ed-ev-bshell-output m (bshell/bshell-output-event "*shell: s*" "a\nb\n") 24 80 24)
-          i (ed-buffer-index-by-name! m1 "*shell: s*")
-          text (buffer-text (ed-buf-at m1 i)))
-      (assert= text "a\nb\n"))))
-
-;; ---- the window size reaches the child ---------------------------------------
-;; A pty child lays out against a size it is TOLD; it has no other way to learn one.
-;; A REPL opened in an 80-column window kept wrapping at 80 after the window widened.
-(describe "a resize reaches the hosted REPL"
-  (test "every live REPL worker is told, and nothing else is"
-    (let (repl (assoc (make-buffer "" "*repl: a*") :bshell-repl true :bshell-proc (self))
-          shell (assoc (make-buffer "" "*shell: b*") :bshell-proc (self))
-          m (ed-open-buffer (ed-open-buffer (ed-init (make-buffer "" "s" "s")) repl) shell)
-          _ (bshell/bshell-resize-all m 120 40)
-          ;; exactly one message, for the REPL buffer only
-          first-msg (receive ([:bshell-resize c r] [c r]) (after 500 :none))
-          second-msg (receive ([:bshell-resize c r] [c r]) (after 200 :none)))
-      (assert= first-msg [120 40])
-      (assert= second-msg :none))))
-
-;; The buffer half: the editor prints no prompt of its own, and the input region
-;; follows whatever the child last wrote.
-(describe "the REPL buffer lets you type after the child's own prompt"
-  (test "output moves the input boundary to the end"
-    (let (buf (assoc (editor/layers/set-buffer-type (make-buffer "" "*repl: x*") :bshell)
-                :bshell-repl true
-                :bshell-input-start 0)
-          m (ed-open-buffer (ed-init (make-buffer "" "scratch" "scratch")) buf)
-          m1 (ed-ev-bshell-output m (bshell/bshell-output-event "*repl: x*" "iex(1)> ") 24 80 24)
-          i (ed-buffer-index-by-name! m1 "*repl: x*")
-          b (ed-buf-at m1 i))
-      ;; typing begins after the prompt the CHILD printed, not at 0
-      (assert= (:bshell-input-start b) (string/length (buffer-text b)))
-      (assert= (buffer-text b) "iex(1)> ")))
-
-  (test "a plain shell buffer keeps its own prompt behaviour"
-    (let (buf (assoc (editor/layers/set-buffer-type (make-buffer "" "*shell: x*") :bshell)
-                :bshell-input-start 0)
-          m (ed-open-buffer (ed-init (make-buffer "" "scratch" "scratch")) buf)
-          m1 (ed-ev-bshell-output m
-               (bshell/bshell-output-event "*shell: x*" "some output\n")
-               24
-               80
-               24)
-          i (ed-buffer-index-by-name! m1 "*shell: x*")
-          b (ed-buf-at m1 i))
-      ;; unchanged: a shell's boundary is reset by the command's exit, not by output
-      (assert= (:bshell-input-start b) 0))))
+  :isolated (test "the session is LONG-LIVED: a variable set by one line survives into the next"
+    (if (not (rt-has-vt?))
+      (io/puts "  (skipped: this nest has no std/vt)")
+      (rt-as-editor
+        (fn ()
+          (let (pid (term/term-connect repl-name "/tmp" "PS1='> ' sh -i" 60 8)
+                prompt (rt-await-screen "> " 8000))
+            (do
+              (is (not (nil? prompt)))
+              (send pid [:term-line "X=99"])
+              (is (not (nil? (rt-await-screen "X=99" 8000))))
+              (send pid [:term-line "echo value-is-$X"])
+              (let (ev (rt-await-screen "value-is-99" 8000))
+                ;; a variable set by the first line survives into the second — the whole
+                ;; difference between a REPL and `sh -c` per line
+                (is (not (nil? ev))))
+              (send pid [:shutdown]))))))))

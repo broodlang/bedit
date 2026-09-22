@@ -21,7 +21,12 @@
 ;;     before it is history (rows the vt evicted, appended once, with their colour
 ;;     kept as `:face-spans`), and point in any pane watching the screen IS the
 ;;     program's cursor;
-;;   - the OVERLAY (`input/term-overlay`) routes every key of a term buffer to the
+;;   - a term buffer is in CHAR mode (the program's line editor: every key goes to it) or
+;;     LINE mode (bedit's: the input region after the program's cursor is edited here,
+;;     with bshell's history and boundary commands, and RET sends the line) — Emacs
+;;     `term-char-mode` / `term-line-mode`, `C-c C-k` / `C-c C-j`. The project REPL
+;;     (`C-x p r`) opens in line mode; a full-screen program in char mode;
+;;   - the OVERLAY (`input/term-overlay`) routes every key of a char-mode term buffer to the
 ;;     worker, except `C-x` — the editor's own prefix stays, so you can switch
 ;;     buffers and panes out of a running program — and `C-y`, which pastes into it;
 ;;     the mode layer adds `C-x c` (the editor's C-c map) and `C-x C-x` / `C-x C-y`
@@ -115,6 +120,8 @@ as several), then render once the pipe goes quiet."
       (do
         (term-write state (vt/paste->bytes text (:vt state)))
         (term-loop state)))
+    ;; line mode: the whole line, as typed, ended the way RET ends it
+    ([:term-line text] (do (term-write state (str text "\r")) (term-loop state)))
     ([:term-mouse action button row col mods]
       (do
         (term-write state (or (vt/mouse->bytes action button row col mods (:vt state)) ""))
@@ -173,6 +180,12 @@ buffer's life. Returns its pid."
 (defn- shift-spans (spans by)
   (into [] (map spans (fn (s) (let ([from to f] s) [(+ from by) (+ to by) f])))))
 
+(defn- clip-spans (spans at)
+  "`spans` cut at offset `at`: those past it dropped, one straddling it shortened."
+  (into []
+    (map (seq/filter spans (fn (s) (< (first s) at)))
+      (fn (s) (let ([from to f] s) [from (math/min to at) f])))))
+
 (defn- history-lines (lines base)
   "The evicted `lines` (`[text spans]` each, spans from 0) laid out one per line from
 offset `base`: `[text spans end]` — their text, their spans made absolute, the offset
@@ -208,14 +221,31 @@ every cell reaching that first; a no-op below both."
           :term-hstart (- hstart cut)
           :term-hspans (shift-spans kept (- cut)))))))
 
+(defn- pending-input (b)
+  "In line mode, what the user has typed past the program's cursor and not yet sent —
+kept across a redraw, as comint keeps the text after its process mark. \"\" otherwise."
+  (let (start (:input-start b))
+    (if (and (:term-line-mode b) (int? start))
+      (string/substring (buffer-text b) start (buffer-length b))
+      "")))
+(sig pending-input (buffer -> string))
+
 (defn- term-apply-screen (b lines screen)
   "Buffer `b` with the evicted `lines` appended to its history and `screen` written as
 its tail, `:face-spans` the history's spans then the screen's, its own point at the
-program's cursor. The buffer is read-only for the user; its producer unlocks it."
+program's cursor — or, in line mode, at the end of the input still being typed, which
+is re-appended after the screen and marked as the input region. The buffer is read-only
+for the user in char mode; its producer unlocks it."
   (let (hstart (history-start b)
+        line? (:term-line-mode b)
+        typed (pending-input b)
+        ;; line mode shows the screen only up to the cursor: the input goes where the
+        ;; program's prompt ends, not after its blank rows
+        shown (if line? (string/substring (:text screen) 0 (:cursor screen)) (:text screen))
+        spans (if line? (clip-spans (:spans screen) (:cursor screen)) (:spans screen))
         [htext hspans hend] (history-lines lines hstart)
         unlocked (set-read-only b false)
-        written (assoc (replace-region unlocked hstart (buffer-length unlocked) (str htext (:text screen)))
+        written (assoc (replace-region unlocked hstart (buffer-length unlocked) (str htext shown))
                   :term-hstart hend
                   :term-hspans (into (:term-hspans b) hspans)
                   ;; the program's cursor as the VIEW paints it, and what the MOUSE needs
@@ -226,9 +256,13 @@ program's cursor. The buffer is read-only for the user; its producer unlocks it.
         ;; trim BEFORE the faces are laid out, so both halves share one offset
         trimmed (trim-history written)
         screen-start (history-start trimmed)
-        faced (assoc (goto-char trimmed (+ screen-start (:cursor screen)))
-                :face-spans (into (:term-hspans trimmed) (shift-spans (:spans screen) screen-start))))
-    (set-read-only faced true)))
+        cursor (+ screen-start (:cursor screen))
+        faced (assoc (goto-char trimmed cursor)
+                :face-spans (into (:term-hspans trimmed) (shift-spans spans screen-start))))
+    (if line?
+      ;; the input region begins at the program's cursor; what was typed goes back after it
+      (assoc (insert faced typed) :input-start cursor)
+      (set-read-only faced true))))
 (sig term-apply-screen (buffer vector screen -> buffer))
 
 (defn- term-follow (m idx before after)
@@ -324,31 +358,109 @@ when the program asked for pastes to be marked, so it can tell one from typing."
 
 ;; ---- the commands --------------------------------------------------------------------------
 
-(defn- term-start (m label root command)
-  "Open a `label` terminal buffer running `command` in `root`, sized to the selected pane."
-  (let (fresh (assoc (editor/layers/set-buffer-type (set-read-only (make-buffer "" (term-buffer-name label root)) true) :term)
+(defn- term-start (m label root command line-mode?)
+  "Open a `label` terminal buffer running `command` in `root`, sized to the selected pane,
+in line mode when `line-mode?`."
+  (let (fresh (assoc (editor/layers/set-buffer-type (set-read-only (make-buffer "" (term-buffer-name label root)) (not line-mode?)) :term)
                 :dir root
                 :term-hstart 0
                 :term-hspans []
-                :face-spans [])
+                :face-spans []
+                :term-line-mode line-mode?
+                :term-label label
+                :input-start (if line-mode? 0 nil)
+                :bshell-history []
+                :bshell-hist-idx nil
+                :bshell-draft nil)
         [cols rows] (term-size-for m fresh)
         pid (term-connect (buffer-name fresh) root command cols rows)
         buf (assoc fresh :term-proc pid :term-size [cols rows]))
-    (message (ed-open-buffer m buf) (str command " (C-x k closes; every other key goes to it)"))))
+    (message (ed-open-buffer m buf)
+      (str command (if line-mode? " (RET sends the line; C-c C-k for char mode)" " (C-x k closes; every other key goes to it)")))))
 
-(defn- term-open (m label command)
+(defn- term-open (m label command &optional (line-mode? false))
   "Switch to this project's `label` terminal, or start one running `command`."
   (let (root (or (ed-project-root m) (:dir (ed-current-buf m)) (file/cwd))
         idx (ed-buffer-index-by-name m (term-buffer-name label root)))
-    (if (nil? idx) (term-start m label root command) (ed-select m idx))))
+    (if (nil? idx) (term-start m label root command line-mode?) (ed-select m idx))))
+
+;; ---- line mode ------------------------------------------------------------------------------
+;; The program's screen ends at its cursor; from there the buffer is bedit's — an input
+;; region (`:input-start`, the field bshell's boundary and history commands read) that RET
+;; sends whole. The echo comes back from the pty and REPLACES the tail, so the region is
+;; cleared on send rather than left to show twice.
+
+(defn- set-line-mode (m on)
+  (let (b (ed-current-buf m))
+    (if (not (term-buffer? b))
+      m
+      ;; on: the tail past the cursor (the screen's blank rows) goes, the region starts at
+      ;; the cursor; off: whatever was typed and not sent goes, the next redraw restores
+      (let (cut (if on (buffer-point b) (or (:input-start b) (buffer-length b)))
+            trimmed (replace-region (set-read-only b false) cut (buffer-length b) "")
+            switched (assoc (set-read-only trimmed (not on))
+                       :term-line-mode on
+                       :input-start (if on cut nil)))
+        (message (ed-set-buf m (goto-char switched cut))
+          (if on "line mode: RET sends the line (C-c C-k for char mode)" "char mode: every key goes to the program (C-c C-j for line mode)"))))))
+
+(defcommand cmd-term-line-mode
+  (m key)
+  "C-c C-j (C-x c C-j from char mode): line mode — the input after the program's cursor is
+edited here with the shell's history and boundary keys, and RET sends it whole."
+  (set-line-mode m true))
+
+(defcommand cmd-term-char-mode
+  (m key)
+  "C-c C-k: char mode — every key goes straight to the program, which does its own editing."
+  (set-line-mode m false))
+
+(defcommand cmd-term-send-line
+  (m key)
+  "RET in a line-mode terminal: send the input region to the program as one line and
+remember it in the buffer's history; the program's echo replaces it."
+  (let (b (ed-current-buf m)
+        start (or (:input-start b) (buffer-length b))
+        line (string/substring (buffer-text b) start (buffer-length b))
+        pid (live-program b))
+    (if (nil? pid)
+      m
+      (do
+        (send pid [:term-line line])
+        (let (remembered (if (string/blank? line) m (bshell/bshell-remember m line))
+              cleared (replace-region (ed-current-buf remembered) start (buffer-length b) ""))
+          (ed-set-buf remembered cleared))))))
+
+(defcommand cmd-project-repl
+  (m key)
+  "Open this project's REPL (C-x p r): `iex -S mix` in a mix project, `nest repl` in a
+Brood one, `python3`, `node` — whatever `toolchain/*toolchains*` says this project's is,
+in a terminal buffer in LINE mode: bedit's editing, history and C-r over the input,
+RET sends the line; `C-c C-k` hands the keys to the REPL's own line editor instead."
+  (let (root (ed-project-root m)
+        command (if (nil? root) nil (toolchain/repl-command m)))
+    (cond
+      (nil? root) (message m "not in a project")
+      (nil? command) (message m (str "no REPL for a " (toolchain/name-of m) " project"))
+      else (term-open m "repl" command true))))
 
 (defcommand cmd-term
   (m key)
   "Open a terminal for the current project (C-x p t): your shell (`$SHELL`, else `sh`)
 under a real terminal emulator in the project root — for the programs the project
 shell's line editor cannot host: `htop`, `vim`, a TUI test runner. Each project has its
-own; re-running switches to it."
-  (term-open m "term" (or (os/env "SHELL") "sh")))
+own; re-running switches to it. With a prefix argument (`C-u`), asks for the program to
+run instead, in a buffer named after it."
+  (if (nil? (current-prefix-arg m))
+    (term-open m "term" (or (os/env "SHELL") "sh"))
+    (assoc m
+      :minibuffer
+        {:edit (ed-mb-edit "Run in a terminal: " "")
+         :on-complete (fn (mm command)
+                        (if (string/blank? command)
+                          (message mm "no program")
+                          (term-open mm (first (string/split (string/trim command) " ")) (string/trim command))))})))
+(interactive/register-prefix-consuming 'term/cmd-term)
 
 (defcommand cmd-claude
   (m key)
@@ -386,11 +498,13 @@ C-c had been pressed (`C-x c t` runs the tests), since the program owns C-c itse
   "The `[row col]` of the program's screen under window cell (`row`, `col`) in `pane`, or
 nil when that cell is above the screen (history) or off the text."
   (let ([x y w h] (:rect pane)
-        text-row (- row y)
-        text-col (- col x)
+        ;; a zoomed pane's cells are bigger than the window's: the click lands in fewer of them
+        [rw rh] (panes/ed-zoom-ratio pane)
+        text-row (math/floor (/ (- row y) rh))
+        text-col (math/floor (/ (- col x) rw))
         screen-top (results/line-of (buffer-rope buf) (history-start buf))
         screen-row (- (+ (panes/ed-pane-top pane buf) text-row) screen-top))
-    (if (and (>= text-row 0) (< text-row (dec h)) (>= text-col 0) (>= screen-row 0))
+    (if (and (>= text-row 0) (< text-row (panes/ed-pane-vrows pane buf)) (>= text-col 0) (>= screen-row 0))
       [screen-row text-col]
       nil)))
 
@@ -414,6 +528,15 @@ nil, and the editor handles it as it would in any buffer."
         (let (key (if (= action :scroll-up) :up :down))
           (do (fold (range 3) nil (fn (_ _) (send pid [:term-key key]))) m))
       else nil)))
+
+;; ---- the mode line ---------------------------------------------------------------------
+
+(defn term-modeline (m buf)
+  "The term layer's `:modeline` service: the program's state and which mode the keys are
+in — `● claude · char`, `○ exited`."
+  (if (:term-exited buf)
+    "○ exited"
+    (str "● " (or (:term-label buf) "program") " · " (if (:term-line-mode buf) "line" "char"))))
 
 ;; ---- the theme ------------------------------------------------------------------------------
 
