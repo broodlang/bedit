@@ -591,3 +591,122 @@ only the profile keymaps are harvested for M-x"
       (assert= (key-of modes/git-status-keymap) 'git/cmd-git-process)
       (assert= (key-of modes/git-report-keymap) 'git/cmd-git-process)
       (assert= (key-of modes/git-process-keymap) 'git/cmd-git-process))))
+
+;; ---- the sequencer: what operation is this repo part-way through? ------------
+;; The one piece of the new porcelain that touches the filesystem, and the one that fails
+;; SILENTLY if it is wrong: a `git-sequencer` that always answered nil would leave
+;; continue / abort / skip permanently reporting "nothing in progress", with nothing on
+;; screen to say why. So this builds a real repo in a temp dir and puts it into each state.
+;;
+;; Real git, deliberately. The detection is a claim about what git leaves in `.git` — a
+;; fixture asserting that `MERGE_HEAD` means a merge would only be testing that this file
+;; agrees with itself.
+
+(defn gt-git (dir args) (os/cmd "git" args dir))
+
+(defn gt-repo (name)
+  "A throwaway repo in a temp dir with two diverged branches whose single file conflicts."
+  (let (dir (path/join (or (os/env "TMPDIR") "/tmp") (str "bedit-git-test-" name)))
+    (do
+      (os/cmd "rm" ["-rf" dir] "/")
+      (file/mkdir dir)
+      (gt-git dir ["init" "-q"])
+      (gt-git dir ["config" "user.email" "t@example.com"])
+      (gt-git dir ["config" "user.name" "Test"])
+      (gt-git dir ["config" "commit.gpgsign" "false"])
+      (file/spit (path/join dir "f.txt") "base\n")
+      (gt-git dir ["add" "f.txt"])
+      (gt-git dir ["commit" "-qm" "base"])
+      (gt-git dir ["branch" "-M" "main"])
+      (gt-git dir ["checkout" "-q" "-b" "other"])
+      (file/spit (path/join dir "f.txt") "theirs\n")
+      (gt-git dir ["commit" "-qam" "theirs"])
+      (gt-git dir ["checkout" "-q" "main"])
+      (file/spit (path/join dir "f.txt") "ours\n")
+      (gt-git dir ["commit" "-qam" "ours"])
+      dir)))
+
+(describe "git: the sequencer knows what is in progress"
+  (test "a clean repo is in the middle of nothing"
+    (assert= (git/git-sequencer (gt-repo "clean")) nil))
+  (test "a conflicted merge reads as a merge"
+    (let (dir (gt-repo "merge"))
+      (do
+        (gt-git dir ["merge" "other"]) ; conflicts on f.txt
+        (assert= (git/git-sequencer dir) {:kind :merge :verb "merge"}))))
+  (test "…and aborting it puts the repo back to nothing in progress"
+    (let (dir (gt-repo "merge-abort"))
+      (do
+        (gt-git dir ["merge" "other"])
+        (gt-git dir ["merge" "--abort"])
+        (assert= (git/git-sequencer dir) nil))))
+  (test "a stopped rebase reads as a rebase, not a merge"
+    ;; the distinction that matters: both leave a conflicted tree, and `git merge
+    ;; --continue` is not what finishes a rebase
+    (let (dir (gt-repo "rebase"))
+      (do
+        (gt-git dir ["rebase" "other"])
+        (assert= (git/git-sequencer dir) {:kind :rebase :verb "rebase"}))))
+  (test "a stopped cherry-pick reads as a cherry-pick"
+    (let (dir (gt-repo "pick"))
+      (do
+        (gt-git dir ["cherry-pick" "other"])
+        (assert= (git/git-sequencer dir) {:kind :cherry-pick :verb "cherry-pick"}))))
+  (test "it reads the real git dir, so it works in a WORKTREE"
+    ;; a worktree's `.git` is a FILE holding a gitdir: pointer, and looking for markers at
+    ;; `<root>/.git/MERGE_HEAD` finds nothing there — every one of these features would be
+    ;; dead in the place a rebase is most likely to be happening
+    (let (dir (gt-repo "worktree")
+          wt (path/join dir "wt"))
+      (do
+        (gt-git dir ["worktree" "add" "-q" "-b" "wtbranch" wt "other"])
+        (assert= (file/dir? (path/join wt ".git")) false) ; it is a file
+        (gt-git wt ["merge" "main"])
+        (assert= (git/git-sequencer wt) {:kind :merge :verb "merge"})))))
+
+(describe "git: conflicts get their own section, once"
+  (test "UU is a conflict, not staged-and-unstaged"
+    (let (e (first (git/git-entries "UU f.txt")))
+      (is (git/git-conflicted? e))))
+  (test "both-added and both-deleted are conflicts too"
+    (is (git/git-conflicted? (first (git/git-entries "AA f.txt"))))
+    (is (git/git-conflicted? (first (git/git-entries "DD f.txt")))))
+  (test "an ordinary staged+unstaged file is NOT a conflict"
+    (is (not (git/git-conflicted? (first (git/git-entries "MM f.txt"))))))
+  (test "a conflicted file appears in Unmerged paths and nowhere else"
+    (let (r (git/git-render "main" (git/git-entries "UU c.txt\u{0}M  s.txt"))
+          text (:text r))
+      (is (includes? text "Unmerged paths (1):"))
+      (is (includes? text "Staged changes (1):"))
+      ;; the conflicted path must not ALSO be listed under staged/unstaged — before this it
+      ;; was in both, and `s` on it staged a file full of <<<<<<< markers
+      (assert= (count (seq/filter (string/split text "\n") (fn (l) (includes? l "c.txt")))) 1)))
+  (test "the section comes first — you cannot get on without dealing with it"
+    (let (lines (string/split (:text (git/git-render "main" (git/git-entries "UU c.txt\u{0}?? n.txt"))) "\n")
+          unmerged (index-of (map lines (fn (l) (includes? l "Unmerged paths"))) true)
+          untracked (index-of (map lines (fn (l) (includes? l "Untracked files"))) true))
+      (is (< unmerged untracked))))
+  (test "the label says HOW it conflicted, which is what decides the resolution"
+    (let (text (:text (git/git-render "main" (git/git-entries "UU b.txt\u{0}UD d.txt"))))
+      (is (includes? text "both modified"))
+      (is (includes? text "deleted by them"))))
+  (test "its row is marked unmerged, so o / T know what they are on"
+    (let (r (git/git-render "main" (git/git-entries "UU c.txt"))
+          row (seq/find (:rows r) (fn (x) (and x (:path x)))))
+      (is (:unmerged? row)))))
+
+(describe "git: the status buffer says what is in progress"
+  (test "nothing in progress adds no line"
+    (is (not (includes? (:text (git/git-render "main" '())) "in progress"))))
+  (test "a rebase in progress is announced ABOVE Head:"
+    (let (lines (string/split (:text (git/git-render "main" '() '() {} '() '() '() '()
+                                       {:sequencer {:kind :rebase :verb "rebase"}}))
+                  "\n"))
+      (is (includes? (first lines) "rebase"))
+      (is (includes? (first lines) "in progress"))
+      (is (includes? (nth lines 2) "Head:"))))
+  (test "…and it names the keys that get you out"
+    (let (text (:text (git/git-render "main" '() '() {} '() '() '() '()
+                        {:sequencer {:kind :merge :verb "merge"}})))
+      (is (includes? text "continue"))
+      (is (includes? text "abort")))))

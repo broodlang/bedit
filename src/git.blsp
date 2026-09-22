@@ -64,7 +64,17 @@ lines) so commands read the current row without re-parsing text. Git runs synchr
    "renamed" git-face-hunk
    "copied" git-face-hunk
    "conflict" git-face-del
-   "untracked" git-face-untracked})
+   "untracked" git-face-untracked
+   ;; how a conflict happened (`git-conflict-label`) — all red, because every one of them
+   ;; is the same instruction: this file is not going anywhere until you decide
+   "both modified" git-face-del
+   "both added" git-face-del
+   "both deleted" git-face-del
+   "added by us" git-face-del
+   "added by them" git-face-del
+   "deleted by us" git-face-del
+   "deleted by them" git-face-del
+   "unmerged" git-face-del})
 
 (defn- git-diff-line-face (line)
   "The face for a unified-diff line (leading indent ignored), or nil for a context line."
@@ -122,12 +132,18 @@ trailing commit subject left in the default face."
 left plain. A commit row (`\"  <hash>  subject\"`) instead gets its leading hash coloured; any
 other 2-space line is left uncoloured."
   (let (end (string/length line)
-        field (string/trim (string/substring line 2 (math/min end (+ 2 git-label-width))))
+        body (string/substring line 2 end)
+        ;; the label runs to the DOUBLE space that separates it from the path, not to a
+        ;; fixed column: a conflict's label says how it conflicted (`deleted by them`) and
+        ;; is wider than the column the other labels are padded into. Measured by the
+        ;; separator, any label colours; measured by `git-label-width`, the long ones
+        ;; silently stopped.
+        sep (index-of body "  ")
+        field (if (< sep 0) (string/trim body) (string/substring body 0 sep))
         face (get git-label-faces field))
     (if face
       (list [(+ off 2) (+ off 2 (string/length field)) face])
-      (let (body (string/substring line 2 end)
-            sp (index-of body " ")
+      (let (sp (index-of body " ")
             tok (if (< sp 0) body (string/substring body 0 sp)))
         (if (git-hex? tok)
           (list [(+ off 2) (+ off 2 (string/length tok)) git-face-hash])
@@ -139,6 +155,9 @@ header (dim count), an inline diff line (4-space indent), a file or commit row (
 indent), or the clean-tree note. `off` is the line's start offset in the buffer."
   (cond
     (= line "") '()
+    ;; the in-progress banner, before the header rules it would otherwise match: it is a
+    ;; `<verb>:` line like `Head:`, and it is the one line here that is a WARNING
+    (includes? line "in progress") (git-whole-line off line git-face-unstaged)
     (or (string/starts-with? line "Head:")
       (string/starts-with? line "Merge:")
       (string/starts-with? line "Push:"))
@@ -289,6 +308,17 @@ new path under point."
   "Parse `git status --porcelain -z` output (NUL-separated; a rename/copy carries its source as
 a trailing field) into a list of `{:x :y :path}`."
   (git-parse-z (seq/reject (string/split porcelain "\u{0}") empty?) '()))
+
+(defn- git-conflicted? (e)
+  "Whether `e` is an unmerged path — a conflict waiting to be resolved.
+
+Porcelain v1 spells these `UU` `AA` `DD` `AU` `UA` `DU` `UD`: either side `U`, or both
+sides the same `A`/`D`. They are NOT staged-and-unstaged, which is how the plain
+`git-staged?` / `git-unstaged?` tests read them — so before this, a conflicted file
+appeared in both sections at once, and `s` on it staged a file with `<<<<<<<` markers in
+it. Its own section is the fix, and the reason Magit has one."
+  (let (x (:x e) y (:y e))
+    (or (= x "U") (= y "U") (and (= x "A") (= y "A")) (and (= x "D") (= y "D")))))
 
 (defn- git-untracked? (e) (and (= (:x e) "?") (= (:y e) "?")))
 (defn- git-staged? (e) (and (not (= (:x e) " ")) (not (= (:x e) "?"))))
@@ -500,13 +530,32 @@ the one they are in now."
 (defn- git-row (e section)
   "The actionable row data for an entry shown in `section` (`:staged` / `:unstaged` /
 `:untracked`): `{:path :staged? :untracked?}`."
-  {:path (:path e) :staged? (= section :staged) :untracked? (= section :untracked)})
+  {:path (:path e)
+   :staged? (= section :staged)
+   :untracked? (= section :untracked)
+   :unmerged? (= section :unmerged)})
 
 (sig git-label-width int)
 (def- git-label-width 9) ; "untracked" is the widest label
+(defn- git-conflict-label (e)
+  "How a conflict happened, from its two status letters — which is what decides how to
+resolve it. `both modified` takes an edit; `deleted by them` takes a decision about whether
+the file should exist at all, and no amount of editing the working copy expresses it."
+  (let (x (:x e) y (:y e))
+    (cond
+      (and (= x "U") (= y "U")) "both modified"
+      (and (= x "A") (= y "A")) "both added"
+      (and (= x "D") (= y "D")) "both deleted"
+      (and (= x "A") (= y "U")) "added by us"
+      (and (= x "U") (= y "A")) "added by them"
+      (and (= x "D") (= y "U")) "deleted by us"
+      (and (= x "U") (= y "D")) "deleted by them"
+      :else "unmerged")))
+
 (defn- git-entry-label (e section)
   "A human-readable status label for `e` in `section`, matching Magit's file-status display."
   (cond
+    (= section :unmerged) (git-conflict-label e)
     (= section :untracked) "untracked"
     (= section :staged)
       (cond
@@ -611,10 +660,25 @@ its commit `subject` (omitted when empty)."
 (defn- git-head-pairs (branch head)
   "The header block `[line row]` pairs: a `Head:` line (branch + latest commit subject) and,
 when `head` carries an `:upstream`, a `Merge:` line (upstream + its subject), then one blank.
-`head` is `{:subject :upstream :upstream-subject}` (all optional — an empty map just names the
-branch, as on a fresh repo)."
-  (let (upstream (:upstream head))
-    (append (list [(git-head-line "Head:" branch (:subject head "")) nil])
+`head` is `{:subject :upstream :upstream-subject :sequencer}` (all optional — an empty map
+just names the branch, as on a fresh repo).
+
+`:sequencer` — the rebase / merge / cherry-pick this repo is part-way through — gets a line
+of its own at the TOP, above Head:, saying what is in flight and which key finishes it.
+That placement is the point. A repo stopped mid-rebase looks, in every other respect, like
+a repo with some conflicted files in it; the difference is that HEAD is detached and half
+your commits are not where you think they are. Magit puts it at the top for the same
+reason, and a status buffer that does not say so is how people lose work."
+  (let (upstream (:upstream head)
+        seq (:sequencer head))
+    (append (if seq
+               (list [(git-head-line (str (:verb seq) ":")
+                        "in progress"
+                        "— r c continue · r s skip · r a abort")
+                       {:sequencer (:kind seq)}]
+                 ["" nil])
+               '())
+      (list [(git-head-line "Head:" branch (:subject head "")) nil])
       (if upstream
         (list [(git-head-line "Merge:" upstream (:upstream-subject head "")) nil])
         '())
@@ -636,19 +700,27 @@ nil on a blank/body line; `{:section-header section}` on a section title line (T
 an inline hunk row; `{:hash :subject :commit-log? true}` for an unpushed/unpulled/recent commit row.
 `diffs` is `path → {section → parsed}` from `git-expanded-diffs`; `head` (see `git-head-pairs`)
 carries the branch/upstream commit subjects for the header block."
-  (let (pairs (append (git-head-pairs branch head)
+  (let (conflicted (seq/filter entries git-conflicted?)
+        pairs (append (git-head-pairs branch head)
+                ;; FIRST, above everything: a conflicted file is the only thing in the
+                ;; buffer you cannot make progress without dealing with.
+                (git-section-pairs "Unmerged paths"
+                  conflicted
+                  :unmerged expanded
+                  diffs
+                  collapsed)
                 (git-section-pairs "Untracked files"
                   (seq/filter entries git-untracked?)
                   :untracked expanded
                   diffs
                   collapsed)
                 (git-section-pairs "Unstaged changes"
-                  (seq/filter entries git-unstaged?)
+                  (seq/reject (seq/filter entries git-unstaged?) git-conflicted?)
                   :unstaged expanded
                   diffs
                   collapsed)
                 (git-section-pairs "Staged changes"
-                  (seq/filter entries git-staged?)
+                  (seq/reject (seq/filter entries git-staged?) git-conflicted?)
                   :staged expanded
                   diffs
                   collapsed)
@@ -668,6 +740,7 @@ section-header, commit-log, blank, and inline-diff rows. Hunk rows carry their s
     (:section-header row) nil
     (:commit-log? row) nil
     (:hunk? row) (:section row)
+    (:unmerged? row) :unmerged
     (:untracked? row) :untracked
     (:staged? row) :staged
     :else :unstaged))
@@ -697,9 +770,13 @@ buffer's lines, the same indexing `git-row-at` uses)."
 (defn- git-sections-of (e)
   "The sections an entry appears in. A file with both staged and unstaged changes is in two, so
 its diff is fetched (and shown) once per section."
-  (append (if (git-staged? e) (list :staged) '())
-    (if (git-unstaged? e) (list :unstaged) '())
-    (if (git-untracked? e) (list :untracked) '())))
+  (if (git-conflicted? e)
+    ;; a conflict shows ONCE, in its own section — never also as staged and unstaged, which
+    ;; is what the plain tests below say about it
+    (list :unmerged)
+    (append (if (git-staged? e) (list :staged) '())
+      (if (git-unstaged? e) (list :unstaged) '())
+      (if (git-untracked? e) (list :untracked) '()))))
 
 (defn- git-diff-args (section path)
   "The `git diff` argv for `path` in `section`: the staged diff (`--cached`), the working-tree
@@ -707,6 +784,9 @@ diff, or — for an untracked file — its whole content as additions (`--no-ind
   (cond
     (= section :staged) ["diff" "--cached" "--" path]
     (= section :untracked) ["diff" "--no-index" "--" "/dev/null" path]
+    ;; a conflict has no single "other side" to diff against, so git's own combined diff is
+    ;; what a merge conflict looks like: both parents at once, two columns of markers
+    (= section :unmerged) ["diff" "--" path]
     :else ["diff" "--" path]))
 
 (defn- git-expanded-diffs (root entries expanded)
@@ -779,7 +859,8 @@ out, no model and no rope."
      :unpushed (if upstream (git-upstream-commits root :unpushed) '())
      :unpulled (if upstream (git-upstream-commits root :unpulled) '())
      :recent recent
-     :head {:subject (if (empty? recent) "" (:subject (first recent) ""))
+     :head {:sequencer (git-sequencer root)
+            :subject (if (empty? recent) "" (:subject (first recent) ""))
             :upstream upstream
             :upstream-subject (if upstream
                                 (let (cs (git-log-commits root ["-1" upstream]))
@@ -1596,16 +1677,10 @@ space), or nil when the line is blank or not a commit line."
 
 (defcommand cmd-git-log
   (m key)
-  "Show the recent commit log in *git-log* (l). RET on a line shows that commit's diff."
-  (let (root (git-resolve-root m))
-    (if (nil? root)
-      (message m "not in a git repository")
-      (let (r (git-git root ["log" "--oneline" "--decorate" "-30"]))
-        ;; open the log in another pane (pop-to-buffer), keeping your working buffer visible
-        (git-show-report (assoc m :git-root root)
-          "*git-log*"
-          (:stdout r "")
-          :git-log {:action :pop})))))
+  "Show the commit log in *git-log* (l l). RET on a line shows that commit's diff. Takes
+the log menu's arguments — `--graph`, `--all`, `-n`, `--author=` — and 30 commits when the
+menu set no limit. Opened in another pane, keeping your working buffer visible."
+  (git-log-report m [] "*git-log*"))
 
 ;; ---- push / pull (synchronous; report in the echo area) ---------------------
 
@@ -1690,12 +1765,9 @@ other answer. Both are refusals to guess."
 
 (defcommand cmd-git-stash
   (m key)
-  "Stash working-tree changes (z z) — `git stash push`. Refreshes status on success."
-  (let (root (git-resolve-root m))
-    (if (nil? root)
-      (message m "not in a git repository")
-      (let (r (git-git root ["stash" "push"]))
-        (git-report-cmd (if (nil? (:git-rows m)) m (git-refresh m)) "stash" r)))))
+  "Stash working-tree changes (z z) — `git stash push`, with the stash menu's arguments
+(`--include-untracked`, `--keep-index`). Refreshes status on success."
+  (git-act m "stash" (append ["stash" "push"] (transient/ed-transient-args m))))
 
 (defcommand cmd-git-stash-pop
   (m key)
@@ -1803,3 +1875,714 @@ runs `git commit --amend` to rewrite the last commit."
   (m key)
   "Abort the commit and close the message buffer (C-c C-k)."
   (message (cmd-kill-buffer (assoc m :git-amend? nil) key) "commit aborted"))
+
+;; ============================================================================
+;; THE REST OF THE PORCELAIN: merge, rebase, cherry-pick, revert, tag, remote,
+;; reset, and menus over the commands that already existed.
+;; ============================================================================
+;;
+;; Every one of these is "run a git subcommand with some flags, then refresh", and the
+;; flags are what a keymap could never hold — which is why this arrives now and not
+;; before: a transient (brood ADR-387) is the place a flag can live.
+;;
+;; Two rules run through the lot.
+;;
+;; **Nothing here guesses.** A command that could lose work asks first — `git-confirm`
+;; is a y/n the dangerous ones go through, and it names what it is about to do rather
+;; than asking "are you sure?". `reset --hard` and `clean` are the two that can destroy
+;; uncommitted work, and both are behind it.
+;;
+;; **The SEQUENCER is one idea, not five.** A rebase, a merge, a cherry-pick and a revert
+;; can all stop half-way and leave the repo waiting for you, and each has its own
+;; `--continue` / `--abort` / `--skip`. Magit has a key per verb; it does not need to be
+;; that way, because git itself records which one is in flight — in `.git`. So
+;; `git-sequencer` reads the state and `cmd-git-sequence-continue` / `-abort` / `-skip`
+;; dispatch on it: one key that means "carry on with whatever we are in the middle of".
+
+(defn- git-act (m verb args)
+  "Resolve the repo root onto the model, then [[git-do]]: run `git args` journalled and
+refresh on success.
+
+`git-do` alone is not enough for anything below. It runs git in `(:git-root m)`, which is
+set while *git-status* is open and nil everywhere else — and every command here is also
+reachable by `M-x`, from a buffer that has never opened a status. Without this they would
+run git in nil."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (git-do (assoc m :git-root root) verb args))))
+
+(def- git-no-editor
+  ;; `git rebase --continue`, `merge`, `commit --amend` and friends all open an EDITOR for
+  ;; the message unless told otherwise. There is no terminal on this side of the pipe, so
+  ;; git would launch a `vi` nobody can see and the command would hang until the 120 s
+  ;; timeout — the editor frozen, waiting on an editor.
+  ;;
+  ;; `core.editor=true` points git at `true(1)`, which exits 0 having changed nothing: the
+  ;; message git prepared is accepted as it stands, exactly what `--no-edit` means for the
+  ;; verbs that have such a flag. `sequence.editor` is the same thing for the interactive
+  ;; rebase todo list.
+  ;;
+  ;; Prepended to the ARGS rather than passed as config, because `git-git` puts our args
+  ;; immediately after its own `-c core.quotePath=false` and `-c` may repeat. The journal's
+  ;; `git-command-text` strips leading `-c` pairs, so `$` still shows `git rebase
+  ;; --continue` rather than the plumbing.
+  ["-c" "core.editor=true" "-c" "sequence.editor=true"])
+
+(def- git-sequencer-markers
+  ;; The file git leaves in `.git` while an operation is part-way through, and what to
+  ;; call it. Order matters: `rebase-merge` and `rebase-apply` are two implementations of
+  ;; the same verb, and a cherry-pick in the middle of a rebase is still a rebase.
+  [["rebase-merge" :rebase "rebase"]
+   ["rebase-apply" :rebase "rebase"]
+   ["CHERRY_PICK_HEAD" :cherry-pick "cherry-pick"]
+   ["REVERT_HEAD" :revert "revert"]
+   ["MERGE_HEAD" :merge "merge"]
+   ["BISECT_LOG" :bisect "bisect"]])
+
+(defn git-sequencer (root)
+  "The git operation this repo is part-way through — `{:kind :rebase :verb \"rebase\"}` —
+or **nil** when none is. Read from the marker `.git` leaves behind, which is how git
+itself knows, so this cannot disagree with what `--continue` would resume.
+
+`.git` is a FILE, not a directory, in a worktree or a submodule (it holds a `gitdir:`
+pointer), so the markers are looked for through `git rev-parse --git-dir` rather than at
+`<root>/.git` — otherwise every one of these features would be silently dead in a
+worktree, which is where a rebase is most likely to be happening."
+  (let (dir (string/trim (:stdout (git-git root ["rev-parse" "--absolute-git-dir"]) ""))
+        hit (if (= dir "")
+              nil
+              (seq/find git-sequencer-markers
+                (fn (row) (file/exists? (path/join dir (first row)))))))
+    (if (nil? hit) nil {:kind (nth hit 1) :verb (nth hit 2)})))
+
+(defn- git-sequence-step (m step)
+  "Run `--<step>` (continue / abort / skip) on whatever operation is in flight. The one
+command behind three keys, because git already knows which verb it is."
+  (let (root (git-resolve-root m))
+    (cond
+      (nil? root) (message m "not in a git repository")
+      :else
+        (let (seq (git-sequencer root))
+          (if (nil? seq)
+            (message m "nothing in progress")
+            (git-act m
+              (str (:verb seq) " --" step)
+              (append git-no-editor [(:verb seq) (str "--" step)])))))))
+
+(defcommand cmd-git-sequence-continue
+  (m key)
+  "Carry on with the rebase / merge / cherry-pick / revert that is part-way through (r c)."
+  (git-sequence-step m "continue"))
+
+(defcommand cmd-git-sequence-abort
+  (m key)
+  "Abandon the operation in progress and put the repo back (r a)."
+  (git-sequence-step m "abort"))
+
+(defcommand cmd-git-sequence-skip
+  (m key)
+  "Skip the commit the operation is stuck on and carry on (r s)."
+  (git-sequence-step m "skip"))
+
+;; ---- picking a ref, and the shape every new command shares -------------------
+;; Six of the commands below are the same sentence: "pick a ref, run a subcommand with the
+;; menu's flags and that ref, refresh". Written out six times that is six chances to forget
+;; the flags, the refresh, or the not-a-repo case — `cmd-git-checkout` above is the
+;; hand-written version, kept because checkout is the one that reports differently.
+
+(defn- git-refs (root kind)
+  "The repo's refs of `kind` — `:branches` (local and remote), `:local` or `:tags` — newest
+first where git will say, as a list of plain names."
+  (let (args (case kind
+               :local ["branch" "--format=%(refname:short)" "--sort=-committerdate"]
+               :tags ["tag" "--sort=-creatordate"]
+               ["branch" "-a" "--format=%(refname:short)" "--sort=-committerdate"])
+        r (git-git root args))
+    (if (= (:exit r) 0)
+      (seq/reject (string/split (string/trim (:stdout r "")) "\n") empty?)
+      '())))
+
+(defn- git-with-ref (m prompt kind then)
+  "Prompt for a ref of `kind` (completing over what the repo has) and hand it to `then`
+(`(model ref) -> model`). The refs are read on the loop, which is the one thing here that
+costs a subprocess — acceptable, because the prompt cannot be shown before they are known."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (assoc m
+        :minibuffer
+          (commands/ed-name-prompt prompt
+            (git-refs root kind)
+            (fn (mm ref)
+              (if (= (string/trim ref) "")
+                (message mm "nothing chosen")
+                (then mm (string/trim ref)))))))))
+
+(defn- git-menu-action (m verb subcommand &optional (tail []))
+  "Run `git <subcommand> <the menu's flags> <tail>`, journalled, then refresh. The shape of
+every menu-driven action: the flags come from whichever menu invoked the command, and are
+empty when it was reached by a key instead."
+  (git-act m verb (append git-no-editor (append [subcommand] (append (transient/ed-transient-args m) tail)))))
+
+;; ---- merge (m) ---------------------------------------------------------------
+
+(def git-merge-transient
+  {:name 'git-merge
+   :title "Merge"
+   :groups [{:title "Arguments"
+             :suffixes [{:key "-n" :kind :switch :arg "--no-ff" :label "always make a merge commit"}
+                        {:key "-s" :kind :switch :arg "--squash" :label "squash to a single change"}
+                        {:key "-S" :kind :switch :arg "--no-commit" :label "stop before committing"}]}
+            {:title "Merge"
+             :suffixes [{:key "m" :kind :command :command 'git/cmd-git-merge :label "a branch into HEAD"}]}
+            {:title "In progress"
+             :suffixes [{:key "c"
+                         :kind :command
+                         :command 'git/cmd-git-sequence-continue
+                         :label "continue"}
+                        {:key "a"
+                         :kind :command
+                         :command 'git/cmd-git-sequence-abort
+                         :label "abort"}]}]})
+
+(defcommand cmd-git-merge-menu
+  (m key)
+  "The merge menu (m)."
+  (transient/ed-transient-open m git-merge-transient))
+
+(defcommand cmd-git-merge
+  (m key)
+  "Merge a branch into HEAD, with the merge menu's flags."
+  (let (args (transient/ed-transient-args m))
+    (git-with-ref m "Merge branch: " :branches
+      (fn (mm ref)
+        (git-act mm "merge" (append git-no-editor (append ["merge"] (append args [ref]))))))))
+
+;; ---- rebase (r) --------------------------------------------------------------
+
+(def git-rebase-transient
+  {:name 'git-rebase
+   :title "Rebase"
+   :groups [{:title "Arguments"
+             :suffixes [{:key "-a"
+                         :kind :switch
+                         :arg "--autostash"
+                         :label "stash local changes and put them back"}
+                        {:key "-i" :kind :switch :arg "--interactive" :label "edit the todo list"}
+                        {:key "-k"
+                         :kind :switch
+                         :arg "--keep-empty"
+                         :label "keep commits that become empty"}]}
+            {:title "Rebase"
+             :suffixes [{:key "u" :kind :command :command 'git/cmd-git-rebase-upstream :label "onto upstream"}
+                        {:key "e" :kind :command :command 'git/cmd-git-rebase :label "onto another branch"}]}
+            {:title "In progress"
+             :suffixes [{:key "c"
+                         :kind :command
+                         :command 'git/cmd-git-sequence-continue
+                         :label "continue"}
+                        {:key "s" :kind :command :command 'git/cmd-git-sequence-skip :label "skip this commit"}
+                        {:key "a"
+                         :kind :command
+                         :command 'git/cmd-git-sequence-abort
+                         :label "abort"}]}]})
+
+(defcommand cmd-git-rebase-menu
+  (m key)
+  "The rebase menu (r): the arguments, where to rebase onto, and the three ways out of one
+that has stopped part-way."
+  (transient/ed-transient-open m git-rebase-transient))
+
+(defcommand cmd-git-rebase
+  (m key)
+  "Rebase the current branch onto a branch you pick, with the menu's flags."
+  (let (args (transient/ed-transient-args m))
+    (git-with-ref m "Rebase onto: " :branches
+      (fn (mm ref)
+        (git-act mm "rebase" (append git-no-editor (append ["rebase"] (append args [ref]))))))))
+
+(defcommand cmd-git-rebase-upstream
+  (m key)
+  "Rebase the current branch onto its upstream — the common case, with no prompt."
+  (let (root (git-resolve-root m))
+    (cond
+      (nil? root) (message m "not in a git repository")
+      (nil? (git-upstream root)) (message m "this branch has no upstream to rebase onto")
+      :else (git-menu-action m "rebase" "rebase" [(git-upstream root)]))))
+
+;; ---- cherry-pick (A) and revert (V) ------------------------------------------
+;; Both take a commit and both can stop on a conflict, so both lead into the sequencer.
+;; In *git-status* the commit under point is the obvious subject — the log sections are
+;; right there — so the commit row's hash is offered as the default.
+
+(defn- git-commit-at-point (m)
+  "The commit hash on the current *git-status* line, or nil when the line is not a commit."
+  (let (row (git-row-at m))
+    (if (and row (:commit-log? row)) (:hash row) nil)))
+
+(defn- git-pick-commit (m prompt then)
+  "Prompt for a commit, defaulting to the one under point in *git-status*, and hand it to
+`then`. The recent commits complete, so picking one off the log is a keystroke."
+  (let (root (git-resolve-root m)
+        here (git-commit-at-point m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let (hashes (map (git-log-commits root ["-30"]) :hash))
+        (assoc m
+          :minibuffer
+            (commands/ed-name-prompt (str prompt (if here (str "(" here ") ") ""))
+              hashes
+              (fn (mm text)
+                (let (chosen (if (= (string/trim text) "") (or here "") (string/trim text)))
+                  (if (= chosen "")
+                    (message mm "no commit chosen")
+                    (then mm chosen))))))))))
+
+(def git-cherry-pick-transient
+  {:name 'git-cherry-pick
+   :title "Cherry-pick"
+   :groups [{:title "Arguments"
+             :suffixes [{:key "-n"
+                         :kind :switch
+                         :arg "--no-commit"
+                         :label "apply it but do not commit"}
+                        {:key "-x"
+                         :kind :switch
+                         :arg "-x"
+                         :label "record which commit it came from"}]}
+            {:title "Cherry-pick"
+             :suffixes [{:key "A"
+                         :kind :command
+                         :command 'git/cmd-git-cherry-pick
+                         :label "a commit onto HEAD"}]}
+            {:title "In progress"
+             :suffixes [{:key "c"
+                         :kind :command
+                         :command 'git/cmd-git-sequence-continue
+                         :label "continue"}
+                        {:key "a"
+                         :kind :command
+                         :command 'git/cmd-git-sequence-abort
+                         :label "abort"}]}]})
+
+(def git-revert-transient
+  {:name 'git-revert
+   :title "Revert"
+   :groups [{:title "Arguments"
+             :suffixes [{:key "-n"
+                         :kind :switch
+                         :arg "--no-commit"
+                         :label "stage the reversal but do not commit"}]}
+            {:title "Revert"
+             :suffixes [{:key "V" :kind :command :command 'git/cmd-git-revert :label "a commit"}]}
+            {:title "In progress"
+             :suffixes [{:key "c"
+                         :kind :command
+                         :command 'git/cmd-git-sequence-continue
+                         :label "continue"}
+                        {:key "a"
+                         :kind :command
+                         :command 'git/cmd-git-sequence-abort
+                         :label "abort"}]}]})
+
+(defcommand cmd-git-cherry-pick-menu
+  (m key)
+  "The cherry-pick menu (A)."
+  (transient/ed-transient-open m git-cherry-pick-transient))
+
+(defcommand cmd-git-revert-menu
+  (m key)
+  "The revert menu (V)."
+  (transient/ed-transient-open m git-revert-transient))
+
+(defcommand cmd-git-cherry-pick
+  (m key)
+  "Cherry-pick a commit onto HEAD — the one under point by default."
+  (let (args (transient/ed-transient-args m))
+    (git-pick-commit m "Cherry-pick commit: "
+      (fn (mm commit)
+        (git-act mm "cherry-pick"
+          (append git-no-editor (append ["cherry-pick"] (append args [commit]))))))))
+
+(defcommand cmd-git-revert
+  (m key)
+  "Revert a commit — the one under point by default."
+  (let (args (transient/ed-transient-args m))
+    (git-pick-commit m "Revert commit: "
+      (fn (mm commit)
+        (git-act mm "revert" (append git-no-editor (append ["revert"] (append args [commit]))))))))
+
+;; ---- asking before something that cannot be undone ---------------------------
+
+(defn- git-confirm (m prompt then)
+  "Ask `prompt` (y/n) and run `then` on yes. The same one-key reader `cmd-git-discard`
+uses, pulled out because three more commands now need it — and the prompt NAMES what is
+about to happen (`Reset --hard to abc123, losing all uncommitted changes?`) rather than
+asking whether you are sure. \"Are you sure?\" is answered yes by reflex; a sentence that
+says what will be lost is not."
+  (ed-read-char m
+    (str prompt " (y/n) ")
+    (fn (mm c) (if (or (= c "y") (= c "Y")) (then mm) (message mm "cancelled")))))
+
+;; ---- tags (t) ----------------------------------------------------------------
+
+(def git-tag-transient
+  {:name 'git-tag
+   :title "Tag"
+   :groups [{:title "Arguments"
+             :suffixes [{:key "-a" :kind :switch :arg "--annotate" :label "annotated"}
+                        {:key "-f" :kind :switch :arg "--force" :label "replace an existing tag"}
+                        {:key "=m" :kind :option :arg "--message=" :label "message" :prompt "Tag message"}]}
+            {:title "Tag"
+             :suffixes [{:key "t" :kind :command :command 'git/cmd-git-tag-create :label "create at HEAD"}
+                        {:key "k" :kind :command :command 'git/cmd-git-tag-delete :label "delete"}
+                        {:key "l" :kind :command :command 'git/cmd-git-tag-list :label "list"}]}]})
+
+(defcommand cmd-git-tag-menu
+  (m key)
+  "The tag menu (t)."
+  (transient/ed-transient-open m git-tag-transient))
+
+(defcommand cmd-git-tag-create
+  (m key)
+  "Create a tag at HEAD, prompting for the name."
+  (let (args (transient/ed-transient-args m))
+    (assoc m
+      :minibuffer
+        (commands/ed-name-prompt "Tag name: "
+          '()
+          (fn (mm name)
+            (if (= (string/trim name) "")
+              (message mm "tag name cannot be empty")
+              (git-act mm "tag" (append ["tag"] (append args [(string/trim name)])))))))))
+
+(defcommand cmd-git-tag-delete
+  (m key)
+  "Delete a tag, completing over the repo's tags."
+  (git-with-ref m "Delete tag: " :tags
+    (fn (mm tag) (git-confirm mm (str "Delete tag " tag "?") (fn (m2) (git-act m2 "tag -d" ["tag" "-d" tag]))))))
+
+(defcommand cmd-git-tag-list
+  (m key)
+  "Every tag in the repo, newest first, in a report buffer."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let ([m1 r] (git-run m ["tag" "-n" "--sort=-creatordate"]))
+        (git-show-report m1 "*git-tags*" (:stdout r "") :git-log {:action :pop})))))
+
+;; ---- remotes (M) -------------------------------------------------------------
+
+(defcommand cmd-git-remote-list
+  (m key)
+  "Every remote and where it points (M l)."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let ([m1 r] (git-run m ["remote" "-v"]))
+        (git-show-report m1 "*git-remotes*" (:stdout r "") :git-log {:action :pop})))))
+
+(defcommand cmd-git-remote-add
+  (m key)
+  "Add a remote: prompts for the name, then the URL."
+  (assoc m
+    :minibuffer
+      (commands/ed-name-prompt "Remote name: "
+        '()
+        (fn (mm name)
+          (if (= (string/trim name) "")
+            (message mm "remote name cannot be empty")
+            (assoc mm
+              :minibuffer
+                (commands/ed-name-prompt (str "URL for " (string/trim name) ": ")
+                  '()
+                  (fn (m2 url)
+                    (if (= (string/trim url) "")
+                      (message m2 "url cannot be empty")
+                      (git-act m2 "remote add"
+                        ["remote" "add" (string/trim name) (string/trim url)]))))))))))
+
+(defcommand cmd-git-remote-remove
+  (m key)
+  "Remove a remote, completing over the ones this repo has."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let (names (seq/reject (string/split (string/trim (:stdout (git-git root ["remote"]) "")) "\n")
+                    empty?))
+        (assoc m
+          :minibuffer
+            (commands/ed-name-prompt "Remove remote: "
+              names
+              (fn (mm name)
+                (git-confirm mm
+                  (str "Remove remote " name "?")
+                  (fn (m2) (git-act m2 "remote remove" ["remote" "remove" (string/trim name)]))))))))))
+
+(def git-remote-transient
+  {:name 'git-remote
+   :title "Remote"
+   :groups [{:title "Remote"
+             :suffixes [{:key "l" :kind :command :command 'git/cmd-git-remote-list :label "list"}
+                        {:key "a" :kind :command :command 'git/cmd-git-remote-add :label "add"}
+                        {:key "k" :kind :command :command 'git/cmd-git-remote-remove :label "remove"}]}]})
+
+(defcommand cmd-git-remote-menu
+  (m key)
+  "The remote menu (M)."
+  (transient/ed-transient-open m git-remote-transient))
+
+;; ---- reset (X) ---------------------------------------------------------------
+;; The one that can destroy work, so `--hard` is the only command in this file that both
+;; asks first AND says in the prompt what will be lost.
+
+(defcommand cmd-git-reset-soft
+  (m key)
+  "Move HEAD to a commit, keeping the index and the working tree (X s)."
+  (git-pick-commit m "Reset --soft to: "
+    (fn (mm commit) (git-act mm "reset --soft" ["reset" "--soft" commit]))))
+
+(defcommand cmd-git-reset-mixed
+  (m key)
+  "Move HEAD to a commit and reset the index, keeping the working tree (X m)."
+  (git-pick-commit m "Reset --mixed to: "
+    (fn (mm commit) (git-act mm "reset" ["reset" "--mixed" commit]))))
+
+(defcommand cmd-git-reset-hard
+  (m key)
+  "Move HEAD to a commit and throw away the index AND the working tree (X h). Asks first,
+naming what goes."
+  (git-pick-commit m "Reset --hard to: "
+    (fn (mm commit)
+      (git-confirm mm
+        (str "Reset --hard to " commit ", losing every uncommitted change?")
+        (fn (m2) (git-act m2 "reset --hard" ["reset" "--hard" commit]))))))
+
+(def git-reset-transient
+  {:name 'git-reset
+   :title "Reset"
+   :groups [{:title "Reset HEAD to a commit"
+             :suffixes [{:key "s"
+                         :kind :command
+                         :command 'git/cmd-git-reset-soft
+                         :label "--soft   keep the index and the working tree"}
+                        {:key "m"
+                         :kind :command
+                         :command 'git/cmd-git-reset-mixed
+                         :label "--mixed  reset the index, keep the working tree"}
+                        {:key "h"
+                         :kind :command
+                         :command 'git/cmd-git-reset-hard
+                         :label "--hard   throw away everything uncommitted"}]}]})
+
+(defcommand cmd-git-reset-menu
+  (m key)
+  "The reset menu (X). The three modes are spelled out with what each keeps, because
+nobody remembers which of soft and mixed touches the index."
+  (transient/ed-transient-open m git-reset-transient))
+
+;; ---- log (l), with the arguments a log is actually read with -----------------
+;; `git log` is the command whose flags matter most and are remembered least: `--graph`,
+;; `--all`, `-n`, `--author=`. Each was a rewrite of the command before; now each is a row.
+
+(def git-log-transient
+  {:name 'git-log
+   :title "Log"
+   :groups [{:title "Arguments"
+             :suffixes [{:key "-g" :kind :switch :arg "--graph" :label "draw the commit graph"}
+                        {:key "-a" :kind :switch :arg "--all" :label "every branch, not just HEAD"}
+                        {:key "-p" :kind :switch :arg "--patch" :label "show each commit's diff"}
+                        {:key "-s" :kind :switch :arg "--stat" :label "show what each commit touched"}
+                        {:key "=n" :kind :option :arg "-n" :label "limit" :prompt "How many commits"}
+                        {:key "=a"
+                         :kind :option
+                         :arg "--author="
+                         :label "author"
+                         :prompt "Author"}
+                        {:key "=g"
+                         :kind :option
+                         :arg "--grep="
+                         :label "message matches"
+                         :prompt "Message pattern"}]}
+            {:title "Log"
+             :suffixes [{:key "l" :kind :command :command 'git/cmd-git-log :label "the current branch"}
+                        {:key "f"
+                         :kind :command
+                         :command 'git/cmd-git-log-file
+                         :label "the file at point"}
+                        {:key "r" :kind :command :command 'git/cmd-git-reflog :label "the reflog"}]}]})
+
+(defcommand cmd-git-log-menu
+  (m key)
+  "The log menu (l)."
+  (transient/ed-transient-open m git-log-transient))
+
+(defn- git-log-report (m extra title)
+  "Run `git log` with the menu's flags plus `extra` and show it in `title`. `-n 30` unless
+the menu set a limit — an unbounded log in a report buffer is a way to render a hundred
+thousand lines nobody asked for."
+  (let (root (git-resolve-root m)
+        args (transient/ed-transient-args m)
+        limited? (any? args (fn (a) (string/starts-with? a "-n")))
+        base (append ["log" "--oneline" "--decorate"] (if limited? [] ["-n" "30"])))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let ([m1 r] (git-run (assoc m :git-root root) (append base (append args extra))))
+        (git-show-report m1 title (:stdout r "") :git-log {:action :pop})))))
+
+(defcommand cmd-git-log-file
+  (m key)
+  "The log of the file on the current line, or of the buffer's own file."
+  (let (row (git-row-at m)
+        path (or (if (and row (git-file-row? row)) (:path row) nil)
+               (:path (ed-current-buf m))))
+    (if (nil? path)
+      (message m "no file here to log")
+      (git-log-report m ["--" path] "*git-log*"))))
+
+(defcommand cmd-git-reflog
+  (m key)
+  "The reflog — where HEAD has been (l r). The thing you want after a reset you regret,
+and the reason a `--hard` is survivable."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let ([m1 r] (git-run (assoc m :git-root root) ["reflog" "-n" "50"]))
+        (git-show-report m1 "*git-reflog*" (:stdout r "") :git-log {:action :pop})))))
+
+;; ---- fetch (f) ---------------------------------------------------------------
+
+(def git-fetch-transient
+  {:name 'git-fetch
+   :title "Fetch"
+   :groups [{:title "Arguments"
+             :suffixes [{:key "-p" :kind :switch :arg "--prune" :label "drop remote branches that are gone"}
+                        {:key "-t" :kind :switch :arg "--tags" :label "fetch tags too"}
+                        {:key "-f" :kind :switch :arg "--force" :label "force"}]}
+            {:title "Fetch"
+             :suffixes [{:key "f" :kind :command :command 'git/cmd-git-fetch-upstream :label "from upstream"}
+                        {:key "a" :kind :command :command 'git/cmd-git-fetch-all :label "from every remote"}]}]})
+
+(defcommand cmd-git-fetch-menu
+  (m key)
+  "The fetch menu (f)."
+  (transient/ed-transient-open m git-fetch-transient))
+
+(defcommand cmd-git-fetch-all
+  (m key)
+  "Fetch from every remote (f a) — off the loop, like every other network command."
+  (git-launch-op m "fetch" (append ["fetch" "--all"] (transient/ed-transient-args m))
+    git-refresh-if-open))
+
+;; ---- stash (z) ---------------------------------------------------------------
+
+(def git-stash-transient
+  {:name 'git-stash
+   :title "Stash"
+   :groups [{:title "Arguments"
+             :suffixes [{:key "-u"
+                         :kind :switch
+                         :arg "--include-untracked"
+                         :label "untracked files too"}
+                        {:key "-k" :kind :switch :arg "--keep-index" :label "leave the index staged"}]}
+            {:title "Stash"
+             :suffixes [{:key "z" :kind :command :command 'git/cmd-git-stash :label "push"}
+                        {:key "p" :kind :command :command 'git/cmd-git-stash-pop :label "pop the latest"}
+                        {:key "a" :kind :command :command 'git/cmd-git-stash-apply :label "apply the latest"}
+                        {:key "l" :kind :command :command 'git/cmd-git-stash-list :label "list"}
+                        {:key "k" :kind :command :command 'git/cmd-git-stash-drop :label "drop the latest"}]}]})
+
+(defcommand cmd-git-stash-menu
+  (m key)
+  "The stash menu (z)."
+  (transient/ed-transient-open m git-stash-transient))
+
+(defcommand cmd-git-stash-apply
+  (m key)
+  "Apply the latest stash without removing it (z a)."
+  (git-act m "stash apply" ["stash" "apply"]))
+
+(defcommand cmd-git-stash-list
+  (m key)
+  "Every stash, newest first (z l)."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let ([m1 r] (git-run m ["stash" "list"]))
+        (git-show-report m1 "*git-stashes*" (:stdout r "") :git-log {:action :pop})))))
+
+(defcommand cmd-git-stash-drop
+  (m key)
+  "Drop the latest stash (z k), after confirmation — a dropped stash is gone."
+  (git-confirm m
+    "Drop the latest stash? It cannot be recovered from the UI."
+    (fn (mm) (git-act mm "stash drop" ["stash" "drop"]))))
+
+;; ---- blame (b) ---------------------------------------------------------------
+
+(defcommand cmd-git-blame
+  (m key)
+  "Who last touched each line of this file, in *git-blame* (C-x v b). Opened beside the
+file and scrolled to the line point was on, because the question is always about a
+particular line rather than about the file."
+  (let (buf (ed-current-buf m)
+        path (:path buf)
+        root (git-resolve-root m)
+        line (inc (buffer-current-line buf)))
+    (cond
+      (nil? root) (message m "not in a git repository")
+      (nil? path) (message m "this buffer is not a file")
+      :else
+        (let ([m1 r] (git-run (assoc m :git-root root) ["blame" "--date=short" "-w" "--" path]))
+          (if (not (= (:exit r) 0))
+            (git-report-cmd m1 "blame" r)
+            (ed-apply (git-show-report m1 "*git-blame*" (:stdout r "") :git-log {:action :pop})
+              (fn (b) (commands/ed-goto-line b line))))))))
+
+(defcommand cmd-git-fetch-upstream
+  (m key)
+  "Fetch from the upstream remote with the fetch menu's arguments (f f) — off the loop.
+
+Distinct from `cmd-git-fetch`, which is the *background* watch's quick fetch on a timer
+and takes no arguments: a menu that offered `--prune` and then dropped it would be worse
+than not offering it."
+  (git-launch-op m "fetch" (append ["fetch"] (transient/ed-transient-args m)) git-refresh-if-open))
+
+;; ---- resolving a conflict (o / T on an unmerged row) -------------------------
+;; The two resolutions that cannot be typed into the file: "keep the version that was
+;; already here" and "keep the version that came in". Everything else is editing, which
+;; the editor already does — you open the file, delete the markers, and press `s`.
+;;
+;; `--ours` and `--theirs` are notoriously backwards during a REBASE: git replays your
+;; commits onto the other branch, so "ours" is the branch you are rebasing onto and
+;; "theirs" is your own work. The labels below say which is which by what it MEANS at the
+;; time, not by which flag it passes, because the flag is the part that misleads.
+
+(defn- git-resolve-with (m side)
+  "Resolve the unmerged file on the current line by taking one whole side, then stage it —
+`git checkout --ours|--theirs -- <path>` followed by `git add`, which is what marks it
+resolved. Without the add it would still be listed as unmerged and the rebase would not
+continue."
+  (let (row (git-row-at m))
+    (cond
+      (or (nil? row) (not (git-file-row? row))) (message m "not on a file")
+      (not (:unmerged? row)) (message m "this file is not conflicted")
+      :else
+        (let (path (:path row)
+              m1 (git-act m
+                   (str "checkout --" side)
+                   ["checkout" (str "--" side) "--" path]))
+          (git-act m1 "add" ["add" "--" path])))))
+
+(defcommand cmd-git-take-ours
+  (m key)
+  "Resolve the conflict on this line by keeping the side that was already here (o) — the
+branch you are merging INTO, or during a rebase the branch you are rebasing ONTO."
+  (git-resolve-with m "ours"))
+
+(defcommand cmd-git-take-theirs
+  (m key)
+  "Resolve the conflict on this line by keeping the side that came in (T) — the branch
+being merged, or during a rebase your own commit being replayed."
+  (git-resolve-with m "theirs"))

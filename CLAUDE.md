@@ -275,6 +275,15 @@ src/git.blsp                git porcelain: C-x g status buffer, diff/log/commit,
                             (`git-run` / `git-run-hunk`, `git-do` to refresh after), so the
                             log cannot disagree with what ran; credentials redacted, `\r`
                             progress applied through ansi/render, NUL shown as ^@
+src/git.blsp (cont.)        the FULL porcelain on transients: merge (m) · rebase (r) ·
+                            cherry-pick (A) · revert (V) · tag (t) · remote (M) · reset (X) ·
+                            log (l) · fetch (f) · stash (z), each a menu of flags. The
+                            SEQUENCER is one idea not five — git records which operation is
+                            half-done in .git, so one continue/skip/abort dispatches on it,
+                            and the status buffer says so above Head:. Conflicts get their
+                            own section (a conflicted file used to appear as BOTH staged and
+                            unstaged, and `s` staged the markers), labelled by how they
+                            happened, with o/T to take one side. Blame + reflog (C-x v b)
 src/gitdiff.blsp            diff-hl change gutter: per-line added/modified/deleted vs HEAD
 src/beam.blsp               the BEAM, from the editor. C-c b p processes · C-c b s the SUPERVISION
                             TREE (indented by depth, supervisors marked) · C-c b e ETS
