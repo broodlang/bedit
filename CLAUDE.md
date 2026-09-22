@@ -246,7 +246,7 @@ src/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e), and
                             repl, python3 — on a pipe an interpreter sees no tty and
                             drops its prompt, so os/spawn-pty is what makes it possible
 src/term.blsp               a TERMINAL buffer (C-x p t, M-x claude): a full-screen program
-                            under a pty, its screen emulated by std/vt (ADR-380) in the
+                            under a pty, its screen emulated by std/vt (ADR-384) in the
                             buffer's worker and painted into the buffer's tail — every
                             key goes to the program (input/term-overlay); C-x stays the
                             editor's, C-y pastes, C-x c is the C-c map, C-x C-x / C-x C-y
