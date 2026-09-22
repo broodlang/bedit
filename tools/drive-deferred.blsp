@@ -1,0 +1,73 @@
+;; The DEFERRED modules, exercised from a session that never loaded them.
+;;
+;; Some of the editor's modules load on demand rather than at startup — `term.blsp` most of
+;; all, because it pulls in `std/vt`. In a session that never opens a terminal its globals
+;; are simply unbound. That is fine right up until an always-loaded module calls one: a
+;; window resize answered `unbound symbol: term/term-sync-sizes` and a theme switch
+;; answered `unbound symbol: term/term-repalette`, in the echo area, with the command
+;; abandoned half-done (2026-09-22).
+;;
+;; Nothing else can catch this. `nest test` runs in an image that has loaded every module,
+;; and so does every pty driver (`tools/term-plain.blsp` calls `project/load-sources`), so
+;; for all of them the symbol is bound and the bug does not exist. The gap is exactly
+;; "what the RELEASED editor loads", and the only way to stand in that image is to load
+;; `main` and nothing else.
+;;
+;; So this driver runs its checks in a CHILD, from a directory outside the project — `nest
+;; run` inside the project root loads every `src/` module, which would re-create the very
+;; image we are trying to avoid.
+(reflect/add-load-path (path/join (file/cwd) "tools"))
+(require-one 'drive)
+
+(def repo (file/cwd))
+
+;; OUTSIDE the repo, deliberately — and not under `target/` either. `nest run` walks up
+;; from the script for a project manifest and loads every `src/` module it finds, so a
+;; probe anywhere inside bedit gets the all-modules-loaded image this driver exists to
+;; avoid. (That is not hypothetical: the first version of this file put it in `target/`
+;; and every check passed for the wrong reason.)
+(def work (path/join (or (os/env "TMPDIR") "/tmp") "bedit-drive-deferred"))
+
+;; The probe. `ok:`/`no:` lines are the wire back to this process: a child that dies on an
+;; unbound symbol prints nothing more, which is itself the answer.
+(def probe
+  (str "(reflect/add-load-path \"" (path/join repo "src") "\")\n"
+    "(require-one 'main)\n"
+    ;; If term ever becomes eager, every check below passes for the wrong reason. Say so.
+    "(io/puts (str (if (bound? 'term/term-sync-sizes) \"no:\" \"ok:\")"
+    " \" term.blsp is still deferred — these checks mean something\"))\n"
+    ;; The editor CATCHES a failing command and shows it in the echo area, so the fold
+    ;; answers a perfectly good model either way — checking the shape is what made the
+    ;; first version of this driver pass against the unfixed code. The echo is the verdict.
+    "(defn- verdict (label m)\n"
+    "  (let (echo (str (:echo m \"\")))\n"
+    "    (io/puts (str (if (includes? echo \"unbound\") (str \"no: \" label \" — \" echo)"
+    " (str \"ok: \" label))))))\n"
+    "(let (m (model/ed-init (editor/buffer/make-buffer \"hello\")))\n"
+    "  (do\n"
+    "    (verdict \"a resize does not call into term.blsp\" (input/ed-update m [:resize 100 30] 100 30))\n"
+    "    (verdict \"a theme switch does not call into term.blsp\" (themes/themes-apply m \"Nord\"))))\n"))
+
+(defn- run-probe ()
+  "Run the probe in a child outside the project; answer its combined output."
+  (let (script (path/join work "probe.blsp")
+        _ (file/mkdir work)
+        _2 (file/spit script probe)
+        r (os/cmd "nest" ["run" script] work))
+    (str (:stdout r "") (:stderr r ""))))
+
+(let (out (run-probe)
+      lines (seq/filter (string/split out "\n")
+              (fn (l) (or (string/starts-with? l "ok:") (string/starts-with? l "no:"))))
+      verdicts (map lines (fn (l) [(string/starts-with? l "ok:") (string/substring l 4 (string/length l))])))
+  (do
+    (doseq (v verdicts) (let ([ok label] v) (drive/check label ok)))
+    ;; A child that died mid-way printed fewer lines than it has checks, and an absent
+    ;; check is not a passing one.
+    (drive/check "the probe ran every check (none died on an unbound symbol)"
+      (= (count verdicts) 3))
+    (when (< (count verdicts) 3)
+      (io/puts "   the child's output was:")
+      (doseq (l (seq/filter (string/split out "\n") (fn (l) (not (string/blank? l)))))
+        (io/puts (str "     " l))))
+    (drive/done "deferred-module checks")))
