@@ -1970,19 +1970,38 @@ worktree, which is where a rebase is most likely to be happening."
                 (fn (row) (file/exists? (path/join dir (first row)))))))
     (if (nil? hit) nil {:kind (nth hit 1) :verb (nth hit 2)})))
 
+(defn- git-sequence-argv (seq step)
+  "The argv that performs `step` (continue / abort / skip) on the operation `seq`, or nil
+when that operation has no such step.
+
+Almost every verb spells these `--continue` / `--abort` / `--skip`, which is what made one
+set of keys possible at all. **Bisect does not**: it is `git bisect reset` to stop and
+`git bisect skip` to move on, with no `--` and no continue at all — `git bisect --abort`
+is simply an error. A table, so the exception is data rather than a special case that gets
+forgotten."
+  (let (verb (:verb seq))
+    (if (= (:kind seq) :bisect)
+      (case step
+        "abort" ["bisect" "reset"]
+        "skip" ["bisect" "skip"]
+        nil) ; there is nothing to "continue" in a bisect — you answer good or bad
+      [verb (str "--" step)])))
+
 (defn- git-sequence-step (m step)
-  "Run `--<step>` (continue / abort / skip) on whatever operation is in flight. The one
-command behind three keys, because git already knows which verb it is."
+  "Run `step` on whatever operation is in flight. The one command behind three keys,
+because git already knows which verb it is."
   (let (root (git-resolve-root m))
     (cond
       (nil? root) (message m "not in a git repository")
       :else
-        (let (seq (git-sequencer root))
-          (if (nil? seq)
-            (message m "nothing in progress")
-            (git-act m
-              (str (:verb seq) " --" step)
-              (append git-no-editor [(:verb seq) (str "--" step)])))))))
+        (let (seq (git-sequencer root)
+              argv (if (nil? seq) nil (git-sequence-argv seq step)))
+          (cond
+            (nil? seq) (message m "nothing in progress")
+            (nil? argv)
+              (message m (str "a " (:verb seq) " has no " step " — answer good or bad"))
+            :else
+              (git-act m (string/join argv " ") (append git-no-editor argv)))))))
 
 (defcommand cmd-git-sequence-continue
   (m key)
@@ -3017,3 +3036,138 @@ the only entry in this menu that can lose work."
   "Git, about the file you are looking at (C-c g): diff, log, blame, stage, unstage,
 discard — without opening the status buffer."
   (transient/ed-transient-open m git-file-transient))
+
+;; ---- bisect (B) --------------------------------------------------------------
+;; Binary search for the commit that broke something. Rarely reached for, and painful
+;; without tooling precisely because it is rare: nobody remembers the four verbs, and the
+;; state lives in the repo rather than in your head, so coming back to it after lunch means
+;; working out where you were.
+;;
+;; The status buffer already says a bisect is in progress (`git-sequencer` reads
+;; `BISECT_LOG`), so the "where was I" half is answered by opening it.
+
+(defcommand cmd-git-bisect-start
+  (m key)
+  "Start a bisect (B s): prompts for a KNOWN-BAD commit, then a known-good one. git then
+checks out a commit half way between them and asks you about it."
+  (git-pick-commit m "Bisect — a commit that is BAD: "
+    (fn (mm bad)
+      (git-with-ref mm "…and one that was GOOD: " :branches
+        (fn (m2 good) (git-act m2 "bisect start" ["bisect" "start" bad good]))))))
+
+(defcommand cmd-git-bisect-good
+  (m key)
+  "This commit is good (B g) — the fault is later."
+  (git-act m "bisect good" ["bisect" "good"]))
+
+(defcommand cmd-git-bisect-bad
+  (m key)
+  "This commit is bad (B b) — the fault is here or earlier."
+  (git-act m "bisect bad" ["bisect" "bad"]))
+
+(defcommand cmd-git-bisect-skip
+  (m key)
+  "Can't tell from this commit — it doesn't build, or the test can't run (B k)."
+  (git-act m "bisect skip" ["bisect" "skip"]))
+
+(defcommand cmd-git-bisect-reset
+  (m key)
+  "Stop bisecting and go back to where you were (B r)."
+  (git-act m "bisect reset" ["bisect" "reset"]))
+
+(defcommand cmd-git-bisect-log
+  (m key)
+  "What the bisect has established so far (B l) — the answers you have given and what they
+ruled out."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let ([m1 r] (git-run (assoc m :git-root root) ["bisect" "log"]))
+        (git-show-report m1 "*git-bisect*" (:stdout r "") :git-log {:action :pop})))))
+
+(def git-bisect-transient
+  {:name 'git-bisect
+   :title "Bisect"
+   :groups [{:title "Start"
+             :suffixes [{:key "s" :kind :command :command 'git/cmd-git-bisect-start :label "start a bisect"}]}
+            {:title "Answer for the commit you are on"
+             :suffixes [{:key "g" :kind :command :command 'git/cmd-git-bisect-good :label "good — the fault is later"}
+                        {:key "b" :kind :command :command 'git/cmd-git-bisect-bad :label "bad — the fault is here or earlier"}
+                        {:key "k" :kind :command :command 'git/cmd-git-bisect-skip :label "can't tell — skip this one"}]}
+            {:title "Finish"
+             :suffixes [{:key "l" :kind :command :command 'git/cmd-git-bisect-log :label "what it has established"}
+                        {:key "r" :kind :command :command 'git/cmd-git-bisect-reset :label "stop and go back"}]}]})
+
+(defcommand cmd-git-bisect-menu
+  (m key)
+  "The bisect menu (B)."
+  (transient/ed-transient-open m git-bisect-transient))
+
+;; ---- worktrees (W) -----------------------------------------------------------
+;; A second checkout of the same repo, on another branch, in another directory. Worth
+;; having in the porcelain because the alternative — stash, switch branch, switch back,
+;; unstash — is the thing worktrees exist to replace, and because a repo with worktrees is
+;; one where `.git` is a FILE and half the naive git tooling quietly stops working.
+
+(defcommand cmd-git-worktree-list
+  (m key)
+  "Every worktree of this repo and the branch it is on (W l)."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let ([m1 r] (git-run (assoc m :git-root root) ["worktree" "list"]))
+        (git-show-report m1 "*git-worktrees*" (:stdout r "") :git-log {:action :pop})))))
+
+(defcommand cmd-git-worktree-add
+  (m key)
+  "Add a worktree (W a): prompts for a directory, then the branch to create there."
+  (assoc m
+    :minibuffer
+      (commands/ed-name-prompt "New worktree at: "
+        '()
+        (fn (mm dir)
+          (if (= (string/trim dir) "")
+            (message mm "a worktree needs a directory")
+            (assoc mm
+              :minibuffer
+                (commands/ed-name-prompt "…on a NEW branch named: "
+                  '()
+                  (fn (m2 branch)
+                    (if (= (string/trim branch) "")
+                      (message m2 "a branch name is needed")
+                      (git-act m2 "worktree add"
+                        ["worktree" "add" "-b" (string/trim branch) (string/trim dir)]))))))))))
+
+(defcommand cmd-git-worktree-remove
+  (m key)
+  "Remove a worktree (W k), after confirmation. Refuses if it has uncommitted changes —
+git's refusal, kept rather than forced past."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let (lines (seq/reject (string/split
+                                (string/trim (:stdout (git-git root ["worktree" "list" "--porcelain"]) ""))
+                                "\n")
+                    (fn (l) (not (string/starts-with? l "worktree "))))
+            dirs (map lines (fn (l) (string/substring l 9 (string/length l)))))
+        (assoc m
+          :minibuffer
+            (commands/ed-name-prompt "Remove worktree: "
+              dirs
+              (fn (mm dir)
+                (git-confirm mm
+                  (str "Remove the worktree at " (string/trim dir) "?")
+                  (fn (m2) (git-act m2 "worktree remove" ["worktree" "remove" (string/trim dir)]))))))))))
+
+(def git-worktree-transient
+  {:name 'git-worktree
+   :title "Worktree"
+   :groups [{:title "Worktree"
+             :suffixes [{:key "l" :kind :command :command 'git/cmd-git-worktree-list :label "list"}
+                        {:key "a" :kind :command :command 'git/cmd-git-worktree-add :label "add one on a new branch"}
+                        {:key "k" :kind :command :command 'git/cmd-git-worktree-remove :label "remove"}]}]})
+
+(defcommand cmd-git-worktree-menu
+  (m key)
+  "The worktree menu (W)."
+  (transient/ed-transient-open m git-worktree-transient))
