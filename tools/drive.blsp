@@ -1,0 +1,250 @@
+;; tools/drive.blsp — drive the real editor over a pty, and assert on what it PAINTS.
+;;
+;; The gap these cover is the one the model tests structurally cannot: that a KEY reaches
+;; the command it is bound to, that an async reply lands, that a buffer is really gone from
+;; the screen. Two bugs found this way were invisible to twelve hundred passing model tests
+;; — a key added to the tutorial's help vocabulary but never `keymap-bind`-ed (so it
+;; rendered as a blank hole and could not be typed), and the window's Wayland `app_id`.
+;;
+;; This was Python until 2026-09-22, for a reason its own docstring gave: "driving a
+;; terminal needs a pty, and Brood has no pty primitive — when Brood grows one, these
+;; belong in Brood." Brood grew one (`os/spawn-pty`), and then grew the other half too:
+;; `std/vt` (ADR-384), the terminal emulator behind bedit's own terminal buffer.
+;;
+;; The emulator is what makes this version SHORTER than the Python it replaces, not merely
+;; a translation of it. That harness accumulated every byte the editor ever wrote, stripped
+;; the escapes with a regex and searched the lot — so "is X on screen NOW" was unanswerable
+;; (history is not the screen), and two devices existed to work around it: `mark`, to cut
+;; the stream so an old paint could not satisfy a new assertion, and `repaint`, which
+;; resized the terminal to provoke a full redraw so that a thing's ABSENCE could be
+;; asserted. Feed the same bytes to a vt and the screen simply IS the screen: `screen` is
+;; current, `gone?` is `(not (includes? …))`, and both devices disappear.
+;;
+;; A session is a PROCESS that owns the pty child and the vt, so a driver reads like the
+;; script it is — `(send s "\r")`, `(wait-for s "ready" 5000)` — with no state threaded
+;; through it. Every call is a round trip, which is also the ordering barrier: when `send`
+;; returns, the editor has been given the keys and everything they painted is in the vt.
+
+(defmodule drive
+  "The live-driver harness: run the editor on a pty, type at it, and assert on the screen
+its `std/vt` renders. `(drive/start \"term-plain.blsp\")` → a session; `send`, `wait-for`,
+`screen`, `gone?`, `quit`; `check` / `done` tally the run."
+  (:use math))
+
+;; ---- the report ---------------------------------------------------------------------
+;; A table, not a threaded value: a driver is a script, and a tally it has to thread
+;; through every assertion is a tally that gets dropped on the one branch that mattered.
+
+(def- *failures* (%table))
+
+(defn check (label ok)
+  "Record and print one check. Returns `ok`, so a driver can branch on it."
+  (do
+    (io/puts (str (if ok "  ok  " "  FAIL ") label))
+    (when (not ok) (%table-put *failures* :n (inc (%table-get *failures* :n 0))))
+    ok))
+
+(defn done (what)
+  "End the run: print the verdict and RAISE when anything failed, so `nest run` exits
+non-zero and `make drive` stops."
+  (let (n (%table-get *failures* :n 0))
+    (do
+      (io/puts "")
+      (if (= n 0)
+        (io/puts (str "all live " what " passed"))
+        (error "drive: " n " check(s) failed")))))
+
+;; ---- a session ----------------------------------------------------------------------
+
+(def- default-cols 140)
+(def- default-rows 40)
+(def- poll-ms 25) ; how often a wait re-reads the screen while the child is quiet
+
+(defn- nap (ms)
+  "Wait `ms` without a message — the driver's own pause between screen reads."
+  (receive (:never nil) (after ms nil)))
+
+(defn- feed (state chunk)
+  "Fold a chunk of the child's output into the session's terminal."
+  (assoc state :vt (vt/feed (:vt state) chunk)))
+
+(defn- feed-burst (state chunk)
+  "Fold `chunk` and every other chunk ALREADY queued, as one feed. An editor repaint is
+many writes, and handling them one message at a time — each with a screen render behind it
+— is how the session fell behind the child. The editor's own terminal worker coalesces for
+the same reason."
+  (letrec (gather (fn (acc)
+                    (receive
+                      ([:proc p more] (gather (str acc more)))
+                      (after 0 acc))))
+    (feed state (gather chunk))))
+
+(defn- screen-text (state)
+  (:text (vt/screen (:vt state) nil)))
+
+(defn- write-keys (state keys)
+  (check-allow :discarded-catch
+    (try (os/write (:proc state) keys) (catch _ nil))))
+
+;; The editor takes over the terminal by switching to the ALTERNATE SCREEN (`term/enter`
+;; → `ESC [ ? 1049 h`), which is also the moment it stops the pty echoing what you type. A
+;; driver that types before then is talking to a COOKED terminal: the keys come back as
+;; literal `^B^[ ` text, land on the screen, and satisfy the driver's own assertions. Every
+;; check in the Python `drive_mspc` was passing on echo. The emulator knows the mode, so the
+;; harness waits for it and no driver can make that mistake again. This runs before the
+;; driver is told the session started, so nothing else can be waiting on the mailbox.
+(defn- alt-screen-loop (state deadline)
+  (cond
+    (vt/mode (:vt state) :alt-screen) state
+    (>= (os/now) deadline) state
+    else
+      (receive
+        ([:proc p data] (alt-screen-loop (feed state data) deadline))
+        ([:proc-closed p code] (alt-screen-loop (assoc state :exited code) deadline))
+        (after poll-ms (alt-screen-loop state deadline)))))
+
+;; ONE mailbox loop, and every request that cannot be answered at once is held as PENDING
+;; state — a `:waiter` (someone waiting for a needle) or a `:settler` (someone waiting for
+;; the paint to stop), each resolved by the next chunk of output or by the loop's own tick.
+;;
+;; It was written the obvious way first — a nested `receive` per wait, matching only the
+;; child's output — and that quietly DROPPED the next request from the driver: after a
+;; twenty-second wait, the following `wait-for` was never seen by the session at all and
+;; timed out. A nested receive makes the loop deaf to everything it did not name, and
+;; whether a skipped message survives is a question about the runtime that an actor should
+;; never have to ask. One loop that names every message cannot have the bug.
+
+(defn- answer-pending (state)
+  "Reply to whatever is now answerable: a waiter whose needle is on screen (or whose
+deadline has passed), a settler whose quiet window has elapsed. Renders the screen only
+when somebody is waiting for one — rendering per chunk is what put the session SECONDS
+behind its own mailbox, so a reply arrived long after the driver had given up on it."
+  (if (and (nil? (:waiter state)) (nil? (:settler state)))
+    state
+    (answer-now state)))
+
+(defn- answer-now (state)
+  (let (now (os/now)
+        w (:waiter state)
+        s (:settler state)
+        state (cond
+                (nil? w) state
+                (includes? (screen-text state) (:needle w))
+                  (do (send (:from w) [:found true]) (dissoc state :waiter))
+                (>= now (:deadline w)) (do (send (:from w) [:found false]) (dissoc state :waiter))
+                else state))
+    (cond
+      (nil? s) state
+      (>= now (:until s)) (do (send (:from s) [:sent nil]) (dissoc state :settler))
+      else state)))
+
+(defn- session-loop (state)
+  (receive
+    ([:proc p data] (session-loop (answer-pending (feed-burst state data))))
+    ([:proc-closed p code] (session-loop (answer-pending (assoc state :exited code))))
+    ([:screen from] (do (send from [:screen (screen-text state)]) (session-loop state)))
+    ([:send from keys pause]
+      (do
+        (write-keys state keys)
+        (session-loop (answer-pending (assoc state :settler {:from from :until (+ (os/now) pause)})))))
+    ([:wait from needle deadline]
+      (session-loop (answer-pending (assoc state :waiter {:from from :needle needle :deadline deadline}))))
+    ([:resize from cols rows]
+      (do
+        (check-allow :discarded-catch
+          (try (os/resize-pty (:proc state) cols rows) (catch _ nil)))
+        (send from [:resized nil])
+        (session-loop (assoc state :vt (vt/resize (:vt state) cols rows)))))
+    ([:quit from]
+      (do
+        (check-allow :discarded-catch (try (os/close (:proc state)) (catch _ nil)))
+        (send from [:quit nil])
+        :drive-stopped))
+    ;; the tick: what makes a deadline real when the child has gone quiet
+    (after poll-ms (session-loop (answer-pending state)))))
+
+(defn- session-boot (script opts me)
+  (let (cols (get opts :cols default-cols)
+        rows (get opts :rows default-rows)
+        env (merge {"TERM" "xterm-256color"} (get opts :env {}))
+        prog (get opts :prog "nest")
+        p (os/spawn-pty prog
+            ["run" script]
+            {:cwd (get opts :cwd (file/cwd)) :cols cols :rows rows :env env}))
+    (let (booted (alt-screen-loop {:proc p :vt (vt/make cols rows)}
+                   (+ (os/now) (get opts :boot 20000))))
+      (do
+        (send me [:started (vt/mode (:vt booted) :alt-screen)])
+        (session-loop booted)))))
+
+(defn- ask (s msg reply-tag &optional (cap 30000))
+  "Send `msg` to session `s` and wait for its `reply-tag` answer — the round trip that
+orders everything a driver does against everything the editor painted.
+
+`cap` is a backstop for a session that has died, and every caller whose request carries
+its OWN deadline must pass a longer one: a fixed cap here silently answered nil for any
+wait longer than it, so a 60-second `wait-for` reported \"never appeared\" after 30."
+  (do
+    (send s msg)
+    (receive
+      ([^reply-tag v] v)
+      (after cap nil))))
+
+(defn start (script &optional (opts {}))
+  "Start the editor on `script` (a path under `tools/`, or absolute) over a pty and let it
+take over the terminal (the alternate screen — see above), then settle. `opts`: `:cols`
+`:rows` `:env` `:cwd` `:prog`, `:boot` (ms to wait for the takeover, default 20000) and
+`:settle` (ms to paint afterwards, default 300).
+Returns the session."
+  (let (path (if (string/starts-with? script "/") script (path/join (file/cwd) "tools" script))
+        me (self)
+        s (spawn (session-boot path opts me)))
+    (do
+      (let (took-over (receive ([:started up] up) (after 25000 false)))
+        (when (not took-over)
+          (io/puts "  note: the editor never switched to the alternate screen — it may not have started"))
+        (ask s [:send (self) "" (get opts :settle 300)] :sent (+ (get opts :settle 300) 15000))
+        s))))
+
+;; NOT `send`: a module-level `send` shadows the BUILTIN inside this file, and `ask`'s own
+;; `(send s msg)` would then call this and recurse until the VM's frame limit — which is
+;; exactly what it did.
+(defn send-keys (s keys &optional (pause 250))
+  "Type `keys` at the editor, then let it paint for `pause` ms. Returns the session."
+  (do (ask s [:send (self) keys pause] :sent (+ pause 15000)) s))
+
+(defn screen (s)
+  "What is on the editor's screen now — the text its terminal renders, escapes applied
+rather than stripped."
+  (or (ask s [:screen (self)] :screen) ""))
+
+(defn wait-for (s needle &optional (timeout 10000))
+  "Wait up to `timeout` ms for `needle` to appear on screen. True when it did."
+  (= true (ask s [:wait (self) needle (+ (os/now) timeout)] :found (+ timeout 5000))))
+
+(defn gone? (s needle)
+  "Whether `needle` is absent from the screen RIGHT NOW. The emulator is what makes this a
+question at all: on a raw stream, absence is unanswerable without forcing a redraw."
+  (not (includes? (screen s) needle)))
+
+(defn wait-gone (s needle &optional (timeout 10000))
+  "Wait up to `timeout` ms for `needle` to LEAVE the screen. True when it did — the
+counterpart of [[wait-for]], and the one to use after a command that takes something down,
+since the repaint that removes it is no more instant than the one that drew it."
+  (letrec (go (fn (deadline)
+                (cond
+                  (gone? s needle) true
+                  (>= (os/now) deadline) false
+                  else (do (nap poll-ms) (go deadline)))))
+    (go (+ (os/now) timeout))))
+
+(defn resize (s cols rows)
+  "Resize the terminal — the child sees SIGWINCH and re-lays out."
+  (do (ask s [:resize (self) cols rows] :resized) s))
+
+(defn quit (s &optional (pause 800))
+  "Ask the editor to quit (C-x C-c), then close the pty."
+  (do
+    (send-keys s "\x18\x03" pause)
+    (ask s [:quit (self)] :quit)
+    nil))

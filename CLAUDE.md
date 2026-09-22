@@ -289,8 +289,9 @@ src/collab.blsp             shared-buffer collaboration: presence carets, delta 
 tests/*_test.blsp           pure model/view tests, one suite per area (no window needed)
 tests/strict_ratchet_test   the `nest check --strict` ceiling: the count may only shrink —
                             a new function that adds a finding declares its contract instead
-tools/drive*               live drivers: run the real editor, assert on what it paints —
-                           the wiring the model tests can't see (`make drive`, tools/README.md)
+tools/drive-*.blsp          live drivers: run the real editor over a pty (std/vt reads what it
+                            paints) or its own ui-run loop, and assert — the wiring the model
+                            tests can't see (`make drive`, tools/README.md)
 assets/                     the desktop identity: the icon (SVG) + the .desktop entry the
                             window's `:app-id` is matched against (`make install` places both)
 project.blsp                the nest manifest (:name "bedit")

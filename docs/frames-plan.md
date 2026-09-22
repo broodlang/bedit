@@ -92,6 +92,6 @@ Tests: `tests/frames_test.blsp` — two models, one registry, no window: a buffe
 in A appears in B as a linked slot; an edit in A lands in B (through the buffer process,
 `ht-settle`-style barriers, no sleeps); kill in A removes from B; A's crash-rehost
 relinks B; a frame model's quit is a frame quit. The live wiring (`C-x 5 2` opening a
-real second window) is a `tools/drive_frames.py`-shaped check only if the pty harness can
+real second window) is a `tools/drive-frames.blsp`-shaped check only if the pty harness can
 observe it — it cannot see a second GUI window, so the live proof is a `BROOD_GUI_DUMP`
 run of two windows, done by hand once.
