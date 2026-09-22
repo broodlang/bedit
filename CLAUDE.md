@@ -283,7 +283,11 @@ src/git.blsp (cont.)        the FULL porcelain on transients: merge (m) · rebas
                             and the status buffer says so above Head:. Conflicts get their
                             own section (a conflicted file used to appear as BOTH staged and
                             unstaged, and `s` staged the markers), labelled by how they
-                            happened, with o/T to take one side. Blame + reflog (C-x v b)
+                            happened, with o/T to take one side. Blame + reflog (C-x v b).
+                            INTERACTIVE REBASE (r i): the todo composed in a buffer with a
+                            key per verb, handed to git as `sequence.editor=cp <file>` —
+                            git never opens the editor nobody could see. `!` runs the
+                            command the menus lack; stashes are a status section
 src/gitdiff.blsp            diff-hl change gutter: per-line added/modified/deleted vs HEAD
 src/beam.blsp               the BEAM, from the editor. C-c b p processes · C-c b s the SUPERVISION
                             TREE (indented by depth, supervisors marked) · C-c b e ETS
