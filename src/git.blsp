@@ -693,7 +693,8 @@ reason, and a status buffer that does not say so is how people lose work."
     (unpushed '())
     (unpulled '())
     (recent '())
-    (head {}))
+    (head {})
+    (stashes '()))
   "`{:text :rows}` for the status buffer. `:rows` is a vector parallel to the buffer's lines —
 nil on a blank/body line; `{:section-header section}` on a section title line (TAB collapses);
 `{:path :staged? :untracked?}` for a file row; `{:path :section :hunk? true :hunk-patch ...}` for
@@ -729,7 +730,8 @@ carries the branch/upstream commit subjects for the header block."
                   '())
                 (git-commit-pairs "Unpushed to upstream" unpushed :unpushed)
                 (git-commit-pairs "Unpulled from upstream" unpulled :unpulled)
-                (git-commit-pairs "Recent commits" recent :recent)))
+                (git-commit-pairs "Recent commits" recent :recent)
+                (git-commit-pairs "Stashes" stashes :stash)))
     {:text (string/join (map pairs first) "\n") :rows (into [] (map pairs second))}))
 
 (defn- git-row-section (row)
@@ -859,6 +861,7 @@ out, no model and no rope."
      :unpushed (if upstream (git-upstream-commits root :unpushed) '())
      :unpulled (if upstream (git-upstream-commits root :unpulled) '())
      :recent recent
+     :stashes (git-stashes root)
      :head {:sequencer (git-sequencer root)
             :subject (if (empty? recent) "" (:subject (first recent) ""))
             :upstream upstream
@@ -886,7 +889,8 @@ lets the slow half go in a task."
             (:unpushed collected)
             (:unpulled collected)
             (:recent collected)
-            (:head collected))
+            (:head collected)
+            (:stashes collected '()))
         rows (:rows r)
         target (cond
                  (fn? line) (line rows)
@@ -1261,7 +1265,7 @@ Section headers, commit rows, and untracked files are no-ops."
       (nil? row) (message m "not on a file or hunk")
       (:section-header row) m
       (:commit-log? row) m
-      (:untracked? row) (message m "untracked file — remove it from a shell, not here")
+      (:untracked? row) (git-remove-untracked m (:path row))
       (:hunk? row)
         (ed-read-char m
           "Discard hunk? (y/n) "
@@ -2086,7 +2090,11 @@ empty when it was reached by a key instead."
                          :label "keep commits that become empty"}]}
             {:title "Rebase"
              :suffixes [{:key "u" :kind :command :command 'git/cmd-git-rebase-upstream :label "onto upstream"}
-                        {:key "e" :kind :command :command 'git/cmd-git-rebase :label "onto another branch"}]}
+                        {:key "e" :kind :command :command 'git/cmd-git-rebase :label "onto another branch"}
+                        {:key "i"
+                         :kind :command
+                         :command 'git/cmd-git-rebase-interactive
+                         :label "interactively — edit the plan first"}]}
             {:title "In progress"
              :suffixes [{:key "c"
                          :kind :command
@@ -2754,3 +2762,192 @@ Journalled like everything else, so `$` shows it alongside the commands the menu
                       (str (:stdout r "") (:stderr r ""))
                       :git-log
                       {:action :pop}))))))))))
+
+;; ---- removing an untracked file ---------------------------------------------
+;; `k` on an untracked row used to answer "remove it from a shell, not here", which is a
+;; strange thing for an editor to say about a file it is showing you. The reason it said it
+;; is real — an untracked file has no copy in git, so deleting it is unrecoverable, unlike
+;; every other `k` in this buffer — but the answer to "this is irreversible" is to say so
+;; and ask, not to refuse and send you elsewhere.
+
+(defn- git-remove-untracked (m path)
+  "Delete an untracked file from the working tree, after confirmation that says so."
+  (git-confirm m
+    (str "Delete " path "? It is untracked, so git has no copy — this cannot be undone.")
+    (fn (mm) (git-act mm "clean" ["clean" "-f" "--" path]))))
+
+;; ---- the stashes, in the status buffer --------------------------------------
+;; A stash you cannot see is a stash you forget you made. Magit lists them; so does this,
+;; below the commit sections, collapsed like any other section.
+
+(defn git-stashes (root)
+  "The repo's stashes as `{:hash :subject}` rows — the same shape the commit sections use,
+so `git-commit-pairs` renders them with no new code. `()` when there are none."
+  (let (r (git-git root ["stash" "list" "--format=%gd %s"]))
+    (if (not (= (:exit r) 0))
+      '()
+      (map (seq/reject (string/split (string/trim (:stdout r "")) "\n") empty?)
+        (fn (line)
+          (let (sp (index-of line " "))
+            (if (< sp 0)
+              {:hash line :subject ""}
+              {:hash (string/substring line 0 sp)
+               :subject (string/substring line (inc sp) (string/length line))})))))))
+
+;; ============================================================================
+;; INTERACTIVE REBASE — the todo list, edited in a buffer
+;; ============================================================================
+;;
+;; `git rebase -i` works by writing a TODO list to `.git/rebase-merge/git-rebase-todo` and
+;; opening your editor on it. That is a problem from inside an editor: git runs as a
+;; subprocess and blocks, and there is no terminal on the far side, so the editor it opens
+;; is one nobody can see. Everywhere else in this file that is solved by
+;; `core.editor=true` — accept whatever git prepared — which for `-i` means "pick
+;; everything", i.e. `--interactive` that is not interactive.
+;;
+;; The way round it is to compose the todo FIRST and hand git a sequence editor that
+;; installs it. `sequence.editor` is run as `<value> <path-to-todo>`, so
+;; `sequence.editor=cp <our file>` becomes `cp <our file> <the todo>` — git then proceeds
+;; with exactly the plan you wrote, and never opens anything.
+;;
+;; So the flow is: press `r i`, get a buffer of `pick <hash> <subject>` lines, edit it (by
+;; key or by hand — it is a text buffer), `C-c C-c` to run it. Which is Magit's flow, and
+;; it reads the same way, but it is doing something quite different underneath.
+
+(def- git-rebase-actions
+  ;; The todo verbs, and what each does. Shown in the buffer's help block, because nobody
+  ;; remembers the difference between squash and fixup under pressure.
+  [["pick" "p" "use the commit as it is"]
+   ["reword" "r" "use it, but edit its message"]
+   ["edit" "e" "use it, then stop so you can amend it"]
+   ["squash" "s" "meld into the previous commit, editing the combined message"]
+   ["fixup" "f" "meld into the previous commit, discarding this message"]
+   ["drop" "d" "remove the commit entirely"]])
+
+(defn- git-rebase-help ()
+  "The comment block under the todo — the verbs, and the keys."
+  (str "\n# Commits are applied TOP DOWN — the oldest is first, the opposite of a log.\n#\n"
+    (string/join (map git-rebase-actions
+                   (fn (row)
+                     (let ([verb key doc] row)
+                       (str "#   " (string/pad-right verb 8) key "   " doc))))
+      "\n")
+    "\n#\n# M-<up> / M-<down> reorder · C-c C-c run it · C-c C-k cancel\n"
+    "# Edit the lines by hand if you prefer; this is an ordinary buffer.\n"))
+
+(defn git-rebase-todo-text (commits)
+  "The todo buffer's text for `commits` (newest first, as git reports them): a `pick` line
+each in OLDEST-FIRST order, then the help block.
+
+Oldest first is not a presentation choice — it is the order a rebase applies them in, and
+it is the reverse of every log you have ever read. A todo shown newest-first would have
+`squash` meld the wrong way round, and nothing would tell you until it had."
+  (str (string/join (map (reverse commits) (fn (c) (str "pick " (:hash c) " " (:subject c "")))) "\n")
+    "\n"
+    (git-rebase-help)))
+
+(defn git-rebase-todo-lines (text)
+  "The instruction lines of a todo buffer — comments and blanks dropped. What gets written
+to git's todo file."
+  (seq/reject (string/split text "\n")
+    (fn (l) (or (string/blank? l) (string/starts-with? (string/triml l) "#")))))
+
+(defcommand cmd-git-rebase-interactive
+  (m key)
+  "Interactive rebase (r i): pick a base commit, then edit the plan in a buffer."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (git-with-ref m "Rebase interactively onto: " :branches
+        (fn (mm ref)
+          (let (commits (git-log-commits root [(str ref "..HEAD")]))
+            (if (empty? commits)
+              (message mm (str "nothing to rebase — HEAD is not ahead of " ref))
+              (ed-show-named (assoc mm :git-root root :git-rebase-onto ref)
+                "*git-rebase-todo*"
+                (git-rebase-todo-text commits)
+                :git-rebase))))))))
+
+(defn- git-rebase-todo-file (root)
+  "Where the composed todo is written for git to copy in. Under `.git`, so it shares the
+repo's lifetime and permissions rather than living in a world-readable temp dir — a todo
+names every commit subject you are about to rewrite."
+  (path/join (string/trim (:stdout (git-git root ["rev-parse" "--absolute-git-dir"]) ""))
+    "bedit-rebase-todo"))
+
+(defcommand cmd-git-rebase-todo-run
+  (m key)
+  "Run the rebase with the plan in this buffer (C-c C-c)."
+  (let (root (:git-root m)
+        onto (:git-rebase-onto m)
+        lines (git-rebase-todo-lines (buffer-text (ed-current-buf m))))
+    (cond
+      (or (nil? root) (nil? onto)) (message m "no rebase in progress")
+      (empty? lines) (message m "the plan is empty — C-c C-k to cancel")
+      :else
+        (let (file (git-rebase-todo-file root)
+              _ (file/spit file (str (string/join lines "\n") "\n"))
+              m1 (cmd-kill-buffer (assoc m :git-rebase-onto nil) key))
+          (git-act m1
+            "rebase -i"
+            ;; `sequence.editor` is run as `<value> <todo path>`, so this copies our plan
+            ;; over git's and git never opens an editor. `core.editor` covers the message
+            ;; editor a `reword` or `squash` would otherwise open.
+            ["-c" (str "sequence.editor=cp " file)
+             "-c" "core.editor=true"
+             "rebase" "-i" onto])))))
+
+(defcommand cmd-git-rebase-todo-abort
+  (m key)
+  "Abandon the plan without starting a rebase (C-c C-k)."
+  (message (cmd-kill-buffer (assoc m :git-rebase-onto nil) key) "rebase cancelled"))
+
+(defn- git-rebase-set-action (m verb)
+  "Replace the verb on the current todo line, leaving the hash and subject alone."
+  (let (b (ed-current-buf m)
+        line (buffer-current-line b)
+        text (buffer-text b)
+        lines (string/split text "\n")
+        current (nth lines line ""))
+    (if (or (string/blank? current) (string/starts-with? (string/triml current) "#"))
+      (message m "not on a commit line")
+      (let (rest-of (let (sp (index-of current " "))
+                      (if (< sp 0) "" (string/substring current sp (string/length current))))
+            updated (string/join (assoc (into [] lines) line (str verb rest-of)) "\n"))
+        (ed-set-buf m (replace-region (ed-current-buf m) 0 (buffer-length b) updated))))))
+
+(defcommand cmd-git-rebase-pick (m key) "Use this commit as it is (p)." (git-rebase-set-action m "pick"))
+(defcommand cmd-git-rebase-reword (m key) "Use it, but edit its message (r)." (git-rebase-set-action m "reword"))
+(defcommand cmd-git-rebase-edit (m key) "Stop at it so you can amend (e)." (git-rebase-set-action m "edit"))
+(defcommand cmd-git-rebase-squash
+  (m key)
+  "Meld into the previous commit, editing the combined message (s)."
+  (git-rebase-set-action m "squash"))
+(defcommand cmd-git-rebase-fixup
+  (m key)
+  "Meld into the previous commit, discarding this message (f)."
+  (git-rebase-set-action m "fixup"))
+(defcommand cmd-git-rebase-drop (m key) "Remove the commit entirely (d)." (git-rebase-set-action m "drop"))
+
+(defn- git-rebase-move (m delta)
+  "Move the current todo line up or down, taking point with it — reordering commits is half
+of what an interactive rebase is for, and doing it by kill-and-yank in a list of hashes is
+how you end up rebasing the wrong plan."
+  (let (b (ed-current-buf m)
+        line (buffer-current-line b)
+        lines (into [] (string/split (buffer-text b) "\n"))
+        target (+ line delta)
+        movable? (fn (i)
+                   (and (>= i 0)
+                     (< i (count lines))
+                     (not (string/blank? (nth lines i "")))
+                     (not (string/starts-with? (string/triml (nth lines i "")) "#")))))
+    (if (not (and (movable? line) (movable? target)))
+      (message m "cannot move past the end of the plan")
+      (let (swapped (assoc (assoc lines line (nth lines target)) target (nth lines line))
+            text (string/join swapped "\n")
+            b2 (replace-region (set-read-only b false) 0 (buffer-length b) text))
+        (ed-set-buf m (commands/ed-goto-line b2 (inc target)))))))
+
+(defcommand cmd-git-rebase-move-up (m key) "Move this commit earlier (M-<up>)." (git-rebase-move m -1))
+(defcommand cmd-git-rebase-move-down (m key) "Move this commit later (M-<down>)." (git-rebase-move m 1))

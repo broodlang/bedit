@@ -710,3 +710,108 @@ only the profile keymaps are harvested for M-x"
                         {:sequencer {:kind :merge :verb "merge"}})))
       (is (includes? text "continue"))
       (is (includes? text "abort")))))
+
+(describe "git: stashes are visible in the status buffer"
+  (test "a stash list becomes commit-shaped rows"
+    (let (dir (gt-repo "stash"))
+      (do
+        (file/spit (path/join dir "f.txt") "work in progress\n")
+        (gt-git dir ["stash" "push" "-qm" "wip thing"])
+        (let (stashes (git/git-stashes dir))
+          (assert= (count stashes) 1)
+          (assert= (:hash (first stashes)) "stash@{0}")
+          (is (includes? (:subject (first stashes)) "wip thing"))))))
+  (test "a repo with no stashes has none, rather than one blank row"
+    (assert= (git/git-stashes (gt-repo "no-stash")) '()))
+  (test "they render as their own section"
+    (let (text (:text (git/git-render "main" '() '() {} '() '() '() '() {}
+                        (list {:hash "stash@{0}" :subject "wip"}))))
+      (is (includes? text "Stashes (1):"))
+      (is (includes? text "wip"))))
+  (test "no section at all when there are none"
+    (is (not (includes? (:text (git/git-render "main" '())) "Stashes")))))
+
+;; ---- interactive rebase: the plan, and that git actually follows it ---------
+;; The claim this rests on is unusual enough to be worth proving with a real repo: that
+;; `sequence.editor=cp <file>` makes git adopt a todo we composed, without opening any
+;; editor. If that is wrong, `r i` silently picks everything — an `--interactive` that is
+;; not interactive, which is exactly what it did before.
+
+(defn gt-linear (name)
+  "A repo with three commits on top of a base, oldest first: one, two, three."
+  (let (dir (gt-repo name))
+    (do
+      (gt-git dir ["tag" "linearbase"]) ; a REF to rebase onto — "base" was only a message
+      (doseq (n ["one" "two" "three"])
+        (file/spit (path/join dir (str n ".txt")) (str n "\n"))
+        (gt-git dir ["add" "-A"])
+        (gt-git dir ["commit" "-qm" n]))
+      dir)))
+
+(defn gt-subjects (dir range)
+  (seq/reject (string/split (string/trim (:stdout (gt-git dir ["log" "--format=%s" range]) "")) "\n")
+    empty?)) ; newest first
+
+(describe "git: the interactive-rebase plan"
+  (test "the todo is OLDEST first — the order a rebase applies, not the order a log reads"
+    (let (text (git/git-rebase-todo-text (list {:hash "ccc" :subject "third"}
+                                           {:hash "bbb" :subject "second"}
+                                           {:hash "aaa" :subject "first"}))
+          lines (git/git-rebase-todo-lines text))
+      (assert= (first lines) "pick aaa first")
+      (assert= (nth lines 2) "pick ccc third")))
+  (test "the help block is comments, and never reaches git"
+    (let (text (git/git-rebase-todo-text (list {:hash "aaa" :subject "x"})))
+      (is (includes? text "# "))
+      (assert= (count (git/git-rebase-todo-lines text)) 1)))
+  (test "every verb the buffer documents is one git accepts"
+    ;; a typo here would be found by git refusing the whole todo, mid-rebase
+    (doseq (row git/git-rebase-actions)
+      (is (includes? ["pick" "reword" "edit" "squash" "fixup" "drop"] (first row))))))
+
+(describe "git: an interactive rebase really follows the plan"
+  (test "dropping a commit removes it, and nothing opens an editor"
+    (let (dir (gt-linear "irebase-drop")
+          todo (path/join dir ".git" "plan")
+          hashes (map (git/git-log-commits dir ["linearbase..HEAD"]) :hash)) ; newest first
+      (do
+        ;; keep one and three, drop two — written oldest-first, as the todo is
+        (file/spit todo
+          (str "pick " (nth hashes 2) " one\n"
+            "drop " (nth hashes 1) " two\n"
+            "pick " (first hashes) " three\n"))
+        (let (r (gt-git dir ["-c" (str "sequence.editor=cp " todo)
+                             "-c" "core.editor=true"
+                             "rebase" "-i" "linearbase"]))
+          (assert= (:exit r) 0)
+          (assert= (gt-subjects dir "linearbase..HEAD") (list "three" "one"))))))
+  (test "reordering the plan reorders the history"
+    (let (dir (gt-linear "irebase-order")
+          todo (path/join dir ".git" "plan")
+          hashes (map (git/git-log-commits dir ["linearbase..HEAD"]) :hash))
+      (do
+        (file/spit todo
+          (str "pick " (nth hashes 1) " two\n"
+            "pick " (nth hashes 2) " one\n"
+            "pick " (first hashes) " three\n"))
+        (let (r (gt-git dir ["-c" (str "sequence.editor=cp " todo)
+                             "-c" "core.editor=true"
+                             "rebase" "-i" "linearbase"]))
+          (assert= (:exit r) 0)
+          (assert= (gt-subjects dir "linearbase..HEAD") (list "three" "one" "two"))))))
+  (test "fixup melds a commit into the one before it, keeping the earlier message"
+    (let (dir (gt-linear "irebase-fixup")
+          todo (path/join dir ".git" "plan")
+          hashes (map (git/git-log-commits dir ["linearbase..HEAD"]) :hash))
+      (do
+        (file/spit todo
+          (str "pick " (nth hashes 2) " one\n"
+            "fixup " (nth hashes 1) " two\n"
+            "pick " (first hashes) " three\n"))
+        (let (r (gt-git dir ["-c" (str "sequence.editor=cp " todo)
+                             "-c" "core.editor=true"
+                             "rebase" "-i" "linearbase"]))
+          (assert= (:exit r) 0)
+          ;; two is gone as a commit, but its file is in one's tree
+          (assert= (gt-subjects dir "linearbase..HEAD") (list "three" "one"))
+          (is (file/exists? (path/join dir "two.txt"))))))))
