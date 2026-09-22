@@ -424,3 +424,170 @@
     (assert= (git/git-sync-seg {:behind "0" :ahead "0"}) nil))
   (test "no upstream shows nothing rather than a zero"
     (assert= (git/git-sync-seg {}) nil)))
+
+;; ---- the process log (`$`, Magit's process buffer) ---------------------------
+;; What git actually ran: every command threaded through the model, its exit code, how
+;; long it took and its whole output — where the echo area could only show one line.
+
+(defn gp-model ()
+  (assoc (model/ed-init (editor/buffer/make-buffer "")) :git-root "."))
+
+(defn gp-entry (m i) (nth (git/git-journal m) i))
+
+(describe "git: the process log records what ran"
+  (test "a synchronous command lands as an entry, with its exit code and output"
+    (let ([m r] (git/git-run (gp-model) ["--version"])
+          e (gp-entry m 0))
+      (assert= (:exit r) 0)
+      (assert= (:args e) ["--version"])
+      (assert= (:exit e) 0)
+      (is (includes? (:output e) "git version"))
+      (is (not (:running? e)))
+      ;; a duration, which Magit's process buffer does not keep
+      (is (int? (:ms e)))))
+  (test "a failure keeps the whole output, not the one line the echo area shows"
+    (let ([m r] (git/git-run (gp-model) ["frobnicate"])
+          e (gp-entry m 0))
+      (is (not (= (:exit e) 0)))
+      (is (not (= (:output e) "")))))
+  (test "entries accumulate oldest-first and are capped"
+    (let (add (fn (mm i) (first (git/git-journal-add mm {:args [(str i)] :running? false :exit 0})))
+          many (fold (range (+ git/*git-journal-max* 3)) (gp-model) add)
+          entries (git/git-journal many))
+      (assert= (count entries) git/*git-journal-max*)
+      ;; the oldest went; the newest is last
+      (assert= (:args (first entries)) ["3"])
+      (assert= (:args (last entries)) [(str (+ git/*git-journal-max* 2))])))
+  (test "a running entry is never trimmed away — its output has not arrived yet"
+    (let (add (fn (mm i) (first (git/git-journal-add mm {:args [(str i)] :running? false :exit 0})))
+          running (first (git/git-journal-add (gp-model) {:args ["pull"] :running? true}))
+          many (fold (range (+ git/*git-journal-max* 3)) running add))
+      (is (any? (git/git-journal many) :running?)))))
+
+(describe "git: an in-flight command reads as `run`"
+  :isolated (test "a launch records the entry before the command has answered"
+    (let (me (self)
+          _ (proc/register :editor me)
+          m (git/git-launch-op (gp-model) "pull" ["--version"])
+          _2 (proc/unregister :editor)
+          e (last (git/git-journal m)))
+      (is (:running? e))
+      (assert= (:args e) ["--version"])
+      (is (includes? (git/git-journal-heading e) "run "))))
+  :isolated (test "the fold completes that entry with the exit code, the output and the duration"
+    (let (me (self)
+          _ (proc/register :editor me)
+          m (git/git-launch-op (gp-model) "pull" ["--version"])
+          _2 (proc/unregister :editor)
+          done (git/git-apply-op m {:exit 0 :stdout "Already up to date." :stderr ""})
+          e (last (git/git-journal done)))
+      (is (not (:running? e)))
+      (assert= (:exit e) 0)
+      (is (includes? (:output e) "Already up to date"))))
+  :isolated (test "a timed-out op completes its entry too, rather than leaving it running forever"
+    (let (me (self)
+          _ (proc/register :editor me)
+          m (git/git-launch-op (gp-model) "pull" ["--version"])
+          _2 (proc/unregister :editor)
+          done (git/git-apply-op m nil)
+          e (last (git/git-journal done)))
+      (is (not (:running? e)))
+      (is (includes? (:output e) "timed out")))))
+
+(describe "git: how the log reads"
+  (test "the heading is Magit's: the exit code in three columns, then the command"
+    (assert= (git/git-journal-heading {:exit 0 :args ["-C" "/r" "-c" "core.quotePath=false" "add" "-u"] :ms 12})
+      "  0 git add -u  (12ms)")
+    (assert= (git/git-journal-heading {:exit 128 :args ["pull"] :ms 2400}) "128 git pull  (2.4s)")
+    (assert= (git/git-journal-heading {:running? true :args ["push"]}) "run git push"))
+  (test "bedit's own global arguments are elided — nobody typed them"
+    (is (not (includes? (git/git-journal-heading {:exit 0 :args ["-C" "/r" "status"] :ms 1}) "-C"))))
+  (test "a credential in a remote URL is redacted: a process log gets pasted into bug reports"
+    (let (h (git/git-journal-heading {:exit 0 :ms 1 :args ["push" "https://me:ghp_secret@github.com/x/y"]}))
+      (is (includes? h "me:***@github.com"))
+      (is (not (includes? h "ghp_secret")))))
+  (test "`\\r` progress is applied, not left as forty redrawn lines"
+    ;; git push writes "Writing objects: 1%\rWriting objects: 100%\r" — Magit hand-rolls
+    ;; this in its process filter; bedit has a real terminal (brood ADR-384)
+    (let (e (git/git-entry-output {:exit 0 :stdout "Writing objects:  1%\rWriting objects: 100%, done.\n" :stderr ""}))
+      (is (includes? e "100%, done."))
+      (is (not (includes? e "1%")))))
+  (test "the text renders one block per entry, the output indented under its heading"
+    (let (m (first (git/git-journal-add (gp-model)
+                     {:args ["add" "-u"] :exit 0 :ms 3 :output "one\ntwo" :running? false}))
+          text (git/git-journal-text m))
+      (assert= text "  0 git add -u  (3ms)\n    one\n    two"))
+    (assert= (git/git-journal-text (gp-model)) "(no git commands yet)"))
+  (test "a heading is coloured by its exit code, the output under it is not"
+    (let (spans (git/git-process-fontify "  0 git add\n    ok\n128 git pull\nrun git push"))
+      (assert= (count spans) 3)
+      (assert= (nth (first spans) 2) git/git-face-add)
+      (assert= (nth (second spans) 2) git/git-face-del)
+      (assert= (nth (nth spans 2) 2) git/git-face-hunk)))
+  (test "an output line that reads like a heading is still output"
+    ;; the whole reason output is indented one column further than the widest heading
+    ;; prefix: `0 files changed` under a command must not be read as a command that exited 0
+    (let (spans (git/git-process-fontify "  0 git apply\n    0 files changed"))
+      (assert= (count spans) 1)))
+  (test "a timed-out entry says `?`, not four blank columns"
+    ;; its `:exit` is present and nil, so a `get` default would never be reached
+    (assert= (git/git-journal-heading {:exit nil :args ["pull"] :ms 120000}) "  ? git pull  (2m 00s)")))
+
+(describe "git: a failure says where the rest of the output is"
+  :isolated (test "the echo area appends the hint; the whole output is in the log"
+    ;; Magit appends the same hint for the same reason: one line reaches the echo area,
+    ;; and nobody guesses that a key shows the rest
+    (let (me (self)
+          _ (proc/register :editor me)
+          [m r] (git/git-run (gp-model) ["frobnicate"])
+          reported (git/git-report-cmd m "bogus" r)
+          _2 (proc/unregister :editor))
+      (is (includes? (:echo reported) "$ for the full output"))
+      (is (includes? (:output (gp-entry reported 0)) "not a git command"))))
+  (test "a SUCCESS gets no hint — there is nothing to go and read"
+    (let ([m r] (git/git-run (gp-model) ["--version"]))
+      (is (not (includes? (:echo (git/git-report-cmd m "version" r)) "$ for")))))
+  (test "NUL from a -z command is shown, never written into the rope"
+    (let (out (git/git-entry-output {:exit 0 :stdout (str " M a.txt" (string/int->char 0) " M b.txt") :stderr ""}))
+      (is (includes? out "^@"))
+      (is (not (includes? out (string/int->char 0)))))))
+
+(describe "git: the buffer is a view of the journal, not a copy"
+  (test "a command while *git-process* is open re-renders it in place"
+    (let (opened (git/cmd-git-process (gp-model) nil)
+          [m _] (git/git-run opened ["--version"])
+          shown (model/ed-buf-at m (model/ed-buffer-index-by-name! m "*git-process*")))
+      ;; no `g` needed: the entry is there the moment it ran
+      (is (includes? (editor/buffer/buffer-text shown) "git --version"))))
+  (test "a command with the buffer CLOSED leaves the pool alone"
+    (let ([m _] (git/git-run (gp-model) ["--version"]))
+      (is (nil? (model/ed-buffer-index-by-name m "*git-process*")))))
+  :isolated (test "an op that lands stops reading `run` without a refresh"
+    (let (me (self)
+          _ (proc/register :editor me)
+          opened (git/cmd-git-process (gp-model) nil)
+          started (git/git-launch-op opened "pull" ["--version"])
+          _2 (proc/unregister :editor)
+          mid (editor/buffer/buffer-text (model/ed-buf-at started (model/ed-buffer-index-by-name! started "*git-process*")))
+          done (git/git-apply-op started {:exit 0 :stdout "Already up to date." :stderr ""})
+          after (editor/buffer/buffer-text (model/ed-buf-at done (model/ed-buffer-index-by-name! done "*git-process*"))))
+      (is (includes? mid "run git --version"))
+      (is (not (includes? after "run git --version")))
+      (is (includes? after "Already up to date")))))
+
+(describe "git: `$` is reachable the way a key and a name should be"
+  (test "M-x git-process works from ANY buffer — the layer must not claim it"
+    ;; a layer's `:commands` are subtracted from the global M-x set, so claiming
+    ;; "git-process" for the *git-process* layer would offer it only where you already are
+    (let (owned (into #{} (model/ed-all-layer-commands)))
+      (is (not (contains? owned "git-process")))
+      ;; clearing the log, on the other hand, means nothing outside that buffer
+      (is (contains? owned "git-process-clear"))))
+  (test "and it is offered before anything has loaded git — `$` is in a MODE keymap, and
+only the profile keymaps are harvested for M-x"
+    (is (not (nil? (interactive/command-sym "git-process")))))
+  (test "`$` is bound in every git buffer, so it is where a Magit user reaches for it"
+    (let (key-of (fn (km) (get km "$")))
+      (assert= (key-of modes/git-status-keymap) 'git/cmd-git-process)
+      (assert= (key-of modes/git-report-keymap) 'git/cmd-git-process)
+      (assert= (key-of modes/git-process-keymap) 'git/cmd-git-process))))

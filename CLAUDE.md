@@ -260,7 +260,13 @@ src/term.blsp               a TERMINAL buffer (C-x p t, C-x p r, M-x claude, C-u
                             that asked for it; the program's cursor shape and visibility
                             are painted; history above the screen keeps its colour and
                             is capped; the mode line chip says which program and mode
-src/git.blsp                git porcelain: C-x g status buffer, diff/log/commit, C-x v = vc-diff
+src/git.blsp                git porcelain: C-x g status buffer, diff/log/commit, C-x v = vc-diff,
+                            and `$` the PROCESS LOG (magit's `magit-process-buffer`) — every
+                            command the editor ran, its exit code, its duration and its whole
+                            output, an in-flight one reading `run`. One logged seam
+                            (`git-run` / `git-run-hunk`, `git-do` to refresh after), so the
+                            log cannot disagree with what ran; credentials redacted, `\r`
+                            progress applied through ansi/render, NUL shown as ^@
 src/gitdiff.blsp            diff-hl change gutter: per-line added/modified/deleted vs HEAD
 src/beam.blsp               the BEAM, from the editor. C-c b p processes · C-c b s the SUPERVISION
                             TREE (indented by depth, supervisors marked) · C-c b e ETS

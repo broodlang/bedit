@@ -4,7 +4,9 @@ Unstaged / Staged / Untracked / Unpushed / Unpulled / Recent-commits sections. S
 stage/unstage/discard the **file or hunk** under point, S stage-all, U unstage-all, c commit
 (a amend), b b checkout branch / b c create branch, n/p jump between actionable rows, TAB
 expand file hunks inline / collapse section, RET preview diff or show commit, d diff whole pane,
-g refresh, q quit, P/F push/pull, l log, z z/z p stash push/pop. Hunk-level staging: TAB expands
+g refresh, q quit, P/F push/pull, l log, z z/z p stash push/pop. `$` opens *git-process*:
+what git actually ran (Magit's process buffer) — every command, its exit code, how long it
+took and its whole output. Hunk-level staging: TAB expands
 a file showing each `@@` hunk as an actionable row; s/u/k on a hunk runs `git apply --cached`
 (or its reverse) piping the patch via stdin (`%os-cmd-stdin`). Section collapsing: TAB on a
 section header toggles it between expanded and collapsed (`:git-collapsed-sections` tracks which).
@@ -944,14 +946,21 @@ synchronously, because there is no loop to hand the reply to."
       (nil? root) (message m "not in a git repository")
       (git-op-running m) (message m (str "git " (git-op-running m) " is already running"))
       (model/ed-headless?)
-        (let (r (git-git root args)
-              m1 (git-report-cmd m verb r))
+        (let ([m0 r] (git-run (assoc m :git-root root) args)
+              m1 (git-report-cmd m0 verb r))
           (if (nil? then) m1 (then m1 r)))
       :else
-        (let (job (task (fn () (git-git root args)) {:timeout *git-op-timeout-ms*}))
-          (assoc (message m (str verb "…"))
+        ;; the entry is recorded when the command STARTS, so an in-flight pull reads as
+        ;; `run git pull` in the process log while it is still out there — which is the
+        ;; question you have when one is slow
+        ;; the entry is journalled when the command STARTS, so an in-flight pull reads as
+        ;; `run git pull` while it is still out there — which is the question you have
+        ;; when one is slow. `git-apply-op` completes it; the entry times itself.
+        (let (job (task (fn () (git-git root args)) {:timeout *git-op-timeout-ms*})
+              [logged id] (git-journal-add m (git-entry args)))
+          (assoc (message logged (str verb "…"))
             :git-op-proc job
-            :git-op {:verb verb :root root :then then}))))))
+            :git-op {:verb verb :root root :then then :entry id}))))))
 
 (check-allow :trusted
   (sig git-apply-op (model any -> model))
@@ -961,9 +970,10 @@ task having errored or timed out — said plainly, rather than reported as a suc
 empty output, which is what a bare exit-code check would do with it."
   (let (op (:git-op m)
         verb (or (:verb op) "git")
-        m1 (dissoc m :git-op :git-op-proc))
+        m1 (git-journal-finish (dissoc m :git-op :git-op-proc) (:entry op) r))
     (if (nil? r)
-      (message m1 (str verb " failed: no result (timed out after " *git-op-timeout-ms* "ms)"))
+      (message m1
+        (str verb " failed: no result (timed out after " *git-op-timeout-ms* "ms)" (git-journal-note)))
       (let (m2 (git-report-cmd m1 verb r))
         (if (nil? (:then op)) m2 ((:then op) m2 r)))))))
 
@@ -1119,17 +1129,13 @@ inline diff body lines (p)."
   (m key)
   "Stage the file or hunk on the current line (s). Hunk row: `git apply --cached` with just
 that hunk's patch. File row: `git add -- <path>`. Section header or commit row: no-op."
-  (let (row (git-row-at m) root (:git-root m))
+  (let (row (git-row-at m))
     (cond
       (nil? row) (message m "not on a file or hunk")
       (:section-header row) (message m "press S to stage all, or move to a specific file")
       (:commit-log? row) m
-      (:hunk? row)
-        (let (r (git-apply-hunk root (:hunk-patch row) true false))
-          (git-refreshed m "stage hunk" r))
-      :else
-        (let (r (git-git root ["add" "--" (:path row)]))
-          (git-refreshed m "stage" r)))))
+      (:hunk? row) (git-do-hunk m "stage hunk" (:hunk-patch row) true false)
+      :else (git-do m "stage" ["add" "--" (:path row)]))))
 
 (defcommand cmd-git-stage-all
   (m key)
@@ -1137,24 +1143,19 @@ that hunk's patch. File row: `git add -- <path>`. Section header or commit row: 
   (let (root (:git-root m))
     (if (nil? root)
       (message m "not in a git repository")
-      (let (r (git-git root ["add" "-u"]))
-        (git-refreshed m "stage all" r)))))
+      (git-do m "stage all" ["add" "-u"]))))
 
 (defcommand cmd-git-unstage
   (m key)
   "Unstage the file or hunk on the current line (u). Hunk row: `git apply --cached --reverse`
 with just that hunk. File row: `git reset HEAD -- <path>`. Section header or commit row: no-op."
-  (let (row (git-row-at m) root (:git-root m))
+  (let (row (git-row-at m))
     (cond
       (nil? row) (message m "not on a file or hunk")
       (:section-header row) (message m "press U to unstage all, or move to a specific file")
       (:commit-log? row) m
-      (:hunk? row)
-        (let (r (git-apply-hunk root (:hunk-patch row) true true))
-          (git-refreshed m "unstage hunk" r))
-      :else
-        (let (r (git-git root ["reset" "-q" "HEAD" "--" (:path row)]))
-          (git-refreshed m "unstage" r)))))
+      (:hunk? row) (git-do-hunk m "unstage hunk" (:hunk-patch row) true true)
+      :else (git-do m "unstage" ["reset" "-q" "HEAD" "--" (:path row)]))))
 
 (defcommand cmd-git-unstage-all
   (m key)
@@ -1162,15 +1163,14 @@ with just that hunk. File row: `git reset HEAD -- <path>`. Section header or com
   (let (root (:git-root m))
     (if (nil? root)
       (message m "not in a git repository")
-      (let (r (git-git root ["reset" "HEAD"]))
-        (git-refreshed m "unstage all" r)))))
+      (git-do m "unstage all" ["reset" "HEAD"]))))
 
 (defcommand cmd-git-discard
   (m key)
   "Discard the working-tree changes to the file or hunk on the current line (k), after
 confirmation. Hunk row: `git apply --reverse`. File row: `git checkout -- <path>`.
 Section headers, commit rows, and untracked files are no-ops."
-  (let (row (git-row-at m) root (:git-root m))
+  (let (row (git-row-at m))
     (cond
       (nil? row) (message m "not on a file or hunk")
       (:section-header row) m
@@ -1181,16 +1181,14 @@ Section headers, commit rows, and untracked files are no-ops."
           "Discard hunk? (y/n) "
           (fn (mm c)
             (if (or (= c "y") (= c "Y"))
-              (let (r (git-apply-hunk root (:hunk-patch row) false true))
-                (git-refreshed mm "discard hunk" r))
+              (git-do-hunk mm "discard hunk" (:hunk-patch row) false true)
               (message mm "discard cancelled"))))
       :else
         (ed-read-char m
           (str "Discard changes to " (:path row) "? (y/n) ")
           (fn (mm c)
             (if (or (= c "y") (= c "Y"))
-              (let (r (git-git root ["checkout" "--" (:path row)]))
-                (git-refreshed mm "discard" r))
+              (git-do mm "discard" ["checkout" "--" (:path row)])
               (message mm "discard cancelled")))))))
 
 (defcommand cmd-git-refresh
@@ -1239,6 +1237,233 @@ commit-log rows, and blank lines are no-ops."
   "Bury the git status buffer (q)."
   (cmd-kill-buffer m key))
 
+;; ---- the journal: what git actually ran (`$`) ---------------------------------
+;; Magit's `$` (`magit-process-buffer`): every git invocation, its exit code and its
+;; output, newest last — the answer to "what did it actually run" and to "it failed and
+;; the echo area only gave me one line of it".
+;;
+;; Called the JOURNAL and not the process log because this file already has three `proc`s
+;; that are handles to running things (`:git-proc`, `:git-op-proc`, `:git-fetch-proc`),
+;; and a `:git-process` four characters away from `:git-proc` meaning a list of past
+;; commands is a misreading waiting to happen. The BUFFER is still `*git-process*`: that
+;; is the name a Magit user is looking for.
+;;
+;; It lives on the MODEL rather than in a shared table because every command worth
+;; recording already threads the model — the synchronous ones through `git-run`, the
+;; network ones through `git-launch-op` (recorded when they START, so an in-flight pull
+;; reads `run`) and `git-apply-op` (completed when they land). A read-only command a
+;; renderer runs to draw a diff is not in here; Magit logs those too and they are mostly
+;; noise.
+;;
+;; Four things this does that Magit does not:
+;;   - a DURATION per entry (Magit has an optional timestamp, off by default), which is
+;;     what you actually want to know when a push feels slow;
+;;   - `\r` progress applied properly — `git push`'s "Writing objects: 47%" rewrites its
+;;     line, so the entry holds the line it ended on rather than forty of them. Magit
+;;     does this by hand in its process filter (find the last ^M, delete the line); bedit
+;;     has `ansi/render`, a real terminal, from the terminal buffer (brood ADR-384);
+;;   - credentials in a remote URL are REDACTED, because a journal gets pasted into bug
+;;     reports;
+;;   - the NUL a `-z` command separates its paths with is shown as `^@` rather than
+;;     written into the rope. Emacs shows those raw.
+
+(def *git-journal-max* 64) ; entries kept; the oldest go first, never one still running
+
+;; ---- an entry ----------------------------------------------------------------
+;; `{:id :verb :args :exit :ms :output :running? :at}` — one map, built in ONE place, so
+;; the three producers (a synchronous run, a hunk apply, a launched network op) cannot
+;; drift into three shapes.
+
+(defn- git-redact (s)
+  "`s` with any `user:secret@` credential in a URL replaced by `user:***@`."
+  (regex/replace "://([^/@:\\s]+):[^/@\\s]+@" s "://$1:***@"))
+
+(defn- git-printable (s)
+  "`s` made fit to put in a rope: `\\r` progress and escape sequences APPLIED (so
+\"Writing objects: 47%\" is the line it ended on, not forty lines), the NUL a `-z`
+command separates paths with shown as `^@`, and credentials redacted."
+  (let (rendered (if (or (includes? s "\r") (includes? s "\e")) (ansi/render "" s) s))
+    (git-redact (string/trimr (string/replace rendered (string/int->char 0) "^@")))))
+
+(defn- git-entry-output (r)
+  "The output an entry shows: stderr then stdout — git says the interesting thing on
+stderr — or what a task that never answered leaves behind."
+  (if (nil? r)
+    "no result (timed out)"
+    (git-printable (str (:stderr r "") (:stdout r "")))))
+
+(defn- git-entry (args)
+  "A journal entry for `git args`, as it reads while it is still running. No `verb`: the
+label a command puts in the echo area (`stage hunk`) is the echo's business, and an entry
+that carried both could disagree with the command line — which is the one thing this
+buffer exists to be right about."
+  {:args (into [] args) :running? true :at (os/now)})
+
+(defn- git-entry-done (e r)
+  "Entry `e` completed by result `r` (nil = the task never answered), timed from its
+own `:at` — the entry knows when it started, so nothing else has to carry that."
+  (assoc e
+    :running? false
+    :ms (- (os/now) (or (:at e) (os/now)))
+    :exit (if (nil? r) nil (:exit r))
+    :output (git-entry-output r)))
+
+;; ---- the log ------------------------------------------------------------------
+;; The buffer is a VIEW of the log, not a copy of it: every write re-renders it in place
+;; (`ed-upsert-named` — no pane, no selection touched) when it happens to be open, so a
+;; `pull` you are watching completes in front of you rather than when you next press `g`.
+;; Nothing happens at all when it is closed, which is the usual case.
+
+;; check-allow: `:git-journal` is the log this file owns and only ever writes as a
+;; vector; the model record does not declare it, so `or` reads as every value a map
+;; key could hold.
+(check-allow :trusted
+  (sig git-journal (model -> vector))
+  (defn git-journal (m)
+    "The git journal, oldest first."
+    (or (:git-journal m) [])))
+
+(defn- git-journal-sync (m)
+  "Re-render *git-process* in place when it is open; the model unchanged when it is not."
+  (if (nil? (ed-buffer-index-by-name m "*git-process*"))
+    m
+    (commands/ed-upsert-named m "*git-process*" (git-journal-text m) :git-process)))
+
+(defn- git-journal-trim (entries)
+  "`entries` cut to `*git-journal-max*`, dropping the oldest — but never one still
+running, whose output has not arrived yet."
+  (let (n (count entries))
+    (if (<= n *git-journal-max*)
+      entries
+      (into [] (append (seq/filter (seq/subvec entries 0 (- n *git-journal-max*)) :running?)
+                 (seq/subvec entries (- n *git-journal-max*)))))))
+
+(defn- git-journal-add (m entry)
+  "`[model' id]`: the model with `entry` appended under a fresh id, the log trimmed and
+the buffer re-rendered if it is open."
+  (let (id (or (:git-journal-seq m) 1))
+    [(git-journal-sync
+       (assoc m
+         :git-journal (git-journal-trim (into (git-journal m) [(assoc entry :id id)]))
+         :git-journal-seq (inc id)))
+      id]))
+
+(defn- git-journal-finish (m id r)
+  "The model with running entry `id` completed by result `r` — unchanged when that entry
+has already been trimmed away. Re-renders the buffer if it is open, so a `pull` you are
+watching stops reading `run` the moment it lands."
+  (git-journal-sync
+    (assoc m
+      :git-journal
+        (into [] (map (git-journal m) (fn (e) (if (= (:id e) id) (git-entry-done e r) e)))))))
+
+(defn git-journal-note ()
+  "The hint appended to a failed command's message: how to see the whole output. Magit
+appends the same thing, for the same reason — the echo area shows one line, and nobody
+guesses that a key exists to show the rest. Nothing to point at when there is no UI."
+  (if (ed-headless?) "" " ($ for the full output)"))
+
+;; ---- running a git command, journalled -----------------------------------------
+;; One seam: `git-journal-run` takes what to RECORD and a thunk that runs it, so a
+;; command cannot be run without being recorded, and the two runners below differ only
+;; in how they invoke git.
+
+(check-allow :trusted
+  (sig git-journal-run (model seqable fn -> vector))
+  (defn- git-journal-run (m args run)
+    "`[model' result]`: record `git args` as started, call `run`, complete the entry."
+    (let ([m1 id] (git-journal-add m (git-entry args))
+          r (run))
+      [(git-journal-finish m1 id r) r])))
+
+(sig git-run (model seqable -> vector))
+(defn git-run (m args)
+  "Run `git args` in the repo root, journalled: `[model' result]`. The seam every
+model-threaded git command goes through, so the journal cannot disagree with what ran."
+  (git-journal-run m args (fn () (git-git (:git-root m) args))))
+
+(sig git-run-hunk (model string bool bool -> vector))
+(defn git-run-hunk (m patch cached? reverse?)
+  "[[git-run]] for the hunk path: the patch goes to `git apply` over stdin, so the entry
+names the arguments rather than the patch — which is in the diff above it anyway."
+  (git-journal-run m
+    (append ["apply"] (if cached? ["--cached"] []) (if reverse? ["--reverse"] []) ["-"])
+    (fn () (git-apply-hunk (:git-root m) patch cached? reverse?))))
+
+;; ---- rendering the buffer ------------------------------------------------------
+;; A heading starts at column 0 and its exit code is right-aligned in three columns; every
+;; line of output is indented FOUR, which is one more than the widest heading prefix can
+;; be. That is what lets the `:fontify` — which sees text and nothing else — tell the two
+;; apart by looking at the line alone: an output line that happens to read `0 …` cannot be
+;; mistaken for a command that exited 0. It also lines the output up under the command.
+
+(def- git-output-indent "    ")
+
+(def- git-global-flags
+  ;; bedit's own arguments, before the subcommand, on every call and typed by nobody:
+  ;; elided. Magit collapses the same thing to `…` with the full text in a tooltip.
+  #{"-C" "-c"})
+
+(defn- git-command-text (args)
+  "The command line as the user means it: `git` plus `args`, less bedit's own flags."
+  (letrec (strip (fn (a)
+                   (if (and (> (count a) 1) (contains? git-global-flags (first a)))
+                     (strip (drop a 2))
+                     a)))
+    (git-redact (string/join (into ["git"] (strip (into [] args))) " "))))
+
+(defn git-journal-heading (e)
+  "One entry's heading: the exit code (Magit's right-aligned three columns, `run` while
+in flight), the command, and how long it took."
+  ;; `(or …)` and not a `get` default: a timed-out entry HAS an `:exit`, whose value is
+  ;; nil, so a default would never be reached — and 0 is truthy in Brood, so an exit of 0
+  ;; still reads as itself
+  (str (if (:running? e) "run " (str (string/pad-left (str (or (:exit e) "?")) 3) " "))
+    (git-command-text (:args e))
+    (if (:running? e) "" (str "  (" (humanize/duration (:ms e 0)) ")"))))
+
+(defn- git-journal-block (e)
+  "An entry as text: its heading, then its output indented under it."
+  (let (out (:output e ""))
+    (if (= out "")
+      (git-journal-heading e)
+      (str (git-journal-heading e)
+        "\n"
+        (string/join (map (string/split out "\n") (fn (l) (str git-output-indent l))) "\n")))))
+
+(defn git-journal-text (m)
+  "The whole journal as the buffer shows it: one block per entry, oldest first."
+  (let (entries (git-journal m))
+    (if (empty? entries)
+      "(no git commands yet)"
+      (string/join (map entries git-journal-block) "\n"))))
+
+(defn git-process-fontify (src)
+  "The *git-process* `:fontify`: a heading reads by its exit code — green for 0, red for
+anything else, blue while it runs — and the output indented under it is plain."
+  (git-fontify-lines (string/split src "\n")
+    0
+    (fn (line off)
+      (cond
+        (string/starts-with? line "run ") (git-whole-line off line git-face-hunk)
+        (string/starts-with? line git-output-indent) '()
+        (string/starts-with? line "  0 ") (git-whole-line off line git-face-add)
+        :else (git-whole-line off line git-face-del)))
+    '()))
+
+(defcommand cmd-git-process
+  (m key)
+  "Show what git actually ran (`$`, Magit's `magit-process-buffer`): every command this
+editor issued, with its exit code, how long it took and its output — the whole of it,
+where the echo area could only show the first line. `g` refreshes, `k` clears, `q` quits."
+  (git-show-report m "*git-process*" (git-journal-text m) :git-process {:action :pop}))
+
+(defcommand cmd-git-process-clear
+  (m key)
+  "Clear the process log (k in *git-process*)."
+  (let (m1 (dissoc m :git-journal))
+    (git-show-report m1 "*git-process*" (git-journal-text m1) :git-process {:action :here})))
+
 ;; ---- a read-only report buffer (diff / log) ---------------------------------
 
 (defn- git-show-report (m name text type &optional (opts {:action :here}))
@@ -1251,11 +1476,26 @@ the current pane); pass `{:action :pop}` to open it in another pane and jump the
 
 (defn- git-report-cmd (m verb r)
   "Echo the result of a git command `r` (`verb` names it), preferring stderr then stdout;
-falls back to the exit code when both streams are empty."
+falls back to the exit code when both streams are empty. A FAILURE says where the rest of
+the output is: the echo area holds one line, and nobody guesses that a key shows the whole
+of it (Magit appends the same hint, for the same reason)."
   (let (e (string/trim (:stderr r ""))
         raw (if (= e "") (string/trim (:stdout r "")) e)
+        failed? (not (= (:exit r) 0))
         out (one-line (if (= raw "") (str "exit " (:exit r)) raw)))
-    (message m (str verb (if (= (:exit r) 0) ": " " failed: ") out))))
+    (message m
+      (str verb (if failed? " failed: " ": ") out (if failed? (git-journal-note) "")))))
+
+(defn- git-do (m verb args)
+  "Run `git args` (logged), then refresh the status buffer on success -- else report what
+went wrong. The shape every working-tree action has: eight sites spelled the run, the log
+and the refresh separately, and the one that must not be got wrong is refreshing after a
+command that FAILED."
+  (let ([m1 r] (git-run m args)) (git-refreshed m1 verb r)))
+
+(defn- git-do-hunk (m verb patch cached? reverse?)
+  "[[git-do]] for a hunk: `git apply` over stdin, logged, then the same refresh."
+  (let ([m1 r] (git-run-hunk m patch cached? reverse?)) (git-refreshed m1 verb r)))
 
 (defn- git-refreshed (m verb r)
   "The outcome of a working-tree-changing git command `r`: re-read the status buffer when it
