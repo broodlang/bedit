@@ -96,6 +96,14 @@ src/input.blsp              dispatch: fold a key/mouse/tick event into the next 
 src/commands.blsp           the editing commands, each a (model key) -> model
 src/keymaps.blsp            keybinding profiles (emacs / modal vim) as model-scope layers
 src/interactive.blsp        the `defcommand` macro + the M-x command registry
+src/transient.blsp          TRANSIENT MENUS (magit's `P`): the editor half of std's
+                            `editor/transient` (brood ADR-387) — the modal overlay, the
+                            minibuffer read behind a `:read` outcome, and the MEMORY (a
+                            menu reopens with the arguments it had last time, in
+                            state/transients.blsp). A command invoked from a menu reads
+                            its flags with `ed-transient-args` and cannot tell it was
+                            reached from one. A keymap has nowhere to put a FLAG, which
+                            is why `--force-with-lease` was untypeable before this
 src/modes.blsp              modes as layers: the keymaps (data) + brood-mode services.
                             `deflanguage` declares a tree-sitter language from ONE spec
                             (faces, indent, heredocs, formatter) and generates its whole

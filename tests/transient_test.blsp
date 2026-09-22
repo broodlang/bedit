@@ -1,0 +1,122 @@
+;; src/transient.blsp — the editor half of a transient menu: the overlay, the prompt for an
+;; option's value, and a command reading the arguments the menu built. The mechanism is
+;; std's (`editor/transient`, brood ADR-387) and tested there; these are the three joins
+;; only an editor has.
+
+(defmodule transient-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use transient))
+
+;; A menu over a command that records what it was given, rather than one that does
+;; anything: the point of every `:run` test below is the ARGUMENTS that arrive.
+(defn tr-record (m key)
+  (assoc m :ran (ed-transient-args m)))
+
+(def tr-spec
+  {:name 'test-menu
+   :title "Test"
+   :groups [{:title "Arguments"
+             :suffixes [{:key "-f" :kind :switch :arg "--force" :label "Force"}
+                        {:key "=d"
+                         :kind :option
+                         :arg "--depth="
+                         :label "Depth"
+                         :prompt "Depth"}]}
+            {:title "Do"
+             :suffixes [{:key "r"
+                         :kind :command
+                         :command 'transient-test/tr-record
+                         :label "record"}]}]})
+
+(defn tr-model () (ed-init (make-buffer "x")))
+(defn tr-open () (ed-transient-open (tr-model) tr-spec))
+(defn tr-keys (m keys) (fold keys m (fn (acc k) (ed-transient-key acc k))))
+
+(describe "the menu is a modal overlay on the model"
+  (test "opening puts it on the model"
+    (is (not (nil? (:transient (tr-open))))))
+  (test "a key toggles a switch without touching the buffer"
+    (let (m (tr-keys (tr-open) ["-" "f"]))
+      (assert= (editor/transient/transient-args (:transient m)) ["--force"])
+      (assert= (buffer-text (ed-current-buf m)) "x")))
+  (test "Esc closes it"
+    (assert= (:transient (tr-keys (tr-open) [:escape])) nil))
+  (test "C-g closes it too"
+    (assert= (:transient (tr-keys (tr-open) [:ctrl-g])) nil))
+  (test "a key the menu does not bind closes it and says so"
+    (let (m (tr-keys (tr-open) ["z"]))
+      (assert= (:transient m) nil)
+      (is (includes? (:echo m) "not in this menu")))))
+
+(describe "a command invoked from the menu reads the arguments"
+  (test "the arguments reach the command"
+    (assert= (:ran (tr-keys (tr-open) ["-" "f" "r"])) ["--force"]))
+  (test "with nothing toggled it gets an empty vector, not nil"
+    (assert= (:ran (tr-keys (tr-open) ["r"])) []))
+  (test "running closes the menu"
+    (assert= (:transient (tr-keys (tr-open) ["r"])) nil))
+  (test "the arguments do NOT linger on the model afterwards"
+    ;; otherwise the next command reached by a keybinding would silently inherit them
+    (let (m (tr-keys (tr-open) ["-" "f" "r"]))
+      (assert= (:transient-args m) nil)
+      (assert= (ed-transient-args m) [])))
+  (test "a command reached any other way sees no arguments"
+    (assert= (ed-transient-args (tr-model)) []))
+  (test "a command that throws is reported, not propagated"
+    (let (spec (assoc tr-spec
+                 :groups
+                   [{:title "Do"
+                     :suffixes [{:key "r"
+                                 :kind :command
+                                 :command 'transient-test/tr-missing
+                                 :label "boom"}]}])
+          m (ed-transient-key (ed-transient-open (tr-model) spec) "r"))
+      (is (includes? (:echo m) "error"))
+      (assert= (:transient m) nil))))
+
+(describe "an option is read through the minibuffer"
+  (test "pressing it opens a prompt and keeps the menu"
+    (let (m (tr-keys (tr-open) ["=" "d"]))
+      (is (not (nil? (:minibuffer m))))
+      (is (not (nil? (:transient m))))))
+  (test "the prompt names the option"
+    (is (includes? (:prompt (:edit (:minibuffer (tr-keys (tr-open) ["=" "d"])))) "Depth")))
+  (test "accepting the prompt sets the value, and the command gets it"
+    (let (m (tr-keys (tr-open) ["=" "d"])
+          answered ((:on-complete (:minibuffer m)) m "5")
+          ran (ed-transient-key answered "r"))
+      (assert= (:ran ran) ["--depth=5"])))
+  (test "an empty answer clears it rather than passing a bare flag"
+    (let (m (tr-keys (tr-open) ["=" "d"])
+          answered ((:on-complete (:minibuffer m)) m "")
+          ran (ed-transient-key answered "r"))
+      (assert= (:ran ran) []))))
+
+(describe "the git menus are wired to the real commands"
+  (test "P opens the push menu"
+    (let (m (git/cmd-git-push-menu (tr-model) "P"))
+      (assert= (editor/transient/transient-title (:transient m)) "Push")))
+  (test "its switches are the ones a push actually takes"
+    (let (m (tr-keys (git/cmd-git-push-menu (tr-model) "P") ["-" "f"]))
+      (assert= (editor/transient/transient-args (:transient m)) ["--force-with-lease"])))
+  (test "the pull menu offers --rebase"
+    (let (m (tr-keys (git/cmd-git-pull-menu (tr-model) "F") ["-" "r"]))
+      (assert= (editor/transient/transient-args (:transient m)) ["--rebase"])))
+  (test "every command a menu names is a symbol that resolves"
+    ;; a menu naming a command that does not exist fails at the keypress, which is the
+    ;; one moment nobody is looking at a test
+    (doseq (spec [git/git-push-transient git/git-pull-transient])
+      (doseq (s (editor/transient/spec-suffixes spec))
+        (when (= (:kind s) :command)
+          (is (bound? (:command s))))))))
+
+(describe "the rendering"
+  (test "a heading per group and a row per suffix (2 groups, 3 suffixes)"
+    (let (rows (editor/transient/transient-rows (:transient (tr-open))))
+      (assert= (count rows) 5)))
+  (test "the view paints the open menu and nothing when closed"
+    (let (m (tr-keys (tr-open) ["-" "f"]))
+      (is (> (count (view/ed-transient-ops m 100 30)) 0))
+      (assert= (view/ed-transient-ops (tr-model) 100 30) []))))

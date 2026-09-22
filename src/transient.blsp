@@ -1,0 +1,135 @@
+;; src/transient.blsp — TRANSIENT MENUS in the editor: the host half of
+;; `std/editor/transient` (brood ADR-387).
+;;
+;; The mechanism — the keymap, the argument value, the rows — is std's and knows nothing
+;; about an editor. This file is the three things only an editor can supply:
+;;
+;;   the OVERLAY     while a menu is open every key is the menu's (`transient-overlay`)
+;;   the PROMPT      a `:read` outcome becomes a minibuffer read, and its answer goes back
+;;   the MEMORY      a menu reopens with the arguments it had last time, across sessions
+;;
+;; The last of those is most of why a transient is pleasant: you set `--force-with-lease`
+;; once and the push menu remembers that is how you push. It rides the shared persistence
+;; layer every other generated file uses (`projects/persist-read-value` /
+;; `persist-write!` under `editor-state-dir`), so it is one more file in `state/`, not a
+;; new mechanism.
+;;
+;; A command invoked from a menu reads its flags with `ed-transient-args`. That is the
+;; whole contract: `cmd-git-push` does not know whether it was reached from the menu, a
+;; keybinding or `M-x` — it asks for arguments and gets the ones that were set, or none.
+
+(defmodule transient
+  "Transient menus in the editor — the host half of `std/editor/transient`. `ed-transient-open`
+opens a menu (restoring the arguments it had last time), `ed-transient-key` folds a key into
+the model, and `ed-transient-args` is what a command invoked from a menu reads its flags from.
+The mechanism is std's; this is the overlay, the prompt and the memory."
+  (:use model) ; message / the model accessors
+  (:use commands) ; ed-name-prompt — a plain minibuffer read for an option's value
+  (:use projects) ; persist-read-value / persist-write! / editor-state-dir
+  (:use editor/transient))
+
+;; ---- remembering a menu's arguments ---------------------------------------------
+
+(defn- persists? (m)
+  "Whether this editor persists generated state — `:recent-files`, the same gate recentf,
+bookmarks and the tutorial's progress use, which `main` sets and a test or a headless
+harness does not. Without it a test run would read and write the developer's real
+`~/.config/bedit/state`, so the suite's verdict would depend on how the developer last
+pushed — and the first run of these tests duly failed, having remembered `--force` from
+the test above it."
+  (= true (:recent-files m)))
+
+(defn- transients-file ()
+  "Where each menu's last arguments live — one map, `{name -> args}`, beside the other
+generated state."
+  (path/join (editor-state-dir) "transients.blsp"))
+
+(defn- remembered ()
+  "Every menu's remembered arguments, `{name -> args}`."
+  (let (v (persist-read-value (transients-file) {}))
+    (if (map? v) v {})))
+
+(defn- remember! (name args)
+  "Store `args` as menu `name`'s arguments. Best-effort, like every other persisted file:
+a menu that cannot write its state still works, it just forgets."
+  (persist-write! (transients-file)
+    (assoc (remembered) (->string name) args)
+    ";; bedit — the arguments each transient menu last had. Safe to delete."))
+
+(defn- recalled (name)
+  "Menu `name`'s arguments from last time, or `{}`."
+  (let (v (get (remembered) (->string name)))
+    (if (map? v) v {})))
+
+;; ---- opening and closing ----------------------------------------------------------
+
+(sig ed-transient-open (model any -> model))
+(defn ed-transient-open (m spec)
+  "Open the menu `spec` describes, restoring the arguments it had last time. The command
+behind a menu key is this and nothing else."
+  (assoc m :transient (transient-open spec (if (persists? m) (recalled (:name spec)) {}))))
+
+(sig ed-transient-close (model -> model))
+(defn ed-transient-close (m)
+  "Dismiss the menu, remembering its arguments first."
+  (let (st (:transient m))
+    (do
+      (when (and st (persists? m)) (remember! (:name (:spec st)) (:args st)))
+      (dissoc m :transient))))
+
+(check-allow :trusted
+  (sig ed-transient-args (model -> vector))
+  (defn ed-transient-args (m)
+    "The arguments the menu that invoked this command had set — `[]` when the command was
+reached any other way. A command asks for this and splices it into its argv; it never has
+to know whether a menu was involved."
+    (or (:transient-args m) [])))
+
+;; ---- the outcomes -----------------------------------------------------------------
+;; One fold per outcome `std/editor/transient` can answer. Each is small on purpose: the
+;; decisions (what a chord means, what the value is) are std's, and what is left here is
+;; only the part that needs an editor.
+
+(defn- run-suffix (m st command args)
+  "Dismiss the menu and run `command` with `args` on the model. The command is resolved by
+SYMBOL at this moment, exactly like a keymap binding, so a menu can name a command whose
+module has not been loaded and a redefined command hot-swaps."
+  (let (closed (assoc (ed-transient-close (assoc m :transient st)) :transient-args args))
+    (check-allow :discarded-catch
+      (try (dissoc ((reflect/eval command) closed :transient) :transient-args)
+        (catch e (message (dissoc closed :transient-args) (str "error: " e)))))))
+
+(defn- read-option (m st arg prompt current)
+  "Prompt for option `arg`'s value and put the answer back in the menu. The menu stays on
+the model while the minibuffer is up, so accepting returns to it with the value set and the
+rows already showing it."
+  (assoc (assoc m :transient st)
+    :minibuffer
+      (ed-name-prompt (str prompt (if (nil? current) "" (str " (" current ")")) ": ")
+        '()
+        (fn (mm text)
+          (assoc mm :transient (transient-set (:transient mm) arg (string/trim text)))))))
+
+(sig ed-transient-key (model any -> model))
+(defn ed-transient-key (m input)
+  "Fold one key into the open menu.
+
+Cancel (Esc / C-g) pops one level out of a sub-menu, or dismisses the menu at the top —
+`transient-pop` answers nil there, which is std's way of saying \"this one is yours to
+close\". Everything else goes to `transient-press`, and its outcome is serviced here."
+  (let (st (:transient m))
+    (cond
+      (nil? st) m
+      (ed-cancel-key? input)
+        (let (out (transient-pop st))
+          (if (nil? out) (message (ed-transient-close m) "quit") (assoc m :transient out)))
+      :else
+        (let ([stepped outcome] (transient-press st input))
+          (case (first outcome)
+            :run (run-suffix m stepped (nth outcome 1) (nth outcome 2))
+            :read (read-option m stepped (nth outcome 1) (nth outcome 2) (nth outcome 3))
+            ;; Magit lets an unbound key dismiss rather than beep, because a menu you
+            ;; cannot type your way out of is a trap
+            :unbound (message (ed-transient-close (assoc m :transient stepped))
+                       (str (ed-key-label input) " is not in this menu"))
+            (assoc m :transient stepped))))))
