@@ -1,0 +1,143 @@
+(defmodule drive-term
+  "A terminal buffer, driven end to end through the real `ui-run`: a program under a pty,
+its screen emulated by `std/vt` in the buffer's worker, painted into the buffer.
+
+The model tests fold synthetic screens and drive the worker directly; what they cannot
+show is the whole chain in one process — `M-x term` opening the buffer sized to the pane,
+the overlay handing a typed key to the worker (not the buffer), the worker's screen event
+reaching the loop and the FRAME painting the program's answer with the cursor where the
+program left it, and `C-x k` taking the worker down with the buffer.
+
+    nest run tools/drive-term.blsp"
+  (:use-internals bedit/input)
+  (:use-internals bedit/term))
+
+(require-one 'project)
+(project/load-config)
+(let (root (project/find-root (file/cwd)))
+  (when root (project/setup root) (project/load-sources root)))
+
+(def *cols* 100)
+(def *rows* 30)
+(def *deadline-ms* 15000)
+
+(def *failures* (%table))
+
+(defn check (what ok)
+  (do
+    (io/puts (str (if ok "  ok  " "  FAIL ") what))
+    (when (not ok) (%table-put *failures* :n (inc (%table-get *failures* :n 0))))
+    ok))
+
+;; The script is held back until the loop says the program is READY (`[:open]`): keys typed
+;; before a shell prints its prompt are echoed by the pty ahead of it, and the screen would
+;; read `echo driven` then `> driven` — true of any terminal, and not what is being tested.
+(defn sched-loop (pending open?)
+  (receive
+    ([:next from]
+      (if (or (not open?) (empty? pending))
+        (do (send from [:scripted nil]) (sched-loop pending open?))
+        (do (send from [:scripted (first pending)]) (sched-loop (rest pending) open?))))
+    ([:open] (sched-loop pending true))
+    ([:stop] nil)))
+
+(defn poll-fn (sch me)
+  (fn (ms)
+    (let (scripted (do (send sch [:next me]) (receive ([:scripted e] e) (after 5000 nil))))
+      (if (nil? scripted) (receive (msg msg) (after (math/max 1 ms) nil)) scripted))))
+
+;; The last frame painted, kept in a table so the assertions can read what the SCREEN
+;; showed, not only what the model holds.
+(def *last-frame* (%table))
+
+(defn frame-text (frame)
+  "Every `[:text row col s …]` op's string, joined — enough to look for a needle."
+  (string/join (map (seq/filter frame (fn (op) (and (vector? op) (= (first op) :text)))) (fn (op) (nth op 3))) "\n"))
+
+(defn drive (m0 script ready? arrived? on-arrival what)
+  (let (t0 (os/now)
+        sch (spawn (fn () (sched-loop script false)))
+        me (self)
+        display {:enter (fn () nil)
+                 :leave (fn () nil)
+                 :size (fn () [*cols* *rows*])
+                 :draw (fn (frame) (%table-put *last-frame* :frame frame))
+                 :poll (poll-fn sch me)}
+        update (fn (m input cols rows)
+                 (let (next (input/ed-update m input cols rows)
+                       _ (when (ready? next) (send sch [:open])))
+                   (cond
+                     (arrived? next) (do (on-arrival next) (assoc next :done true))
+                     (> (- (os/now) t0) *deadline-ms*)
+                       (do (check (str what " arrived before the deadline") false)
+                         (assoc next :done true))
+                     :else next))))
+    (do (editor/ui/ui-run m0 view/ed-view update display) (send sch [:stop]))))
+
+(defn term-buf (m)
+  (let (i (model/ed-buffer-index-by-name m (term/term-buffer-name "term" (file/cwd))))
+    (if (nil? i) nil (nth (:buffers m) i))))
+
+(defn drive-term (m0)
+  ;; `sh -i` with a known prompt stands in for a program: `cmd-term` runs `$SHELL`, and
+  ;; the driver names its program directly through the same opener
+  (let (opened (term/term-open m0 "term" "PS1='> ' sh -i")
+        b (term-buf opened))
+    (do
+      (check "M-x term opened a :term buffer for this project" (and b (= (:type b) :term)))
+      ;; the pane keeps a column and the mode-line / echo rows for itself
+      (check "sized to the pane, not a default"
+        (and b (>= (first (:term-size b)) (- *cols* 2)) (< (first (:term-size b)) *cols*)
+          (< (second (:term-size b)) *rows*) (> (second (:term-size b)) 24)))
+      (drive opened
+        ;; wait for the prompt, then type a command; the keys are the overlay's to route
+        (list "e" "c" "h" "o" " " "d" "r" "i" "v" "e" "n" :enter)
+        (fn (m) (let (tb (term-buf m)) (and tb (includes? (editor/buffer/buffer-text tb) "> "))))
+        (fn (m) (let (tb (term-buf m)) (and tb (includes? (editor/buffer/buffer-text tb) "\ndriven"))))
+        (fn (m)
+          (let (tb (term-buf m)
+                text (editor/buffer/buffer-text tb)
+                ;; the loop stops on arrival, before its next draw — so ask the pure view for
+                ;; the frame this model paints, and keep the last drawn one as a sanity check
+                painted (frame-text (view/ed-view m *cols* *rows*))
+                drawn (frame-text (%table-get *last-frame* :frame [])))
+            (do
+              (check "the typed line reached the program, not the buffer (it was echoed, not inserted)"
+                (includes? text "> echo driven"))
+              (check "the program's answer is in the buffer" (includes? text "\ndriven\n"))
+              (check "point is the program's cursor — after the prompt that followed"
+                (string/ends-with? (string/substring text 0 (editor/buffer/buffer-point (model/ed-current-buf m))) "\ndriven\n> "))
+              (check "and the FRAME paints the answer" (includes? painted "driven"))
+              (check "…the loop having drawn the program's prompt on the way" (includes? drawn "> "))
+              (check "the buffer is read-only to the user" (editor/buffer/read-only? tb))
+              ;; take the program down with the run: a worker left behind keeps its pty
+              ;; child, and a child that outlives the driver holds whatever the driver held
+              (commands/cmd-kill-buffer m nil))))
+        "the program's answer"))))
+
+(defn drive-kill (m0)
+  (let (opened (term/term-open m0 "term" "PS1='> ' sh -i")
+        pid (:term-proc (term-buf opened)))
+    (do
+      (check "the worker is alive" (proc/alive? pid))
+      (let (killed (commands/cmd-kill-buffer opened nil))
+        (do
+          (check "C-x k removed the buffer" (nil? (term-buf killed)))
+          ;; the worker gets `[:shutdown]` from the layer's :on-close and leaves
+          (receive (:never nil) (after 300 nil))
+          (check "…and its worker with it" (not (proc/alive? pid))))))))
+
+(let (_ (proc/register :editor (self))
+      m0 (assoc (model/ed-init (editor/buffer/make-buffer "" "*scratch*"))
+           :recent-files false
+           :gui-keys true
+           :_lc [*cols* *rows*]))
+  (do
+    (io/puts "== a program under a pty answers through the buffer")
+    (drive-term m0)
+    (io/puts "== killing the buffer stops the program")
+    (drive-kill m0)
+    (io/puts "")
+    (if (= (%table-get *failures* :n 0) 0)
+      (io/puts "the terminal buffer hosts a program end to end")
+      (error "drive-term: " (%table-get *failures* :n 0) " check(s) failed"))))

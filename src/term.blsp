@@ -1,0 +1,427 @@
+;; src/term.blsp — a terminal buffer: a full-screen program under a pty, its screen
+;; painted from `std/vt`.
+;;
+;; The project shell (bshell) and the project REPL host LINE-oriented programs: the
+;; buffer is the line editor, RET sends a line, and `ansi/render` is enough for the
+;; redraw a prompt does. A full-screen program — `claude`, `htop`, `vim`, a TUI test
+;; runner — is the other thing: it positions the cursor, scrolls a region, switches to
+;; the alternate screen, colours everything and BLOCKS on a query it expects the
+;; terminal to answer. That needs a terminal, and `std/vt` (ADR-380) is one as pure
+;; data: the worker that owns the pty feeds it the child's output and sends the
+;; editor a rendered SCREEN; the editor writes that screen into the buffer's tail and
+;; puts the cursor where the program put it. Emacs's `term` / `vterm`, in char mode.
+;;
+;; Where the pieces live:
+;;   - the WORKER (a process per buffer) owns the pty child and the `vt` value: it
+;;     feeds chunks (coalescing a burst into one screen), writes the replies the
+;;     program waits on, encodes keys with `vt/key->bytes` (the vt knows the
+;;     program's cursor-key mode) and answers a resize;
+;;   - the MODEL fold (`ed-ev-term-screen`) keeps the buffer as scrollback + screen:
+;;     `:term-hstart` is the char offset where the live screen begins, everything
+;;     before it is history (rows the vt evicted, appended once, with their colour
+;;     kept as `:face-spans`), and point in any pane watching the screen IS the
+;;     program's cursor;
+;;   - the OVERLAY (`input/term-overlay`) routes every key of a term buffer to the
+;;     worker, except `C-x` — the editor's own prefix stays, so you can switch
+;;     buffers and panes out of a running program — and `C-y`, which pastes into it;
+;;     the mode layer adds `C-x c` (the editor's C-c map) and `C-x C-x` / `C-x C-y`
+;;     (the literal keys), and `panes/ed-mouse` hands a term pane's pointer to
+;;     `term-mouse`.
+
+(defmodule term
+  "A terminal buffer (M-x term, M-x claude): a full-screen program under a pty,
+its screen emulated by `std/vt` and painted into a buffer — every key goes to the
+program, the buffer's tail is its screen, everything above it is scrollback."
+  (:use model)
+  (:use commands)
+  (:use editor/buffer)
+  (:use interactive))
+
+;; ---- the buffer ---------------------------------------------------------------------
+
+(defn term-buffer-name (label root)
+  "The buffer name for a `label` program in `root`: `*claude: ~/src/x*`."
+  (str "*" label ": " (path/abbreviate root) "*"))
+
+(defn term-buffer? (b)
+  "Whether buffer `b` is a terminal buffer (mode `:type` `:term`)."
+  (= (:type b) :term))
+
+(defn- live-program (b)
+  "The worker pid of term buffer `b` while its program is still running, else nil."
+  (if (:term-exited b) nil (:term-proc b)))
+
+;; check-allow: `:term-hstart` is the term buffer's own field, which the buffer record
+;; does not declare; every write below keeps it an int
+(check-allow :trusted
+  (defn- history-start (b)
+    "The char offset where `b`'s live screen begins — everything before it is history."
+    (or (:term-hstart b) 0)))
+(sig history-start (buffer -> int))
+
+;; ---- the worker: owns the pty child and the vt ----------------------------------------
+;; State: {:buffer nm :root dir :command cmd :cols :rows :palette :proc :vt :evicted}.
+;; The record constructors are named QUALIFIED because these sends run inside a
+;; `spawn`ed process, where the bare name is not bound (see bshell's note on the same).
+
+(def *term-coalesce-ms* 8) ; how long after a chunk the worker waits for the next before rendering
+
+(defn- term-palette ()
+  "How a program's colours look: the theme's sixteen, and its text / background for
+inverse video."
+  {:colors *term-palette* :fg *text* :bg *base*})
+
+(defn- term-write (state s)
+  "Write `s` to the child, tolerating one that has gone."
+  (when (and (:proc state) (not (= s "")))
+    (check-allow :discarded-catch (try (os/write (:proc state) s) (catch _ nil)))))
+
+(defn- term-feed (state chunk)
+  "Fold `chunk` into the vt; answer what the program asked; keep the rows it scrolled off
+until the next render."
+  (let (v (vt/feed (:vt state) chunk))
+    (do
+      (fold (:replies v) nil (fn (_ r) (term-write state r)))
+      (assoc state :vt v :evicted (into (:evicted state) (:evicted v))))))
+
+(defn- term-render (state)
+  "Send the editor the screen as it stands, the rows evicted since the last render read
+through the palette ahead of it, and start a fresh eviction list."
+  (let (pal (:palette state)
+        lines (into [] (map (:evicted state) (fn (row) (vt/line row pal)))))
+    (do
+      (send :editor (term/term-screen-event (:buffer state) lines (vt/screen (:vt state) pal)))
+      (assoc state :evicted []))))
+
+(defn- term-drain (state)
+  "After a chunk: keep folding chunks that are already queued (a program writes a frame
+as several), then render once the pipe goes quiet."
+  (receive
+    ([:proc p data] (term-drain (term-feed state data)))
+    (after *term-coalesce-ms* (term-render state))))
+
+(defn- term-loop (state)
+  (receive
+    ([:proc p data] (term-loop (term-drain (term-feed state data))))
+    ([:proc-closed p code]
+      (do
+        (send :editor (term/term-exit-event (:buffer state) code))
+        (term-loop (assoc state :proc nil))))
+    ([:term-key key]
+      (do
+        (term-write state (or (vt/key->bytes key (:vt state)) ""))
+        (term-loop state)))
+    ([:term-paste text]
+      (do
+        (term-write state (vt/paste->bytes text (:vt state)))
+        (term-loop state)))
+    ([:term-mouse action button row col mods]
+      (do
+        (term-write state (or (vt/mouse->bytes action button row col mods (:vt state)) ""))
+        (term-loop state)))
+    ([:term-palette pal] (term-loop (term-render (assoc state :palette pal))))
+    ([:term-resize cols rows]
+      (do
+        (when (:proc state)
+          (check-allow :discarded-catch
+            (try (os/resize-pty (:proc state) cols rows) (catch _ nil))))
+        (term-loop (term-render (assoc state :vt (vt/resize (:vt state) cols rows))))))
+    ([:shutdown] (do (when (:proc state) (os/close (:proc state))) :term-stopped))))
+
+(defn- term-boot (state)
+  "Start the child under a pty of the buffer's size — `sh -c`, since a program is
+configured as a command line — and serve it."
+  (let (p (os/spawn-pty "sh"
+            ["-c" (:command state)]
+            {:cwd (:root state)
+             :cols (:cols state)
+             :rows (:rows state)
+             :env {"TERM" "xterm-256color" "COLORTERM" "truecolor"}}))
+    (term-loop (assoc state :proc p :vt (vt/make (:cols state) (:rows state)) :evicted []))))
+
+(defn term-connect (buffer root command cols rows)
+  "Spawn the worker for `buffer`: `command` under a `cols`×`rows` pty in `root`, for the
+buffer's life. Returns its pid."
+  (let (state {:buffer buffer :root root :command command :cols cols :rows rows :palette (term-palette)})
+    (spawn (term-boot state))))
+
+(defn term-on-close (buf)
+  "The term layer's `:on-close`: the buffer is going, so is its worker and the program."
+  (do (when (:term-proc buf) (send (:term-proc buf) [:shutdown])) buf))
+
+;; ---- the inbound events -------------------------------------------------------------
+
+(defrecord term-screen-event (buffer lines screen)) ; rows evicted since the last screen, then the screen
+(defrecord term-exit-event (buffer code)) ; the program exited
+(deftype screen (record &open :text string :spans vector :cursor int)) ; what `vt/screen` answers
+(impl UiEvent
+  term-screen-event
+  (ui-event-fold [e m textrows cols rows] (ed-ev-term-screen m e textrows cols rows)))
+(impl UiEvent
+  term-exit-event
+  (ui-event-fold [e m textrows cols rows] (ed-ev-term-exit m e textrows cols rows)))
+
+;; ---- history: the rows above the screen ----------------------------------------------
+;; A program that runs for hours must not leave a buffer the renderer carries whole, so
+;; the history is trimmed from the top — in one cut, at a line start — once it grows past
+;; the ceiling, down to the floor.
+
+(def *term-scrollback-chars* 600000)
+(def *term-scrollback-keep* 400000)
+(def *term-scrollback-spans* 40000) ; a second ceiling: the faces the view is handed per frame
+
+(defn- shift-spans (spans by)
+  (into [] (map spans (fn (s) (let ([from to f] s) [(+ from by) (+ to by) f])))))
+
+(defn- history-lines (lines base)
+  "The evicted `lines` (`[text spans]` each, spans from 0) laid out one per line from
+offset `base`: `[text spans end]` — their text, their spans made absolute, the offset
+after them. The spans are gathered as a list and vectored once: a program that dumps ten
+thousand lines evicts them in ONE event, and growing a vector per row is quadratic there."
+  (let ([acc end] (fold lines
+                    [() base]
+                    (fn (state line)
+                      (let ([acc pos] state
+                            [text spans] line
+                            shifted (fold spans acc (fn (a s) (let ([from to f] s) (cons [(+ from pos) (+ to pos) f] a)))))
+                        [shifted (+ pos (string/length text) 1)])))
+        text (string/join (map lines (fn (line) (str (first line) "\n"))) ""))
+    [text (into [] (reverse acc)) end]))
+
+(defn- trim-history (b)
+  "`b` with its history cut back to `*term-scrollback-keep*` chars once it has grown past
+`*term-scrollback-chars*` — or past `*term-scrollback-spans*` faces, a program that colours
+every cell reaching that first; a no-op below both."
+  (let (hstart (history-start b)
+        hspans (:term-hspans b)
+        excess (- (count hspans) (math/quot (* 2 *term-scrollback-spans*) 3)))
+    (if (and (<= hstart *term-scrollback-chars*) (<= (count hspans) *term-scrollback-spans*))
+      b
+      (let (by-chars (math/max 0 (- hstart *term-scrollback-keep*))
+            ;; past the span ceiling: cut where the span a third of the way in begins
+            by-spans (if (> excess 0) (first (nth hspans excess)) 0)
+            at (math/max by-chars by-spans)
+            nl (index-of (buffer-text b) "\n" at)
+            cut (if (< nl 0) at (inc nl))
+            kept (seq/filter hspans (fn (s) (>= (first s) cut))))
+        (assoc (replace-region b 0 cut "")
+          :term-hstart (- hstart cut)
+          :term-hspans (shift-spans kept (- cut)))))))
+
+(defn- term-apply-screen (b lines screen)
+  "Buffer `b` with the evicted `lines` appended to its history and `screen` written as
+its tail, `:face-spans` the history's spans then the screen's, its own point at the
+program's cursor. The buffer is read-only for the user; its producer unlocks it."
+  (let (hstart (history-start b)
+        [htext hspans hend] (history-lines lines hstart)
+        unlocked (set-read-only b false)
+        written (assoc (replace-region unlocked hstart (buffer-length unlocked) (str htext (:text screen)))
+                  :term-hstart hend
+                  :term-hspans (into (:term-hspans b) hspans)
+                  ;; the program's cursor as the VIEW paints it, and what the MOUSE needs
+                  :cursor-hidden (not (:cursor-visible screen))
+                  :cursor-shape (:cursor-style screen)
+                  :term-mouse (:mouse screen)
+                  :term-alt-screen (:alt-screen screen))
+        ;; trim BEFORE the faces are laid out, so both halves share one offset
+        trimmed (trim-history written)
+        screen-start (history-start trimmed)
+        faced (assoc (goto-char trimmed (+ screen-start (:cursor screen)))
+                :face-spans (into (:term-hspans trimmed) (shift-spans (:spans screen) screen-start))))
+    (set-read-only faced true)))
+(sig term-apply-screen (buffer vector screen -> buffer))
+
+(defn- term-follow (m idx before after)
+  "Every pane on pool buffer `idx` whose point was watching the screen (at or past the
+old `:term-hstart`) follows the program's cursor, and scrolls so the screen's first
+row is its top row — the pane SHOWS the program. A pane scrolled up into the history
+stays where the reader left it."
+  (let (watching (history-start before)
+        cursor (buffer-point after)
+        top (results/line-of (buffer-rope after) (history-start after)))
+    (ed-map-panes m
+      (fn (w)
+        (if (and (= (:buffer w) idx) (or (nil? (:point w)) (>= (:point w) watching)))
+          (assoc w :point cursor :mark nil :top top)
+          w)))))
+
+(defn ed-ev-term-screen (m event textrows cols rows)
+  "A `term-screen-event` → the buffer's tail becomes the screen, the evicted rows join
+its history, every pane watching the screen follows the cursor, and a pane that changed
+size since tells its program."
+  (let (idx (ed-buffer-index-by-name m (term-screen-event-buffer event)))
+    (if (nil? idx)
+      m
+      (let (before (ed-buf-at m idx)
+            after (term-apply-screen before (term-screen-event-lines event) (term-screen-event-screen event)))
+        (term-sync-sizes (term-follow (ed-set-buf-at m idx after) idx before after))))))
+
+(defn ed-ev-term-exit (m event textrows cols rows)
+  "A `term-exit-event` → say so on the buffer's tail; the buffer stays to be read, `C-x k`
+closes it."
+  (let (code (term-exit-event-code event)
+        note (str "\n[process exited" (if (nil? code) "" (str " with code " code)) " — C-x k to close]\n"))
+    (ed-update-named m (term-exit-event-buffer event)
+      (fn (b)
+        (let (noted (insert (end-of-buffer (set-read-only b false)) note))
+          (set-read-only (assoc noted :term-exited true) true))))))
+
+;; ---- sizing: the vt is the size of the pane that shows it ---------------------------------
+
+(defn- term-pane-size (pane buf)
+  [(panes/ed-pane-text-cols pane buf) (math/max 1 (panes/ed-pane-vrows pane buf))])
+
+(defn term-sync-sizes (m)
+  "Tell every term worker whose pane changed size — `[:term-resize cols rows]`, recorded
+on the buffer as `:term-size` so it is sent once per change. A term buffer shown in two
+panes is sized to the first."
+  (let (layout (panes/ed-layout-now m))
+    (if (nil? layout)
+      m
+      (fold (:panes layout)
+        m
+        (fn (mm pane)
+          (let (idx (get-in pane [:payload :buffer])
+                buf (ed-buf-at mm (if (int? idx) idx 0))
+                pid (if (term-buffer? buf) (live-program buf) nil)
+                size (if pid (term-pane-size pane buf) nil))
+            (if (or (nil? size) (= size (:term-size buf)))
+              mm
+              (do
+                (send pid [:term-resize (first size) (second size)])
+                (ed-set-buf-at mm idx (assoc buf :term-size size))))))))))
+
+(defn- term-size-for (m buf)
+  "The size a new term buffer gets: the selected pane's text area for `buf` (a term
+buffer draws no gutter), or 80×24 before any frame."
+  (let (layout (panes/ed-layout-now m))
+    (if (nil? layout)
+      [80 24]
+      (term-pane-size (panes/ed-selected-pane (:panes layout)) buf))))
+
+;; ---- keys: everything goes to the program ------------------------------------------------
+
+(defn term-send-key (m key)
+  "Forward `key` to the current term buffer's program (the worker encodes it against the
+program's own cursor-key mode). Nothing to send once the program has exited."
+  (do
+    (when-let (pid (live-program (ed-current-buf m)))
+      (send pid [:term-key key]))
+    m))
+
+;; check-allow: `ed-kill-head` answers `[model text]`, and a vector's parts are unknown to
+;; the checker; every branch answers that model
+(check-allow :trusted
+  (defcommand cmd-term-paste
+    (m key)
+    "C-y in a terminal buffer: paste the kill ring's head into the program — bracketed
+when the program asked for pastes to be marked, so it can tell one from typing."
+    (let ([m1 text] (ed-kill-head m)
+          pid (live-program (ed-current-buf m1)))
+      (do
+        (when (and text pid) (send pid [:term-paste text]))
+        (if (nil? text) (message m1 "kill ring is empty") m1)))))
+
+;; ---- the commands --------------------------------------------------------------------------
+
+(defn- term-start (m label root command)
+  "Open a `label` terminal buffer running `command` in `root`, sized to the selected pane."
+  (let (fresh (assoc (editor/layers/set-buffer-type (set-read-only (make-buffer "" (term-buffer-name label root)) true) :term)
+                :dir root
+                :term-hstart 0
+                :term-hspans []
+                :face-spans [])
+        [cols rows] (term-size-for m fresh)
+        pid (term-connect (buffer-name fresh) root command cols rows)
+        buf (assoc fresh :term-proc pid :term-size [cols rows]))
+    (message (ed-open-buffer m buf) (str command " (C-x k closes; every other key goes to it)"))))
+
+(defn- term-open (m label command)
+  "Switch to this project's `label` terminal, or start one running `command`."
+  (let (root (or (ed-project-root m) (:dir (ed-current-buf m)) (file/cwd))
+        idx (ed-buffer-index-by-name m (term-buffer-name label root)))
+    (if (nil? idx) (term-start m label root command) (ed-select m idx))))
+
+(defcommand cmd-term
+  (m key)
+  "Open a terminal for the current project (C-x p t): your shell (`$SHELL`, else `sh`)
+under a real terminal emulator in the project root — for the programs the project
+shell's line editor cannot host: `htop`, `vim`, a TUI test runner. Each project has its
+own; re-running switches to it."
+  (term-open m "term" (or (os/env "SHELL") "sh")))
+
+(defcommand cmd-claude
+  (m key)
+  "Run Claude Code in the current project (M-x claude): `claude` in the project root, in
+a terminal buffer — every key goes to it, `C-x` stays yours, `C-y` pastes. Re-running
+switches to the project's running session."
+  (term-open m "claude" "claude"))
+
+;; ---- the keys the program cannot have ---------------------------------------------------
+;; C-x is the editor's prefix and C-y pastes, so neither reaches the program as itself;
+;; `C-x C-x` / `C-x C-y` send the literal. And the editor's C-c map — tests, the debugger,
+;; the playground — sits under a key the program owns outright, so `C-x c` stands in for
+;; C-c: the next key resolves in that map exactly as if C-c had been pressed.
+
+(defcommand cmd-term-send-literal
+  (m key)
+  "C-x C-x / C-x C-y in a terminal buffer: send the chord's last key (C-x, C-y) to the
+program as itself — the two keys the editor keeps for its own use."
+  (term-send-key m key))
+
+(defcommand cmd-term-editor-c-c
+  (m key)
+  "C-x c in a terminal buffer: the editor's C-c map — the next key resolves in it as if
+C-c had been pressed (`C-x c t` runs the tests), since the program owns C-c itself."
+  (input/ed-press-prefix m :ctrl-c))
+
+;; ---- the mouse ----------------------------------------------------------------------------
+;; A program that asked for mouse reporting gets clicks, drags and the wheel in the cells of
+;; ITS screen — the pane's rows mapped through the history above the screen. A pane scrolled
+;; up into the history is being read, and its clicks are the editor's. A full-screen program
+;; that did not ask for the mouse still gets the wheel as arrow keys, which is what every
+;; terminal does for `less` and friends; anywhere else the wheel scrolls the buffer.
+
+(defn- term-screen-cell (m pane buf row col)
+  "The `[row col]` of the program's screen under window cell (`row`, `col`) in `pane`, or
+nil when that cell is above the screen (history) or off the text."
+  (let ([x y w h] (:rect pane)
+        text-row (- row y)
+        text-col (- col x)
+        screen-top (results/line-of (buffer-rope buf) (history-start buf))
+        screen-row (- (+ (panes/ed-pane-top pane buf) text-row) screen-top))
+    (if (and (>= text-row 0) (< text-row (dec h)) (>= text-col 0) (>= screen-row 0))
+      [screen-row text-col]
+      nil)))
+
+(defn term-mouse (m pane input)
+  "Fold a `[:mouse action button row col mods]` event over `pane` (which shows a term
+buffer) into the program, answering the model when the event was the program's — else
+nil, and the editor handles it as it would in any buffer."
+  (let (buf (panes/ed-pane-buf m pane)
+        pid (live-program buf)
+        action (nth input 1)
+        wheel? (includes? [:scroll-up :scroll-down] action)
+        cell (term-screen-cell m pane buf (nth input 3) (nth input 4)))
+    (cond
+      (or (nil? pid) (nil? cell)) nil
+      (:term-mouse buf)
+        (do
+          (send pid [:term-mouse action (nth input 2) (first cell) (second cell) (nth input 5 [])])
+          m)
+      ;; a full-screen program without the mouse: the wheel is arrow keys, three a notch
+      (and wheel? (:term-alt-screen buf))
+        (let (key (if (= action :scroll-up) :up :down))
+          (do (fold (range 3) nil (fn (_ _) (send pid [:term-key key]))) m))
+      else nil)))
+
+;; ---- the theme ------------------------------------------------------------------------------
+
+(defn term-repalette (m)
+  "After a theme switch: every running program's screen is re-read through the new
+palette. History keeps the colours it was written in — its cells are gone."
+  (do
+    (fold (:buffers m)
+      nil
+      (fn (_ b) (when-let (pid (and (term-buffer? b) (live-program b))) (send pid [:term-palette (term-palette)]))))
+    m))

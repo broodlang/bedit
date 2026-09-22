@@ -1,0 +1,261 @@
+;; The terminal buffer (`M-x term` / `M-x claude`) — `src/term.blsp`. A full-screen
+;; program under a pty, its screen emulated by `std/vt` in the buffer's worker and
+;; painted into the buffer's tail. The model folds here take a rendered SCREEN
+;; (`{:text :spans :cursor …}`, what `vt/screen` returns) and evicted rows
+;; (`[text spans]` each, what `vt/line` returns), so they run with no vt and no
+;; process; the last group drives a real `sh` through the worker.
+
+(defmodule term-test
+  (:use test)
+  (:use model)
+  (:use commands)
+  (:use editor/buffer)
+  (:use-internals term)
+  (:use-internals input))
+
+(def term-name (term/term-buffer-name "term" "/tmp"))
+
+(defn term-model ()
+  "A model whose current buffer is a /tmp terminal — the buffer as `term-start` makes it,
+no worker."
+  (let (raw (set-read-only (make-buffer "" term-name) true)
+        buf (assoc (editor/layers/set-buffer-type raw :term)
+              :dir "/tmp"
+              :term-proc nil
+              :term-size [80 24]
+              :term-hstart 0
+              :term-hspans []
+              :face-spans []))
+    (ed-open-buffer (ed-init (make-buffer "")) buf)))
+
+(defn screen (text cursor &optional (spans []))
+  {:text text :spans spans :cursor cursor :cursor-visible true :cursor-style :block})
+
+(defn fold-screen (m lines scr)
+  (term/ed-ev-term-screen m (term/term-screen-event term-name lines scr) 24 80 24))
+
+(defn term-buf (m) (nth (:buffers m) (ed-buffer-index-by-name! m term-name)))
+(defn term-text (m) (buffer-text (term-buf m)))
+(defn term-point (m) (buffer-point (ed-current-buf m)))
+
+(describe "a screen event paints the buffer's tail"
+  (test "the screen's text is the buffer, the cursor is point"
+    (let (m (fold-screen (term-model) [] (screen "$ ls\na.txt\n$ " 12)))
+      (assert= (term-text m) "$ ls\na.txt\n$ ")
+      (assert= (term-point m) 12)
+      (assert= (:term-hstart (term-buf m)) 0)))
+  (test "the next screen REPLACES the tail — a redraw is not an append"
+    (let (m1 (fold-screen (term-model) [] (screen "$ ls\na.txt\n$ " 12))
+          m2 (fold-screen m1 [] (screen "$ ls\na.txt\n$ echo" 16)))
+      (assert= (term-text m2) "$ ls\na.txt\n$ echo")
+      (assert= (term-point m2) 16)))
+  (test "the screen's faces become the buffer's face-spans"
+    (let (m (fold-screen (term-model) [] (screen "red" 3 [[0 3 {:fg [1 0 0]}]])))
+      (assert= (:face-spans (term-buf m)) [[0 3 {:fg [1 0 0]}]])))
+  (test "the buffer stays read-only for the user"
+    (is (read-only? (term-buf (fold-screen (term-model) [] (screen "x" 1)))))))
+
+(describe "evicted rows become history above the screen"
+  (test "an evicted row is appended once, and the screen follows it"
+    (let (m1 (fold-screen (term-model) [] (screen "one\ntwo" 7))
+          m2 (fold-screen m1 [["one" []]] (screen "two\nthree" 9)))
+      (assert= (term-text m2) "one\ntwo\nthree")
+      (assert= (:term-hstart (term-buf m2)) 4)
+      (assert= (term-point m2) 13)))
+  (test "history keeps its colour; the screen's spans sit after it"
+    (let (m1 (fold-screen (term-model) [] (screen "a" 1))
+          m2 (fold-screen m1 [["ab" [[0 2 {:fg [1 1 1]}]]]] (screen "c" 1 [[0 1 {:fg [2 2 2]}]])))
+      (assert= (:face-spans (term-buf m2)) [[0 2 {:fg [1 1 1]}] [3 4 {:fg [2 2 2]}]])))
+  (test "several rows at once, in order"
+    (let (m (fold-screen (term-model) [["1" []] ["2" []] ["3" []]] (screen "4" 1)))
+      (assert= (term-text m) "1\n2\n3\n4")
+      (assert= (:term-hstart (term-buf m)) 6)))
+  (test "history past the cap is trimmed from the top, at a line start, spans shifted"
+    (let (long (string/repeat "x" 999)
+          rows (into [] (map (range 700) (fn (i) [long [[0 1 {:fg [1 1 1]}]]])))
+          m (fold-screen (term-model) rows (screen "end" 3))
+          b (term-buf m))
+      ;; 700 × 1000 chars = 700k > the 600k cap → cut back toward 400k
+      (is (<= (:term-hstart b) term/*term-scrollback-keep*))
+      (is (string/starts-with? (buffer-text b) "x"))
+      (assert= (:term-hstart b) (- (buffer-length b) 3))
+      (assert= (first (first (:face-spans b))) 0)
+      (assert= (term-point m) (buffer-length b)))))
+
+(describe "panes watching the screen follow the cursor"
+  (test "the selected pane's point follows and its top is the screen's first line"
+    (let (m1 (fold-screen (term-model) [] (screen "a" 1))
+          ;; a typed key would cache the pane point; a screen event must still move it
+          m2 (fold-screen m1 [["h1" []] ["h2" []]] (screen "s1\ns2" 5)))
+      (assert= (term-point m2) 11)
+      (assert= (ed-current-top m2) 2)))
+  (test "a pane scrolled up into the history is left where the reader put it"
+    (let (m1 (fold-screen (term-model) [["h1" []] ["h2" []]] (screen "s1\ns2" 5))
+          m2 (ed-set-buf m1 (goto-char (ed-current-buf m1) 0)) ; reading the history
+          m3 (fold-screen m2 [] (screen "s1\ns2\ns3" 8)))
+      (assert= (term-point m3) 0))))
+
+(describe "the program exiting"
+  (test "is noted on the tail and remembered on the buffer"
+    (let (m1 (fold-screen (term-model) [] (screen "bye" 3))
+          m2 (term/ed-ev-term-exit m1 (term/term-exit-event term-name 0) 24 80 24))
+      (is (includes? (term-text m2) "[process exited with code 0"))
+      (is (:term-exited (term-buf m2)))
+      (is (read-only? (term-buf m2))))))
+
+(describe "keys are the program's"
+  (test "the term overlay is active in a term buffer and owns everything but C-x"
+    (let (m (term-model)
+          o (seq/find input/ed-transient-handlers (fn (o) (= (:__id__ o) :bedit/input/term-overlay))))
+      (is (not (nil? o)))
+      (is (editor/ui/overlay-active? o m))
+      (is (editor/ui/overlay-owns? o m "a"))
+      (is (editor/ui/overlay-owns? o m :ctrl-c))
+      (is (not (editor/ui/overlay-owns? o m :ctrl-x)))
+      (is (not (editor/ui/overlay-owns? o m :ctrl-y)))))
+  (test "mid-chord (after C-x) the overlay steps aside so the chord completes"
+    (let (m (assoc (term-model) :pending {})
+          o (seq/find input/ed-transient-handlers (fn (o) (= (:__id__ o) :bedit/input/term-overlay))))
+      (is (not (editor/ui/overlay-active? o m)))))
+  (test "a typed key reaches the worker, not the buffer"
+    (let (m0 (ed-set-buf (term-model) (assoc (ed-current-buf (term-model)) :term-proc (self)))
+          m (ed-update m0 "a" 80 24))
+      (assert= (term-text m) "")
+      (receive
+        ([:term-key k] (assert= k "a"))
+        (after 500 (is (= :sent "the key never reached the worker"))))))
+  (test "C-y pastes the kill ring's head to the worker"
+    (let (m0 (ed-set-buf (term-model) (assoc (ed-current-buf (term-model)) :term-proc (self)))
+          m1 (assoc m0 :kill-ring (list "pasted"))
+          m (ed-update m1 :ctrl-y 80 24))
+      (assert= (term-text m) "")
+      (receive
+        ([:term-paste t] (assert= t "pasted"))
+        (after 500 (is (= :sent "the paste never reached the worker")))))))
+
+;; ---- a real program under the worker -----------------------------------------------
+;; `sh` stands in for `claude`: it is a program, it prompts under a pty, and it is on
+;; every machine. What is tested is the hosting — a key typed reaches it, its answer
+;; comes back as a SCREEN with the cursor where the program left it.
+
+(defn tt-await-screen (want deadline)
+  "The first `term-screen-event` whose text contains `want`, or nil."
+  (receive
+    (msg
+      (let (text (check-allow :discarded-catch
+                   (try (:text (term/term-screen-event-screen msg)) (catch _ nil))))
+        (if (and text (includes? text want)) msg (tt-await-screen want deadline))))
+    (after deadline nil)))
+
+(defn tt-as-editor (f)
+  (let (previous (proc/whereis :editor))
+    (proc/register :editor (self))
+    (let (out (f))
+      (when previous (proc/register :editor previous))
+      out)))
+
+(defn tt-has-vt? ()
+  "Whether this nest ships `std/vt` — the term worker needs it; a nest built before the
+  module lands skips the live test rather than failing it."
+  (check-allow :discarded-catch (try (do (vt/make 1 1) true) (catch _ false))))
+
+(describe "a hosted program answers what the buffer sends it"
+  :isolated (test "sh echoes a line and prompts again, on one screen"
+    (if (not (tt-has-vt?))
+      (io/puts "  (skipped: this nest has no std/vt)")
+    (tt-as-editor
+      (fn ()
+        (let (pid (term/term-connect term-name "/tmp" "PS1='> ' sh -i" 40 6)
+              ;; wait for the prompt: keys typed before it are echoed by the pty AHEAD of
+              ;; it, and the screen would read `echo hi` then `> hi`
+              prompt (tt-await-screen "> " 8000))
+          (do
+            (is (not (nil? prompt)))
+            (send pid [:term-key "e"]) (send pid [:term-key "c"]) (send pid [:term-key "h"])
+            (send pid [:term-key "o"]) (send pid [:term-key " "]) (send pid [:term-key "h"])
+            (send pid [:term-key "i"]) (send pid [:term-key :enter])
+            (let (ev (tt-await-screen "\nhi" 8000))
+              (is (not (nil? ev)))
+              (when ev
+                (let (scr (term/term-screen-event-screen ev))
+                  (is (includes? (:text scr) "> echo hi"))
+                  ;; the cursor sits after the prompt that followed the output (the
+                  ;; blank rows below it are still part of the screen's text)
+                  (is (string/ends-with? (string/substring (:text scr) 0 (:cursor scr)) "> ")))))
+            (send pid [:shutdown]))))))))
+
+;; ---- the keys the program cannot have ------------------------------------------------
+
+(describe "the two keys the editor keeps, and the C-c map"
+  (test "C-x C-x sends a literal C-x, C-x C-y a literal C-y"
+    (let (m0 (ed-set-buf (term-model) (assoc (ed-current-buf (term-model)) :term-proc (self)))
+          m1 (ed-update (ed-update m0 :ctrl-x 80 24) :ctrl-x 80 24)
+          m2 (ed-update (ed-update m1 :ctrl-x 80 24) :ctrl-y 80 24))
+      (assert= (term-text m2) "")
+      (receive ([:term-key k] (assert= k :ctrl-x)) (after 500 (is (= :sent "no C-x"))))
+      (receive ([:term-key k] (assert= k :ctrl-y)) (after 500 (is (= :sent "no C-y"))))))
+  (test "C-x c presses C-c: the next key resolves in the editor's C-c map"
+    (let (m0 (term-model)
+          m1 (ed-update (ed-update m0 :ctrl-x 80 24) "c" 80 24))
+      (assert= (:echo m1) "C-c-")
+      (assert= (:pending m1) (get (input/ed-active-keymap m0) :ctrl-c))
+      ;; and a key in it runs the command, not the program: C-c C-g is keyboard-quit
+      (is (nil? (:pending (ed-update m1 :ctrl-g 80 24)))))))
+
+;; ---- the mouse ----------------------------------------------------------------------------
+
+(defn mouse (m action button row col)
+  (ed-update m [:mouse action button row col []] 80 24))
+
+(describe "the mouse reaches a program that asked for it"
+  (test "a press is sent in the program's screen cells; the pane is still selected"
+    (let (m0 (fold-screen (term-model) [] (screen "a\nb\nc" 5))
+          m1 (ed-set-buf m0 (assoc (ed-current-buf m0) :term-proc (self) :term-mouse 1000))
+          m (mouse m1 :press :left 2 5))
+      (receive
+        ([:term-mouse action button row col mods] (do (assert= action :press) (assert= [row col] [2 5])))
+        (after 500 (is (= :sent "the press never reached the worker"))))
+      (assert= (term-point m) 5))) ; point untouched: the click was the program's, not the editor's
+  (test "a click in the HISTORY above the screen is the editor's"
+    (let (m0 (fold-screen (term-model) [["h1" []] ["h2" []]] (screen "s1\ns2" 5))
+          ;; scrolled up to read the history — the pane's first row is history, not screen
+          m1 (ed-set-top (ed-set-buf m0 (assoc (ed-current-buf m0) :term-proc (self) :term-mouse 1000)) 0)
+          m (mouse m1 :press :left 0 1))
+      (receive ([:term-mouse a b r c mods] (is (= :editor "the click went to the program"))) (after 100 nil))
+      (assert= (term-point m) 1)))
+  (test "a full-screen program without the mouse gets the wheel as arrow keys"
+    (let (m0 (fold-screen (term-model) [] (screen "a" 1))
+          m1 (ed-set-buf m0 (assoc (ed-current-buf m0) :term-proc (self) :term-alt-screen true))
+          _ (mouse m1 :scroll-down nil 1 1))
+      (receive ([:term-key k] (assert= k :down)) (after 500 (is (= :sent "no arrow"))))))
+  (test "otherwise the wheel scrolls the buffer, as anywhere"
+    (let (m0 (fold-screen (term-model) [] (screen "a" 1))
+          m1 (ed-set-buf m0 (assoc (ed-current-buf m0) :term-proc (self)))
+          _ (mouse m1 :scroll-down nil 1 1))
+      (receive (msg (is (= :editor msg))) (after 100 nil)))))
+
+;; ---- the view, the theme, the ceilings ---------------------------------------------------
+
+(describe "what the program says about its cursor, the view honours"
+  (test "a hidden cursor paints no caret; a bar shape paints a bar"
+    (let (m0 (fold-screen (term-model) [] (screen "abc" 3))
+          hidden (ed-set-buf m0 (assoc (ed-current-buf m0) :cursor-hidden true))
+          bar (ed-set-buf m0 (assoc (ed-current-buf m0) :cursor-shape :bar))
+          carets (fn (m) (seq/filter (view/ed-view (assoc m :blink-on? true) 80 24) (fn (op) (and (vector? op) (= (first op) :cursor))))))
+      (is (empty? (carets hidden)))
+      (assert= (nth (first (carets bar)) 3) :bar))))
+
+(describe "a theme switch reaches a running program"
+  (test "every live worker is sent the new palette"
+    (let (m0 (ed-set-buf (term-model) (assoc (ed-current-buf (term-model)) :term-proc (self)))
+          _ (term/term-repalette m0))
+      (receive ([:term-palette pal] (is (= (count (:colors pal)) 16))) (after 500 (is (= :sent "no palette")))))))
+
+(describe "the span ceiling"
+  (test "history that is all colour is trimmed by its span count, not only its chars"
+    (let (rows (into [] (map (range 500) (fn (i) ["x" (into [] (map (range 100) (fn (j) [0 1 {:fg [1 1 1]}])))])))
+          m (fold-screen (term-model) rows (screen "end" 3))
+          b (term-buf m))
+      ;; 50 000 spans over 1 000 chars: past the 40 000 ceiling, cut to two thirds
+      (is (<= (count (:term-hspans b)) (- term/*term-scrollback-spans* 10000)))
+      (assert= (:term-hstart b) (- (buffer-length b) 3)))))
