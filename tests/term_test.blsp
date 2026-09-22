@@ -198,7 +198,9 @@ no worker."
     (let (m0 (term-model)
           m1 (ed-update (ed-update m0 :ctrl-x 80 24) "c" 80 24))
       (assert= (:echo m1) "C-c-")
-      (assert= (:pending m1) (get (input/ed-active-keymap m0) :ctrl-c))
+      ;; the mode's own toggles AND what C-c means everywhere else (C-c t runs the tests)
+      (assert= (get (:pending m1) :ctrl-j) 'term/cmd-term-line-mode)
+      (is (not (nil? (get (:pending m1) "t"))))
       ;; and a key in it runs the command, not the program: C-c C-g is keyboard-quit
       (is (nil? (:pending (ed-update m1 :ctrl-g 80 24)))))))
 
@@ -259,3 +261,78 @@ no worker."
       ;; 50 000 spans over 1 000 chars: past the 40 000 ceiling, cut to two thirds
       (is (<= (count (:term-hspans b)) (- term/*term-scrollback-spans* 10000)))
       (assert= (:term-hstart b) (- (buffer-length b) 3)))))
+
+(describe "holding a key in a terminal"
+  (test "an arrow repeats into the program, as it would in any terminal"
+    (let (m (assoc (term-model) :gui-keys true))
+      (is (input/ed-repeatable? m :left))
+      (is (input/ed-repeatable? m :backspace))))
+  (test "RET never does: each repeat RUNS something"
+    ;; a key-up lost to a focus change would run the command again and again — the
+    ;; driver caught exactly that, fourteen prompts deep
+    (is (not (input/ed-repeatable? (assoc (term-model) :gui-keys true) :enter))))
+  (test "and RET still repeats in an ordinary buffer, where it only inserts a line"
+    (let (m (assoc (ed-init (make-buffer "" "x")) :gui-keys true))
+      (is (input/ed-repeatable? m :enter)))))
+
+;; ---- the input region survives what the user can do to the buffer -------------------
+;; In line mode the buffer is EDITABLE, and the layer binds Backspace but not every kill.
+;; So a reader can click up into the scrollback, press C-k, and leave `:input-start` past
+;; the end of the rope — which the next screen event would index off.
+
+(defn line-model (text start)
+  (let (raw (insert (make-buffer "" "*repl: /tmp*") text)
+        buf (assoc (editor/layers/set-buffer-type raw :term)
+              :dir "/tmp" :term-proc nil :term-size [80 24]
+              :term-hstart 0 :term-hspans [] :face-spans []
+              :term-line-mode true :input-start start :term-cursor start))
+    (ed-open-buffer (ed-init (make-buffer "")) buf)))
+
+(describe "line mode holds together when the buffer is edited under it"
+  (test "a kill that reached above the input start does not break the next screen"
+    (let (m0 (line-model "> hello" 2)
+          ;; C-k from a click up in the prompt: the buffer is now shorter than :input-start
+          shortened (ed-set-buf m0 (replace-region (ed-current-buf m0) 0 7 ""))
+          screened (term/ed-ev-term-screen shortened
+                     (term/term-screen-event "*repl: /tmp*" [] (screen "> " 2))
+                     24 80 24)
+          b (nth (:buffers screened) (ed-buffer-index-by-name! screened "*repl: /tmp*")))
+      ;; no throw, and the region is back where the program's cursor is
+      (assert= (buffer-text b) "> ")
+      (assert= (:input-start b) 2)))
+  (test "RET with the region past the end sends the empty line rather than throwing"
+    (let (m (ed-set-buf (line-model "> hi" 4) (assoc (ed-current-buf (line-model "> hi" 4)) :term-proc (self)))
+          shortened (ed-set-buf m (replace-region (ed-current-buf m) 0 4 ""))
+          _ (term/cmd-term-send-line shortened nil))
+      (receive ([:term-line line] (assert= line "")) (after 500 (is (= :sent "nothing sent")))))))
+
+(describe "switching to line mode cuts at the program's cursor, not at point"
+  (test "a reader who clicked up in the scrollback keeps the screen"
+    (let (m0 (fold-screen (term-model) [] (screen "$ ls\na.txt\n$ \n\n" 13))
+          ;; click into the history: the pane's point is 2, the program's cursor is 13
+          clicked (ed-set-buf m0 (goto-char (ed-current-buf m0) 2))
+          line (term/cmd-term-line-mode clicked nil)
+          b (term-buf line))
+      ;; the screen up to the cursor is kept; only the blank rows below it go
+      (assert= (buffer-text b) "$ ls\na.txt\n$ ")
+      (assert= (:input-start b) 13))))
+
+(describe "C-x c is the editor's C-c map, not just the mode's two keys"
+  (test "it carries the profile's bindings AND the mode's"
+    ;; the term layer binds `C-c C-j`, and a chord belongs to its winning layer
+    ;; (std/editor/layers, deliberately) — so the COMPOSED keymap's C-c holds only the
+    ;; mode's two keys. A command whose whole purpose is to reach the editor's map has
+    ;; to merge the model scope's in.
+    (let (m (term-model)
+          pressed (input/ed-press-prefix m :ctrl-c)
+          ;; `ed-press-prefix` arms `:transient-map`; the dispatcher turns it into `:pending`
+          reachable (:transient-map pressed))
+      ;; the mode's own toggles
+      (assert= (get reachable :ctrl-j) 'term/cmd-term-line-mode)
+      ;; …and what C-c means everywhere else in the editor (C-c t runs the tests)
+      (is (> (count reachable) 2))
+      (is (not (nil? (get reachable "t"))))
+      (assert= (:transient-key pressed) :ctrl-c)))
+  (test "a key that is no prefix anywhere leaves the model alone"
+    (let (m (term-model))
+      (assert= (input/ed-press-prefix m "q") m))))
