@@ -142,7 +142,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   fixed; a test asserts it. Tutor should be a client of playground-core.
 - [ ] **L2 Spy pane cache keyed by form index shows the wrong form after a shift**
   (`playground-core.blsp:583`).
-- [ ] **L3 Elixir playground: `x = x + 1` doesn't depend on `x`** (`form-deps`).
+- [x] **L3 Elixir playground: `x = x + 1` doesn't depend on `x`** (`form-deps`).
 - [ ] **L4 Playground/tutor in a second frame hang** — replies go to `:editor`.
 
 ### Hosted / collab
