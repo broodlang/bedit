@@ -150,7 +150,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   never shares other files from the live editor (`collab.blsp:33-39,257`).
 - [ ] **H2 Hosted edits diff whole text per edit, and misplace splices in runs of equal
   chars** (`hosted.blsp:124-130`). *Brood:* rope edits report their splice.
-- [ ] **H3 SSE subscribers never monitored; snapshot per blink tick** (`web.blsp:293-306`).
+- [x] **H3 SSE subscribers never monitored; snapshot per blink tick** (`web.blsp:293-306`). (The snapshot half was already debounced to the idle beat behind `:web-dirty`.)
 - [x] **H4 `:version-format` symbol calls any function** (`about.blsp:139`) — KEPT by design: it is a documented extension point in the user's own config, which is not a trust boundary; FIXED:
   `--attach` writes a default config (`remote.blsp:88`).
 
