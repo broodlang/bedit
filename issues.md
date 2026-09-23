@@ -30,7 +30,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   undos through broken states.
   *Brood:* atomic `replace-region`; a `with-undo-group` for multi-edit commands.
 
-- [ ] **S4 Buffers are shared by display NAME.** `src/hosted.blsp:96`,
+- [x] **S4 Buffers are shared by display NAME.** `src/hosted.blsp:96`,
   `src/frames.blsp:52`, std `editor/buffer-registry`. `/a/README.md` then `/b/README.md`
   share one process — B's edits splice into A. `C-x C-w` renames without telling the
   registry (leak; other frames keep the old name).
