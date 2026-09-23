@@ -3,7 +3,7 @@
 ;; hunk parsing and patch construction. Git subprocess actions are exercised by
 ;; hand against a real repo, not here.
 
-(defmodule git-test (:use test) (:use-internals git))
+(defmodule git-test (:use test) (:use editor/section) (:use-internals git) (:use-internals gitview) (:use-internals smerge) (:use-internals sectionbuf))
 
 (describe "git: porcelain parse (-z, NUL-separated)"
   (test "staged / unstaged / untracked classification"
@@ -26,207 +26,134 @@
   (test "a too-short token is skipped"
     (assert= (git/git-entries "\u{0}  \u{0}M  a") (list {:x "M" :y " " :path "a"}))))
 
+;; ---- the status buffer is a section tree ----------------------------------------
+;; `git-status-tree` is pure: a collection in, a tree out. `gt-render` flattens it the way
+;; the buffer does (`std/editor/section`), so these assert on the lines a reader sees and
+;; the rows the commands read.
+
+(defn gt-render (collected &optional (vis {}))
+  "The status tree for `collected`, rendered: `{:lines :rows :text}`."
+  (let (r (section-render (git/git-status-tree collected) vis))
+    (assoc r :text (string/join (:lines r) "\n"))))
+
+(defn gt-status (entries &optional (more {}))
+  "A collection with `entries` (porcelain text) on branch main, plus `more`."
+  (merge {:branch "main" :entries (git/git-entries entries) :head {}} more))
+
+(defn gt-rows-of (r type)
+  "The heading rows of `type` in rendering `r`."
+  (seq/filter (:rows r) (fn (x) (and x (:heading? x) (= (:type x) type)))))
+
 (describe "git: status render"
-  (test "sections appear with their files; rows align to file lines"
-    (let (r (git/git-render "main"
-              (git/git-entries "M  s.rb\u{0} M u.rb\u{0}?? n.rb"))
-          rows (:rows r)
-          lines (string/split (:text r) "\n"))
-      ;; header line 0, blank line 1 (label padded so the branch column aligns with Merge:)
-      (assert= (first lines) "Head:   main")
-      (is (nil? (nth rows 0)))
-      ;; each section header shows the file count; its row is {:section-header section}
-      (is (includes? (:text r) "Staged changes (1):"))
-      (is (includes? (:text r) "Unstaged changes (1):"))
-      (is (includes? (:text r) "Untracked files (1):"))
-      ;; section header rows are non-nil with :section-header set
-      (is (not (nil? (seq/find rows (fn (r) (= (:section-header r) :staged))))))
-      ;; file lines use readable labels, not raw XY codes
-      (is (includes? (:text r) "modified"))
-      (is (includes? (:text r) "untracked"))
-      ;; exactly three file rows (one per file), each carrying its path
-      (let (file-rows (seq/filter rows git/git-file-row?))
-        (assert= (count file-rows) 3)
-        (assert= (sort (map file-rows :path)) (list "n.rb" "s.rb" "u.rb")))
-      ;; the staged row is flagged staged?, the untracked row untracked?
-      (let (byp (fold rows {} (fn (a x) (if (git/git-file-row? x) (assoc a (:path x) x) a))))
-        (is (:staged? (get byp "s.rb")))
-        (is (not (:staged? (get byp "u.rb"))))
-        (is (:untracked? (get byp "n.rb"))))))
+  (test "sections appear with their counts; each file is a heading carrying its path"
+    (let (r (gt-render (gt-status "M  s.rb\u{0} M u.rb\u{0}?? n.rb")))
+      (assert= (first (:lines r)) "Head:   main")
+      (is (includes? (:lines r) "Staged changes (1)"))
+      (is (includes? (:lines r) "Unstaged changes (1)"))
+      (is (includes? (:lines r) "Untracked files (1)"))
+      (let (files (gt-rows-of r :file))
+        (assert= (sort (map files (fn (x) (:path (:value x))))) (list "n.rb" "s.rb" "u.rb"))
+        (assert= (:section (:value (seq/find files (fn (x) (= (:path (:value x)) "s.rb"))))) :staged))))
+  (test "Magit's density: a file line is its state word and the path, nothing indented"
+    (let (r (gt-render (gt-status " M src/u.rb\u{0}?? n.rb")))
+      (is (includes? (:lines r) "modified   src/u.rb"))
+      ;; an untracked file is just its path — the section says what it is
+      (is (includes? (:lines r) "n.rb"))))
+  (test "one blank line between top-level sections, and no blank line anywhere else"
+    (let (lines (:lines (gt-render (gt-status "M  s.rb\u{0} M u.rb"))))
+      (assert= lines ["Head:   main" "" "Unstaged changes (1)" "modified   u.rb" "" "Staged changes (1)" "modified   s.rb" ""])))
   (test "unstaged renders above staged; untracked renders above unstaged"
-    (let (text (get (git/git-render "main" (git/git-entries "M  s.rb\u{0} M u.rb\u{0}?? n.rb"))
-                 :text))
+    (let (text (:text (gt-render (gt-status "M  s.rb\u{0} M u.rb\u{0}?? n.rb"))))
       (is (< (index-of text "Untracked files") (index-of text "Unstaged changes")))
       (is (< (index-of text "Unstaged changes") (index-of text "Staged changes")))))
-  (test "row-section / section-lines classify rows by section and keep buffer-line indices"
-    (let (rows (get (git/git-render "main" (git/git-entries "M  s.rb\u{0} M u.rb\u{0}?? n.rb"))
-                 :rows)
-          byp (fold rows {} (fn (a x) (if (git/git-file-row? x) (assoc a (:path x) x) a))))
-      ;; section-header rows return nil from git--row-section
-      (is (nil? (git/git-row-section {:section-header :staged})))
-      ;; one file row per section, classified by row-section
-      (assert= (git/git-row-section (get byp "u.rb")) :unstaged)
-      (assert= (git/git-row-section (get byp "s.rb")) :staged)
-      (assert= (git/git-row-section (get byp "n.rb")) :untracked)
-      (is (nil? (git/git-row-section nil)))
-      ;; section-lines returns the (single) buffer line index of each section's file
-      (assert= (count (git/git-section-lines rows :unstaged)) 1)
-      (assert= (count (git/git-section-lines rows :staged)) 1)
-      (assert= (count (git/git-section-lines rows :untracked)) 1)
-      ;; order: untracked → unstaged → staged
-      (let (line-of (fn (section)
-                      (or (first (git/git-section-lines rows section)) (error "no " section " row"))))
-        (is (< (line-of :untracked) (line-of :unstaged)))
-        (is (< (line-of :unstaged) (line-of :staged)))
-        ;; the indices really point back at the right rows
-        (is (= (get (nth rows (line-of :staged)) :path) "s.rb")))))
-  (test "a clean tree renders the clean message and no rows"
-    (let (r (git/git-render "main" '()))
-      (is (includes? (:text r) "working tree clean"))
-      (is (empty? (seq/filter (:rows r) git/git-file-row?)))))
-  (test "an expanded file shows its diff inline with an actionable hunk row"
-    (let (parsed {:headers [] :hunks [{:header "@@ -1 +1 @@" :lines ["-old" "+new"]}]}
-          es (git/git-entries " M f.txt")
-          r (git/git-render "main" es (list "f.txt") {"f.txt" {:unstaged parsed}})
-          rows (:rows r))
-      (is (includes? (:text r) "    @@ -1 +1 @@")) ; indented hunk header
-      (is (includes? (:text r) "    +new")) ; indented body line
-      ;; section-header + file row + @@ hunk row are non-nil; -old/+new body lines are nil
-      (let (non-nil (seq/reject rows nil?))
-        (assert= (count non-nil) 3)
-        (is (:section-header (first non-nil))) ; first non-nil is the section header
-        (is (git/git-file-row? (second non-nil))) ; second is the file row
-        (is (:hunk? (last non-nil)))) ; last is the hunk row
-      ;; the hunk row carries :hunk? true and a :hunk-patch
-      (let (hunk-row (last (seq/reject rows nil?)))
-        (is (:hunk? hunk-row))
-        (is (not (nil? (:hunk-patch hunk-row)))))))
-  (test "a both-staged-and-unstaged file shows each section's own diff under its row"
-    (let (staged-parsed {:headers [] :hunks [{:header "@@ -1 +1 @@" :lines ["+staged-side"]}]}
-          unstaged-parsed {:headers [] :hunks [{:header "@@ -1 +1 @@" :lines ["+unstaged-side"]}]}
-          text (get (git/git-render "main"
-                      (git/git-entries "MM f.txt")
-                      (list "f.txt")
-                      {"f.txt" {:staged staged-parsed :unstaged unstaged-parsed}})
-                 :text))
-      (is (includes? text "    +unstaged-side")) ; under the unstaged row → working-tree diff
-      (is (includes? text "    +staged-side")))) ; under the staged row → --cached diff
-  (test "without expansion the diff is not shown"
-    (let (r (git/git-render "main" (git/git-entries " M f.txt")))
-      (is (not (includes? (:text r) "@@")))))
-  (test "recent commits render as a section of commit-log rows (RET shows the diff)"
-    (let (recent (list {:hash "abc1234" :subject "first"} {:hash "def5678" :subject "second"})
-          r (git/git-render "main" '() '() {} '() '() '() recent)
-          rows (:rows r))
-      (is (includes? (:text r) "Recent commits (2):"))
-      (is (includes? (:text r) "abc1234  first"))
-      ;; each commit is a commit-log row (RET → cmd-git-show-diff)
-      (let (log-rows (seq/filter rows (fn (x) (and x (:commit-log? x)))))
-        (assert= (count log-rows) 2)
-        (assert= (:hash (first log-rows)) "abc1234"))
-      ;; its section header carries :recent so navigation treats it like the others
-      (is (not (nil? (seq/find rows (fn (x) (= (:section-header x) :recent)))))))))
+  (test "a rename shows where it came from, and both halves travel with the row"
+    (let (r (gt-render (gt-status (str "R  new.txt" (string/int->char 0) "old.txt")))
+          f (:value (first (gt-rows-of r :file))))
+      (is (includes? (:lines r) "renamed    old.txt -> new.txt"))
+      (assert= (:orig-path f) "old.txt")))
+  (test "a long conflict label still leaves two spaces before the path"
+    (is (includes? (:lines (gt-render (gt-status "UD d.txt"))) "deleted by them  d.txt")))
+  (test "files start folded and say they have not been fetched"
+    (let (r (gt-render (gt-status " M f.txt"))
+          f (first (gt-rows-of r :file)))
+      (is (not (includes? (:text r) "@@")))
+      (is (:lazy? (:value f)))))
+  (test "an opened file shows its hunks, each a section with its lines under it"
+    (let (file (first (diff/parse-unified "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-old\n+new\n"))
+          r (gt-render (gt-status " M f.txt" {:diffs {:unstaged {"f.txt" file}}})
+              {[[:status nil] [:unstaged nil] [:file "f.txt"]] :show})
+          hunk (first (gt-rows-of r :hunk)))
+      (is (includes? (:lines r) "@@ -1 +1 @@"))
+      (is (includes? (:lines r) "+new"))
+      (assert= (:path (:value hunk)) "f.txt")
+      (assert= (:section (:value hunk)) :unstaged)
+      ;; a body line knows its hunk and its index in it — what line-level staging reads
+      (let (body (seq/find (:rows r) (fn (x) (and x (not (:heading? x)) (= (:type x) :hunk)))))
+        (assert= (:line body) 0))))
+  (test "a both-staged-and-unstaged file shows each list's own diff"
+    (let (staged (first (diff/parse-unified "--- a/f\n+++ b/f\n@@ -1 +1 @@\n+staged-side\n")))
+      (let (unstaged (first (diff/parse-unified "--- a/f\n+++ b/f\n@@ -1 +1 @@\n+unstaged-side\n"))
+            text (:text (gt-render (gt-status "MM f" {:diffs {:staged {"f" staged} :unstaged {"f" unstaged}}})
+                          {[[:status nil] [:staged nil] [:file "f"]] :show
+                           [[:status nil] [:unstaged nil] [:file "f"]] :show})))
+        (is (includes? text "+unstaged-side"))
+        (is (includes? text "+staged-side")))))
+  (test "recent commits are commit sections with their refs"
+    (let (r (gt-render (gt-status "" {:recent (list {:hash "abc1234" :refs "HEAD -> main" :subject "first"}
+                                                {:hash "def5678" :refs "" :subject "second"})})))
+      (is (includes? (:lines r) "Recent commits"))
+      (is (includes? (:lines r) "abc1234 (HEAD -> main) first"))
+      (is (includes? (:lines r) "def5678 second"))
+      (assert= (:hash (:value (first (gt-rows-of r :commit)))) "abc1234")))
+  (test "upstream sections name the upstream"
+    (let (r (gt-render (gt-status "" {:head {:upstream "origin/main"} :unpushed (list {:hash "aaa1111" :subject "mine"})})))
+      (is (includes? (:lines r) "Merge:  origin/main"))
+      (is (includes? (:lines r) "Unpushed to origin/main (1)"))))
+  (test "a tag behind HEAD is in the header, with the distance"
+    (is (includes? (:lines (gt-render (gt-status "" {:head {:tag {:name "v1.0" :distance 3}}}))) "Tag:    v1.0  (3)")))
+  (test "a clean tree lists no files"
+    (is (empty? (gt-rows-of (gt-render (gt-status "")) :file)))))
 
-(describe "git: hunk parsing and patch construction"
-  (test "parse-hunks: splits diff into file headers and individual hunks"
-    (let (diff "diff --git a/f.rb b/f.rb\nindex abc..def 100644\n--- a/f.rb\n+++ b/f.rb\n@@ -1,3 +1,4 @@\n context\n+addition\n context\n@@ -10,3 +11,4 @@\n more\n+another\n"
-          parsed (git/git-parse-hunks diff))
-      (assert= (count (:headers parsed)) 4) ; diff --git, index, ---, +++
-      (assert= (count (:hunks parsed)) 2)
-      (assert= (get (first (:hunks parsed)) :header) "@@ -1,3 +1,4 @@")
-      (assert= (get (second (:hunks parsed)) :header) "@@ -10,3 +11,4 @@")
-      (assert= (count (get (first (:hunks parsed)) :lines)) 3))) ; " context" "+addition" " context"
-  (test "parse-hunks: empty or nil input gives zero hunks"
-    (assert= (:hunks (git/git-parse-hunks "")) [])
-    (assert= (:hunks (git/git-parse-hunks nil)) []))
+(describe "git: faces come from what a line IS"
+  (test "a list heading: the name, then the count dim"
+    (assert= (git/git-section-faces {:type :staged :heading? true} "Staged changes (1)")
+      (list [0 14 git/git-face-section] [15 18 git/git-face-meta])))
+  (test "a file heading colours its state word"
+    (assert= (git/git-section-faces {:type :file :heading? true :value {:section :unstaged}} "modified   f")
+      (list [0 8 git/git-face-unstaged])))
+  (test "a hunk's body is coloured by its first character, context left alone"
+    (assert= (git/git-section-faces {:type :hunk :heading? false} "+new") (list [0 4 git/git-face-add]))
+    (assert= (git/git-section-faces {:type :hunk :heading? false} "-old") (list [0 4 git/git-face-del]))
+    (assert= (git/git-section-faces {:type :hunk :heading? false} " ctx") '()))
+  (test "a commit subject that starts with - is not a removed line"
+    (assert= (git/git-section-faces {:type :commit :heading? true :value {:hash "abc1234" :refs ""}} "abc1234 - fix")
+      (list [0 7 git/git-face-hash])))
+  (test "the Head: branch is local blue, Merge: remote green"
+    (assert= (git/git-section-faces {:type :branch :heading? true :value {:name "main" :local? true}} "Head:   main  subj")
+      (list [0 5 git/git-face-meta] [8 12 git/git-face-branch-local]))
+    (assert= (map (git/git-section-faces {:type :branch :heading? true :value {:name "origin/main"}} "Merge:  origin/main")
+               (fn (s) (nth s 2)))
+      (list git/git-face-meta git/git-face-branch-remote)))
+  (test "the raw-text diff fontify (for `!` output) still colours by the text"
+    (let (spans (git/git-diff-fontify "@@ -1 +1 @@\n-old\n+new\n ctx"))
+      (assert= (map spans (fn (s) (nth s 2))) (list git/git-face-hunk git/git-face-del git/git-face-add)))))
 
-  (test "parse-hunks: a diff with no file headers (e.g. --no-index) is still valid"
-    (let (diff "@@ -0,0 +1 @@\n+new file\n"
-          parsed (git/git-parse-hunks diff))
-      (assert= (count (:headers parsed)) 0)
-      (assert= (count (:hunks parsed)) 1)
-      (assert= (get (first (:hunks parsed)) :header) "@@ -0,0 +1 @@")))
-
-  (test "hunk-patch: produces a patch containing the file headers and just the one hunk"
-    (let (parsed {:headers ["diff --git a/f b/f" "--- a/f" "+++ b/f"]
-                  :hunks [{:header "@@ -1,1 +1,2 @@" :lines [" ctx" "+new"]}
-                           {:header "@@ -5,1 +6,2 @@" :lines [" ctx2" "+new2"]}]}
-          patch (git/git-hunk-patch parsed (first (:hunks parsed))))
-      (is (includes? patch "diff --git a/f b/f"))
-      (is (includes? patch "@@ -1,1 +1,2 @@"))
-      (is (includes? patch "+new"))
-      (is (not (includes? patch "@@ -5,1 +6,2 @@"))) ; second hunk excluded
-      (is (not (includes? patch "+new2")))
-      (is (string/ends-with? patch "\n"))))) ; git apply rejects a patch with no trailing newline
 (describe "git: log parsing"
-  (test "parse-log-oneline: splits each row into hash + subject; blank input gives ()"
-    (let (cs (git/git-parse-log-oneline "abc1234 a message\ndef5678 another one\n"))
-      (assert= (count cs) 2)
-      (assert= (first cs) {:hash "abc1234" :subject "a message"})
-      (assert= (:subject (second cs)) "another one"))
-    (assert= (git/git-parse-log-oneline "") '())
-    (assert= (git/git-parse-log-oneline nil) '()))
-
-  (test "log-line-hash: the leading hash, or nil for a line that doesn't start with one"
-    (assert= (git/git-log-line-hash "abc1234 a message") "abc1234")
-    (is (nil? (git/git-log-line-hash "")))
-    (is (nil? (git/git-log-line-hash "no-space-at-all")))
-    (is (nil? (git/git-log-line-hash " leading space"))))) ; index 0 → not a hash
-(describe "git: the pure row/section helpers behind navigation"
-  (test "sections-of: a file staged AND unstaged appears in both, so its diff shows twice"
-    (let (es (git/git-entries "MM both.rb\u{0}M  staged.rb\u{0} M unstaged.rb\u{0}?? new.rb")
-          by (fn (p) (git/git-sections-of (seq/find es (fn (e) (= (:path e) p))))))
-      (assert= (by "both.rb") (list :staged :unstaged))
-      (assert= (by "staged.rb") (list :staged))
-      (assert= (by "unstaged.rb") (list :unstaged))
-      (assert= (by "new.rb") (list :untracked))))
-
-  (test "scan-rows: steps over nil (blank / diff-body) rows and clamps at both ends"
-    ;; 0:row 1:nil 2:row 3:nil 4:row — 1-based lines come back out
-    (let (rows [{:path "a"} nil {:path "b"} nil {:path "c"}])
-      (assert= (git/git-scan-rows rows 0 1 1) 3) ; 0 → skips 1 → lands 2 (line 3)
-      (assert= (git/git-scan-rows rows 0 1 2) 5) ; two steps → row 4 (line 5)
-      (assert= (git/git-scan-rows rows 4 -1 1) 3) ; backwards, same skipping
-      (assert= (git/git-scan-rows rows 4 1 1) 5) ; at the end → clamped, stays put
-      (assert= (git/git-scan-rows rows 0 -1 1) 1) ; at the start → clamped
-      (assert= (git/git-scan-rows rows 2 1 9) 5))) ; more steps than rows → last row
+  (test "parse-log: hash, refs, subject, author and age, NUL-separated"
+    (let (z (string/int->char 0)
+          cs (git/git-parse-log (str "abc1234" z "HEAD -> main" z "a - message" z "Ann" z "2 days ago\n")))
+      (assert= (first cs) {:hash "abc1234" :graph "" :refs "HEAD -> main" :subject "a - message" :author "Ann" :date "2 days ago"})))
+  (test "a --graph log keeps the drawing, and a graph-only line has no hash"
+    (let (z (string/int->char 0)
+          cs (git/git-parse-log (str "* abc1234" z "" z "s" z "A" z "now\n|\\\n")))
+      (assert= (:graph (first cs)) "* ")
+      (assert= (:hash (first cs)) "abc1234")
+      (is (nil? (:hash (second cs))))))
   (test "commit-message: comment lines are dropped and the rest trimmed"
     (assert= (git/git-commit-message "feat: a thing\n\nbody line\n# a comment\n#another\n")
       "feat: a thing\n\nbody line")
     (assert= (git/git-commit-message "  # indented comments count too\nreal\n") "real")
     (assert= (git/git-commit-message "# only comments\n") "")))
-
-(describe "git: syntax highlighting (fontify)"
-  (test "diff fontify colours @@ / - / + lines and leaves context uncoloured"
-    (let (spans (git/git-diff-fontify "@@ -1 +1 @@\n-old\n+new\n ctx"))
-      (assert= (count spans) 3) ; context line gets no span
-      (assert= (map spans (fn (s) (nth s 2)))
-        (list git/git-face-hunk git/git-face-del git/git-face-add))
-      (assert= (first spans) [0 11 git/git-face-hunk]))) ; whole-line span at the right offset
-  (test "+++/--- file headers are file-coloured, not add/del"
-    (assert= (map (git/git-diff-fontify "+++ b/f\n--- a/f") (fn (s) (nth s 2)))
-      (list git/git-face-file git/git-face-file)))
-  (test "status fontify: header (label+branch), section name + dim count, coloured label, diff"
-    ;; "Head: main"        → "Head:" meta (dim) + "main" local-branch (blue)
-    ;; "Staged changes (1):" → name section face + "(1):" dim meta count
-    ;; "  modified   f"     → the "modified" label in the unstaged (yellow) face
-    ;; "    +x"             → the added-line diff colour
-    (assert= (map (git/git-status-fontify "Head: main\n\nStaged changes (1):\n  modified   f\n    +x")
-               (fn (s) (nth s 2)))
-      (list git/git-face-meta
-        git/git-face-branch-local git/git-face-section git/git-face-meta git/git-face-unstaged
-        git/git-face-add)))
-  (test "status fontify: a Merge: header line colours the upstream green (remote branch)"
-    (assert= (map (git/git-status-fontify "Merge:  origin/main updated widgets") (fn (s) (nth s 2)))
-      (list git/git-face-meta git/git-face-branch-remote)))
-  (test "status fontify: a commit row colours its leading short hash"
-    ;; a 2-space row whose first field isn't a status label is a commit row → hash coloured
-    (assert= (map (git/git-status-fontify "  abc1234  a subject") (fn (s) (nth s 2)))
-      (list git/git-face-hash)))
-  (test "log fontify colours just the leading commit hash"
-    (let (spans (git/git-log-fontify "abc1234 a message\ndef5678 another"))
-      (assert= (count spans) 2)
-      (assert= (first spans) [0 7 git/git-face-hash]))))
 
 (describe "git: status-bar segments (branch + working-tree indicator)"
   (def CLEAN
@@ -680,40 +607,33 @@ only the profile keymaps are harvested for M-x"
   (test "an ordinary staged+unstaged file is NOT a conflict"
     (is (not (git/git-conflicted? (first (git/git-entries "MM f.txt"))))))
   (test "a conflicted file appears in Unmerged paths and nowhere else"
-    (let (r (git/git-render "main" (git/git-entries "UU c.txt\u{0}M  s.txt"))
-          text (:text r))
-      (is (includes? text "Unmerged paths (1):"))
-      (is (includes? text "Staged changes (1):"))
+    (let (text (:text (gt-render (gt-status "UU c.txt\u{0}M  s.txt"))))
+      (is (includes? text "Unmerged paths (1)"))
+      (is (includes? text "Staged changes (1)"))
       ;; the conflicted path must not ALSO be listed under staged/unstaged — before this it
       ;; was in both, and `s` on it staged a file full of <<<<<<< markers
       (assert= (count (seq/filter (string/split text "\n") (fn (l) (includes? l "c.txt")))) 1)))
   (test "the section comes first — you cannot get on without dealing with it"
-    (let (lines (string/split (:text (git/git-render "main" (git/git-entries "UU c.txt\u{0}?? n.txt"))) "\n")
-          unmerged (index-of (map lines (fn (l) (includes? l "Unmerged paths"))) true)
-          untracked (index-of (map lines (fn (l) (includes? l "Untracked files"))) true))
-      (is (< unmerged untracked))))
+    (let (text (:text (gt-render (gt-status "UU c.txt\u{0}?? n.txt"))))
+      (is (< (index-of text "Unmerged paths") (index-of text "Untracked files")))))
   (test "the label says HOW it conflicted, which is what decides the resolution"
-    (let (text (:text (git/git-render "main" (git/git-entries "UU b.txt\u{0}UD d.txt"))))
+    (let (text (:text (gt-render (gt-status "UU b.txt\u{0}UD d.txt"))))
       (is (includes? text "both modified"))
       (is (includes? text "deleted by them"))))
-  (test "its row is marked unmerged, so o / T know what they are on"
-    (let (r (git/git-render "main" (git/git-entries "UU c.txt"))
-          row (seq/find (:rows r) (fn (x) (and x (:path x)))))
-      (is (:unmerged? row)))))
+  (test "its file is in the unmerged list, so k knows to offer ours / theirs"
+    (let (f (first (gt-rows-of (gt-render (gt-status "UU c.txt")) :file)))
+      (assert= (:section (:value f)) :unmerged))))
 
 (describe "git: the status buffer says what is in progress"
   (test "nothing in progress adds no line"
-    (is (not (includes? (:text (git/git-render "main" '())) "in progress"))))
+    (is (not (includes? (:text (gt-render (gt-status ""))) "in progress"))))
   (test "a rebase in progress is announced ABOVE Head:"
-    (let (lines (string/split (:text (git/git-render "main" '() '() {} '() '() '() '()
-                                       {:sequencer {:kind :rebase :verb "rebase"}}))
-                  "\n"))
+    (let (lines (:lines (gt-render (gt-status "" {:head {:sequencer {:kind :rebase :verb "rebase"}}}))))
       (is (includes? (first lines) "rebase"))
       (is (includes? (first lines) "in progress"))
-      (is (includes? (nth lines 2) "Head:"))))
+      (is (string/starts-with? (nth lines 1) "Head:"))))
   (test "…and it names the keys that get you out"
-    (let (text (:text (git/git-render "main" '() '() {} '() '() '() '()
-                        {:sequencer {:kind :merge :verb "merge"}})))
+    (let (text (:text (gt-render (gt-status "" {:head {:sequencer {:kind :merge :verb "merge"}}}))))
       (is (includes? text "continue"))
       (is (includes? text "abort")))))
 
@@ -729,13 +649,14 @@ only the profile keymaps are harvested for M-x"
           (is (includes? (:subject (first stashes)) "wip thing"))))))
   (test "a repo with no stashes has none, rather than one blank row"
     (assert= (git/git-stashes (gt-repo "no-stash")) '()))
-  (test "they render as their own section"
-    (let (text (:text (git/git-render "main" '() '() {} '() '() '() '() {}
-                        (list {:hash "stash@{0}" :subject "wip"}))))
-      (is (includes? text "Stashes (1):"))
+  (test "they render as their own section, each stash acting on its ref"
+    (let (r (gt-render (gt-status "" {:stashes (list {:hash "stash@{0}" :subject "wip"})}))
+          text (:text r))
+      (assert= (:ref (:value (first (gt-rows-of r :stash)))) "stash@{0}")
+      (is (includes? text "Stashes (1)"))
       (is (includes? text "wip"))))
   (test "no section at all when there are none"
-    (is (not (includes? (:text (git/git-render "main" '())) "Stashes")))))
+    (is (not (includes? (:text (gt-render (gt-status ""))) "Stashes")))))
 
 ;; ---- interactive rebase: the plan, and that git actually follows it ---------
 ;; The claim this rests on is unusual enough to be worth proving with a real repo: that
@@ -858,7 +779,7 @@ only the profile keymaps are harvested for M-x"
 (describe "git: hunks, renames, the unborn branch"
   (test "a context line that starts with @@ after its indent does not start a hunk"
     (let (diff "diff --git a/c.rb b/c.rb\n--- a/c.rb\n+++ b/c.rb\n@@ -1,3 +1,3 @@\n class C\n-  x = 1\n+  x = 2\n   @@count = 0\n"
-          parsed (git/git-parse-hunks diff))
+          parsed (first (diff/parse-unified diff)))
       (assert= (count (:hunks parsed)) 1)))
   (test "a rename keeps its source path"
     (let (es (git/git-entries (str "R  new.txt" (string/int->char 0) "old.txt" (string/int->char 0))))

@@ -1,0 +1,110 @@
+(defmodule smerge
+  "Resolving a merge conflict IN the file (Emacs's `smerge-mode`, which Magit hands you to).
+
+A conflicted file holds each conflict as a block of markers —
+
+    <<<<<<< HEAD
+    what was here (upper)
+    ||||||| base            (only with merge.conflictStyle=diff3 / zdiff3)
+    what both started from
+    =======
+    what came in (lower)
+    >>>>>>> feature
+
+— and resolving one is choosing: keep the upper side, the lower, both, or the base. That is
+a small edit done a hundred times in a bad afternoon, so it gets keys, `C-c ^` then:
+`n` / `p` next and previous conflict, `u` keep upper, `l` keep lower, `a` keep all, `b` keep
+base. From *git-status*, `e` on a conflicted file opens it at its first conflict. When no
+conflict is left, stage the file (`s` in the status buffer, `C-c g s` here) to mark it
+resolved.
+
+The parse is pure (`smerge-conflicts`): the text in, the conflicts' offsets out."
+  (:use model) ; ed-current-buf / ed-apply / ed-edit / message
+  (:use interactive) ; defcommand
+  (:use editor/buffer)) ; buffer-text / buffer-point / goto-char / replace-region
+
+(defn- smerge-line-kind (line)
+  "What marker line `line` is — `:upper` `:base` `:sep` `:lower` — or nil."
+  (cond
+    (string/starts-with? line "<<<<<<<") :upper
+    (string/starts-with? line "|||||||") :base
+    (string/starts-with? line "=======") :sep
+    (string/starts-with? line ">>>>>>>") :lower
+    :else nil))
+
+(defn smerge-conflicts (text)
+  "Every conflict in `text`, top to bottom: `{:start :end :upper :base :lower}` — `:start` and
+`:end` the char offsets of the whole block (markers included, the last line's newline too)
+and the three sides as strings (`:base` nil without a diff3 base). A block whose markers do
+not close is not a conflict."
+  (let (lines (string/split text "\n")
+        n (count lines))
+    (letrec (go (fn (i off st acc)
+                  (if (>= i n)
+                    (reverse acc)
+                    (let (line (nth lines i)
+                          next-off (+ off (string/length line) 1)
+                          kind (smerge-line-kind line))
+                      (cond
+                        (= kind :upper) (go (inc i) next-off {:start off :part :upper :upper '() :base nil :lower '()} acc)
+                        (nil? st) (go (inc i) next-off nil acc)
+                        (= kind :base) (go (inc i) next-off (assoc st :part :base :base '()) acc)
+                        (= kind :sep) (go (inc i) next-off (assoc st :part :lower) acc)
+                        (= kind :lower)
+                          (go (inc i)
+                            next-off
+                            nil
+                            (cons {:start (:start st)
+                                   :end (math/min next-off (string/length text))
+                                   :upper (string/join (reverse (:upper st)) "\n")
+                                   :base (if (nil? (:base st)) nil (string/join (reverse (:base st)) "\n"))
+                                   :lower (string/join (reverse (:lower st)) "\n")}
+                              acc))
+                        :else (go (inc i) next-off (assoc st (:part st) (cons line (get st (:part st)))) acc))))))
+      (go 0 0 nil '()))))
+(sig smerge-conflicts (string -> list))
+
+(defn- smerge-at (m)
+  "The conflict point is in, or nil."
+  (let (b (ed-current-buf m)
+        p (buffer-point b))
+    (seq/find (smerge-conflicts (buffer-text b)) (fn (c) (and (>= p (:start c)) (< p (:end c)))))))
+
+(defn- smerge-goto (m pick what)
+  "Move point to the conflict `pick` chooses from `(point conflicts)`."
+  (let (b (ed-current-buf m)
+        c (pick (buffer-point b) (smerge-conflicts (buffer-text b))))
+    (if (nil? c) (message m (str "no " what " conflict")) (ed-apply m (fn (bb) (goto-char bb (:start c)))))))
+
+(defcommand cmd-smerge-next
+  (m key)
+  "The next conflict (C-c ^ n)."
+  (smerge-goto m (fn (p cs) (seq/find cs (fn (c) (> (:start c) p)))) "next"))
+
+(defcommand cmd-smerge-prev
+  (m key)
+  "The previous conflict (C-c ^ p)."
+  (smerge-goto m (fn (p cs) (last (seq/filter cs (fn (c) (< (:start c) p))))) "previous"))
+
+(defn- smerge-keep (m choose label)
+  "Replace the conflict at point with `(choose conflict)`."
+  (let (c (smerge-at m))
+    (if (nil? c)
+      (message m "not in a conflict")
+      (let (kept (choose c)
+            text (if (= kept "") "" (str kept "\n")))
+        (message (ed-edit m (fn (b) (goto-char (replace-region b (:start c) (:end c) text) (:start c))))
+          (str "kept " label))))))
+
+(defcommand cmd-smerge-keep-upper (m key) "Keep the upper side — what was here (C-c ^ u)." (smerge-keep m :upper "upper"))
+(defcommand cmd-smerge-keep-lower (m key) "Keep the lower side — what came in (C-c ^ l)." (smerge-keep m :lower "lower"))
+(defcommand cmd-smerge-keep-all
+  (m key)
+  "Keep both sides, upper then lower (C-c ^ a)."
+  (smerge-keep m (fn (c) (string/join (seq/reject [(:upper c) (:lower c)] (fn (s) (= s ""))) "\n")) "both"))
+(defcommand cmd-smerge-keep-base
+  (m key)
+  "Keep the base both sides started from (C-c ^ b) — needs a diff3-style conflict."
+  (if (nil? (:base (or (smerge-at m) {})))
+    (message m "this conflict has no base (set merge.conflictStyle=diff3)")
+    (smerge-keep m :base "base")))

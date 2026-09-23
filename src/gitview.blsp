@@ -1,0 +1,686 @@
+(defmodule gitview
+  "The git buffers that SHOW something — a commit, a diff, a log, blame, the refs, a file as
+it was — each a section buffer (`sectionbuf`), so they fold and walk the way *git-status*
+does and every one of them can be acted on, not just read.
+
+Magit's point, and what these were missing: a log is a list of COMMITS, not lines of text,
+so RET shows one, `A` cherry-picks the one under point and `r i` rebases from it; a commit
+is a list of FILES and HUNKS, so RET on a `+` line goes to the line it became, `a` applies
+the hunk to your work tree and `v` reverses it; a diff of your unstaged work can be staged
+from where you are reading it. Before, each was `git … | buffer`, and the only thing you
+could do with one was read it.
+
+Every view keeps what it needs to rebuild itself on its buffer (`:section-ctx`: the repo,
+the revision, the arguments, and a `:reload`), so `g` re-runs it and a stage from inside it
+refreshes it."
+  (:use model) ; ed-current-buf / ed-buf-at / ed-set-buf-at / message / ed-apply
+  (:use commands) ; ed-display-buffer / ed-pop-to-file / ed-name-prompt / ed-goto-line
+  (:use interactive) ; defcommand
+  (:use transient) ; ed-transient-args — a view opened from a menu takes its flags
+  (:use editor/buffer) ; buffer-file / buffer-current-line / buffer-name / make-buffer
+  (:use editor/section) ; section — the trees
+  (:use git)) ; git-git / git-run / git-resolve-root / the shared section helpers
+
+;; ---- diffs as sections ----------------------------------------------------------
+
+(defn- gv-file-label (file)
+  "What happened to a file in a diff, from its header lines — Magit's words."
+  (let (h (:headers file []))
+    (cond
+      (any? h (fn (l) (string/starts-with? l "new file mode"))) "new file"
+      (any? h (fn (l) (string/starts-with? l "deleted file mode"))) "deleted"
+      (any? h (fn (l) (string/starts-with? l "rename from"))) "renamed"
+      (any? h (fn (l) (string/starts-with? l "copy from"))) "copied"
+      (any? h (fn (l) (string/starts-with? l "old mode"))) "mode"
+      :else "modified")))
+
+(defn gv-file-sections (files lst)
+  "The file sections of a parsed diff (`diff/parse-unified`), open by default — a commit is
+read file by file. `lst` is the working-tree list the diff is OF (`:unstaged`, `:staged`)
+or nil for a diff of history, which is what lets `s` / `u` / `k` act on it the way they
+act on the same hunk in *git-status*."
+  (into []
+    (map files
+      (fn (f)
+        (let (path (or (:new-path f) (:old-path f) "?")
+              orig (if (and (:old-path f) (:new-path f) (not (= (:old-path f) (:new-path f)))) (:old-path f) nil)
+              label (gv-file-label f)
+              shown (if orig (str orig " -> " path) path)
+              binary (seq/filter (:headers f []) (fn (l) (string/starts-with? l "Binary files"))))
+          (section :file
+            {:path path :orig-path orig :section lst :x (if (= label "new file") "A" "M")}
+            (str label (string/pad-right "" (math/max 2 (- 11 (string/length label)))) shown)
+            (if (empty? (:hunks f)) binary (git-hunk-sections path lst f))
+            {:key path}))))))
+
+(defn- gv-empty (text)
+  "A one-line note section, for a view with nothing in it."
+  (section :note nil text))
+
+;; ---- a commit: *git-revision* ----------------------------------------------------
+
+(def- gv-show-format
+  ;; What sits above the diff: the full hash, who, when, the refs pointing at it, then the
+  ;; raw message. `%B` is the message as written, so its first line is the summary.
+  "--format=commit %H%nAuthor: %an <%ae>%nDate:   %ad%nRefs:   %D%n%n%B%n")
+
+(defn gv-parse-show (stdout)
+  "Split `git show` output into `{:meta :message :files}`: the header lines, the message
+lines, and the diff parsed by `diff/parse-unified` (which skips everything above the first
+file)."
+  (let (lines (string/split (or stdout "") "\n")
+        head (take-while lines (fn (l) (not (string/starts-with? l "diff "))))
+        meta (take-while head (fn (l) (not (= l ""))))
+        message (drop head (inc (count meta))))
+    {:meta (seq/reject meta (fn (l) (= l "Refs:   ")))
+     :message (reverse (drop-while (reverse message) string/blank?))
+     :files (diff/parse-unified stdout)}))
+
+(defn gv-revision-tree (rev shown)
+  "The *git-revision* tree for a parsed `git show` (`gv-parse-show`): the header, the
+message with its summary as the heading, then the files."
+  (let (msg (:message shown))
+    (section :revision
+      rev
+      nil
+      (into [(section :meta nil nil (into [] (:meta shown)) {:separator true})
+             (section :message
+               rev
+               (if (empty? msg) "(no message)" (first msg))
+               (into [] (rest msg))
+               {:separator true})]
+        (let (fs (gv-file-sections (:files shown) nil))
+          (if (empty? fs) [(gv-empty "(no changes)")] fs))))))
+
+(defn git-show-revision (m root rev &optional (action :pop))
+  "Show commit `rev` of `root` in *git-revision* — its message, then every file and hunk as
+sections. A stash is a commit too; `--diff-merges=first-parent` shows it (and any merge) as
+the change it made, rather than as a combined diff nobody can read."
+  (cond
+    (nil? root) (message m "not in a git repository")
+    (or (nil? rev) (= rev "")) (message m "no commit here")
+    :else
+      (let (r (git-git root ["show" "--no-color" "--no-ext-diff" "--diff-merges=first-parent" gv-show-format rev]))
+        (if (not (= (:exit r) 0))
+          (git-report-cmd m (str "git show " rev) r)
+          (sectionbuf/sb-show (assoc m :git-root root)
+            "*git-revision*"
+            (gv-revision-tree rev (gv-parse-show (:stdout r "")))
+            :git-revision
+            {:action action :ctx {:root root :rev rev :reload 'gitview/git-revision-reload} :line 1 :vis {}})))))
+
+(defn git-revision-reload (m)
+  "*git-revision*'s `:reload`: show the same commit again."
+  (let (c (sectionbuf/sb-ctx m)) (git-show-revision m (:root c) (:rev c) :here)))
+
+(defcommand cmd-git-show-commit
+  (m key)
+  "Show a commit (d c) — the one at point, or one you pick."
+  (git-pick-commit m "Show commit: " (fn (mm c) (git-show-revision mm (git-resolve-root mm) c))))
+
+;; ---- a diff: *git-diff* ---------------------------------------------------------
+
+(defn gv-diff-tree (stdout lst title)
+  "The *git-diff* tree for `git diff` output: a title line, then the files."
+  (let (fs (gv-file-sections (diff/parse-unified stdout) lst))
+    (section :diff
+      nil
+      nil
+      (into [(section :meta nil nil [title] {:separator true})] (if (empty? fs) [(gv-empty "(no changes)")] fs)))))
+
+(defn git-show-diff (m root args lst &optional (action :pop))
+  "Show `git diff args` of `root` in *git-diff*, as files and hunks. `lst` names the
+working-tree list it is a diff OF (`:unstaged` / `:staged`, nil for history), so `s` /
+`u` / `k` work on it as they do in *git-status*. `+` / `-` widen and narrow the context."
+  (if (nil? root)
+    (message m "not in a git repository")
+    (let (full (append ["diff" "--no-color" "--no-ext-diff"] args)
+          r (git-git root full))
+      (if (>= (:exit r) 2)
+        (git-report-cmd m "git diff" r)
+        (sectionbuf/sb-show (assoc m :git-root root)
+          "*git-diff*"
+          (gv-diff-tree (:stdout r "") lst (string/join (into ["git"] full) " "))
+          :git-diff
+          {:action action :ctx {:root root :args args :section lst :reload 'gitview/git-diff-reload} :line 1})))))
+
+(defn git-diff-reload (m)
+  "*git-diff*'s `:reload`: the same diff again, point kept."
+  (let (c (sectionbuf/sb-ctx m))
+    (sectionbuf/sb-show m
+      "*git-diff*"
+      (let (r (git-git (:root c) (append ["diff" "--no-color" "--no-ext-diff"] (:args c))))
+        (gv-diff-tree (:stdout r "") (:section c) (string/join (append ["git" "diff"] (:args c)) " ")))
+      :git-diff
+      {:action :here})))
+
+(defn- gv-diff-args (m extra)
+  "The diff menu's flags, then `extra`."
+  (append (transient/ed-transient-args m) extra))
+
+(defcommand cmd-git-diff-unstaged
+  (m key)
+  "Everything not yet staged (d u) — stage from here with `s`."
+  (git-show-diff m (git-resolve-root m) (gv-diff-args m []) :unstaged))
+
+(defcommand cmd-git-diff-staged
+  (m key)
+  "Everything staged, against HEAD (d s) — unstage from here with `u`."
+  (git-show-diff m (git-resolve-root m) (gv-diff-args m ["--cached"]) :staged))
+
+(defcommand cmd-git-diff-worktree
+  (m key)
+  "The work tree against HEAD, staged or not (d w)."
+  (git-show-diff m (git-resolve-root m) (gv-diff-args m ["HEAD"]) nil))
+
+(defcommand cmd-git-diff-range
+  (m key)
+  "A diff between two revisions (d r): `main..feature`, `HEAD~3`, `v1.0...HEAD`."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let (args (transient/ed-transient-args m))
+        (assoc m
+          :minibuffer
+            (commands/ed-name-prompt "Diff range: "
+              (git-refs root :branches)
+              (fn (mm range)
+                (if (string/blank? range)
+                  (message mm "no range")
+                  (git-show-diff mm root (append args [(string/trim range)]) nil)))))))))
+
+(defcommand cmd-git-diff
+  (m key)
+  "The diff of what is at point (d d): a file or hunk in its list, a list's heading its
+whole list, a commit its change; elsewhere, everything unstaged."
+  (let (root (git-resolve-root m)
+        row (git-row-at m)
+        f (git-file-at m)
+        commit (git-commit-at-point m)
+        args (transient/ed-transient-args m))
+    (cond
+      (nil? root) (message m "not in a git repository")
+      (and row (= (:type row) :staged)) (git-show-diff m root (append args ["--cached"]) :staged)
+      (and row (= (:type row) :unstaged)) (git-show-diff m root args :unstaged)
+      (and f (= (:section f) :staged)) (git-show-diff m root (append args ["--cached" "--" (:path f)]) :staged)
+      (and f (= (:section f) :unstaged)) (git-show-diff m root (append args ["--" (:path f)]) :unstaged)
+      (and f (= (:section f) :untracked)) (git-show-diff m root ["--no-index" "--" "/dev/null" (:path f)] :untracked)
+      (not (nil? commit)) (git-show-revision m root commit)
+      :else (git-show-diff m root args :unstaged))))
+
+(defcommand cmd-vc-diff
+  (m key)
+  "This file's changes against HEAD, in *git-diff* beside it (C-x v =)."
+  (let (file (buffer-file (ed-current-buf m))
+        root (git-resolve-root m))
+    (cond
+      (nil? file) (message m "no file to diff")
+      (nil? root) (message m "not in a git repository")
+      :else (git-show-diff m root ["HEAD" "--" file] nil))))
+
+(defn- gv-context (m delta)
+  "Widen or narrow the current diff's context by `delta` lines and show it again."
+  (let (c (sectionbuf/sb-ctx m)
+        given (seq/find (:args c []) (fn (a) (string/starts-with? a "--unified=")))
+        parsed (if (nil? given) nil (string/->number (string/substring given 10 (string/length given))))
+        now (if (int? parsed) parsed 3)
+        next (math/max 0 (+ now delta))
+        args (seq/reject (:args c []) (fn (a) (string/starts-with? a "--unified=")))
+        args2 (into [(str "--unified=" next)] args))
+    (if (or (nil? c) (nil? (:reload c)) (not (= (buffer-name (ed-current-buf m)) "*git-diff*")))
+      (message m "not in a diff")
+      (message (git-show-diff m (:root c) args2 (:section c) :here)
+        (str next " lines of context")))))
+
+(defcommand cmd-git-diff-more-context (m key) "Show more context around each hunk (+)." (gv-context m 1))
+(defcommand cmd-git-diff-less-context (m key) "Show less context around each hunk (-)." (gv-context m -1))
+
+;; ---- applying a change from history: `a` and `v` --------------------------------
+
+(defn- gv-patch-at (m reverse?)
+  "The patch at point as `[label patch]`: the region's lines within one hunk, or the hunk."
+  (let (hunk (git-hunk-at m)
+        rows (sectionbuf/sb-region-rows m)
+        lines (if (nil? rows) '() (seq/reject (map (seq/filter rows (fn (r) (and r (= (:type r) :hunk)))) :line) nil?)))
+    (cond
+      (nil? hunk) nil
+      (not (empty? lines))
+        (let (lo (reduce lines math/min)
+              hi (reduce lines math/max)
+              cut (if (and (int? lo) (int? hi)) (diff/hunk-select (:hunk hunk) lo (inc hi) reverse?) nil))
+          (if (nil? cut) nil ["lines" (diff/hunk-patch (:file hunk) cut)]))
+      :else ["hunk" (diff/hunk-patch (:file hunk) (:hunk hunk))])))
+
+(defcommand cmd-git-apply
+  (m key)
+  "Apply what is at point to the work tree (a): a hunk or the region's lines of one — from
+a commit, a stash, any diff — or a stash's whole change, or a commit's (without
+committing it)."
+  (let (row (git-row-at m)
+        p (gv-patch-at m false))
+    (cond
+      (not (nil? p)) (git-do-hunk (ed-apply m clear-mark) (str "apply " (first p)) (second p) false false)
+      (and row (= (:type row) :stash)) (git-act m "stash apply" ["stash" "apply" (:ref (:value row))])
+      (not (nil? (git-commit-at-point m)))
+        (git-act m "cherry-pick --no-commit" ["cherry-pick" "--no-commit" (git-commit-at-point m)])
+      :else (message m "nothing to apply here"))))
+
+(defcommand cmd-git-reverse
+  (m key)
+  "Reverse what is at point in the work tree (v): a hunk or the region's lines, or a
+commit's whole change (a revert, not committed)."
+  (let (p (gv-patch-at m true))
+    (cond
+      (not (nil? p))
+        (git-confirm m (str "Reverse this " (first p) " in the work tree?")
+          (fn (mm) (git-do-hunk (ed-apply mm clear-mark) (str "reverse " (first p)) (second p) false true)))
+      (not (nil? (git-commit-at-point m)))
+        (git-act m "revert --no-commit" ["revert" "--no-commit" (git-commit-at-point m)])
+      :else (message m "nothing to reverse here"))))
+
+;; ---- a log: *git-log* --------------------------------------------------------------
+
+(def *git-log-limit* 256)
+;; How many commits a log shows before `+` asks for more. Magit's default is 256 too: enough
+;; to be the history you are asking about, few enough to render in a blink.
+
+(defn- gv-margin (c)
+  "The right-hand margin of a log line: who and when (Magit's margin)."
+  (let (author (str (:author c "")))
+    (str (if (> (string/length author) 18) (str (string/substring author 0 17) "…") author) " " (:date c ""))))
+
+(defn gv-log-tree (commits width)
+  "The *git-log* tree: a commit section per commit, its graph (when drawn), hash, refs and
+subject on the left and author and age right-aligned to `width`; a line of graph with no
+commit on it is a plain line."
+  (section :log
+    nil
+    nil
+    (into []
+      (map commits
+        (fn (c)
+          (if (nil? (:hash c))
+            (:graph c "")
+            (let (left (str (:graph c "") (:hash c) " " (if (= (:refs c "") "") "" (str "(" (:refs c) ") ")) (:subject c ""))
+                  margin (gv-margin c)
+                  room (- width (string/length left) (string/length margin))
+                  gap (if (and (int? room) (> room 2)) room 2)
+                  heading (str left (string/pad-right "" gap) margin))
+              (section :commit (assoc c :margin-at (- (string/length heading) (string/length margin))) heading [] {:key (:hash c)}))))))))
+
+(defn- gv-log-width (m action)
+  "The width a log's margin is right-aligned to: the pane it will land in. A log opened
+beside the current buffer gets half the window (the split it makes, or the other half of
+the one there is); one that replaces the current pane of an unsplit window gets all of it."
+  (let (cols (let (c (:view-cols m)) (if (int? c) c 100))
+        whole? (and (= action :here) (= 1 (editor/pane/pane-count (:layout m)))))
+    (math/max 50 (- (if whole? cols (math/quot cols 2)) 6))))
+
+(defn git-show-log (m root args title &optional (limit nil) (action :pop))
+  "Show `git log args` of `root` as *git-log* — up to `limit` commits (`*git-log-limit*`),
+graph drawn when the args ask for it."
+  (if (nil? root)
+    (message m "not in a git repository")
+    (let (n (or limit *git-log-limit*)
+          limited? (any? args (fn (a) (or (string/starts-with? a "-n") (string/starts-with? a "--max-count"))))
+          full (append ["log" "--no-color" git-log-format "--decorate=short"] (if limited? [] [(str "-n" n)]) args)
+          r (git-git root full))
+      (if (not (= (:exit r) 0))
+        (git-report-cmd m title r)
+        (sectionbuf/sb-show (assoc m :git-root root)
+          "*git-log*"
+          (gv-log-tree (git-parse-log (:stdout r "")) (gv-log-width m action))
+          :git-log
+          {:action action :line 1 :vis {} :ctx {:root root :args args :title title :limit n :reload 'gitview/git-log-reload}})))))
+
+(defn git-log-reload (m)
+  "*git-log*'s `:reload`: the same log again."
+  (let (c (sectionbuf/sb-ctx m)) (git-show-log m (:root c) (:args c) (:title c) (:limit c) :here)))
+
+(defcommand cmd-git-log
+  (m key)
+  "The log of the current branch (l l), with the log menu's arguments."
+  (git-show-log m (git-resolve-root m) (transient/ed-transient-args m) "git log"))
+
+(defcommand cmd-git-log-other
+  (m key)
+  "The log of a branch or revision you pick (l o)."
+  (let (args (transient/ed-transient-args m))
+    (git-with-ref m "Log of: " :branches (fn (mm ref) (git-show-log mm (git-resolve-root mm) (append args [ref]) (str "git log " ref))))))
+
+(defcommand cmd-git-log-local
+  (m key)
+  "The log of every local branch (l L)."
+  (git-show-log m (git-resolve-root m) (append (transient/ed-transient-args m) ["--branches"]) "git log --branches"))
+
+(defcommand cmd-git-log-branches
+  (m key)
+  "The log of every branch, local and remote (l b)."
+  (git-show-log m (git-resolve-root m) (append (transient/ed-transient-args m) ["--branches" "--remotes"]) "git log --branches --remotes"))
+
+(defcommand cmd-git-log-all
+  (m key)
+  "The log of every ref (l a)."
+  (git-show-log m (git-resolve-root m) (append (transient/ed-transient-args m) ["--all"]) "git log --all"))
+
+(defcommand cmd-git-log-file
+  (m key)
+  "The history of the file at point, or of this buffer's file (l f, C-x v l) — following
+renames."
+  (let (f (git-file-at m)
+        root (git-resolve-root m)
+        path (or (if f (:path f) nil) (buffer-file (ed-current-buf m))))
+    (if (nil? path)
+      (message m "no file here to log")
+      (git-show-log m root (append (transient/ed-transient-args m) ["--follow" "--" path]) (str "git log " path)))))
+
+(defcommand cmd-git-log-more
+  (m key)
+  "Show twice as many commits (+)."
+  (let (c (sectionbuf/sb-ctx m))
+    (if (nil? (:limit c))
+      (message m "not in a log")
+      (git-show-log m (:root c) (:args c) (:title c) (* 2 (:limit c)) :here))))
+
+(defcommand cmd-git-log-show
+  (m key)
+  "Show the commit at point (RET), selecting it."
+  (git-show-revision m (git-resolve-root m) (git-commit-at-point m) :pop))
+
+(defcommand cmd-git-log-peek
+  (m key)
+  "Show the commit at point beside the log without leaving it (SPC)."
+  (git-show-revision m (git-resolve-root m) (git-commit-at-point m) :display))
+
+;; ---- the reflog --------------------------------------------------------------------
+
+(defcommand cmd-git-reflog
+  (m key)
+  "Where HEAD has been (l r), newest first, as commits you can show, reset to or pick —
+the thing you want after a reset you regret, and the reason a `--hard` is survivable."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let (r (git-git root ["reflog" "--no-color" "-n" "100" "--format=%h%x00%gd%x00%gs%x00%an%x00%ar"]))
+        (if (not (= (:exit r) 0))
+          (git-report-cmd m "git reflog" r)
+          (sectionbuf/sb-show (assoc m :git-root root)
+            "*git-reflog*"
+            (gv-log-tree (git-parse-log (:stdout r "")) (gv-log-width m :pop))
+            :git-log
+            {:action :pop :line 1 :vis {} :ctx {:root root :reload 'gitview/git-reflog-reload}}))))))
+
+(defn git-reflog-reload (m) "*git-reflog*'s `:reload`." (cmd-git-reflog m nil))
+
+;; ---- blame: *git-blame* -------------------------------------------------------------
+;; Who last touched each line, as CHUNKS: a heading per run of lines one commit wrote
+;; (hash, author, age, summary) with the lines under it. RET on a heading shows the commit,
+;; RET on a line goes to it in the file, `b` blames the version before that commit — how you
+;; walk back past a reformat to the change that actually mattered.
+
+(defn- gv-hex40? (s)
+  "Whether `s` starts with a 40-character hash then a space — a porcelain group header."
+  (and (> (string/length s) 41)
+    (= (string/char-at s 40) " ")
+    (not (any? (range 40) (fn (i) (< (index-of "0123456789abcdef" (string/char-at s i)) 0))))))
+
+(defn gv-parse-blame (stdout)
+  "Parse `git blame --porcelain` into chunks `[{:hash :author :time :summary :previous
+:lines [{:final :text}]}]`, a chunk per run of consecutive lines from one commit."
+  (let (st (fold (string/split (or stdout "") "\n")
+             {:commits {} :cur nil :final 0 :entries '()}
+             (fn (st line)
+               (cond
+                 (string/starts-with? line "\t")
+                   (assoc st
+                     :entries (cons {:hash (:cur st) :final (:final st) :text (string/substring line 1 (string/length line))}
+                                (:entries st)))
+                 (gv-hex40? line)
+                   (let (parts (string/split line " "))
+                     (let (n (string/->number (nth parts 2 "0"))) (assoc st :cur (first parts) :final (if (int? n) n 0))))
+                 (nil? (:cur st)) st
+                 :else
+                   (let (sp (index-of line " ")
+                         k (if (< sp 0) line (string/substring line 0 sp))
+                         v (if (< sp 0) "" (string/substring line (inc sp) (string/length line))))
+                     (assoc-in st [:commits (:cur st) k] v)))))
+        entries (reverse (:entries st)))
+    (reverse
+      (fold entries
+        '()
+        (fn (acc e)
+          (if (and (not (empty? acc)) (= (:hash (first acc)) (:hash e)))
+            (cons (assoc (first acc) :lines (into (:lines (first acc)) [e])) (rest acc))
+            (let (c (get (:commits st) (:hash e) {}))
+              (cons {:hash (:hash e)
+                     :author (get c "author" "")
+                     :time (get c "author-time" "")
+                     :summary (get c "summary" "")
+                     :previous (get c "previous" nil)
+                     :lines [e]}
+                acc))))))))
+
+(defn- gv-age (epoch)
+  "How long ago an epoch-seconds string was, as `3 days ago`."
+  (let (t (string/->number (or epoch "")))
+    (if (not (int? t)) "" (str (humanize/duration (math/max 0 (- (os/now) (* 1000 t)))) " ago"))))
+
+(defn gv-blame-tree (chunks)
+  "The *git-blame* tree: a section per chunk, its lines as the body."
+  (section :blame-file
+    nil
+    nil
+    (into []
+      (map (range (count chunks))
+        (fn (i)
+          (let (c (nth chunks i)
+                short (let (h (str (:hash c))) (string/substring h 0 (math/min 8 (string/length h)))))
+            (section :blame
+              {:hash short :full (:hash c) :previous (:previous c) :first (:final (first (:lines c)))}
+              (str short " " (:author c) " " (gv-age (:time c)) "  " (:summary c))
+              (into [] (map (:lines c) :text))
+              {:key i})))))))
+
+(defn git-show-blame (m root path rev line)
+  "Blame `path` (relative to `root`) at `rev` (nil: the work tree) in *git-blame*, point on
+the chunk holding `line`."
+  (let (r (git-git root (append ["blame" "--porcelain" "-w"] (if rev [rev] []) ["--" path])))
+    (if (not (= (:exit r) 0))
+      (git-report-cmd m "blame" r)
+      (let (chunks (gv-parse-blame (:stdout r "")))
+        (sectionbuf/sb-show (assoc m :git-root root)
+          "*git-blame*"
+          (gv-blame-tree chunks)
+          :git-blame
+          {:action (if (= (buffer-name (ed-current-buf m)) "*git-blame*") :here :pop)
+           :vis {}
+           :ctx {:root root :path path :rev rev :reload 'gitview/git-blame-reload}
+           :line (fn (rows)
+                   (let (i (seq/index-where rows
+                             (fn (row)
+                               (and row (= (:type row) :blame) (not (:heading? row))
+                                 (= line (+ (:first (:value row)) (:line row)))))))
+                     (if (< i 0) 1 (inc i))))})))))
+
+(defn git-blame-reload (m)
+  "*git-blame*'s `:reload`."
+  (let (c (sectionbuf/sb-ctx m)) (git-show-blame m (:root c) (:path c) (:rev c) 1)))
+
+(defn- gv-relative (root file)
+  "`file` relative to `root`."
+  (let (r (str root "/")) (if (string/starts-with? file r) (string/substring file (string/length r) (string/length file)) file)))
+
+(defcommand cmd-git-blame
+  (m key)
+  "Who last touched each line of this file (C-x v b), as chunks — RET shows a chunk's
+commit, `b` blames the version before it."
+  (let (buf (ed-current-buf m)
+        file (buffer-file buf)
+        root (git-resolve-root m))
+    (cond
+      (nil? root) (message m "not in a git repository")
+      (nil? file) (message m "this buffer is not a file")
+      :else (git-show-blame m root (gv-relative root file) nil (inc (buffer-current-line buf))))))
+
+(defcommand cmd-git-blame-previous
+  (m key)
+  "Blame the file as it was just before the chunk at point's commit (b) — past a reformat
+or a rename to the change behind it."
+  (let (row (sectionbuf/sb-ancestor m :blame)
+        c (sectionbuf/sb-ctx m))
+    (cond
+      (nil? row) (message m "not on a chunk")
+      (nil? (:previous (:value row))) (message m "this chunk's commit has no parent — it is where the line began")
+      :else
+        (let (parts (string/split (:previous (:value row)) " "))
+          (git-show-blame m (:root c) (string/join (rest parts) " ") (first parts) 1)))))
+
+(defcommand cmd-git-blame-visit
+  (m key)
+  "RET in *git-blame*: on a chunk's heading, show its commit; on a line, go to it in the
+file (the work tree's version when blaming the work tree)."
+  (let (row (git-row-at m)
+        c (sectionbuf/sb-ctx m))
+    (cond
+      (nil? row) m
+      (:heading? row) (git-show-revision m (:root c) (:full (:value row)))
+      :else (commands/ed-pop-to-file m (path/join (:root c) (:path c)) (+ (:first (:value row)) (:line row))))))
+
+;; ---- the refs: *git-refs* (y) ----------------------------------------------------------
+
+(defn gv-parse-refs (stdout)
+  "Parse `git for-each-ref` (our NUL format) into `{:name :full :hash :upstream :head?
+:subject}` rows."
+  (seq/filter
+    (map (seq/reject (string/split (or stdout "") "\n") empty?)
+      (fn (line)
+        (let (p (string/split line (string/int->char 0)))
+          (if (< (count p) 6)
+            nil
+            {:full (str (nth p 0)) :name (str (nth p 1)) :hash (str (nth p 2)) :upstream (str (nth p 3)) :head? (= (nth p 4) "*") :subject (str (nth p 5))}))))
+    (fn (r) (and r (not (string/ends-with? (:full r) "/HEAD"))))))
+
+(defn gv-refs-tree (refs)
+  "The *git-refs* tree: local branches (the checked-out one starred), each remote's, tags."
+  (let (width (reduce (cons 8 (map refs (fn (r) (string/length (str (:name r)))))) math/max)
+        row (fn (r kind)
+              (section :ref
+                {:name (:name r) :kind kind :remote? (= kind :remote)}
+                (str (if (:head? r) "* " "  ")
+                  (string/pad-right (:name r) width) " " (:hash r) " "
+                  (if (= (:upstream r "") "") "" (str "[" (:upstream r) "] "))
+                  (:subject r))
+                []
+                {:key (:full r)}))
+        local (seq/filter refs (fn (r) (string/starts-with? (str (:full r)) "refs/heads/")))
+        remote (seq/filter refs (fn (r) (string/starts-with? (str (:full r)) "refs/remotes/")))
+        tags (seq/filter refs (fn (r) (string/starts-with? (str (:full r)) "refs/tags/")))
+        remotes (sort (into [] (into #{} (map remote (fn (r) (first (string/split (str (:name r)) "/")))))))
+        group (fn (title rs kind key)
+                (if (empty? rs)
+                  nil
+                  (section :refs-group key (str title " (" (count rs) ")") (into [] (map rs (fn (r) (row r kind)))) {:separator true}))))
+    (section :refs
+      nil
+      nil
+      (seq/reject
+        (into [(group "Branches" local :local :local)]
+          (append (map remotes
+                    (fn (rm)
+                      (group (str "Remote " rm)
+                        (seq/filter remote (fn (r) (string/starts-with? (str (:name r)) (str rm "/"))))
+                        :remote
+                        rm)))
+            [(group "Tags" tags :tag :tags)]))
+        nil?))))
+
+(defcommand cmd-git-refs
+  (m key)
+  "Every branch, remote branch and tag (y) — RET shows one's log, `b` checks it out, `k`
+deletes it."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let (r (git-git root
+                ["for-each-ref" "--sort=-committerdate"
+                 "--format=%(refname)%00%(refname:short)%00%(objectname:short)%00%(upstream:short)%00%(HEAD)%00%(contents:subject)"
+                 "refs/heads" "refs/remotes" "refs/tags"]))
+        (if (not (= (:exit r) 0))
+          (git-report-cmd m "git for-each-ref" r)
+          (sectionbuf/sb-show (assoc m :git-root root)
+            "*git-refs*"
+            (gv-refs-tree (gv-parse-refs (:stdout r "")))
+            :git-refs
+            {:action (if (= (buffer-name (ed-current-buf m)) "*git-refs*") :here :pop)
+             :ctx {:root root :reload 'gitview/git-refs-reload}}))))))
+
+(defn git-refs-reload (m) "*git-refs*'s `:reload`." (cmd-git-refs m nil))
+
+(defcommand cmd-git-refs-visit
+  (m key)
+  "RET in *git-refs*: the log of the ref at point."
+  (let (row (git-row-at m))
+    (if (and row (= (:type row) :ref))
+      (git-show-log m (git-resolve-root m) [(:name (:value row))] (str "git log " (:name (:value row))))
+      (sectionbuf/sb-toggle m))))
+
+;; ---- a file as it was: find-file at a revision, and stepping through its history -------
+
+(defn- gv-blob-name (path rev)
+  "The buffer name of `path` at `rev` — Magit's `file.~rev~`."
+  (str (path/basename path) ".~" rev "~"))
+
+(defn git-show-blob (m root path rev)
+  "Open `path` (relative to `root`) as it was at `rev`: read-only, in the file's own mode so
+it is coloured like the file, remembering where it came from so `C-c g p` / `C-c g n` can
+step to the version before or after."
+  (let (r (git-git root ["show" (str rev ":" path)]))
+    (if (not (= (:exit r) 0))
+      (git-report-cmd m (str "git show " rev ":" path) r)
+      (let (name (gv-blob-name path rev)
+            type (editor/layers/buffer-type-for (assoc (make-buffer "" name) :file (path/join root path)))
+            m1 (commands/ed-display-buffer m name (:stdout r "") type {:action :here})
+            i (ed-buffer-index-by-name! m1 name))
+        (ed-set-buf-at m1 i (assoc (set-read-only (ed-buf-at m1 i) true) :blob {:root root :path path :rev rev}))))))
+
+(defn- gv-blob-origin (m)
+  "`{:root :path :rev}` for the current buffer: a blob buffer's own, or the work-tree file
+(rev nil)."
+  (let (b (ed-current-buf m))
+    (or (:blob b)
+      (let (root (git-resolve-root m) file (buffer-file b))
+        (if (or (nil? root) (nil? file)) nil {:root root :path (gv-relative root file) :rev nil})))))
+
+(defcommand cmd-git-find-file
+  (m key)
+  "Open this file as it was at a revision you pick (C-c g f)."
+  (let (o (gv-blob-origin m))
+    (if (nil? o)
+      (message m "this buffer is not a file in a git repository")
+      (git-with-ref m "Find file at revision: " :branches (fn (mm rev) (git-show-blob mm (:root o) (:path o) rev))))))
+
+(defcommand cmd-git-blob-previous
+  (m key)
+  "The version of this file before the one shown (C-c g p) — from the work tree, the last
+committed one."
+  (let (o (gv-blob-origin m))
+    (if (nil? o)
+      (message m "this buffer is not a file in a git repository")
+      (let (r (git-git (:root o) (append ["log" "--format=%h" "-n" "2"] (if (:rev o) [(:rev o)] []) ["--" (:path o)]))
+            hashes (seq/reject (string/split (string/trim (:stdout r "")) "\n") empty?)
+            target (if (:rev o) (second hashes) (first hashes)))
+        (if (nil? target) (message m "no earlier version") (git-show-blob m (:root o) (:path o) target))))))
+
+(defcommand cmd-git-blob-next
+  (m key)
+  "The version of this file after the one shown (C-c g n) — the newest is the work tree's."
+  (let (o (gv-blob-origin m))
+    (cond
+      (nil? o) (message m "this buffer is not a file in a git repository")
+      (nil? (:rev o)) (message m "this is the work tree — there is nothing newer")
+      :else
+        (let (r (git-git (:root o) ["log" "--reverse" "--format=%h" (str (:rev o) "..HEAD") "--" (:path o)])
+              target (first (seq/reject (string/split (string/trim (:stdout r "")) "\n") empty?)))
+          (if (nil? target)
+            (commands/ed-pop-to-file m (path/join (:root o) (:path o)) 1)
+            (git-show-blob m (:root o) (:path o) target))))))

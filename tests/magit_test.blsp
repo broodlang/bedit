@@ -1,0 +1,381 @@
+;; The Magit layer, driven the way a reader drives it: open the status, move to a line,
+;; press the key. Every test here runs REAL git in a throwaway repo — the claims are about
+;; what git ends up with (what is staged, what the history says), which a fixture could
+;; only agree with itself about. Headless, so every git command runs synchronously.
+
+(defmodule magit-test
+  (:use test)
+  (:use model)
+  (:use commands)
+  (:use editor/buffer)
+  (:use-internals git)
+  (:use-internals gitview)
+  (:use-internals smerge)
+  (:use-internals sectionbuf))
+
+(defn- mg-git (dir args) (os/cmd "git" args {:cwd dir}))
+
+(defn- mg-out (dir args) (string/trim (:stdout (mg-git dir args) "")))
+
+(defn- mg-repo (name files)
+  "A repo with one commit holding `files` (`{path content}`)."
+  (let (dir (path/join (or (os/env "TMPDIR") "/tmp") (str "bedit-magit-test-" name)))
+    (do
+      (os/cmd "rm" ["-rf" dir] {:cwd "/"})
+      (file/mkdir dir)
+      (mg-git dir ["init" "-q" "-b" "main"])
+      (mg-git dir ["config" "user.email" "t@example.com"])
+      (mg-git dir ["config" "user.name" "Test"])
+      (mg-git dir ["config" "commit.gpgsign" "false"])
+      (doseq (kv files) (file/spit (path/join dir (first kv)) (second kv)))
+      (mg-git dir ["add" "-A"])
+      (mg-git dir ["commit" "-qm" "base"])
+      dir)))
+
+(defn- mg-status (dir)
+  "A model showing *git-status* for `dir` — opened from a file in it, as `C-x g` would be."
+  (let (m0 (ed-init (make-buffer ""))
+        m1 (ed-find-file m0 (path/join dir (str (first (seq/reject (file/ls dir) (fn (f) (string/starts-with? f "."))))))))
+    (git/cmd-git-status m1 nil)))
+
+(defn- mg-line-of (m pred)
+  "The 1-based line of the first row matching `pred` in the current section buffer."
+  (let (i (seq/index-where (sectionbuf/sb-rows m) (fn (r) (and r (pred r))))) (inc i)))
+
+(defn- mg-goto (m pred)
+  "Point to the first row matching `pred`."
+  (ed-apply m (fn (b) (ed-goto-line b (mg-line-of m pred)))))
+
+(defn- mg-heading (type value-pred)
+  "A row predicate: a heading of `type` whose value passes `value-pred`."
+  (fn (r) (and (:heading? r) (= (:type r) type) (value-pred (:value r)))))
+
+(defn- mg-goto-text (m text)
+  "Point to the first line of the current buffer that reads exactly `text`."
+  (let (lines (string/split (buffer-text (ed-current-buf m)) "\n")
+        i (index-of lines text))
+    (ed-apply m (fn (b) (ed-goto-line b (inc i))))))
+
+(defn- mg-answer (m text)
+  "Answer the minibuffer prompt `m` is showing with `text`."
+  ((:on-complete (:minibuffer m)) (dissoc m :minibuffer) text))
+
+(defn- mg-key (m c)
+  "Answer the one-key question `m` is asking with `c`."
+  ((:then (:read-char m)) (dissoc m :read-char) c))
+
+(defn- mg-open-file (m path)
+  "TAB on the unstaged file `path` in the status buffer."
+  (sectionbuf/sb-toggle (mg-goto m (mg-heading :file (fn (v) (and (= (:path v) path) (= (:section v) :unstaged)))))))
+
+(describe "magit: the status buffer"
+  (test "C-x g shows the repo, and a changed file folded"
+    (let (dir (mg-repo "open" {"a.txt" "one\n"})
+          _ (file/spit (path/join dir "a.txt") "ONE\n")
+          m (mg-status dir))
+      (assert= (buffer-name (ed-current-buf m)) "*git-status*")
+      (is (includes? (buffer-text (ed-current-buf m)) "modified   a.txt"))
+      (is (not (includes? (buffer-text (ed-current-buf m)) "+ONE")))))
+  (test "TAB on a file fetches its diff and shows the hunks"
+    (let (dir (mg-repo "tab" {"a.txt" "one\n"})
+          _ (file/spit (path/join dir "a.txt") "ONE\n")
+          m (mg-open-file (mg-status dir) "a.txt")
+          text (buffer-text (ed-current-buf m)))
+      (is (includes? text "@@ -1 +1 @@"))
+      (is (includes? text "+ONE"))
+      ;; and TAB again folds it, without fetching
+      (is (not (includes? (buffer-text (ed-current-buf (sectionbuf/sb-toggle m))) "+ONE")))))
+  (test "faces travel with the text: the added line is green"
+    (let (dir (mg-repo "faces" {"a.txt" "one\n"})
+          _ (file/spit (path/join dir "a.txt") "ONE\n")
+          m (mg-open-file (mg-status dir) "a.txt")
+          b (ed-current-buf m)
+          at (index-of (buffer-text b) "+ONE"))
+      (is (any? (:face-spans b) (fn (s) (and (= (first s) at) (= (nth s 2) git/git-face-add)))))))
+  (test "n / p walk the headings; ^ climbs"
+    (let (dir (mg-repo "nav" {"a.txt" "one\n" "b.txt" "two\n"})
+          _ (file/spit (path/join dir "a.txt") "ONE\n")
+          _ (file/spit (path/join dir "b.txt") "TWO\n")
+          m (mg-status dir)
+          first-file (sectionbuf/sb-at m)
+          m2 (sectionbuf/cmd-section-next m nil))
+      (assert= (:path (:value first-file)) "a.txt")
+      (assert= (:path (:value (sectionbuf/sb-at m2))) "b.txt")
+      (assert= (:type (sectionbuf/sb-at (sectionbuf/cmd-section-up m2 nil))) :unstaged))))
+
+(describe "magit: staging"
+  (test "s on a file stages it, and point moves on to the next file in the list"
+    (let (dir (mg-repo "stage-file" {"a.txt" "a\n" "b.txt" "b\n"})
+          _ (file/spit (path/join dir "a.txt") "A\n")
+          _ (file/spit (path/join dir "b.txt") "B\n")
+          m (git/cmd-git-stage (mg-status dir) nil))
+      (assert= (mg-out dir ["diff" "--cached" "--name-only"]) "a.txt")
+      (assert= (:path (:value (sectionbuf/sb-at m))) "b.txt")))
+  (test "s on the Untracked heading stages every untracked file"
+    (let (dir (mg-repo "stage-untracked" {"a.txt" "a\n"})
+          _ (file/spit (path/join dir "n1.txt") "1\n")
+          _ (file/spit (path/join dir "n2.txt") "2\n")
+          _ (git/cmd-git-stage (mg-goto (mg-status dir) (mg-heading :untracked (fn (v) true))) nil))
+      (assert= (mg-out dir ["diff" "--cached" "--name-only"]) "n1.txt\nn2.txt")))
+  (test "s on a hunk stages just that hunk"
+    (let (dir (mg-repo "stage-hunk" {"f.txt" "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n"})
+          _ (file/spit (path/join dir "f.txt") "ONE\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nTWELVE\n")
+          m (mg-open-file (mg-status dir) "f.txt")
+          _ (git/cmd-git-stage (mg-goto m (mg-heading :hunk (fn (v) true))) nil)
+          staged (mg-out dir ["diff" "--cached"]))
+      (is (includes? staged "+ONE"))
+      (is (not (includes? staged "+TWELVE")))))
+  (test "s on a REGION stages only the selected lines of a hunk"
+    (let (dir (mg-repo "stage-lines" {"f.txt" "a\nb\nc\nd\n"})
+          _ (file/spit (path/join dir "f.txt") "a\nB\nc\nD\n")
+          m (mg-open-file (mg-status dir) "f.txt")
+          ;; select "-b" and "+B", the first change, leaving the D change unstaged
+          m1 (mg-goto-text m "-b")
+          m2 (ed-apply m1 set-mark)
+          m3 (ed-apply m2 (fn (b) (end-of-line (forward-line b))))
+          _ (git/cmd-git-stage m3 nil)
+          staged (mg-out dir ["diff" "--cached"])
+          unstaged (mg-out dir ["diff"]))
+      (is (includes? staged "+B"))
+      (is (not (includes? staged "+D")))
+      (is (includes? unstaged "+D"))
+      (is (not (includes? unstaged "+B")))))
+  (test "u on a region unstages only those lines"
+    (let (dir (mg-repo "unstage-lines" {"f.txt" "a\nb\nc\nd\n"})
+          _ (file/spit (path/join dir "f.txt") "a\nB\nc\nD\n")
+          _ (mg-git dir ["add" "f.txt"])
+          m (mg-status dir)
+          m1 (sectionbuf/sb-toggle (mg-goto m (mg-heading :file (fn (v) (= (:section v) :staged)))))
+          m2 (ed-apply (mg-goto-text m1 "-d") set-mark)
+          m3 (ed-apply m2 (fn (b) (end-of-line (forward-line b))))
+          _ (git/cmd-git-unstage m3 nil))
+      (is (includes? (mg-out dir ["diff" "--cached"]) "+B"))
+      (is (not (includes? (mg-out dir ["diff" "--cached"]) "+D")))
+      (is (includes? (mg-out dir ["diff"]) "+D"))))
+  (test "u on a staged file unstages it"
+    (let (dir (mg-repo "unstage" {"a.txt" "a\n"})
+          _ (file/spit (path/join dir "a.txt") "A\n")
+          _ (mg-git dir ["add" "a.txt"])
+          _ (git/cmd-git-unstage (mg-goto (mg-status dir) (mg-heading :file (fn (v) true))) nil))
+      (assert= (mg-out dir ["diff" "--cached" "--name-only"]) "")))
+  (test "k on a hunk asks, and y throws it away"
+    (let (dir (mg-repo "discard" {"a.txt" "a\n"})
+          _ (file/spit (path/join dir "a.txt") "A\n")
+          m (mg-open-file (mg-status dir) "a.txt")
+          asked (git/cmd-git-discard (mg-goto m (mg-heading :hunk (fn (v) true))) nil))
+      (is (not (nil? (:read-char asked))))
+      (mg-key asked "y")
+      (assert= (file/slurp (path/join dir "a.txt")) "a\n")))
+  (test "k on a conflicted file offers ours or theirs"
+    (let (dir (mg-repo "conflict" {"f.txt" "base\n"})
+          _ (mg-git dir ["checkout" "-q" "-b" "other"])
+          _ (file/spit (path/join dir "f.txt") "theirs\n")
+          _ (mg-git dir ["commit" "-qam" "theirs"])
+          _ (mg-git dir ["checkout" "-q" "main"])
+          _ (file/spit (path/join dir "f.txt") "ours\n")
+          _ (mg-git dir ["commit" "-qam" "ours"])
+          _ (mg-git dir ["merge" "other"])
+          m (mg-status dir)
+          asked (git/cmd-git-discard (mg-goto m (mg-heading :file (fn (v) (= (:section v) :unmerged)))) nil))
+      (mg-key asked "t")
+      (assert= (file/slurp (path/join dir "f.txt")) "theirs\n")
+      (assert= (mg-out dir ["diff" "--name-only" "--diff-filter=U"]) ""))))
+
+(describe "magit: committing"
+  (test "c c opens the message beside the staged diff, and C-c C-c commits it"
+    (let (dir (mg-repo "commit" {"a.txt" "a\n"})
+          _ (file/spit (path/join dir "a.txt") "A\n")
+          _ (mg-git dir ["add" "a.txt"])
+          m (git/cmd-git-commit (mg-status dir) nil)
+          _ (assert= (buffer-name (ed-current-buf m)) "*git-commit*")
+          _ (is (not (nil? (ed-buffer-index-by-name m "*git-diff*"))))
+          typed (ed-apply m (fn (b) (goto-char (insert b "change a") 0)))
+          done (git/cmd-git-commit-finish typed nil))
+      (assert= (mg-out dir ["log" "-1" "--format=%s"]) "change a")
+      ;; the message is remembered for M-p next time
+      (assert= (first (:git-message-ring done)) "change a")))
+  (test "with nothing staged, c c offers to stage everything first"
+    (let (dir (mg-repo "commit-all" {"a.txt" "a\n"})
+          _ (file/spit (path/join dir "a.txt") "A\n")
+          asked (git/cmd-git-commit (mg-status dir) nil))
+      (is (not (nil? (:read-char asked))))
+      (let (m (mg-key asked "y"))
+        (assert= (buffer-name (ed-current-buf m)) "*git-commit*")
+        (assert= (mg-out dir ["diff" "--cached" "--name-only"]) "a.txt"))))
+  (test "a failed commit keeps its message as the draft"
+    (let (dir (mg-repo "commit-fail" {"a.txt" "a\n"})
+          m (git/git-open-commit (mg-status dir) dir :commit "")
+          typed (ed-apply m (fn (b) (goto-char (insert b "nothing to commit here") 0)))
+          done (git/cmd-git-commit-finish typed nil))
+      (assert= (:git-commit-draft done) "nothing to commit here")))
+  (test "r w rewords an earlier commit and leaves the rest of history alone"
+    (let (dir (mg-repo "reword" {"a.txt" "a\n"})
+          _ (file/spit (path/join dir "b.txt") "b\n")
+          _ (mg-git dir ["add" "b.txt"])
+          _ (mg-git dir ["commit" "-qm" "add b"])
+          _ (file/spit (path/join dir "c.txt") "c\n")
+          _ (mg-git dir ["add" "c.txt"])
+          _ (mg-git dir ["commit" "-qm" "add c"])
+          target (mg-out dir ["rev-parse" "--short" "HEAD~1"])
+          _ (git/git-reword-at (mg-status dir) dir target "add b, reworded"))
+      (assert= (mg-out dir ["log" "--format=%s" "-3"]) "add c\nadd b, reworded\nbase")))
+  (test "c F makes a fixup and folds it into its target at once"
+    (let (dir (mg-repo "instant-fixup" {"a.txt" "a\n"})
+          _ (file/spit (path/join dir "b.txt") "b\n")
+          _ (mg-git dir ["add" "b.txt"])
+          _ (mg-git dir ["commit" "-qm" "add b"])
+          _ (file/spit (path/join dir "c.txt") "c\n")
+          _ (mg-git dir ["add" "c.txt"])
+          _ (mg-git dir ["commit" "-qm" "add c"])
+          target (mg-out dir ["rev-parse" "--short" "HEAD~1"])
+          _ (file/spit (path/join dir "b.txt") "b fixed\n")
+          _ (mg-git dir ["add" "b.txt"])
+          asked (git/cmd-git-commit-instant-fixup (mg-status dir) nil)
+          _ (mg-answer asked target))
+      (assert= (mg-out dir ["log" "--format=%s" "-3"]) "add c\nadd b\nbase")
+      (assert= (mg-out dir ["show" "HEAD~1:b.txt"]) "b fixed"))))
+
+(describe "magit: branches"
+  (test "checking out a remote branch makes a local one that tracks it"
+    (let (origin (mg-repo "origin" {"a.txt" "a\n"})
+          _ (mg-git origin ["branch" "feature"])
+          clone (path/join (or (os/env "TMPDIR") "/tmp") "bedit-magit-test-clone")
+          _ (os/cmd "rm" ["-rf" clone] {:cwd "/"})
+          _ (os/cmd "git" ["clone" "-q" origin clone] {:cwd "/"}))
+      (assert= (git/git-checkout-args clone "origin/feature") ["checkout" "--track" "origin/feature"])
+      (assert= (git/git-checkout-args clone "origin/main") ["checkout" "main"])
+      (assert= (git/git-checkout-args clone "main") ["checkout" "main"])))
+  (test "b k on an unmerged branch asks before -D"
+    (let (dir (mg-repo "delete" {"a.txt" "a\n"})
+          _ (mg-git dir ["checkout" "-q" "-b" "side"])
+          _ (file/spit (path/join dir "s.txt") "s\n")
+          _ (mg-git dir ["add" "s.txt"])
+          _ (mg-git dir ["commit" "-qm" "side work"])
+          _ (mg-git dir ["checkout" "-q" "main"])
+          asked (mg-answer (git/cmd-git-branch-delete (mg-status dir) nil) "side"))
+      (is (not (nil? (:read-char asked))))
+      (mg-key asked "y")
+      (assert= (mg-out dir ["branch" "--list" "side"]) ""))))
+
+(describe "magit: the views"
+  (test "a log lists commits you can act on; RET shows one as files and hunks"
+    (let (dir (mg-repo "log" {"a.txt" "a\n"})
+          _ (file/spit (path/join dir "a.txt") "A\n")
+          _ (mg-git dir ["commit" "-qam" "capitalise"])
+          m (gitview/git-show-log (mg-status dir) dir [] "git log" nil :here)
+          _ (assert= (buffer-name (ed-current-buf m)) "*git-log*")
+          commit (sectionbuf/sb-at m)
+          shown (gitview/cmd-git-log-show m nil)
+          text (buffer-text (ed-current-buf shown)))
+      (assert= (:subject (:value commit)) "capitalise")
+      (assert= (buffer-name (ed-current-buf shown)) "*git-revision*")
+      (is (includes? text "capitalise"))
+      (is (includes? text "modified   a.txt"))
+      (is (includes? text "+A"))))
+  (test "a hunk from history applies to the work tree with a"
+    (let (dir (mg-repo "apply" {"a.txt" "a\n"})
+          _ (file/spit (path/join dir "a.txt") "A\n")
+          _ (mg-git dir ["commit" "-qam" "up"])
+          _ (mg-git dir ["revert" "--no-edit" "HEAD"])
+          target (mg-out dir ["rev-parse" "--short" "HEAD~1"])
+          m (gitview/git-show-revision (mg-status dir) dir target :here)
+          _ (gitview/cmd-git-apply (mg-goto m (mg-heading :hunk (fn (v) true))) nil))
+      (assert= (file/slurp (path/join dir "a.txt")) "A\n")))
+  (test "the unstaged diff buffer stages a hunk with s"
+    (let (dir (mg-repo "diffbuf" {"a.txt" "a\n"})
+          _ (file/spit (path/join dir "a.txt") "A\n")
+          m (gitview/git-show-diff (mg-status dir) dir [] :unstaged :here)
+          _ (git/cmd-git-stage (mg-goto m (mg-heading :hunk (fn (v) true))) nil))
+      (assert= (mg-out dir ["diff" "--cached" "--name-only"]) "a.txt")))
+  (test "blame groups lines into chunks per commit, and b goes back past one"
+    (let (dir (mg-repo "blame" {"f.txt" "one\ntwo\n"})
+          _ (file/spit (path/join dir "f.txt") "one\nTWO\n")
+          _ (mg-git dir ["commit" "-qam" "shout two"])
+          m (gitview/git-show-blame (mg-status dir) dir "f.txt" nil 2)
+          rows (gt-headings m :blame))
+      (assert= (count rows) 2)
+      (is (includes? (buffer-text (ed-current-buf m)) "shout two"))
+      ;; point is on line 2's chunk; b blames the version before its commit
+      (let (back (gitview/cmd-git-blame-previous m nil))
+        (is (not (includes? (buffer-text (ed-current-buf back)) "shout two"))))))
+  (test "refs lists local branches, starring the current one"
+    (let (dir (mg-repo "refs" {"a.txt" "a\n"})
+          _ (mg-git dir ["branch" "side"])
+          _ (mg-git dir ["tag" "v1"])
+          m (gitview/cmd-git-refs (mg-status dir) nil)
+          text (buffer-text (ed-current-buf m)))
+      (is (includes? text "Branches (2)"))
+      (is (includes? text "* main"))
+      (is (includes? text "Tags (1)"))))
+  (test "a file as it was, and the version before"
+    (let (dir (mg-repo "blob" {"f.txt" "v1\n"})
+          _ (file/spit (path/join dir "f.txt") "v2\n")
+          _ (mg-git dir ["commit" "-qam" "v2"])
+          m (gitview/git-show-blob (mg-status dir) dir "f.txt" "HEAD")
+          _ (assert= (buffer-text (ed-current-buf m)) "v2\n")
+          prev (gitview/cmd-git-blob-previous m nil))
+      (assert= (buffer-text (ed-current-buf prev)) "v1\n"))))
+
+(defn- gt-headings (m type)
+  "The heading rows of `type` in the current section buffer."
+  (seq/filter (sectionbuf/sb-rows m) (fn (r) (and r (:heading? r) (= (:type r) type)))))
+
+(describe "magit: parsing what git prints"
+  (test "blame --porcelain becomes chunks, one per run of a commit's lines"
+    (let (h1 (string/join (map (range 40) (fn (_) "a")) "")
+          h2 (string/join (map (range 40) (fn (_) "b")) "")
+          text (str h1 " 1 1 2\nauthor Ann\nauthor-time 0\nsummary first\n\tline one\n"
+                 h1 " 2 2\n\tline two\n"
+                 h2 " 3 3 1\nauthor Bob\nauthor-time 0\nsummary second\nprevious " h1 " f.txt\n\tline three\n")
+          chunks (gitview/gv-parse-blame text))
+      (assert= (count chunks) 2)
+      (assert= (into [] (map (:lines (first chunks)) :text)) ["line one" "line two"])
+      (assert= (:summary (second chunks)) "second")
+      (assert= (:previous (second chunks)) (str h1 " f.txt"))))
+  (test "git show splits into header, message and files"
+    (let (shown (gitview/gv-parse-show "commit abc\nAuthor: A <a@b>\nDate:   now\n\nsubject line\n\nbody\n\ndiff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n"))
+      (assert= (first (:meta shown)) "commit abc")
+      (assert= (:message shown) (list "subject line" "" "body"))
+      (assert= (count (:files shown)) 1))))
+
+(describe "magit: smerge — resolving a conflict in the file"
+  (def mg-conflict "top\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> other\nbottom\n")
+  (test "a conflict is found with its sides and its extent"
+    (let (c (first (smerge/smerge-conflicts mg-conflict)))
+      (assert= (:upper c) "ours")
+      (assert= (:lower c) "theirs")
+      (is (nil? (:base c)))
+      (assert= (string/substring mg-conflict (:start c) (:end c)) "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> other\n")))
+  (test "a diff3 conflict has its base"
+    (assert= (:base (first (smerge/smerge-conflicts "<<<<<<< a\nx\n||||||| base\nb\n=======\ny\n>>>>>>> c\n"))) "b"))
+  (test "unclosed markers are not a conflict"
+    (assert= (smerge/smerge-conflicts "<<<<<<< a\nx\n=======\n") '()))
+  (test "keep upper / lower / all replace the block"
+    (let (m0 (ed-init (make-buffer mg-conflict))
+          at (fn (m) (ed-apply m (fn (b) (goto-char b 6)))))
+      (assert= (buffer-text (ed-current-buf (smerge/cmd-smerge-keep-upper (at m0) nil))) "top\nours\nbottom\n")
+      (assert= (buffer-text (ed-current-buf (smerge/cmd-smerge-keep-lower (at m0) nil))) "top\ntheirs\nbottom\n")
+      (assert= (buffer-text (ed-current-buf (smerge/cmd-smerge-keep-all (at m0) nil))) "top\nours\ntheirs\nbottom\n")))
+  (test "n moves to the next conflict"
+    (let (m (smerge/cmd-smerge-next (ed-init (make-buffer mg-conflict)) nil))
+      (assert= (buffer-point (ed-current-buf m)) 4))))
+
+(describe "magit: a repository to begin with"
+  (test "git-init makes a repository and opens its status"
+    (let (dir (path/join (or (os/env "TMPDIR") "/tmp") "bedit-magit-test-init"))
+      (do
+        (os/cmd "rm" ["-rf" dir] {:cwd "/"})
+        (file/mkdir dir)
+        (let (m (mg-answer (git/cmd-git-init (ed-init (make-buffer "")) nil) dir))
+          (is (file/exists? (path/join dir ".git")))
+          (assert= (buffer-name (ed-current-buf m)) "*git-status*")))))
+  (test "git-clone clones into the directory the URL names, and opens it"
+    (let (origin (mg-repo "clone-src" {"a.txt" "a\n"})
+          target (path/join (or (os/env "TMPDIR") "/tmp") "bedit-magit-test-cloned")
+          _ (os/cmd "rm" ["-rf" target] {:cwd "/"})
+          asked (mg-answer (git/cmd-git-clone (ed-init (make-buffer "")) nil) origin)
+          m (mg-answer asked target))
+      (assert= (git/git-clone-name "https://example.com/org/thing.git") "thing")
+      (assert= (git/git-clone-name "git@example.com:org/other") "other")
+      (is (file/exists? (path/join target "a.txt")))
+      (assert= (buffer-name (ed-current-buf m)) "*git-status*"))))

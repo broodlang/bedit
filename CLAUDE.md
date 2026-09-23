@@ -268,26 +268,52 @@ src/term.blsp               a TERMINAL buffer (C-x p t, C-x p r, M-x claude, C-u
                             that asked for it; the program's cursor shape and visibility
                             are painted; history above the screen keeps its colour and
                             is capped; the mode line chip says which program and mode
-src/git.blsp                git porcelain: C-x g status buffer, diff/log/commit, C-x v = vc-diff,
-                            and `$` the PROCESS LOG (magit's `magit-process-buffer`) — every
-                            command the editor ran, its exit code, its duration and its whole
-                            output, an in-flight one reading `run`. One logged seam
-                            (`git-run` / `git-run-hunk`, `git-do` to refresh after), so the
-                            log cannot disagree with what ran; credentials redacted, `\r`
-                            progress applied through ansi/render, NUL shown as ^@
-src/git.blsp (cont.)        the FULL porcelain on transients: merge (m) · rebase (r) ·
-                            cherry-pick (A) · revert (V) · tag (t) · remote (M) · reset (X) ·
-                            log (l) · fetch (f) · stash (z), each a menu of flags. The
-                            SEQUENCER is one idea not five — git records which operation is
-                            half-done in .git, so one continue/skip/abort dispatches on it,
-                            and the status buffer says so above Head:. Conflicts get their
-                            own section (a conflicted file used to appear as BOTH staged and
-                            unstaged, and `s` staged the markers), labelled by how they
-                            happened, with o/T to take one side. Blame + reflog (C-x v b).
-                            INTERACTIVE REBASE (r i): the todo composed in a buffer with a
-                            key per verb, handed to git as `sequence.editor=cp <file>` —
-                            git never opens the editor nobody could see. `!` runs the
-                            command the menus lack; stashes are a status section
+src/sectionbuf.blsp         the SECTION BUFFER: a read-only buffer whose text is a
+                            std/editor/section tree (brood ADR-388) — tree, rows and
+                            visibility live ON THE BUFFER, faces come from the mode's
+                            `:section-faces` service as data (`:face-spans`), and TAB · n/p ·
+                            ^ · M-n/M-p · 1-4 · M-w are shared by every such buffer. A lazy
+                            section (a status file whose diff was never fetched) asks the
+                            mode's `:section-reload`
+src/git.blsp                git porcelain, Magit's: C-x g *git-status* is a section tree —
+                            in-progress line, Head:/Merge:/Push:/Tag:, Unmerged / Untracked /
+                            Unstaged / Staged files (TAB fetches a file's hunks), unpushed,
+                            unpulled, stashes, recent commits; one blank line between
+                            sections and nothing indented. s/u/k act on what is at point: a
+                            REGION of a hunk's lines (std/diff `hunk-select`), a hunk, a file,
+                            several files, a whole list, a stash; k on a conflict offers
+                            ours/theirs, e opens it at its first marker (smerge). RET goes to
+                            the line a diff line became. `$` is the PROCESS LOG (magit's
+                            `magit-process-buffer`) — every command, exit code, duration and
+                            output; one logged seam (`git-run` / `git-run-hunk`, `git-do` to
+                            refresh after), credentials redacted, `\r` progress applied
+src/git.blsp (cont.)        every Magit menu on Magit's letter, each a transient of flags:
+                            c commit (extend · reword · amend · fixup · squash · instant
+                            fixup/squash; off the loop, the staged diff beside the message,
+                            M-p/M-n message history, a failed commit keeps its draft) · b
+                            branch (a remote branch checks out as a tracking local one;
+                            create from a start point, spin off, upstream, reset, delete
+                            asking before -D) · P push (where it pushes / upstream /
+                            elsewhere / another branch / tags; a branch with nowhere to go
+                            is asked and remembers) · F pull · f fetch · m merge (+preview) ·
+                            r rebase (interactive from the commit at point, and reword /
+                            modify / remove ONE commit, autosquash — a plan handed to git as
+                            `sequence.editor=cp <file>`, so no editor ever opens) · A · V ·
+                            X (mixed/soft/hard/keep, index, worktree, file) · z (at point) ·
+                            t · M · B bisect · % worktrees · W/w patches · o submodules · T
+                            notes · i ignore · K untrack · R rename · j jump · ? all of them.
+                            The SEQUENCER is one idea not five: git records which operation is
+                            half-done in .git, so one continue/skip/abort dispatches on it
+src/gitview.blsp            the git VIEWS, section buffers acted on in place: *git-revision*
+                            (a commit's message then files and hunks — RET to a line, a applies
+                            a hunk, v reverses it), *git-diff* (s/u/k as in the status, + / -
+                            context), *git-log* (graph, refs, author/age margin; RET shows,
+                            SPC peeks, + doubles; A/V/X/r i act on the commit at point), the
+                            reflog, *git-blame* (chunks per commit; b blames the version
+                            before), *git-refs* (y), a file at a revision and C-c g p / n to
+                            step through its history
+src/smerge.blsp             conflicts resolved IN the file, Emacs's smerge: C-c ^ n/p between
+                            conflicts, u/l/a/b keep upper / lower / both / base
 src/gitdiff.blsp            diff-hl change gutter: per-line added/modified/deleted vs HEAD
 src/beam.blsp               the BEAM, from the editor. C-c b p processes · C-c b s the SUPERVISION
                             TREE (indented by depth, supervisors marked) · C-c b e ETS
