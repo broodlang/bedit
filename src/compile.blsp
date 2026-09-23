@@ -16,71 +16,13 @@ and a dead one (e.g. after a crash) is replaced transparently."
 (def *compile-buf* "*compilation*")
 
 ;; ---- error line parser -------------------------------------------------------
-;; Emacs keeps `compilation-error-regexp-alist-alist`: a table of (REGEXP FILE LINE
-;; COL) rows where the numbers say which capture group holds what, and teaching
-;; `next-error` a new tool is adding a row. bedit could not have that table until
-;; Brood's regex engine grew capture groups — with a boolean `match?` there is no
-;; way to say "group 1 is the file" — so this was three hand-written
-;; string-splitting parsers, one per format someone had bothered to code, and a
-;; fourth format meant a fourth function.
-;;
-;; The order is the priority: a `-->` line also contains `file:line:col`, and a
-;; Python traceback must be read before anything hunts for colons in it.
-
-(def *error-patterns*
-  [{:name :rust :pattern "--> +([^\\s:]+):(\\d+):(\\d+)" :file 1 :line 2 :col 3}
-    ;; python traceback:   File "app.py", line 12, in foo
-    {:name :python :pattern "File \"([^\"]+)\", line (\\d+)" :file 1 :line 2 :col nil}
-    ;; gcc / clang / mix / elixir / brood:   path:12:5: message
-    {:name :gnu :pattern "([^\\s:()]*[^\\s:()\\d][^\\s:()]*):(\\d+):(\\d+)" :file 1 :line 2 :col 3}
-    ;; the same without a column — ExUnit's `test/foo_test.exs:12`, mix warnings,
-    ;; and every `file:line:` message whose next field is prose rather than a number
-    {:name :gnu-line
-     :pattern "([^\\s:()]*[^\\s:()\\d][^\\s:()]*):(\\d+)"
-     :file 1
-     :line 2
-     :col nil}])
-
-;; The file group is spelled `[^\s:()]*[^\s:()\d][^\s:()]*` — path characters, at
-;; least one of which is not a digit — rather than a plain `[^\s:()]+`, so that a
-;; bare `12:34:56` in a log is not read as line 34 of a file called `12`. The old
-;; parser, which split on `:` and asked only whether the next field was numeric,
-;; reported exactly that.
-
-(defn- compile-parse-int (s)
-  ;; `s` is a token scraped from compiler output — not reading as a number is the answer
-  (check-allow :discarded-catch
-    (try (let (v (reflect/read-string s)) (if (int? v) v nil)) (catch e nil))))
-
-(defn- compile-group-text (match k)
-  "The text of capture group `k` of `match`, or nil — for a group index that is
-itself nil (a pattern with no column), and for a group that did not participate."
-  (when k
-    (let (g (nth (get match :groups) (dec k) nil))
-      (when g (get g :text)))))
-
-(defn- compile-loc-from (pattern line)
-  "Apply one `*error-patterns*` row to `line`; returns `{:file :line :col}` or nil.
-A row that matches but yields no usable file or line counts as no match, so the
-next row still gets its turn."
-  (let (m (regex/find (get pattern :pattern) line))
-    (when m
-      (let (file (compile-group-text m (get pattern :file))
-            ln (compile-parse-int (compile-group-text m (get pattern :line))))
-        (when (and file (> (string/length file) 0) ln)
-          ;; a column the pattern does not capture is column 1, as it was
-          {:file file
-           :line ln
-           :col (or (compile-parse-int (compile-group-text m (get pattern :col))) 1)})))))
-
-(defn- compile-first-loc (patterns line)
-  (when (not (empty? patterns))
-    (or (compile-loc-from (first patterns) line) (compile-first-loc (rest patterns) line))))
+;; The table of error formats (Emacs' `compilation-error-regexp-alist`) is
+;; `results/*error-patterns*`: one parser for C-x ` here and for RET / click on any
+;; results row, which used to be two that disagreed.
 
 (defn- compile-parse-error-line (line)
-  "Parse a compiler error/warning location from `line` — the first `*error-patterns*`
-row that matches it, or nil."
-  (compile-first-loc *error-patterns* line))
+  "Parse a compiler error/warning location from `line` (`results/loc-at-line`), or nil."
+  (results/loc-at-line line))
 
 (defn- compile-parse-errors (text)
   (seq/reject (map (string/split text "\n") compile-parse-error-line) nil?))
@@ -283,11 +225,15 @@ the cursor would run off the end."
       (let (err (or (nth errors idx) (error "no compilation error at the cursor")) ; in range by the test above
             file (path/absolute (path/join (or (:project-root m) ".") (:file err)))
             line (:line err)
+            col (or (:col err) 1)
             m1 (assoc (ed-find-file m file) :compile-error-idx idx))
+        ;; the column too, when the tool gave one — it used to be parsed and dropped
         (message (ed-apply m1
                    (fn (b)
-                     (let (target (math/max 0 (math/min (dec line) (dec (buffer-line-count b)))))
-                       (fold (range target) (beginning-of-buffer b) (fn (bb _) (forward-line bb))))))
+                     (let (target (math/max 0 (math/min (dec line) (dec (buffer-line-count b))))
+                           at-line (fold (range target) (beginning-of-buffer b) (fn (bb _) (forward-line bb)))
+                           room (string/length (string/trimr (buffer-line-at at-line target))))
+                       (forward-char at-line (math/max 0 (math/min (dec col) room))))))
           (str (:file err) ":" line))))))
 
 (defcommand cmd-next-error

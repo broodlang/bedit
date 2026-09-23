@@ -115,7 +115,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
 - [x] **G5 Token-only URLs not redacted** in the process log (`git.blsp:1369`).
 - [x] **G6 find-file: `git ls-files` without `-z`** (quoted non-ASCII names; deleted
   files listed). `projects.blsp:129`.
-- [ ] **G7 Two location parsers disagree** (`compile.blsp:31-43` vs `results.blsp:34-66`);
+- [x] **G7 Two location parsers disagree** (`compile.blsp:31-43` vs `results.blsp:34-66`);
   URLs / `0.0.0.0:8080` read as errors; `:col` ignored.
 - [ ] **F1 Format-on-save skips the disk-changed check; `mix format` runs in the file's
   dir (ignores `.formatter.exs`) and blocks the UI.** `commands.blsp:4590`,

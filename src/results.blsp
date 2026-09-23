@@ -31,41 +31,86 @@ this layer's vocabulary — the app-specific half, kept out of the abstraction."
   (:use editor/pane)) ; pane-update-path — scroll the pane that follows the tail
 ;; ---- location vocabulary: parse a row → a source location -------------------
 
+;; ONE parser for "where in which file", used by every results buffer (RET / click) AND by
+;; M-x compile's next-error. There used to be two — a split-on-`:` token parser here and a
+;; regexp table in `compile` — and they disagreed: a Python `File "x", line 12` row jumped
+;; with C-x ` but not with RET, and the table read `http://localhost:4000` as line 4000 of
+;; `//localhost`. Now it is the table, behind this module's file-token guard.
+;;
+;; The Emacs-style table: each row a regexp and which capture group is FILE, LINE, COL.
+;; Teaching the editor a new tool is adding a row. The order is the priority: a `-->` line
+;; also contains `file:line:col`, and a Python traceback must be read before anything hunts
+;; for colons in it. The file group is spelled `[^\s:()]*[^\s:()\d][^\s:()]*` — path
+;; characters, at least one not a digit — so a bare `12:34:56` is not line 34 of `12`.
+
+(def *error-patterns*
+  [{:name :rust :pattern "--> +([^\\s:]+):(\\d+):(\\d+)" :file 1 :line 2 :col 3}
+    ;; python traceback:   File "app.py", line 12, in foo
+    {:name :python :pattern "File \"([^\"]+)\", line (\\d+)" :file 1 :line 2 :col nil}
+    ;; gcc / clang / mix / elixir / brood:   path:12:5: message
+    {:name :gnu :pattern "([^\\s:()]*[^\\s:()\\d][^\\s:()]*):(\\d+):(\\d+)" :file 1 :line 2 :col 3}
+    ;; the same without a column — ExUnit's `test/foo_test.exs:12`, mix warnings,
+    ;; and every `file:line:` message whose next field is prose rather than a number
+    {:name :gnu-line
+     :pattern "([^\\s:()]*[^\\s:()\\d][^\\s:()]*):(\\d+)"
+     :file 1
+     :line 2
+     :col nil}])
+
+(def *extensionless-files*
+  ;; build files a compiler names bare — `Makefile:12: *** missing separator`
+  ["Makefile" "GNUmakefile" "Dockerfile" "Rakefile" "Gemfile" "Justfile" "Containerfile"])
+
 (defn- loc-file-token? (file)
   "Whether `file` looks like a source path rather than a host / clock field. A path
 separator is decisive; a dot counts only when the part after the LAST dot is a
 non-empty, non-numeric extension (`foo.blsp` yes; `0.0.0.0`, `127.0.0.1` no — an
-all-numeric tail is an IP octet, not an extension). Guards against `12:34:56`
-timestamps and `host:port` being read as `file:line` (a red log line + a jump to a
-bogus `<root>/12` on click)."
+all-numeric tail is an IP octet, not an extension); a few build files are named bare.
+Guards against `12:34:56` timestamps and `host:port` being read as `file:line` (a red log
+line + a jump to a bogus `<root>/12` on click)."
   (and (> (string/length file) 0)
     (or (includes? file "/")
+      (includes? *extensionless-files* file)
       (let (i (string/last-index-of file "."))
         (and (>= i 0)
           (let (ext (string/substring file (inc i) (string/length file)))
             (and (> (string/length ext) 0)
               (failure? (string/->number ext)))))))))
 
-(defn- loc-parse-token (token)
-  (let (parts (string/split (or token "") ":")
-        n (count parts))
-    (when (>= n 2)
-      (let (nums (seq/filter (map (rest parts) string/->number) int?)
-            file (first parts))
-        (when (and (loc-file-token? file) (not (empty? nums)))
-          {:file file :line (first nums) :col (or (second nums) 1)})))))
+(defn- loc-group-int (match k)
+  "Capture group `k` of `match` as an int, or nil — for a group index that is itself nil
+(a pattern with no column), a group that did not participate, or one not a number."
+  (when k
+    (let (g (nth (get match :groups) (dec k) nil)
+          n (when g (string/->number (get g :text))))
+      (when (int? n) n))))
+
+(defn- loc-group-text (match k)
+  (when k
+    (let (g (nth (get match :groups) (dec k) nil))
+      (when g (get g :text)))))
+
+(defn- loc-from (pattern line)
+  "Apply one `*error-patterns*` row to `line`; `{:file :line :col}` or nil. A row that
+matches but yields no usable file or line counts as no match, so the next row still gets
+its turn. A column the pattern does not capture is column 1."
+  (let (m (regex/find (get pattern :pattern) line))
+    (when m
+      (let (file (loc-group-text m (get pattern :file))
+            ln (loc-group-int m (get pattern :line)))
+        (when (and file ln (loc-file-token? file))
+          {:file file :line ln :col (or (loc-group-int m (get pattern :col)) 1)})))))
+
+(defn- loc-first (patterns text)
+  (when (not (empty? patterns))
+    (or (loc-from (first patterns) text) (loc-first (rest patterns) text))))
 
 (defn loc-at-line (line)
-  "Parse a `file:line[:col]` location from a report row — the leading token (an
-indented failure line) or the trailing one (a labelled ✓/✗ row that carries its
-declaration site at the end). nil when the row names none."
-  ;; `trim`, not `triml`: `buffer-line-at` keeps the trailing newline, which would
-  ;; otherwise stick to a TRAILING location token (`12\n`) and fail to parse — the
-  ;; reason a ✓/✗ row (its `file:line` at the end) wouldn't jump.
-  (let (tokens (seq/filter (string/split (string/trim line) " ") (fn (t) (not (= t "")))))
-    (when (not (empty? tokens))
-      (or (loc-parse-token (first tokens))
-        (loc-parse-token (last tokens))))))
+  "Parse a `file:line[:col]` location from a report or compiler row — the first
+`*error-patterns*` row that matches it — or nil when the row names none. URLs are taken out
+first: `http://localhost:4000` is a server announcing itself, not line 4000 of a file."
+  (let (text (regex/replace "[a-zA-Z][a-zA-Z0-9+.-]*://\\S*" (or line "") " "))
+    (loc-first *error-patterns* text)))
 
 (defn default-line-loc (buf line0)
   "The default `:line-loc` service — parse `file:line[:col]` from the line's TEXT
