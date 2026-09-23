@@ -170,5 +170,5 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   LSP JSON-RPC framing in bedit (*Brood:* `std/jsonrpc`).
 - [ ] **T1 No tests for git's destructive commands, format.blsp, the playground send side,
   undo atomicity, `:modified` after kill/yank.**
-- [ ] **T2 `strict_ratchet_test` tracks the installed nest**; stale references to
+- [x] **T2 `strict_ratchet_test` tracks the installed nest** (now checks with `os/exe-path`, the nest running the suite); stale references to
   deleted Python drivers (`tools/drive-elixir.blsp:8`, `tools/term-tutor.blsp:27`).
