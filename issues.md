@@ -54,7 +54,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   filename runs code.
   *Brood:* `os/shell-quote`. *bedit:* argv rows where possible; quote the rest.
 
-- [ ] **S8 Web mirror / collab trust model.** `remote.blsp:92-117` — the machine-wide
+- [~] **S8 Web mirror / collab trust model.** FIXED: bare `--listen PORT` binds loopback; docs say attaching is full trust. OPEN (Brood): per-session cookies, a link that cannot ship code, trusted `--as`. `remote.blsp:92-117` — the machine-wide
   cookie is what the docs tell you to hand a collaborator (full code execution on every
   node); bare `--listen PORT` binds `0.0.0.0`; `--as NAME` is trusted.
   *Brood:* capability-scoped links. *bedit:* loopback default; docs say attach = full trust.

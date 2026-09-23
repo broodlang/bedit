@@ -100,14 +100,20 @@ Every attach is a Brood **node link**, and node links run over TCP. `--listen
 
 ```bash
 # host machine (copy ~/.config/brood/cookie to the other machine first — it authenticates)
-bedit --name ed --serve --shared --listen 7457 --as wilhelm notes.txt
+bedit --name ed --serve --shared --listen 0.0.0.0:7457 --as wilhelm notes.txt
 
 # any machine that can reach it:
 bedit --attach ed@HOST:7457 --as alice
 ```
 
-- A bare port binds `0.0.0.0` (every interface); give `HOST:PORT` to bind one.
+- A bare port binds **loopback only** (`127.0.0.1`); to be reachable from another machine,
+  say so: `0.0.0.0:PORT` (every interface) or `HOST:PORT` (one).
 - The **cookie** (`~/.config/brood/cookie`) must match on both ends — that's the auth.
+- **Attaching is full trust.** A node link ships code: whoever holds the cookie can run
+  anything, as you, on every Brood node you run — not just edit this session's buffers.
+  Hand the cookie only to someone you would give a shell on this machine. (The cookie is
+  machine-wide today; a per-session cookie and a link that cannot ship code are the
+  missing Brood pieces — see issues.md S8.)
 - Dual-listen: the per-user Unix socket stays bound alongside TCP, so local attaches
   keep the bare-NAME form while remote machines use `@HOST:PORT`.
 - Verified over a real TCP link (loopback: two runtimes, full presence + edit fan-out);
