@@ -66,10 +66,10 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
 ## P1 — correctness
 
 ### Input / view / theme
-- [ ] **C1 ✔ `C-u 3 C-x o` inserts `oo`.** `input.blsp` `ed-run-arg` re-runs
+- [x] **C1 ✔ `C-u 3 C-x o` inserts `oo`.** `input.blsp` `ed-run-arg` re-runs
   `keymap-step` N times; step 1 clears `:pending`, steps 2..N look the last key up at top
   level. Fix: resolve once, repeat the command.
-- [ ] **C2 ✔ `C-u -` on a chord leaves `:pending` set** (the inverse branch bypasses
+- [x] **C2 ✔ `C-u -` on a chord leaves `:pending` set** (the inverse branch bypasses
   `step`: no `:pending`/`:echo` reset, no `try`).
 - [ ] **C3 ✔ Theme switch leaves region / hl-line / brackets / scrollbar / isearch in the
   old palette.** `view.blsp:59-63,1051`, `isearch.blsp:20` copy faces at load;
@@ -77,7 +77,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   *Brood:* palette-derived chrome faces in `std/editor/face`.
 - [x] **C4 ✔ Read-only yank is silent; `C-k` at EOL pushes `"\n"` before the refusal.**
   (Falls out of S2's single mutation path.)
-- [ ] **C5 Registries reset on reload.** `interactive.blsp:269,291`
+- [x] **C5 Registries reset on reload.** `interactive.blsp:269,291`
   (`*prefix-consuming*`, `*command-inverse*`), `keymaps.blsp:504` `*profiles*` — `def`,
   not `defonce`.
 - [ ] **C6 Mode line / ui-kit widths count chars, not cells.** `statusbar.blsp:66,100,123,
@@ -87,7 +87,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
 - [ ] **C8 Three different "visible rows" computations.** `input.blsp:1179` ignores
   inlays; `ed-scroll`, `panes/ed-pane-rows` each rebuild the predicate.
 - [ ] **C9 `ui-row-ops` label runs under the key column.** `ui-kit.blsp:196`.
-- [ ] **C10 Tab in a minibuffer with no `:complete-fn` calls nil** (compile, preset-save,
+- [x] **C10 Tab in a minibuffer with no `:complete-fn` calls nil** (compile, preset-save,
   beam trace, term prompts).
 
 ### Editing commands
