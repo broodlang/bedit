@@ -536,7 +536,7 @@ qualify to root and could shadow-instrument a prelude/root binding of the same n
         (when module (reflect/read-string (str module "/" nm)))))))
 
 (def *breakpoint-originals* {})
-;; sym -> the original fn value. The editor's OWN breakpoint registry (std's
+;; sym -> {:orig the original fn value, :wrapper the parking fn we bound in its place}. The editor's OWN breakpoint registry (std's
 ;; break-fn would park whatever process calls the function — including the ui-run
 ;; loop itself, the only sender of [:resume]: an unrecoverable freeze). Our wrapper
 ;; parks every caller EXCEPT the editor process.
@@ -549,29 +549,33 @@ qualify to root and could shadow-instrument a prelude/root binding of the same n
   "Rebind `sym` to a parking wrapper. The editor's loop process runs the original
 untouched — it must never park (nothing else can resume it); every other caller
 (an eval task, a shell, app code) parks with its args captured for eval-in-scope."
-  (let (orig (or (get *breakpoint-originals* sym) (reflect/eval sym))
-        editor-pid (proc/whereis :editor))
+  (let (orig (or (get-in *breakpoint-originals* [sym :orig]) (reflect/eval sym))
+        editor-pid (proc/whereis :editor)
+        wrapper (fn (& args)
+                  (if (= (self) editor-pid)
+                    (apply orig args)
+                    ;; `break` is a MACRO (it captures the caller's scope with `%scope`), so it
+                    ;; is called, never `apply`ed — `apply` of a macro raises at runtime, which
+                    ;; made every breakpoint hit by a non-editor process throw instead of
+                    ;; parking. Same shape std's own `break-fn` uses.
+                    (do
+                      (debug/break (str sym) :args args)
+                      (apply orig args)))))
     (when (not (fn? orig)) (error "breakpoint: not a function: " sym))
-    (def *breakpoint-originals* (assoc *breakpoint-originals* sym orig))
-    (reflect/eval
-      (list 'def
-        sym
-        (fn (& args)
-          (if (= (self) editor-pid)
-            (apply orig args)
-            ;; `break` is a MACRO (it captures the caller's scope with `%scope`), so it
-            ;; is called, never `apply`ed — `apply` of a macro raises at runtime, which
-            ;; made every breakpoint hit by a non-editor process throw instead of
-            ;; parking. Same shape std's own `break-fn` uses.
-            (do
-              (debug/break (str sym) :args args)
-              (apply orig args))))))
+    (reflect/eval (list 'def sym wrapper))
+    ;; the value as the global now holds it — what uninstall compares against to tell our
+    ;; wrapper from a redefinition
+    (def *breakpoint-originals* (assoc *breakpoint-originals* sym {:orig orig :wrapper (reflect/eval sym)}))
     sym))
 
 (defn- debugger-uninstall-breakpoint (sym)
-  (let (orig (get *breakpoint-originals* sym))
-    (when orig
-      (reflect/eval (list 'def sym orig))
+  "Take the breakpoint off `sym`: put the original back — but only while `sym` is still
+bound to OUR wrapper. Redefining a function with a breakpoint on it (C-x C-e on the new
+version) replaces the wrapper, and restoring the pre-breakpoint original then silently
+undid that edit; a redefined function simply keeps its new definition."
+  (let (entry (get *breakpoint-originals* sym))
+    (when entry
+      (when (= (reflect/eval sym) (:wrapper entry)) (reflect/eval (list 'def sym (:orig entry))))
       (def *breakpoint-originals* (dissoc *breakpoint-originals* sym))
       sym)))
 
