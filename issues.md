@@ -91,14 +91,14 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   beam trace, term prompts).
 
 ### Editing commands
-- [ ] **E1 ✔ `C-t` at end of line swaps the newline** (`commands.blsp:861`); at EOB it
+- [x] **E1 ✔ `C-t` at end of line swaps the newline** (`commands.blsp:861`); at EOB it
   no-ops. Emacs swaps the two chars before point.
-- [ ] **E2 ✔ Repeated `C-x C-t` toggles** — point stays on the current line
+- [x] **E2 ✔ Repeated `C-x C-t` toggles** — point stays on the current line
   (`commands.blsp:893`).
 - [ ] **E3 ✔ `M-q` destroys indentation and comment prefixes.** *Brood:* `string/fill`
   with a fill prefix.
 - [ ] **E4 `C-M-h` / `C-x n d` parse every buffer as Brood** (`commands.blsp:2327,2372`).
-- [ ] **E5 ✔ Kill coalescing list incomplete; `M-w` wrongly appends.**
+- [x] **E5 ✔ Kill coalescing list incomplete; `M-w` wrongly appends.** (M-w appending after a kill is Emacs's own `copy-region-as-kill` behaviour — kept.)
   `ed-kill-commands` (`commands.blsp:755`).
 - [ ] **E6 isearch vs Emacs:** wraps without "Failing"; C-s→C-r skips the current match;
   DEL re-searches from origin.
