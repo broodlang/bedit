@@ -132,9 +132,9 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   into `/tmp`; diagnostics re-root it) — wipes playground state.
 - [ ] **P5 Removing a breakpoint can revert a later redefinition** (`debugger.blsp:548-575`);
   editor-internal processes can be paused.
-- [ ] **P6 LSP URIs not percent-encoded** (`lsp.blsp:257-260,534`).
-- [ ] **P7 LSP advertises `workspace/configuration` then answers MethodNotFound.**
-- [ ] **P8 LSP handshake drops server messages before the initialize reply.**
+- [x] **P6 LSP URIs not percent-encoded** (`lsp.blsp:257-260,534`).
+- [x] **P7 LSP advertises `workspace/configuration` then answers MethodNotFound.**
+- [x] **P8 LSP handshake drops server messages before the initialize reply.**
 - [ ] **P9 bshell: no interrupt; non-pty children are not killed as a group.**
 
 ### Live eval
@@ -166,7 +166,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
 - [ ] **X4 `model.blsp` names its feature clients.** *Brood:* `autoload` declarations.
 - [ ] **X5 Perf:** word motion / completion preview / `qr-replace` stringify the whole
   buffer per key. *Brood:* rope-scanning word motion + rope slice.
-- [ ] **X6 Duplicated parsers:** two unified-diff parsers (*Brood:* `diff/parse-unified`),
+- [~] **X6 Duplicated parsers:** two unified-diff parsers (*Brood:* `diff/parse-unified` — being added by the parallel magit session on its branch),
   LSP JSON-RPC framing in bedit (*Brood:* `std/jsonrpc`).
 - [ ] **T1 No tests for git's destructive commands, format.blsp, the playground send side,
   undo atomicity, `:modified` after kill/yank.**

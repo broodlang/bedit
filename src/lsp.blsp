@@ -230,8 +230,8 @@ either a `CompletionItem[]` (a vector) or a `{:items [...] :isIncomplete b}` obj
   "The 0-based `[line char]` to jump to for `sym` — its `:selectionRange` start (a
 hierarchical DocumentSymbol), else its `:range` start, else its `:location`'s range start
 (a flat SymbolInformation). `[0 0]` if none is present."
-  (let (rand/rng (or (:selectionRange sym) (:range sym) (get-in sym [:location :range]))
-        start (when rand/rng (:start rand/rng)))
+  (let (span (or (:selectionRange sym) (:range sym) (get-in sym [:location :range]))
+        start (when span (:start span)))
     [(:line start 0) (:character start 0)]))
 
 (defn- lsp-flatten-symbols (syms prefix acc)
@@ -255,16 +255,21 @@ before children, in document order."
 ;; ---- pure protocol: location / hover / edit shapes (goto, refs, hover, rename) ----
 
 (defn- lsp-uri->path (uri)
-  "The filesystem path of a `file://` `uri` (the inverse of `lsp-path->uri`); `uri`
-unchanged if it has no scheme."
-  (if (string/starts-with? uri "file://") (string/substring uri 7 (string/length uri)) uri))
+  "The filesystem path of a `file://` `uri`, percent-decoded (the inverse of
+`lsp-path->uri`); `uri` unchanged if it has no scheme, and the raw path if it does not
+decode."
+  (if (string/starts-with? uri "file://")
+    (let (raw (string/substring uri 7 (string/length uri))
+          decoded (url/percent-decode raw))
+      (if (string? decoded) decoded raw))
+    uri))
 
 (defn- lsp-location (loc)
   "Normalise one LSP `Location` (`:uri`+`:range`) or `LocationLink` (`:targetUri`+
 `:targetSelectionRange`/`:targetRange`) to `{:path :line :char}` (0-based)."
   (let (uri (or (:uri loc) (:targetUri loc) "")
-        rand/rng (or (:range loc) (:targetSelectionRange loc) (:targetRange loc))
-        start (when rand/rng (:start rand/rng)))
+        span (or (:range loc) (:targetSelectionRange loc) (:targetRange loc))
+        start (when span (:start span)))
     {:path (lsp-uri->path uri) :line (:line start 0) :char (:character start 0)}))
 
 (defn lsp-locations (result)
@@ -393,7 +398,7 @@ in the picker would promise a fix that cannot happen."
 (defn- lsp-text-edit (e)
   "Normalise one `TextEdit` (`:range {:start :end}` + `:newText`) to
 `{:start-line :start-char :end-line :end-char :text}` (0-based)."
-  (let (rand/rng (:range e) s (:start rand/rng) en (:end rand/rng))
+  (let (span (:range e) s (:start span) en (:end span))
     {:start-line (:line s 0)
      :start-char (:character s 0)
      :end-line (:line en 0)
@@ -688,8 +693,17 @@ acknowledged; anything else gets MethodNotFound, which is a real answer and unbl
 server just as well as agreement would."
   (let (id (:id msg)
         method (:method msg))
-    (if (= method "workspace/applyEdit")
-      (lsp-apply-edit-request state msg)
+    (cond
+      (= method "workspace/applyEdit") (lsp-apply-edit-request state msg)
+      ;; we advertise `workspace.configuration`, so the server asks — one result per item
+      ;; it asked about, and `null` is "no setting, use your default". MethodNotFound here
+      ;; answered a capability we had claimed.
+      (= method "workspace/configuration")
+        (assoc state
+          :outbox
+            (append (or (:outbox state) [])
+              [(lsp-response id (into [] (map (get-in msg [:params :items] []) (fn (_) nil))))]))
+      :else
       (let (frame (if (contains? *lsp-server-requests-handled* method)
                     (lsp-response id nil)
                     (lsp-error-response id -32601 (str "bedit does not implement " method))))
@@ -736,6 +750,21 @@ reply is `[pid message]` for the shell to `send`."
 (defn- lsp-send-all (proc frames)
   (doseq (f frames) (os/write proc f)))
 
+(defn- lsp-drain (state replies)
+  "Carry out what a fold of server output (`lsp-ingest` / `lsp-dispatch`) left to do, and
+answer the state without it: `replies` to their waiters, anything we owe the SERVER down
+its stdin, anything it SAID to the editor, and anything it asked us to CHANGE (a code
+action's command, applied by the loop that owns the buffers). Here rather than in the
+fold, so the fold stays pure."
+  (doseq (r replies) (send (first r) (second r)))
+  (lsp-send-all (:proc state) (or (:outbox state) []))
+  (doseq (line (or (:notices state) [])) (send :editor [:lsp-notice line]))
+  (doseq (d (or (:diags state) []))
+    (let ([path items raw] d)
+      (send :editor [:lsp-diagnostics path items raw])))
+  (doseq (e (or (:edits state) [])) (send :editor [:lsp-apply-edit e]))
+  (dissoc state :outbox :notices :diags :edits))
+
 (defn- lsp-await-init (state id)
   "Read frames until the `initialize` response (jsonrpc `id`) arrives, returning the
 state with the consumed bytes drained. Bounded (`*lsp-init-timeout-ms*`) so a server that
@@ -747,8 +776,15 @@ late first completion rather than a frozen editor."
   (receive
     ([:proc p chunk] (let (buf (str (:buf state) chunk)
                            [msgs remaining] (lsp-decode buf)
-                           st (assoc state :buf remaining)
-                           hit (seq/find msgs (fn (msg) (= (:id msg) id))))
+                           hit (seq/find msgs (fn (msg) (and (= (:id msg) id) (nil? (:method msg)))))
+                           ;; everything else that arrived meanwhile is handled as the loop
+                           ;; would: a server that asks for its configuration or registers a
+                           ;; capability BEFORE answering initialize is waiting on us, and
+                           ;; dropping the request left it waiting for good
+                           st (apply lsp-drain
+                                (fold (seq/reject msgs (fn (msg) (= msg hit)))
+                                  [(assoc state :buf remaining) '()]
+                                  lsp-dispatch)))
                        (if hit
                          ;; …keeping what it says it can do. A server that does not offer
                          ;; signature help should not be asked for it on every keystroke,
@@ -764,21 +800,7 @@ late first completion rather than a frozen editor."
 routed to waiters); a `[:complete …]` request is turned into frames and written to the
 server; `:shutdown` or the server dying stops it."
   (receive
-    ([:proc p chunk] (let ([st2 replies] (lsp-ingest state chunk))
-                       (doseq (r replies) (send (first r) (second r)))
-                       ;; …anything we owe the SERVER goes back down its stdin, and
-                       ;; anything the server SAID goes to the editor. Both drained here
-                       ;; rather than in the fold, so the fold stays pure.
-                       (lsp-send-all (:proc st2) (or (:outbox st2) []))
-                       (doseq (line (or (:notices st2) [])) (send :editor [:lsp-notice line]))
-                       (doseq (d (or (:diags st2) []))
-                         (let ([path items raw] d)
-                           (send :editor [:lsp-diagnostics path items raw])))
-                       ;; …and anything the server asked us to CHANGE (a code action's
-                       ;; command, applied by the loop that owns the buffers)
-                       (doseq (e (or (:edits st2) [])) (send :editor [:lsp-apply-edit e]))
-                       (lsp-loop (dissoc (dissoc (dissoc (dissoc st2 :outbox) :notices) :diags)
-                                   :edits))))
+    ([:proc p chunk] (lsp-loop (apply lsp-drain (lsp-ingest state chunk))))
     ([:proc-err p chunk] (lsp-loop state))
     ([:proc-closed p code] :lsp-stopped)
     ([:complete corr reply-to uri lang text line char] (let ([st2 frames] (lsp-request-complete state
@@ -1050,7 +1072,10 @@ boundary rule the other sources use (`symbol-prefix-at`), so the merge keeps thi
   (first (symbol-prefix-at text p)))
 
 (defn lsp-path->uri (path)
-  (str "file://" path))
+  "The `file://` URI of `path`, each segment percent-encoded: a server compares URIs as
+strings and sends them encoded, so `/my project/a.ex` has to go out as `my%20project`
+or its answers name a file this client never opened."
+  (str "file://" (string/join (map (string/split path "/") url/percent-encode) "/")))
 
 
 (def *lsp-language-ids*
