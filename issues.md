@@ -82,7 +82,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   not `defonce`.
 - [x] **C6 Mode line / ui-kit widths count chars, not cells.** `statusbar.blsp:66,100,123,
   130-132`, `ui-kit.blsp:108,159,178`; `ui-clip` duplicates `view/ed-fit`.
-- [ ] **C7 Horizontal scroll ignores tab width.** `model.blsp:2223` uses
+- [x] **C7 Horizontal scroll ignores tab width.** `model.blsp:2223` uses
   `buffer-column`; the view measures cells.
 - [ ] **C8 Three different "visible rows" computations.** `input.blsp:1179` ignores
   inlays; `ed-scroll`, `panes/ed-pane-rows` each rebuild the predicate.
