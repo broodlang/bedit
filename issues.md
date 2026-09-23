@@ -80,13 +80,13 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
 - [x] **C5 Registries reset on reload.** `interactive.blsp:269,291`
   (`*prefix-consuming*`, `*command-inverse*`), `keymaps.blsp:504` `*profiles*` — `def`,
   not `defonce`.
-- [ ] **C6 Mode line / ui-kit widths count chars, not cells.** `statusbar.blsp:66,100,123,
+- [x] **C6 Mode line / ui-kit widths count chars, not cells.** `statusbar.blsp:66,100,123,
   130-132`, `ui-kit.blsp:108,159,178`; `ui-clip` duplicates `view/ed-fit`.
 - [ ] **C7 Horizontal scroll ignores tab width.** `model.blsp:2223` uses
   `buffer-column`; the view measures cells.
 - [ ] **C8 Three different "visible rows" computations.** `input.blsp:1179` ignores
   inlays; `ed-scroll`, `panes/ed-pane-rows` each rebuild the predicate.
-- [ ] **C9 `ui-row-ops` label runs under the key column.** `ui-kit.blsp:196`.
+- [x] **C9 `ui-row-ops` label runs under the key column.** `ui-kit.blsp:196`.
 - [x] **C10 Tab in a minibuffer with no `:complete-fn` calls nil** (compile, preset-save,
   beam trace, term prompts).
 
@@ -95,7 +95,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   no-ops. Emacs swaps the two chars before point.
 - [x] **E2 ✔ Repeated `C-x C-t` toggles** — point stays on the current line
   (`commands.blsp:893`).
-- [ ] **E3 ✔ `M-q` destroys indentation and comment prefixes.** *Brood:* `string/fill`
+- [x] **E3 ✔ `M-q` destroys indentation and comment prefixes.** *Brood:* `string/fill`
   with a fill prefix.
 - [ ] **E4 `C-M-h` / `C-x n d` parse every buffer as Brood** (`commands.blsp:2327,2372`).
 - [x] **E5 ✔ Kill coalescing list incomplete; `M-w` wrongly appends.** (M-w appending after a kill is Emacs's own `copy-region-as-kill` behaviour — kept.)
