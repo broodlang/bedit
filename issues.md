@@ -17,14 +17,14 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   *bedit:* a per-server random token in the page URL, required on every route; reject a
   non-loopback `Host`.
 
-- [ ] **S2 ✔ Most edits never set `:modified`.** Only `ed-edit` (`commands.blsp:69`) sets
+- [x] **S2 ✔ Most edits never set `:modified`.** Only `ed-edit` (`commands.blsp:69`) sets
   it. `ed-kill-span` (C-k, M-d, M-DEL, C-M-k, M-z, M-k), `cmd-yank`, `cmd-yank-pop`,
   `qr-replace`, `ed-undo-step`, paredit edits (`ed-apply`), `preview-accept` bypass it —
   C-k then C-x k asks nothing and the edit is lost; auto-save skips the buffer.
   *Brood:* the buffer owns "modified" (rope ≠ saved rope, or bumped by every mutator).
   *bedit:* every mutation goes through one path; read-only refusal comes with it (C4).
 
-- [ ] **S3 ✔ `replace-region` is two undo steps.** `std/editor/buffer.blsp:1134`
+- [x] **S3 ✔ `replace-region` is two undo steps.** `std/editor/buffer.blsp:1134`
   (delete + insert). `M-q` then `C-/` empties the paragraph; `M-c`, `C-t`, `M-t`, case
   region, comment toggle, cycle-spacing, completion accept; query-replace `!` takes 2×N
   undos through broken states.
@@ -75,7 +75,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   old palette.** `view.blsp:59-63,1051`, `isearch.blsp:20` copy faces at load;
   `theme.blsp:173-236` hand-duplicates face formulas and drops `:bold` on 8 faces.
   *Brood:* palette-derived chrome faces in `std/editor/face`.
-- [ ] **C4 ✔ Read-only yank is silent; `C-k` at EOL pushes `"\n"` before the refusal.**
+- [x] **C4 ✔ Read-only yank is silent; `C-k` at EOL pushes `"\n"` before the refusal.**
   (Falls out of S2's single mutation path.)
 - [ ] **C5 Registries reset on reload.** `interactive.blsp:269,291`
   (`*prefix-consuming*`, `*command-inverse*`), `keymaps.blsp:504` `*profiles*` — `def`,

@@ -1864,6 +1864,52 @@ the echo area. Never disturbs the current buffer's point. The editor's primary o
 `ed-append-named` + the log routes)."
   (assoc (ed-append-named m "*Messages*" s) :echo (one-line s)))
 
+
+;; ---- applying buffer ops to the current buffer ------------------------------
+;; The editing core: every command that changes the text goes through `ed-try-edit`
+;; (or `ed-edit`), so a read-only refusal is handled in ONE place and a command
+;; learns whether its edit happened. Here rather than in `commands` because isearch's
+;; query-replace is an editing command too, and `commands` uses isearch.
+
+(defn ed-apply (m f)
+  "Apply a pure `buffer -> buffer` op `f` to the current buffer (movement/undo:
+no status change)."
+  (ed-set-buf m (f (ed-current-buf m))))
+
+(defn ed-try-edit (m f)
+  "Apply a pure `buffer -> buffer` edit `f` to the current buffer: `[m' true]` when it
+ran, `[m' false]` when the buffer refused it (with the echo area saying why). The one
+path an edit takes, so a command that does something ELSE besides the edit — push the
+killed text, remember the yanked span — can do it only when the edit really happened.
+(The buffer records that it is modified itself — std/editor/buffer.)
+
+Refuses on a read-only buffer (a process list, etc.): the edit is skipped and the echo
+area says so, rather than letting the model's `insert`/`delete` guard surface as a raw
+`error:`. Movement (`ed-apply`) is never blocked — a read-only buffer stays navigable.
+
+A PARTIAL read-only span (a form buffer's generated text — the tutorial's prose, a shell
+prompt) can't be pre-checked here (`f` is opaque), so the mutator throws `text is read-only`
+and this catches it: the whole op is abandoned (the buffer is immutable — a mid-op throw
+leaves nothing behind) and the echo shows the buffer's own `:read-only-hint`, or a neutral
+line. Any other error is re-raised untouched."
+  (if (read-only? (ed-current-buf m))
+    [(message m "buffer is read-only") false]
+    (try
+      [(assoc (ed-set-buf m (f (ed-current-buf m))) :status "modified") true]
+      (catch e
+        ;; A partial read-only span refused the edit: the mutator throws `:kind :read-only`
+        ;; (std/editor/buffer) — matched by KIND, not message text, so the wording can change
+        ;; without breaking this. The whole op is abandoned (immutable) and the buffer's own
+        ;; `:read-only-hint` says where you CAN edit; any other error re-raises untouched.
+        (if (and (map? e) (= (:kind e) :read-only))
+          [(message m (or (ed-mode-service (ed-current-buf m) :read-only-hint) "read-only text here"))
+           false]
+          (throw e))))))
+
+(defn ed-edit (m f)
+  "Apply a pure `buffer -> buffer` edit `f` to the current buffer — `ed-try-edit`, for a
+command with nothing to do beyond the edit itself."
+  (first (ed-try-edit m f)))
 ;; ---- log routing: one logger, a filtered backend per destination buffer ------
 ;; stdout (a raw `*out*` stream) and logging (structured, levelled records) are
 ;; different pipes that converge only here — text appended to a named buffer. The
@@ -2007,10 +2053,10 @@ metric."
 
 (defn ed-window-title (m)
   "OS title bar: `name` [*] [— branch] — bedit.
-`*` when the current buffer is modified; branch from the git summary when present."
+`*` when the current buffer has unsaved changes to its file; branch from the git summary when present."
   (let (buf (ed-current-buf m)
         name (buffer-name buf)
-        modified (if (:modified buf) " *" "")
+        modified (if (and (buffer-file buf) (buffer-modified? buf)) " *" "")
         branch (:branch (:git-summary m))
         branch-seg (if (nil? branch) "" (str " — " branch)))
     (str name modified branch-seg " — " *app-name*)))
@@ -2035,7 +2081,7 @@ once per `*auto-save-interval-ms*`. Returns the model with `:auto-saved-at` upda
       (do
         (doseq (buf (:buffers m))
           (let (path (buffer-file buf))
-            (when (and path (:modified buf))
+            (when (and path (buffer-modified? buf))
               (try
                 (file/spit (ed-auto-save-path path) (buffer-text buf))
                 (catch e (log/warn (str "auto-save of " path " failed: " (error-message e))))))))
@@ -2089,7 +2135,7 @@ unreadable now) is logged and skipped. Runs on the idle beat."
           acc
           (let (now (file/mtime f))
             (cond
-              (not (:modified b))
+              (not (buffer-modified? b))
                 (try
                   (message (ed-revert-at acc i) (str "reverted " f " (changed on disk)"))
                   (catch e

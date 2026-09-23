@@ -307,27 +307,55 @@ a name, not a sentence."
 (defn- qr-replace (m)
   "Replace the current match with `:to` — case-adjusted to the text it is replacing when
 the search folded ([[replacement-for]]) — and return `[model' next-search-pos]` (the model
-with its count bumped, point just past the inserted text)."
+with its count bumped, point just past the inserted text). A buffer that refuses the edit
+(read-only) ends the replace there."
   (let (qr (qr-state m)
-        buf (ed-current-buf m)
         start (qr-match qr)
         end (+ start (string/length (:from qr)))
-        matched (string/substring (buffer-text buf) start end)
+        matched (text/slice (buffer-rope (ed-current-buf m)) start end)
         to (replacement-for matched (:to qr) (search-fold? (:from qr)))
-        buf2 (replace-region buf start end to)
-        nextpos (+ start (string/length to)))
-    [(assoc (ed-set-buf m buf2)
-       :status "modified"
-       :query-replace (assoc qr :count (inc (:count qr))))
-      nextpos]))
+        [m2 replaced?] (ed-try-edit m (fn (b) (replace-region b start end to))))
+    (if replaced?
+      [(assoc m2 :query-replace (assoc qr :count (inc (:count qr)))) (+ start (string/length to))]
+      [(assoc m2 :query-replace (assoc qr :match nil)) (buffer-length (ed-current-buf m2))])))
+
+(defn- qr-matches (buf from pos acc)
+  "Every match of `from` at or after `pos`, non-overlapping, as a reversed list of starts
+— the matches `!` will replace, found before any of them is."
+  (let (start (buffer-search-forward buf from pos (search-fold? from)))
+    (if (nil? start)
+      acc
+      (qr-matches buf from (+ start (math/max 1 (string/length from))) (cons start acc)))))
+
+(defn- qr-replace-at (buf from to starts)
+  "`buf` with the match at each of `starts` (ascending, found in `buf` before any edit)
+replaced by `to`, case-adjusted per match. Front to back, each start shifted by what the
+replacements before it added or removed, so point ends after the last one."
+  (let (n (string/length from)
+        fold? (search-fold? from))
+    (first (fold starts
+             [buf 0]
+             (fn (acc start)
+               (let ([b shift] acc
+                     at (+ start shift)
+                     matched (text/slice (buffer-rope b) at (+ at n))
+                     replacement (replacement-for matched to fold?))
+                 [(replace-region b at (+ at n) replacement) (+ shift (- (string/length replacement) n))]))))))
 
 (defn- qr-all (m)
-  "Replace the current match and every subsequent one, then finish (`!`)."
-  (if (nil? (get-in m [:query-replace :match]))
-    (qr-finish m)
-    (let ([m2 pos] (qr-replace m)
-          m3 (qr-goto m2 pos))
-      (if (nil? (:query-replace m3)) m3 (qr-all m3)))))
+  "Replace the current match and every one after it, then finish (`!`). All of them are
+ONE edit in one `undo-group`, so a single undo puts every occurrence back — never the
+2×N steps of replacing them one by one."
+  (let (qr (qr-state m)
+        match (:match qr))
+    (if (nil? match)
+      (qr-finish m)
+      (let (starts (reverse (qr-matches (ed-current-buf m) (:from qr) match '()))
+            [m2 replaced?] (ed-try-edit m
+                             (fn (b) (undo-group b (fn (g) (qr-replace-at g (:from qr) (:to qr) starts))))))
+        (qr-finish (if replaced?
+                     (assoc m2 :query-replace (assoc qr :count (+ (:count qr) (count starts))))
+                     (assoc m2 :query-replace qr)))))))
 
 (def *qr-keys* ["y" "n" " " "!" "." "q"])
 

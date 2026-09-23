@@ -44,39 +44,6 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
 ;; and config (init-config / apply-to-model) are referenced qualified below and auto-load.
 ;; `modes` (a project source module, loaded with the image) provides
 ;; welcome-link-at / *welcome-links* — the welcome scratch's clickable link lines.
-;; ---- applying buffer ops to the current buffer ------------------------------
-
-(defn ed-apply (m f)
-  "Apply a pure `buffer -> buffer` op `f` to the current buffer (movement/undo:
-no status change)."
-  (ed-set-buf m (f (ed-current-buf m))))
-
-(defn ed-edit (m f)
-  "Apply a pure `buffer -> buffer` op `f` to the current buffer, marking it
-modified (edits). Refuses on a read-only buffer (a process list, etc.): the edit is
-skipped and the echo area says so, rather than letting the model's `insert`/`delete`
-guard surface as a raw `error:`. Movement (`ed-apply`) is never blocked — a read-only
-buffer stays navigable.
-
-A PARTIAL read-only span (a form buffer's generated text — the tutorial's prose, a shell
-prompt) can't be pre-checked here (`f` is opaque), so the mutator throws `text is read-only`
-and this catches it: the whole op is abandoned (the buffer is immutable — a mid-op throw
-leaves nothing behind) and the echo shows the buffer's own `:read-only-hint`, or a neutral
-line. Any other error is re-raised untouched."
-  (if (read-only? (ed-current-buf m))
-    (message m "buffer is read-only")
-    (try
-      (let (nb (assoc (f (ed-current-buf m)) :modified true))
-        (assoc (ed-set-buf m nb) :status "modified"))
-      (catch e
-        ;; A partial read-only span refused the edit: the mutator throws `:kind :read-only`
-        ;; (std/editor/buffer) — matched by KIND, not message text, so the wording can change
-        ;; without breaking this. The whole op is abandoned (immutable) and the buffer's own
-        ;; `:read-only-hint` says where you CAN edit; any other error re-raises untouched.
-        (if (and (map? e) (= (:kind e) :read-only))
-          (message m
-            (or (ed-mode-service (ed-current-buf m) :read-only-hint) "read-only text here"))
-          (throw e))))))
 
 (defn ed-name-prompt (prompt names on-complete &optional (limit 20) (recent []))
   "A Vertico minibuffer spec that completes input against a fixed `names` list — Tab to
@@ -793,16 +760,16 @@ selection is its own entry, never appended to a prior kill."
 (defn ed-kill-span (m move)
   "Kill from point to where `move` (a `buffer -> buffer` point move) lands: push
 the spanned text onto the kill ring (coalescing with an adjacent kill) and delete
-it. An empty span is a no-op."
+it. An empty span is a no-op. A buffer that refuses the delete (read-only) says so and
+the kill ring is left alone — nothing was killed."
   (let (b (ed-current-buf m)
         p0 (buffer-point b)
         moved (move (set-mark b)) ; mark = point; point moves
         text (buffer-region moved))
     (if (or (nil? text) (= text ""))
       m
-      (assoc (ed-set-buf (ed-push-kill m text (> (buffer-point moved) p0))
-               (clear-mark (delete-region moved)))
-        :status "modified"))))
+      (let ([m2 killed?] (ed-try-edit m (fn (_) (clear-mark (delete-region moved)))))
+        (if killed? (ed-push-kill m2 text (> (buffer-point moved) p0)) m2)))))
 
 (defn ed-capitalize (s)
   "`s` with its first character upper-cased and the rest lower-cased."
@@ -840,10 +807,7 @@ after it (M-u / M-l / M-c)."
 (defcommand cmd-kill-line
   (m key)
   "Kill from point to end of line (C-k); at end of line, kill the newline."
-  (let (b (ed-current-buf m))
-    (if (= (buffer-char-after b) "\n")
-      (ed-edit (ed-push-kill m "\n" true) delete-char)
-      (ed-kill-span m end-of-line))))
+  (ed-kill-span m (if (= (buffer-char-after (ed-current-buf m)) "\n") forward-char end-of-line)))
 (defcommand cmd-sexp-kill
   (m key)
   "Structure-aware kill (paredit C-k): kill to end of line, but never past the
@@ -1097,20 +1061,21 @@ A hex view is refused: its text renders the binary, it is not the binary."
                 (let (b (assoc (ed-current-buf mm)
                           :file path
                           :name (file-display-name path (ed-project-root mm))))
-                  (do
-                    (save-buffer b)
-                    (let (b2 (dissoc b :modified)
-                          as-path (when old-file (ed-auto-save-path old-file))
-                          m2 (dissoc (ed-set-buf mm b2) :status))
-                      (when (and as-path (file/exists? as-path))
-                        (try
-                          (file/rm as-path)
-                          (catch e
-                            (log/warn (str "could not remove auto-save "
-                                        as-path
-                                        ": "
-                                        (error-message e))))))
-                      (message m2 (str "wrote " path)))))
+                  ;; keep what save-buffer returns: it is unmodified AND stamped with the
+                  ;; new file's mtime (dropping it left a stale stamp -> a false
+                  ;; "changed on disk" on the next save)
+                  (let (b2 (save-buffer b)
+                        as-path (when old-file (ed-auto-save-path old-file))
+                        m2 (dissoc (ed-set-buf mm b2) :status))
+                    (when (and as-path (file/exists? as-path))
+                      (try
+                        (file/rm as-path)
+                        (catch e
+                          (log/warn (str "could not remove auto-save "
+                                      as-path
+                                      ": "
+                                      (error-message e))))))
+                    (message m2 (str "wrote " path))))
                 (catch e (message mm (str "write failed: " (error-message e)))))))))))
 
 (defcommand cmd-revert-buffer
@@ -2223,7 +2188,7 @@ outside your selection are simply not applied."
       (let (undone (editor/buffer/undo-in-region b))
         (if (= (buffer-text undone) (buffer-text b))
           (message m "no change in the region to undo")
-          (message (ed-set-buf m (assoc undone :modified true))
+          (message (ed-set-buf m undone)
             "undid the region"))))))
 
 (defcommand cmd-redo
@@ -2464,37 +2429,33 @@ on a results buffer's link line it copies the whole link — the link's absolute
   (m key)
   "Insert the most recently killed/copied text at point (C-y), recording the
 inserted span + ring index in `:yank` so M-y (`cmd-yank-pop`) can replace it. First
-adopts the OS clipboard if another app copied something newer (`ed-adopt-clipboard`)."
+adopts the OS clipboard if another app copied something newer (`ed-adopt-clipboard`).
+A read-only buffer says so and records no span."
   (let ([m text] (ed-kill-head m))
     (if (nil? text)
       (message m "kill ring is empty")
-      (let (b (ed-current-buf m)
-            start (buffer-point b)
-            b2 (insert b text))
-        (assoc (ed-set-buf m b2)
-          :status "modified"
-          :yank {:start start :end (buffer-point b2) :index 0})))))
+      (let (start (buffer-point (ed-current-buf m))
+            [m2 yanked?] (ed-try-edit m (fn (b) (insert b text))))
+        (if yanked?
+          (assoc m2 :yank {:start start :end (buffer-point (ed-current-buf m2)) :index 0})
+          m2)))))
 
 (defcommand cmd-yank-pop
   (m key)
   "Replace the text of the immediately-preceding yank with the next-older kill,
 cycling the ring (M-y). Only valid right after a yank or yank-pop; otherwise it
-reports that the previous command was not a yank."
+reports that the previous command was not a yank. The swap is one `replace-region`, so
+one undo takes the whole M-y back."
   (let (y (:yank m) ring (:kill-ring m))
     (if (or (nil? y) (not (ed-yank-command? (:last-command m))) (empty? ring))
       (message m "previous command was not a yank")
       (let (n (count ring)
             idx (let (i (inc (:index y))) (if (>= i n) 0 i))
-            text (nth ring idx)
-            b (ed-current-buf m)
-            ;; delete the previous yank's span [start,end] (point lands at start),
-            ;; then insert the next entry there
-            cleared (delete-region (assoc b :mark (:start y) :point (:end y)))
-            b2 (insert cleared text))
-        (assoc (ed-set-buf m b2)
-          :status "modified"
-          :yank {:start (:start y) :end (buffer-point b2) :index idx})))))
-
+            [m2 swapped?] (ed-try-edit m
+                            (fn (b) (clear-mark (replace-region b (:start y) (:end y) (nth ring idx))))))
+        (if swapped?
+          (assoc m2 :yank {:start (:start y) :end (buffer-point (ed-current-buf m2)) :index idx})
+          m2)))))
 ;; ---- right-click context menu (a standard dropdown) -------------------------
 ;; A modal overlay on `:menu` listing actions that run the *same* commands as the
 ;; keyboard (so Copy is exactly M-w, Cut C-w, Paste C-y, Select All C-x h — and thus the
@@ -2698,7 +2659,7 @@ that mode asked to take with it (`layers/request-close`) are killed as well."
     (cond
       (= (buffer-name buf) "*Messages*") (message m "cannot kill *Messages*")
       ;; unsaved changes to a file: ask, as Emacs does, rather than drop them silently
-      (and (:modified buf) (buffer-file buf))
+      (and (buffer-modified? buf) (buffer-file buf))
         (ed-read-char m
           (str "Buffer " (buffer-name buf) " modified; kill anyway? (y or n)")
           (fn (mm k)
@@ -3805,7 +3766,7 @@ how many are modified up front is the same consent, informed, in one key."
       (message m "not in a project")
       (let (names (project-buffer-names m root)
             dirty (count (seq/filter (:buffers m)
-                           (fn (b) (and (project-owns-buffer? root b) (:modified b)))))
+                           (fn (b) (and (project-owns-buffer? root b) (buffer-modified? b)))))
             label (path/basename root))
         (if (empty? names)
           (message m (str "no open buffers in " label))
@@ -4443,7 +4404,7 @@ isn't on a process row, or the process is already gone."
 quit must ask about. A modified scratch or generated buffer has nowhere to be saved and is
 not asked about (Emacs asks only for file-visiting buffers)."
   (seq/filter (range (count (:buffers m)))
-    (fn (i) (let (b (ed-buf-at m i)) (and (:modified b) (not (nil? (buffer-file b))))))))
+    (fn (i) (let (b (ed-buf-at m i)) (and (buffer-modified? b) (not (nil? (buffer-file b))))))))
 
 (defn- ed-quit-now (m)
   "End the loop — and, on the primary, every open frame with it (`frames/frames-close-all`;
@@ -4552,8 +4513,8 @@ way). ESC is *not* quit (it's `keyboard-escape-quit`; see `modes`)."
 (sig ed-save-buf-at (model int -> model))
 (defn ed-save-buf-at (m i)
   "Write pool buffer `i` to its file: the plain save every path shares — `C-x C-s` on the
-current buffer, and `save-some-buffers` on any other at quit. Clears the buffer's
-`:modified` flag in the pool and deletes its `#filename#` auto-save sidecar on success;
+current buffer, and `save-some-buffers` on any other at quit. The buffer comes back unmodified
+(`save-buffer` sets its baseline) and its `#filename#` auto-save sidecar is deleted on success;
 reports the outcome in the echo area either way. The diff-hl gutter is NOT recomputed
 here: a save writes the working tree but touches neither the buffer text nor HEAD, so
 the buffer-vs-HEAD diff is unchanged (and any prior edit already refreshed it via the
@@ -4563,7 +4524,7 @@ steady — dropping it made them blink off and back on each save."
     (try
       ;; `save-buffer` answers the buffer stamped with the file's new mtime, so the idle
       ;; beat's change check (`ed-revert-changed-files`) knows text and file agree again
-      (let (saved (dissoc (save-buffer buf) :modified :disk-warned)
+      (let (saved (dissoc (save-buffer buf) :disk-warned)
             f (buffer-file buf)
             as-path (ed-auto-save-path f)
             m2 (dissoc (ed-set-buf-at m i saved) :status))
@@ -4579,7 +4540,7 @@ steady — dropping it made them blink off and back on each save."
 (defcommand cmd-save
   (m key)
   "Write the current buffer to its file (C-x C-s); report the outcome in the echo
-area. Clears the buffer's `:modified` flag and deletes the `#filename#` auto-save
+area. Leaves the buffer unmodified and deletes the `#filename#` auto-save
 sidecar on success (`ed-save-buf-at`). A no-op-with-message if the buffer has no
 backing file."
   (let (buf (ed-current-buf m)
@@ -6130,7 +6091,7 @@ then name, size, mode and file (Emacs `list-buffers`, minus the columns nobody r
   (let (rows (map (:buffers m)
                (fn (b)
                  (str "  "
-                   (if (:modified b) "*" " ")
+                   (if (buffer-modified? b) "*" " ")
                    (if (read-only? b) "%" " ")
                    " "
                    (string/pad-right (buffer-name b) 24)
