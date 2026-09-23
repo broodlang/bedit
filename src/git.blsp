@@ -235,9 +235,22 @@ git from prompting. `opts` go to `os/cmd` (`:stdin`, `:timeout-ms`, `:env` over 
     (if (= (:exit r) 0) (string/trim (:stdout r)) nil)))
 
 (defn- git-branch (root)
-  "The current branch name (or a short hash when detached), `?` on error."
-  (let (r (git-git root ["rev-parse" "--abbrev-ref" "HEAD"]))
-    (if (= (:exit r) 0) (string/trim (:stdout r)) "?")))
+  "The current branch name (or a short hash when detached), `?` on error — `projects`'
+`git-branch`, the one implementation."
+  (or (projects/git-branch root) "?"))
+
+(defn- git-born? (root)
+  "Whether the repo at `root` has a first commit. Before one, HEAD names a branch with
+nothing on it, and everything that resolves `HEAD` fails."
+  (= 0 (:exit (git-git root ["rev-parse" "-q" "--verify" "HEAD"]))))
+
+(defn- git-unstage-args (root paths)
+  "The git arguments that take `paths` out of the index, back to HEAD. `reset HEAD` is the
+usual way, and it fails in a repo with no commits yet (there is no HEAD to reset to) — so
+after `git init`, nothing could be unstaged. There, the index entry is simply removed."
+  (if (or (nil? root) (git-born? root))
+    (into ["reset" "-q" "HEAD" "--"] paths)
+    (into ["rm" "--cached" "-q" "-r" "--"] paths)))
 
 (defn- git-resolve-root (m)
   "The repo root: `:git-root` when already in a git buffer, else `git-toplevel` of the
@@ -272,7 +285,10 @@ gives zero hunks."
                    {:headers [] :hunks [] :pending-header nil :pending-lines []}
                    (fn (acc line)
                      (cond
-                       (string/starts-with? (string/triml line) "@@")
+                       ;; the RAW line: a hunk header starts at column 0, and a context line
+                       ;; is a space then the source — a Ruby `  @@count = 0` trimmed to "@@"
+                       ;; split the hunk and handed `git apply` a corrupt patch
+                       (string/starts-with? line "@@")
                          (assoc (git-finish-hunk acc)
                            :pending-header line
                            :pending-lines [])
@@ -291,11 +307,12 @@ stage/unstage just this hunk."
     "\n"))
 
 (defn- git-apply-hunk (root patch-text cached? reverse?)
-  "Pipe `patch-text` to `git apply -` (stdin). `cached?` adds `--cached` (index);
+  "Pipe `patch-text` to `git apply -` (stdin). `cached?` adds `--cached` (the index alone),
+or `:index` for `--index` (index and work tree together — discarding a staged hunk);
 `reverse?` adds `--reverse` (for unstage/discard). Returns `{:exit :stdout :stderr}`."
   (git-git root
     (append ["apply" "--ignore-space-change"]
-      (if cached? ["--cached"] [])
+      (cond (= cached? :index) ["--index"] cached? ["--cached"] :else [])
       (if reverse? ["--reverse"] [])
       ["-"])
     {:stdin patch-text}))
@@ -318,8 +335,10 @@ new path under point."
               y (string/substring t 1 2)
               path (string/substring t 3 (string/length t))
               rename? (or (= x "R") (= x "C")))
+          ;; keep a rename's source: unstaging `new` alone left the deletion of `old` staged
           (git-parse-z (if rename? (rest (rest tokens)) (rest tokens))
-            (cons {:x x :y y :path path} acc)))))))
+            (cons (if rename? {:x x :y y :path path :orig-path (second tokens)} {:x x :y y :path path})
+              acc)))))))
 
 (defn- git-entries (porcelain)
   "Parse `git status --porcelain -z` output (NUL-separated; a rename/copy carries its source as
@@ -548,6 +567,7 @@ the one they are in now."
   "The actionable row data for an entry shown in `section` (`:staged` / `:unstaged` /
 `:untracked`): `{:path :staged? :untracked?}`."
   {:path (:path e)
+   :orig-path (:orig-path e)
    :staged? (= section :staged)
    :untracked? (= section :untracked)
    :unmerged? (= section :unmerged)})
@@ -1262,7 +1282,10 @@ with just that hunk. File row: `git reset HEAD -- <path>`. Section header or com
       (:section-header row) (message m "press U to unstage all, or move to a specific file")
       (:commit-log? row) m
       (:hunk? row) (git-do-hunk m "unstage hunk" (:hunk-patch row) true true)
-      :else (git-do m "unstage" ["reset" "-q" "HEAD" "--" (:path row)]))))
+      :else
+        (git-do m
+          "unstage"
+          (git-unstage-args (:git-root m) (if (:orig-path row) [(:path row) (:orig-path row)] [(:path row)]))))))
 
 (defcommand cmd-git-unstage-all
   (m key)
@@ -1270,7 +1293,7 @@ with just that hunk. File row: `git reset HEAD -- <path>`. Section header or com
   (let (root (:git-root m))
     (if (nil? root)
       (message m "not in a git repository")
-      (git-do m "unstage all" ["reset" "HEAD"]))))
+      (git-do m "unstage all" (git-unstage-args root ["."])))))
 
 (defcommand cmd-git-discard
   (m key)
@@ -1288,14 +1311,18 @@ Section headers, commit rows, and untracked files are no-ops."
           "Discard hunk? (y/n) "
           (fn (mm c)
             (if (or (= c "y") (= c "Y"))
-              (git-do-hunk mm "discard hunk" (:hunk-patch row) false true)
+              ;; a STAGED hunk goes from the index and the work tree at once (`--index`):
+              ;; reversing it in the work tree alone left it staged
+              (git-do-hunk mm "discard hunk" (:hunk-patch row) (if (= (:section row) :staged) :index false) true)
               (message mm "discard cancelled"))))
       :else
         (ed-read-char m
           (str "Discard changes to " (:path row) "? (y/n) ")
           (fn (mm c)
             (if (or (= c "y") (= c "Y"))
-              (git-do mm "discard" ["checkout" "--" (:path row)])
+              ;; `checkout -- path` restores from the INDEX, so on a staged row it discarded
+              ;; only the unstaged part; from HEAD it takes the staged change too (Magit)
+              (git-do mm "discard" (if (:staged? row) ["checkout" "HEAD" "--" (:path row)] ["checkout" "--" (:path row)]))
               (message mm "discard cancelled")))))))
 
 (defcommand cmd-git-refresh
@@ -1495,12 +1522,15 @@ guesses that a key exists to show the rest. Nothing to point at when there is no
 model-threaded git command goes through, so the journal cannot disagree with what ran."
   (git-journal-run m args (fn () (git-git (:git-root m) args))))
 
-(sig git-run-hunk (model string bool bool -> vector))
+(sig git-run-hunk (model string (or bool keyword) bool -> vector))
 (defn git-run-hunk (m patch cached? reverse?)
   "[[git-run]] for the hunk path: the patch goes to `git apply` over stdin, so the entry
 names the arguments rather than the patch — which is in the diff above it anyway."
   (git-journal-run m
-    (append ["apply"] (if cached? ["--cached"] []) (if reverse? ["--reverse"] []) ["-"])
+    (append ["apply"]
+      (cond (= cached? :index) ["--index"] cached? ["--cached"] :else [])
+      (if reverse? ["--reverse"] [])
+      ["-"])
     (fn () (git-apply-hunk (:git-root m) patch cached? reverse?))))
 
 ;; ---- rendering the buffer ------------------------------------------------------
@@ -3031,7 +3061,7 @@ how you end up rebasing the wrong plan."
 (defcommand cmd-git-file-unstage
   (m key)
   "Unstage this file (C-c g u)."
-  (git-on-file m "reset" (fn (path) ["reset" "HEAD" "--" path])))
+  (git-on-file m "reset" (fn (path) (git-unstage-args (git-resolve-root m) [path]))))
 
 (defcommand cmd-git-file-discard
   (m key)

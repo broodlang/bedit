@@ -104,16 +104,16 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   DEL re-searches from origin.
 
 ### Git / tooling
-- [ ] **G1 Ruby `@@var` context line splits a hunk.** `git.blsp:258` trims before the
+- [x] **G1 Ruby `@@var` context line splits a hunk.** `git.blsp:258` trims before the
   `@@` test → corrupt patch to `git apply`.
-- [ ] **G2 Renames lose the original path** (`git-parse-z`, `git.blsp:304`); unstage of a
+- [x] **G2 Renames lose the original path** (`git-parse-z`, `git.blsp:304`); unstage of a
   staged rename leaves the delete staged. `k` on a staged row / hunk discards the wrong thing.
-- [ ] **G3 Unborn branch / detached HEAD.** `git-branch` returns `HEAD`/`?`; `u` fails
+- [x] **G3 Unborn branch / detached HEAD.** `git-branch` returns `HEAD`/`?`; `u` fails
   before the first commit. Two `git-branch` implementations (`projects.blsp:135`).
 - [x] **G4 Background fetch can prompt for credentials.** `git.blsp:1083,1106`.
   *Brood:* `:env` (and a timeout) on `os/cmd`.
 - [x] **G5 Token-only URLs not redacted** in the process log (`git.blsp:1369`).
-- [ ] **G6 find-file: `git ls-files` without `-z`** (quoted non-ASCII names; deleted
+- [x] **G6 find-file: `git ls-files` without `-z`** (quoted non-ASCII names; deleted
   files listed). `projects.blsp:129`.
 - [ ] **G7 Two location parsers disagree** (`compile.blsp:31-43` vs `results.blsp:34-66`);
   URLs / `0.0.0.0:8080` read as errors; `:col` ignored.
