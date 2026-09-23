@@ -117,9 +117,9 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   files listed). `projects.blsp:129`.
 - [x] **G7 Two location parsers disagree** (`compile.blsp:31-43` vs `results.blsp:34-66`);
   URLs / `0.0.0.0:8080` read as errors; `:col` ignored.
-- [ ] **F1 Format-on-save skips the disk-changed check; `mix format` runs in the file's
+- [~] **F1 Format-on-save skips the disk-changed check; `mix format` runs in the file's
   dir (ignores `.formatter.exs`) and blocks the UI.** `commands.blsp:4590`,
-  `format.blsp:54,78-84`. No tests.
+  `format.blsp:54,78-84`. No tests. — FIXED: check order, project root, stamp/unmodified on failure, tests. OPEN: the formatter still runs on the loop (blocks the UI).
 
 ### Processes / sessions
 - [x] **P1 `C-c t` (cold) and `C-c r` run the project's `:main`.** `apprun.blsp:29`,
