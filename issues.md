@@ -140,8 +140,8 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
 ### Live eval
 - [~] **L1 Tutor clears pending on ready** (`tutor.blsp:1179`) — FIXED (pending kept, test corrected). OPEN: the tutor is still a second copy of playground-core's launch/reply logic, not a client of it. Was: the bug playground-core
   fixed; a test asserts it. Tutor should be a client of playground-core.
-- [ ] **L2 Spy pane cache keyed by form index shows the wrong form after a shift**
-  (`playground-core.blsp:583`).
+- [x] **L2 Spy pane cache keyed by form index shows the wrong form after a shift**
+  (`playground-core.blsp:583`). — FIXED: `workings/rekey` moves each report through the same form pairing the notes use, before the stale ones are forgotten.
 - [x] **L3 Elixir playground: `x = x + 1` doesn't depend on `x`** (`form-deps`).
 - [ ] **L4 Playground/tutor in a second frame hang** — replies go to `:editor`.
 
