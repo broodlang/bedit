@@ -48,7 +48,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   every client.
   *Brood:* a per-session reply address in `std/editor/serve` / `evalsession`.
 
-- [ ] **S7 Unquoted paths into `sh -c`.** `toolchain.blsp:119-120,183,200` (`pytest `,
+- [x] **S7 Unquoted paths into `sh -c`.** `toolchain.blsp:119-120,183,200` (`pytest `,
   `go test `, `npm test -- ` + file), `npm run <script>`; `git.blsp:2922`
   `sequence.editor=cp <file>` (git runs it through the shell). Spaces break; a crafted
   filename runs code.
@@ -110,9 +110,9 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   staged rename leaves the delete staged. `k` on a staged row / hunk discards the wrong thing.
 - [ ] **G3 Unborn branch / detached HEAD.** `git-branch` returns `HEAD`/`?`; `u` fails
   before the first commit. Two `git-branch` implementations (`projects.blsp:135`).
-- [ ] **G4 Background fetch can prompt for credentials.** `git.blsp:1083,1106`.
+- [x] **G4 Background fetch can prompt for credentials.** `git.blsp:1083,1106`.
   *Brood:* `:env` (and a timeout) on `os/cmd`.
-- [ ] **G5 Token-only URLs not redacted** in the process log (`git.blsp:1369`).
+- [x] **G5 Token-only URLs not redacted** in the process log (`git.blsp:1369`).
 - [ ] **G6 find-file: `git ls-files` without `-z`** (quoted non-ASCII names; deleted
   files listed). `projects.blsp:129`.
 - [ ] **G7 Two location parsers disagree** (`compile.blsp:31-43` vs `results.blsp:34-66`);
@@ -122,7 +122,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   `format.blsp:54,78-84`. No tests.
 
 ### Processes / sessions
-- [ ] **P1 `C-c t` (cold) and `C-c r` run the project's `:main`.** `apprun.blsp:29`,
+- [x] **P1 `C-c t` (cold) and `C-c r` run the project's `:main`.** `apprun.blsp:29`,
   `testrun.blsp:97` — `path/temp` gives no `.blsp` suffix; `nest run` opens it as a
   document.
 - [ ] **P2 BEAM attach: trace/break/resume/pstate act on the local VM.**

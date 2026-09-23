@@ -8,12 +8,12 @@ g refresh, q quit, P/F push/pull, l log, z z/z p stash push/pop. `$` opens *git-
 what git actually ran (Magit's process buffer) — every command, its exit code, how long it
 took and its whole output. Hunk-level staging: TAB expands
 a file showing each `@@` hunk as an actionable row; s/u/k on a hunk runs `git apply --cached`
-(or its reverse) piping the patch via stdin (`%os-cmd-stdin`). Section collapsing: TAB on a
+(or its reverse) piping the patch via stdin (`os/cmd` `:stdin`). Section collapsing: TAB on a
 section header toggles it between expanded and collapsed (`:git-collapsed-sections` tracks which).
 The dired pattern: a `:git-status` mode layer over a generated buffer, with the per-row data (file,
 hunk, section-header, OR commit-log row) kept on the model (`:git-rows`, parallel to the buffer's
 lines) so commands read the current row without re-parsing text. Git runs synchronously via
-`%os-cmd` in the repo root (`:git-root`). Parsing/rendering are pure (tests/git_test.blsp)."
+`os/cmd` in the repo root (`:git-root`). Parsing/rendering are pure (tests/git_test.blsp)."
   (:use model) ; ed-current-buf / ed-set-buf / message / ed-read-char / ed-apply
   (:use commands) ; ed-show-named / ed-default-dir / ed-goto-line / cmd-kill-buffer
   (:use interactive) ; defcommand
@@ -207,14 +207,31 @@ file/commit rows, and inline diffs (`git-status-line-spans`)."
 
 ;; ---- running git ------------------------------------------------------------
 
-(defn- git-git (root args)
+(def *git-env*
+  ;; Every git the editor runs: there is no terminal for git to prompt on — bedit started
+  ;; from a shell would hand git THAT terminal, and a password prompt would appear in a
+  ;; window nobody is looking at while the command hangs. A credential git cannot find is a
+  ;; failed command, reported like any other.
+  {"GIT_TERMINAL_PROMPT" "0"})
+
+(def *git-background-env*
+  ;; A git nobody asked for (the background fetch) must not ask anything at all: no askpass
+  ;; dialog popping up every three minutes, no ssh passphrase prompt. `true` as the askpass
+  ;; program answers every question with nothing, so the fetch fails quietly instead.
+  (merge *git-env*
+    {"GIT_ASKPASS" "true" "SSH_ASKPASS" "true" "GIT_SSH_COMMAND" "ssh -o BatchMode=yes"}))
+
+(defn- git-git (root args &optional (opts {}))
   "Run git in `root` with `args` (a vector); `{:exit :stdout :stderr}`. `core.quotePath=false`
-keeps non-ASCII paths literal (no octal escapes) in status / diff output."
-  (%os-cmd "git" (into ["-C" root "-c" "core.quotePath=false"] args)))
+keeps non-ASCII paths literal (no octal escapes) in status / diff output; `*git-env*` keeps
+git from prompting. `opts` go to `os/cmd` (`:stdin`, `:timeout-ms`, `:env` over `*git-env*`)."
+  (os/cmd "git"
+    (into ["-C" root "-c" "core.quotePath=false"] args)
+    (assoc opts :env (merge *git-env* (get opts :env {})))))
 
 (defn- git-toplevel (dir)
   "The git work-tree root containing `dir`, or nil when `dir` isn't in a repo."
-  (let (r (%os-cmd "git" ["-C" dir "rev-parse" "--show-toplevel"]))
+  (let (r (os/cmd "git" ["-C" dir "rev-parse" "--show-toplevel"]))
     (if (= (:exit r) 0) (string/trim (:stdout r)) nil)))
 
 (defn- git-branch (root)
@@ -230,7 +247,7 @@ current file's directory. Returns nil when not in a git repository."
 ;; ---- hunk parsing + patch construction (for hunk-level staging) ------------
 ;; Magit's defining feature: TAB on a file expands it into individual `@@` hunks, each
 ;; an actionable row. `s`/`u`/`k` on a hunk row builds a minimal one-hunk patch and pipes
-;; it to `git apply --cached` (or its reverse) via `%os-cmd-stdin` — `git apply -` reads
+;; it to `git apply --cached` (or its reverse) via `os/cmd` `:stdin` — `git apply -` reads
 ;; the patch from stdin, avoiding any temp file.
 
 (defn- git-finish-hunk (acc)
@@ -276,12 +293,12 @@ stage/unstage just this hunk."
 (defn- git-apply-hunk (root patch-text cached? reverse?)
   "Pipe `patch-text` to `git apply -` (stdin). `cached?` adds `--cached` (index);
 `reverse?` adds `--reverse` (for unstage/discard). Returns `{:exit :stdout :stderr}`."
-  (%os-cmd-stdin "git"
-    (into ["-C" root "-c" "core.quotePath=false" "apply" "--ignore-space-change"]
-      (append (if cached? ["--cached"] [])
-        (if reverse? ["--reverse"] [])
-        ["-"]))
-    patch-text))
+  (git-git root
+    (append ["apply" "--ignore-space-change"]
+      (if cached? ["--cached"] [])
+      (if reverse? ["--reverse"] [])
+      ["-"])
+    {:stdin patch-text}))
 
 ;; ---- pure: parse `git status --porcelain -z` --------------------------------
 ;; The NUL-separated form is robust to paths with spaces / quotes / newlines (no quoting, no
@@ -1103,7 +1120,7 @@ one of them a network round trip."
         (do
           ;; the fetch itself; its exit code does not matter here — offline just means the
           ;; counts below are unchanged, which is exactly the right thing to report
-          (git-git root ["fetch" "--quiet"])
+          (git-git root ["fetch" "--quiet"] {:env *git-background-env* :timeout-ms *git-op-timeout-ms*})
           (let (ab (git-ahead-behind root))
             {:root root
              :upstream upstream
@@ -1365,8 +1382,14 @@ commit-log rows, and blank lines are no-ops."
 ;; drift into three shapes.
 
 (defn- git-redact (s)
-  "`s` with any `user:secret@` credential in a URL replaced by `user:***@`."
-  (regex/replace "://([^/@:\\s]+):[^/@\\s]+@" s "://$1:***@"))
+  "`s` with the credentials in its URLs replaced by `***`: the password of a
+`user:secret@`, and the whole user part of an `http(s)://token@` — a personal access
+token is sent as the USERNAME (`https://ghp_…@github.com`), so hiding only what follows a
+colon left the token itself in the log. An ssh `git@host` names an account, not a
+secret, and stays."
+  (regex/replace "(https?://)[^/@:\\s]+@"
+    (regex/replace "://([^/@:\\s]+):[^/@\\s]+@" s "://$1:***@")
+    "$1***@"))
 
 (defn- git-printable (s)
   "`s` made fit to put in a rope: `\\r` progress and escape sequences APPLIED (so
@@ -2919,7 +2942,7 @@ names every commit subject you are about to rewrite."
             ;; `sequence.editor` is run as `<value> <todo path>`, so this copies our plan
             ;; over git's and git never opens an editor. `core.editor` covers the message
             ;; editor a `reword` or `squash` would otherwise open.
-            ["-c" (str "sequence.editor=cp " file)
+            ["-c" (str "sequence.editor=cp " (os/shell-quote file))
              "-c" "core.editor=true"
              "rebase" "-i" onto])))))
 
