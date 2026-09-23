@@ -127,7 +127,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   document.
 - [ ] **P2 BEAM attach: trace/break/resume/pstate act on the local VM.**
   `elixir/bedit_agent.exs:357-420,490-510`.
-- [ ] **P3 A warm test session keeps its first project's root.** `testrun.blsp:597-613`.
+- [x] **P3 A warm test session keeps its first project's root.** `testrun.blsp:597-613`.
 - [ ] **P4 The shared `:sandbox` re-roots back and forth** (`sandbox.blsp:174` turns nil
   into `/tmp`; diagnostics re-root it) — wipes playground state.
 - [ ] **P5 Removing a breakpoint can revert a later redefinition** (`debugger.blsp:548-575`);
