@@ -370,11 +370,11 @@ brood/gui` in ../brood). A plain `cargo run -p nest -- test` rebuilds
 `target/debug/nest` *without* the GUI feature and clobbers the installed binary's
 counterpart — it won't reflect the windowed build.
 
-**Don't run `nest format` here.** It reformats all ~55 files and hoists every
-trailing `; comment` onto its own line above the form — this codebase documents
-`(:use …)` clauses and assertions with trailing comments deliberately, so the
-formatter's output is a large, lossy diff. Reformatting is a decision to take
-explicitly, not a side effect of a change.
+**The tree is `nest format`-clean, and CI enforces it** (`nest format --check`). Run
+`nest format --changed` before committing — the whole tree was reformatted once, on
+2026-09-23, after the check had kept CI red for a day. The formatter keeps a trailing
+`; comment` on a `(:use …)` clause or a simple form, but moves one off a `cond` clause or
+out of a vector/map literal onto its own line — so write those comments above the form.
 
 **Process tests use barriers, not sleeps.** `buffer-query` (and any other
 synchronous call) is a FIFO round-trip: when it returns, every message the test
