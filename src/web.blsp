@@ -112,9 +112,12 @@ pre{margin:0;padding:.5rem 1rem;white-space:pre;tab-size:4}
 ;; keystroke back to POST /input — so the browser is a read-write remote frontend, not
 ;; just a viewer. Bare modifier presses are skipped; `preventDefault` keeps the browser's
 ;; own chords (Ctrl-F find, Ctrl-S save, Space scroll) from stealing keys from the editor.
+;; Every request carries the page's own `?token=` back (see `web-handler`): the page
+;; learned it from the URL it was opened with, which is the only way anything can.
 (def *web-js*
-  "const es=new EventSource('/events');es.onmessage=e=>{document.getElementById('app').innerHTML=e.data};
-addEventListener('keydown',e=>{const k=e.key;if(k==='Shift'||k==='Control'||k==='Alt'||k==='Meta')return;e.preventDefault();fetch('/input',{method:'POST',body:JSON.stringify({k:k,ctrl:e.ctrlKey,alt:e.altKey,shift:e.shiftKey})});});")
+  "const q='?token='+encodeURIComponent(new URLSearchParams(location.search).get('token')||'');
+const es=new EventSource('/events'+q);es.onmessage=e=>{document.getElementById('app').innerHTML=e.data};
+addEventListener('keydown',e=>{const k=e.key;if(k==='Shift'||k==='Control'||k==='Alt'||k==='Meta')return;e.preventDefault();fetch('/input'+q,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({k:k,ctrl:e.ctrlKey,alt:e.altKey,shift:e.shiftKey})});});")
 
 (defn- web-escape (s)
   "HTML-escape the three markup-significant characters in `s`."
@@ -431,22 +434,38 @@ to nil and is ignored — a bad key can never disrupt the editor."
 
 ;; ---- the HTTP handler (routes the page + the event stream) ------------------
 
-(defn web-handler (pub editor)
+(defn web-handler (pub editor token)
   "The server's handler: `/` renders the current snapshot as the full page; `/events`
 is the long-lived SSE stream the page subscribes to (a `stream-response`, so the socket
 stays open and `web-sse-serve` pumps it); `/input` accepts a browser key event (POST)
 and forwards it to the `editor` process as a key token — the read-write half that makes
-the mirror a real remote frontend. All close over `pub`/`editor`."
-  (router {"/" (fn (req)
-                 (send pub [:get (self)])
-                 (receive
-                   ([:snap s] (ok (web-render-page s)))
-                   (after 1000 (text-response "bedit: no snapshot"))))
-           "/events" (fn (req)
-                       (stream-response 200
-                         (sse/headers)
-                         (fn (c) (web-sse-serve c pub))))
-           "/input" (fn (req) (web-handle-input editor req))}))
+the mirror a real remote frontend. All close over `pub`/`editor`.
+
+Every route is behind std's `loopback-only` and `require-token`. `/input` types into the
+editor — M-x, `C-x C-e`, a shell command — and a 127.0.0.1 socket is reachable from every
+page the user has open: a cross-site `text/plain` POST needs no preflight, and DNS
+rebinding reads `/` and `/events` too. `token` is minted per server and handed out only
+in the URL the editor echoes."
+  (loopback-only
+    (require-token token
+      (router {"/" (fn (req)
+                     (send pub [:get (self)])
+                     (receive
+                       ([:snap s] (ok (web-render-page s)))
+                       (after 1000 (text-response "bedit: no snapshot"))))
+               "/events" (fn (req)
+                           (stream-response 200
+                             (sse/headers)
+                             (fn (c) (web-sse-serve c pub))))
+               "/input" (fn (req)
+                          (if (= (:method req) "POST")
+                            (web-handle-input editor req)
+                            (response 405 {} "")))}))))
+
+(defn web-url (srv)
+  "The address to open a running server `srv` at — its bound port and the token every
+request must carry — or nil while the port is not yet known."
+  (when (:port srv) (str "http://localhost:" (:port srv) "/?token=" (:token srv))))
 
 ;; ---- the server process -----------------------------------------------------
 
@@ -457,11 +476,11 @@ the mirror a real remote frontend. All close over `pub`/`editor`."
   ;; that raced ahead of the bind.
   (ui-event-fold [e m textrows cols rows]
     (if (:server m)
-      (message (update m :server assoc :port (web-port-event-port e))
-        (str "serving selected buffer on http://localhost:" (web-port-event-port e)))
+      (let (m2 (update m :server assoc :port (web-port-event-port e)))
+        (message m2 (str "serving selected buffer on " (web-url (:server m2)))))
       m)))
 
-(defn web-serve-proc (port pub reply-to)
+(defn web-serve-proc (port pub reply-to token)
   "The accept loop: bind a listener (falling back to an OS-assigned port if `port`
 is taken), tell `reply-to` the bound port (a `web-port-event`), then `serve-loop`
 forever. Must own the listener it serves, so the `listen` happens here — not in
@@ -469,20 +488,22 @@ the editor process — which is why the port comes back as a message."
   (let (ls (try (listen port) (catch e (listen 0)))
         bound (tcp/local-port ls))
     (send reply-to (web-port-event bound))
-    (serve-loop ls (web-handler pub reply-to))))
+    (serve-loop ls (web-handler pub reply-to token))))
 
 ;; ---- lifecycle (called from the commands, in the editor process) ------------
 
 (defn web-start (m port)
   "Spawn the publisher (seeded with the current snapshot, no subscribers yet) and the
-accept loop, trying `port` first. Returns `{:pub :proc :port}` for the model's
+accept loop, trying `port` first. Returns `{:pub :proc :port :token}` for the model's
 `:server` field; `:port` is nil until the `web-port-event` reply arrives. `(self)` is
-captured here (the editor process) so the server can report its bound port back."
+captured here (the editor process) so the server can report its bound port back.
+`:token` is this server's secret (see `web-handler`); `web-url` puts it in the link."
   (let (me (self)
+        token (random-token)
         seed (web-snapshot m)
         pub (spawn (web-pub-loop seed '()))
-        proc (spawn (web-serve-proc port pub me)))
-    {:pub pub :proc proc :port nil}))
+        proc (spawn (web-serve-proc port pub me token)))
+    {:pub pub :proc proc :port nil :token token}))
 
 (defn web-stop! (srv)
   "Stop a running server: ask the publisher to close every open SSE connection and
