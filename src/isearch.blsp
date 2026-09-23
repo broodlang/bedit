@@ -91,6 +91,19 @@ leaves point where it was."
 
 ;; ---- the key handlers -------------------------------------------------------
 
+;; DEL walks BACK through the search, the way Emacs's `isearch-delete-char` does: every
+;; step that changed it — a typed char, a paste, a C-s or C-r — pushes the state it replaced
+;; (point included) onto `:history`, and DEL pops one. It used to drop the last char and
+;; search again from the origin, which after three C-s's threw away the three matches you
+;; had stepped through.
+
+(defn- isearch-remember (m is)
+  "`is` with the state it is about to replace pushed onto its `:history`."
+  (assoc is
+    :history
+      (cons (assoc (dissoc is :history) :point (buffer-point (ed-current-buf m)))
+        (or (:history is) '()))))
+
 (defn- isearch-extend (m is ch)
   "Add a typed char to the search string and re-search, anchored on the current hit so
 the match grows in place: forward from the match start, backward from the match *end*
@@ -103,7 +116,7 @@ no match yet, search from the origin."
                (= dir :forward) match
                else (+ match (string/length (:string is)))))
     ; backward: the match end
-    (isearch-land m is (str (:string is) ch) dir from false)))
+    (isearch-land m (isearch-remember m is) (str (:string is) ch) dir from false)))
 
 (defn- isearch-yank (m is text)
   "Extend the search string with `text` (a paste) and re-search, anchored like a typed
@@ -130,20 +143,35 @@ grows by the text under the cursor: Emacs `isearch-yank-word-or-char`."
     (isearch-yank m is text)))
 
 (defn- isearch-backspace (m is)
-  "Drop the last char of the search string and re-search from the origin."
-  (let (s (:string is))
-    (isearch-land m
-      is
-      (if (= s "") "" (string/substring s 0 (dec (string/length s))))
-      (:dir is)
-      (:origin is)
-      false)))
+  "DEL: undo the last step of the search — the char or paste that extended it, or the
+C-s / C-r that moved it — back to the match and point it had before. At the start of the
+search there is nothing to undo."
+  (let (history (or (:history is) '()))
+    (if (empty? history)
+      m
+      (let (prev (dissoc (assoc (first history) :history (rest history)) :point)
+            m1 (ed-set-buf m (goto-char (ed-current-buf m) (:point (first history))))
+            s (:string prev))
+        (if (nil? (:match prev))
+          (assoc m1
+            :echo (isearch-prompt (:dir prev) s (not (= s "")) (:wrapped prev))
+            :overlays nil
+            :isearch prev)
+          (isearch-show m1 prev (:dir prev) (:match prev)))))))
 
-(defn- isearch-repeat (m is dir)
-  "Find the next match in `dir` (`C-s` / `C-r`): from just past the current match
-forward, or just before it backward; wrapping once around the buffer on a miss. An
-empty search string reuses the last search (`:isearch-last`)."
-  (let (s (:string is))
+(defn- isearch-repeat (m is0 dir)
+  "Find the next match in `dir` (`C-s` / `C-r`), as Emacs does:
+
+  - from just past the current match forward, or just before it backward;
+  - the first key in the OTHER direction turns round on the current match rather than
+    jumping to the next one (C-s then C-r leaves you on the same `foo`, point at its start);
+  - a miss FAILS in place — `Failing I-search`, point where it was — and only the next key
+    wraps round the buffer (`Wrapped I-search`). Wrapping on the first miss moved the reader
+    without telling them they had passed the last match.
+
+An empty search string reuses the last search (`:isearch-last`)."
+  (let (is (isearch-remember m is0)
+        s (:string is))
     (if (= s "")
       (let (last (or (:isearch-last m) ""))
         (if (= last "")
@@ -151,24 +179,28 @@ empty search string reuses the last search (`:isearch-last`)."
           (isearch-land m is last dir (:origin is) false)))
       (let (buf (ed-current-buf m)
             match (:match is)
-            len (buffer-length buf)
-            from (cond
-                   (nil? match) (if (= dir :forward) 0 len)
-                   ; failing → wrap
-                   (= dir :forward) (+ match (string/length s))
-                   ; past this hit (no overlap)
-                   else match)
-            start (isearch-find buf dir s from))
-        (if start
-          (isearch-show m (assoc is :wrapped (nil? match) :dir dir) dir start)
-          ;; miss — try once from the far end (wrap)
-          (let (wstart (isearch-find buf dir s (if (= dir :forward) 0 len)))
-            (if (nil? wstart)
-              (assoc m
-                :echo (isearch-prompt dir s true (:wrapped is))
-                :overlays nil
-                :isearch (assoc is :match nil :dir dir))
-              (isearch-show m (assoc is :wrapped true :dir dir) dir wstart))))))))
+            len (buffer-length buf))
+        (if (and (int? match) (not (= dir (:dir is))))
+          (isearch-show m (assoc is :dir dir) dir match)
+          (let (from (cond
+                       ;; failing: this key wraps
+                       (nil? match) (if (= dir :forward) 0 len)
+                       ;; past this hit (no overlap)
+                       (= dir :forward) (+ match (string/length s))
+                       :else match)
+                start (isearch-find buf dir s from))
+            (cond
+              start (isearch-show m (assoc is :wrapped (nil? match) :dir dir) dir start)
+              ;; the first miss past a match: fail here, keep the match on screen
+              (int? match)
+                (assoc m
+                  :echo (isearch-prompt dir s true (:wrapped is))
+                  :isearch (assoc is :match nil :dir dir))
+              :else
+                (assoc m
+                  :echo (isearch-prompt dir s true (:wrapped is))
+                  :overlays nil
+                  :isearch (assoc is :match nil :dir dir)))))))))
 
 (defn isearch-exit (m)
   "Finish the search: leave point at the match, push the *origin* onto the mark ring
@@ -217,7 +249,7 @@ or one of its control keys. Any other key exits the search and is dispatched nor
 (defn isearch-handle (m input)
   "Fold one isearch control key into the search (gated by `isearch-control-key?`):
 printable chars extend, `C-s`/`C-r` repeat, `C-y` pastes the kill ring, `C-w` pulls in the next word of the
-buffer, `Backspace` shortens, `Enter`/`Esc` exit, `C-g` aborts."
+buffer, `Backspace` steps back, `Enter`/`Esc` exit, `C-g` aborts."
   (let (is (:isearch m))
     (cond
       (string? input) (isearch-extend m is input)

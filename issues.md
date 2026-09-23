@@ -100,8 +100,8 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
 - [x] **E4 `C-M-h` / `C-x n d` parse every buffer as Brood** (`commands.blsp:2327,2372`).
 - [x] **E5 ✔ Kill coalescing list incomplete; `M-w` wrongly appends.** (M-w appending after a kill is Emacs's own `copy-region-as-kill` behaviour — kept.)
   `ed-kill-commands` (`commands.blsp:755`).
-- [ ] **E6 isearch vs Emacs:** wraps without "Failing"; C-s→C-r skips the current match;
-  DEL re-searches from origin.
+- [x] **E6 isearch vs Emacs:** wraps without "Failing"; C-s→C-r skips the current match;
+  DEL re-searches from origin. — FIXED: fail in place then wrap, turn round on the same match, DEL pops a step history (tests in editing_test).
 
 ### Git / tooling
 - [x] **G1 Ruby `@@var` context line splits a hunk.** `git.blsp:258` trims before the
