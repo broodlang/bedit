@@ -113,10 +113,16 @@ worker.
 
 `attempt` is unused: unlike the Elixir session, there is no second way to start a Brood
 child that might work where the first did not."
+  (spawn-child-at *sandbox-script-path* root))
+
+(defn- spawn-child-at (path root)
+  "Write the eval-server script to `path` and start a runtime on it in `root` — nil, with a
+warning, when that fails. Each session has its OWN path: a ready banner deletes the script
+its child read, and a path two sessions shared could vanish under the second one's start."
   (try
     (do
-      (file/spit *sandbox-script-path* (sandbox-script-source))
-      (spawn-runtime-on *sandbox-script-path* root))
+      (file/spit path (sandbox-script-source))
+      (spawn-runtime-on path root))
     (catch e (do (log/warn (str "sandbox: could not start a child: " (error-message e))) nil))))
 
 ;; ---- the wire ------------------------------------------------------------------
@@ -171,7 +177,13 @@ A worker already running in another root is re-rooted (a respawn there) when `ro
 given; nil means any root will do (the tutorial's case): a new worker starts projectless,
 a running one is left where it is. The child runtime starts spawning immediately — call
 this when the tutorial opens, so its startup hides behind the user reading."
-  (session/start *session* *spec* (or root *sandbox-default-root*) sink))
+  ;; nil means 'any root will do': it may only pick the projectless root for a session that
+  ;; is not running yet. Handing the default to a RUNNING one re-rooted it there, which
+  ;; respawned the child and wiped the playground's definitions.
+  (session/start *session*
+    *spec*
+    (if (and (nil? root) (not (sandbox-running?))) *sandbox-default-root* root)
+    sink))
 
 (defn sandbox-next-id (m)
   "The next request id to put on the wire, from the model. ONE counter for every session,
@@ -199,12 +211,45 @@ record it as in flight, or the form it belongs to waits on an answer that is not
 and, being already \"in flight\", is never re-sent either."
   (session/request *session* id timeout-ms {:src src :trace trace}))
 
+;; ---- the checking session --------------------------------------------------------
+;; A Brood buffer's diagnostics are `:check` requests to a child rooted in THAT buffer's
+;; project — its own session, not the `:sandbox` the tutorial and playground evaluate in.
+;; Sharing one meant every edit to a project file re-rooted the playground's child into the
+;; project, and opening the playground re-rooted it back: each move a respawn, wiping the
+;; playground's definitions and dropping any attachment.
+
+(def *check-session* :sandbox-check)
+(def *check-script-path* (str (path/temp "bedit-check-server-") ".blsp"))
+
+(defn spawn-check-child (root &optional (attempt 0))
+  "The checking session's `:spawn` hook — [[spawn-child]] on its own script path."
+  (spawn-child-at *check-script-path* root))
+
+(defn emit-check (sink kind payload gen name)
+  "The checking session's `:emit` hook — forgets ITS script on the ready banner."
+  (session/emit-after-script *check-script-path* sink kind payload gen name))
+
+(def *check-spec* (assoc *spec* :spawn 'sandbox/spawn-check-child :emit 'sandbox/emit-check))
+
+(defn sandbox-check-start (root)
+  "Ensure the checking session is up, rooted in `root` (re-rooted there if it runs
+elsewhere — one project checked at a time, and nothing else lives in it to lose)."
+  (session/start *check-session* *check-spec* root nil))
+
 (defn sandbox-check (id src timeout-ms)
-  "Fire-and-forget: ask the child's CHECKER about `src` — the reply's `:diagnostics` is
-the list of `{:line :col :message}` maps, whole (eval-server's `:check`). The reply
-arrives as a `sandbox-reply-event` carrying `:id id`; queued while the child boots.
-Answers whether the request was accepted, like [[sandbox-eval]]."
-  (session/request *session* id timeout-ms {:src src :check? true}))
+  "Fire-and-forget: ask the checking child's CHECKER about `src` — the reply's
+`:diagnostics` is the list of `{:line :col :message}` maps, whole (eval-server's `:check`).
+The reply arrives as a `session-reply` of `:sandbox-check` carrying `:id id`; queued while
+the child boots. Answers whether the request was accepted, like [[sandbox-eval]]."
+  (session/request *check-session* id timeout-ms {:src src :check? true}))
+
+(defn sandbox-check-running? ()
+  "Whether the checking session's worker is alive."
+  (session/running? *check-session*))
+
+(defn sandbox-check-shutdown ()
+  "Kill the checking child and stop its worker. A no-op when not running."
+  (session/shutdown *check-session*))
 
 (defn sandbox-attach (id spec cookie)
   "Point the session at the node `spec` names — `\"name\"` for a local node over its Unix
