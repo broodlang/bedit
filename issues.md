@@ -85,8 +85,8 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   130-132`, `ui-kit.blsp:108,159,178`; `ui-clip` duplicates `view/ed-fit`.
 - [x] **C7 Horizontal scroll ignores tab width.** `model.blsp:2223` uses
   `buffer-column`; the view measures cells.
-- [ ] **C8 Three different "visible rows" computations.** `input.blsp:1179` ignores
-  inlays; `ed-scroll`, `panes/ed-pane-rows` each rebuild the predicate.
+- [x] **C8 Three different "visible rows" computations.** `input.blsp:1179` ignores
+  inlays; `ed-scroll`, `panes/ed-pane-rows` each rebuild the predicate. — FIXED: one `model/ed-row-wise?` read by all three; the cursor step counts inlay rows.
 - [x] **C9 `ui-row-ops` label runs under the key column.** `ui-kit.blsp:196`.
 - [x] **C10 Tab in a minibuffer with no `:complete-fn` calls nil** (compile, preset-save,
   beam trace, term prompts).
@@ -118,9 +118,9 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   files listed). `projects.blsp:129`.
 - [x] **G7 Two location parsers disagree** (`compile.blsp:31-43` vs `results.blsp:34-66`);
   URLs / `0.0.0.0:8080` read as errors; `:col` ignored.
-- [~] **F1 Format-on-save skips the disk-changed check; `mix format` runs in the file's
+- [x] **F1 Format-on-save skips the disk-changed check; `mix format` runs in the file's
   dir (ignores `.formatter.exs`) and blocks the UI.** `commands.blsp:4590`,
-  `format.blsp:54,78-84`. No tests. — FIXED: check order, project root, stamp/unmodified on failure, tests. OPEN: the formatter still runs on the loop (blocks the UI).
+  `format.blsp:54,78-84`. No tests. — FIXED: check order, project root, stamp/unmodified on failure, tests; the formatter runs in a task (`:format-proc`), your edits since the save kept.
 
 ### Processes / sessions
 - [x] **P1 `C-c t` (cold) and `C-c r` run the project's `:main`.** `apprun.blsp:29`,
