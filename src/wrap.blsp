@@ -15,7 +15,8 @@
 row segments at most `w` cells wide, breaking after the last space that fits (else
 mid-word). The one place the breaks are decided, so the view, the cursor, the mouse and
 the scroll agree."
-  (:use editor/buffer)) ; buffer-line-at — a line's text for `line-segments`
+  (:use editor/buffer) ; buffer-rope — a line's text for `line-segments`
+  (:use memo)) ; defmemo — the row table is asked for over and over while nothing changes
 (defn- break-at (text from col w)
   "The char offset (absolute in `text`) where the row starting at `from` (display column
 `col` of the line) ends: after the last space among the chars that fit in `w` cells,
@@ -60,12 +61,17 @@ line. A row is what `break-at` says."
       (list [0 len])
       (segments-step text len 0 0 w '()))))
 
+(sig rope-line-segments (any int int -> list))
+(defn- rope-line-segments (rope line w)
+  "`segments` of line `line` of `rope` (its text without the newline), `w` cells wide."
+  (let (lt (text/line rope line)
+        text (if (string/ends-with? lt "\n") (string/substring lt 0 (dec (string/length lt))) lt))
+    (segments text w)))
+
 (sig line-segments (buffer int int -> list))
 (defn line-segments (buf line w)
   "`segments` of buffer line `line` (its text without the newline), `w` cells wide."
-  (let (lt (buffer-line-at buf line)
-        text (if (string/ends-with? lt "\n") (string/substring lt 0 (dec (string/length lt))) lt))
-    (segments text w)))
+  (rope-line-segments (buffer-rope buf) line w))
 
 ;; ---- inlay rows: a screen row that is not buffer text -------------------------------
 ;; A row need not show text the buffer contains. An INLAY row carries derived text of its
@@ -87,27 +93,26 @@ line. A row is what `break-at` says."
     acc
     (fn (a text) (if (>= (count a) limit) a (conj a [line 0 nil text])))))
 
-(sig rows-step (buffer int int int int map vector -> vector))
-(defn- rows-step (buf n line w limit inlays acc)
+(sig rows-step (any int int int int map vector -> vector))
+(defn- rows-step (rope n line w limit inlays acc)
   "Tail-recursive: `acc` plus the rows of `line` and the lines after it, up to `limit`."
   (if (or (>= line n) (>= (count acc) limit))
     acc
-    (rows-step buf
+    (rows-step rope
       n
       (inc line)
       w
       limit
       inlays
-      (fold (line-segments buf line w)
+      (fold (rope-line-segments rope line w)
         (inlay-rows inlays line limit acc)
         (fn (a seg)
           (if (>= (count a) limit) a (conj a [line (first seg) (second seg) nil])))))))
 
-(def *rows-cache* {})
-;; `{[rope top w limit inlays] -> rows}` — the last few row tables built. A global memo, the
-;; same shape (and the same reason) as `view/*bracket-cache*`: this is asked from the pure
-;; `view`, from three hit-test sites in `panes`, and from `input/ed-point-into-view`, so there
-;; is no model to hang a cache on — and the table is a pure function of that key.
+;; The row table is memoised (`defmemo`, std/memo) on `[rope top w limit inlays]`: it is
+;; asked from the pure `view`, from three hit-test sites in `panes`, and from
+;; `input/ed-point-into-view`, so there is no model to hang a cache on — and the table is a
+;; pure function of those.
 ;;
 ;; Worth a cache because it is neither cheap nor asked once: building one measured **1.7 ms**
 ;; on a 2,374-line markdown file, and a single turn asks for it at least twice. Markdown WRAPS
@@ -115,40 +120,32 @@ line. A row is what `break-at` says."
 ;; `update :ctrl-n` read 4.2 ms there against 0.9 ms in a buffer that does not wrap.
 ;;
 ;; Note what is NOT in the key: point. A cursor move re-reads the table rather than rebuilding
-;; it, which is the whole point of caching this rather than the pane's view of it.
+;; it, which is the whole point of caching this rather than the pane's view of it — and why
+;; the memoised function takes the ROPE, not the buffer. Matched by `=`, not hashed: this
+;; cache used to be a map keyed on the rope, and a rope hashes by its whole text.
 
-(def *rows-cache-max* 8)
-;; Entries past this and the cache is dropped whole. A key holds a rope, so entries would
-;; otherwise pin every edited version of a buffer alive; a handful of rebuilt tables cost far
-;; less than the bookkeeping to evict precisely.
+(defmemo rope-rows 8 (rope top w limit inlays)
+  "The row table for `rows-from`, memoised on exactly what it depends on."
+  (rows-step rope (text/line-count rope) top w limit inlays []))
 
 (sig rows-from
   (buffer int int int &optional map -> (vector (tuple int int (or nil int) (or nil string)))))
-;; check-allow: the cache only ever holds what the `rows-step` below built, so a hit has the
-;; declared shape by construction — but it comes back through a map `get`, which the checker
+;; check-allow: the cache only ever holds what `rows-step` built, so a hit has the declared
+;; shape by construction — but it comes back out of the memo's store, which the checker
 ;; reads as unknown.
 (check-allow :trusted
   (defn rows-from (buf top w limit &optional (inlays {}))
     "The first `limit` screen rows from buffer line `top` down, each
 `[line from to inlay]` — a line's inlay rows, then its text segments in order, then the
 next line's — stopping at the buffer's end. What a `w`-wide, `limit`-tall pane shows; the
-row↔line owner's table. Memoised on its inputs — see `*rows-cache*`.
+row↔line owner's table. Memoised on its inputs — see `rope-rows`.
 
 `inlay` is nil for a row of the buffer's own text, and the derived text to paint for an
 INLAY row (`{line -> [text …]}` in `inlays`, keyed by the line each sits above). A reader
 of this table that cares about the line's TEXT — where a column sits, which rows a
 region fills — must skip the inlay rows; `panes/ed-rows-line-rows` is that filter, and
 everything in the editor goes through it."
-    (let (safe-inlays (or inlays {})
-          key [(buffer-rope buf) (math/max 0 top) w limit safe-inlays]
-          hit (get *rows-cache* key))
-      (if (not (nil? hit))
-        hit
-        (let (rows (rows-step buf (buffer-line-count buf) (math/max 0 top) w limit safe-inlays []))
-          (do
-            (def *rows-cache*
-              (assoc (if (> (count *rows-cache*) *rows-cache-max*) {} *rows-cache*) key rows))
-            rows))))))
+    (rope-rows (buffer-rope buf) (math/max 0 top) w limit (or inlays {}))))
 
 (sig row-of-step (list int int -> int))
 (defn- row-of-step (segs col i)
