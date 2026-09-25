@@ -166,8 +166,8 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
 - [ ] **X3 Global `def` caches** (`wrap.blsp:104`, `view.blsp:107`,
   `complete-at-point.blsp:59`). *Brood:* bounded memo / LRU.
 - [ ] **X4 `model.blsp` names its feature clients.** *Brood:* `autoload` declarations.
-- [ ] **X5 Perf:** word motion / completion preview / `qr-replace` stringify the whole
-  buffer per key. *Brood:* rope-scanning word motion + rope slice.
+- [x] **X5 Perf:** word motion / completion preview / `qr-replace` stringify the whole
+  buffer per key. *Brood:* rope-scanning word motion + rope slice. — FIXED: brood 96c962c9 — `%rope-skip` (`text/skip-forward`/`-backward`) walks the rope from point, so M-f/M-b, M-m and M-SPC read only what they cross, and M-e/M-a slice only the paragraph; the completion preview reads the character after point and the buffer-words source the line before it; query-replace already sliced and searched the rope in place.
 - [x] **X6 Duplicated parsers:** two unified-diff parsers (*Brood:* `diff/parse-unified`),
   LSP JSON-RPC framing in bedit (*Brood:* `std/jsonrpc`). — FIXED: gitdiff reads hunk headers with `diff/hunk-header`; the LSP client builds and decodes through brood's new `std/jsonrpc` (3f87601c), its framing tests moved there.
 - [ ] **T1 No tests for git's destructive commands, format.blsp, the playground send side,
