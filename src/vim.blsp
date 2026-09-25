@@ -1,0 +1,333 @@
+(defmodule vim
+  "The Vim grammar — `[count] operator [count] motion|text-object`, `.` to repeat — on top
+of the modal keybinding profile (`keymaps`). The commands here are what the normal-mode keys
+run; the profile switch itself (M-x vim-mode / emacs-mode) stays with the other profile
+commands in `commands`.
+
+Split out of `commands.blsp` (issues.md X1)."
+  (:use model) ; message / ed-apply / ed-current-buf — the model the grammar edits
+  (:use commands) ; cmd-kill-region / cmd-copy-region / ed-reselect-lines — what an operator does
+  (:use editor/buffer) ; the buffer motions a Vim motion is made of
+  (:use interactive) ; defcommand — the normal-mode commands, on M-x
+  (:use keymaps)) ; vim-to-insert / vim-to-normal — the modal state the grammar switches
+;; ---- the Vim grammar: [count] operator [count] motion|text-object -----------
+;; The modal grammar is plain state on the model (`:vim-pending`) read by the commands
+;; below — no operator-pending keymap layer needed: after `d`, the SAME normal keymap
+;; dispatches the next key, and the motion / text-object commands see the pending
+;; operator and act on the region the motion spans instead of moving point. Counts
+;; multiply (`2d3w` = 6); a doubled operator (`dd`/`cc`/`yy`) is linewise on the current
+;; line(s); `.` replays the last change. Operators reuse the kill-ring region commands by
+;; activating the target as the point↔mark region. Motions are the existing buffer ops,
+;; applied `count` times. (Future: more text objects/motions, register prefixes, insert-`.`.)
+
+(defn- ed-vim-skip-blank-fwd (buf)
+  "Move point past any run of whitespace immediately ahead of it."
+  (let (c (buffer-char-after buf))
+    (if (and c (string/blank? c)) (ed-vim-skip-blank-fwd (forward-char buf)) buf)))
+
+(defn- ed-vim-word-start (buf)
+  "Vim `w`: to the start of the *next* word — this word's end (`forward-word`), then past
+the gap to the next word. (`forward-word` alone lands at the word *end*, which is Vim `e`.)"
+  (ed-vim-skip-blank-fwd (forward-word buf)))
+
+(defdyn *vim-motions*
+  ;; key -> {:op <buffer-op SYMBOL> :linewise?}. The operator target is the point after `op`
+  ;; is applied `count` times; a linewise motion makes the operator act on whole lines.
+  ;;
+  ;; The ops are SYMBOLS, resolved at dispatch (`cmd-vim-motion`) exactly like the command
+  ;; symbols in a keymap — not captured function values. That is what makes the motion table
+  ;; self-editable: redefine `ed-vim-word-start`, or point `"w"` at your own fn, and the
+  ;; next `w` uses it with no reload. Capturing values here would freeze the motions at
+  ;; module-load time — which is also why they were invisible to `nest test --cover`, whose
+  ;; instrumentation rebinds the global a captured value has already bypassed.
+  {"h" {:op 'editor/buffer/backward-char :linewise? false}
+   "l" {:op 'editor/buffer/forward-char :linewise? false}
+   "j" {:op 'editor/buffer/forward-line :linewise? true}
+   "k" {:op 'editor/buffer/backward-line :linewise? true}
+   "w" {:op 'vim/ed-vim-word-start :linewise? false} ; next word start
+   "b" {:op 'editor/buffer/backward-word :linewise? false}
+   "e" {:op 'vim/ed-vim-word-end :linewise? false :inclusive? true} ; ON the last char
+   "^" {:op 'editor/buffer/beginning-of-line :linewise? false}
+   "$" {:op 'editor/buffer/end-of-line :linewise? false}
+   :left {:op 'editor/buffer/backward-char :linewise? false}
+   :right {:op 'editor/buffer/forward-char :linewise? false}
+   :up {:op 'editor/buffer/backward-line :linewise? true}
+   :down {:op 'editor/buffer/forward-line :linewise? true}})
+
+(def *vim-digits* {"1" 1 "2" 2 "3" 3 "4" 4 "5" 5 "6" 6 "7" 7 "8" 8 "9" 9}) ; `0` → cmd-vim-zero
+;; The accumulator's shape: two optional counts (`2d3w`), the pending operator, the text
+;; object flavour. Declared once so `ed-vim-count`'s arithmetic reads ints.
+(deftype vim-pending
+  (record &open
+    :count1 (optional int)
+    :count2 (optional int)
+    :operator (optional keyword)
+    :textobj (optional keyword)))
+(sig ed-vim-pending (model -> vim-pending))
+(defn- ed-vim-pending (m)
+  "The Vim command accumulator map, or `{}`."
+  ;; `:vim-pending` rides the open model shape undeclared (the record is this module's,
+  ;; the model's deftype is `model`'s), so the guard is what proves it a map here
+  (let (pending (:vim-pending m))
+    (if (map? pending) pending {})))
+(defn- ed-vim-clear (m) "Drop the Vim command accumulator." (dissoc m :vim-pending))
+
+(sig ed-vim-count (model -> int))
+(defn- ed-vim-count (m)
+  "The effective repeat count: the pre-operator count × the post-operator count (each
+defaulting to 1), so `2d3w` is 6."
+  (let (p (ed-vim-pending m)) (* (or (:count1 p) 1) (or (:count2 p) 1))))
+
+(defn- ed-vim-apply-n (buf op n)
+  "Apply buffer op `op` `n` times (n≥0)."
+  (if (<= n 0) buf (ed-vim-apply-n (op buf) op (dec n))))
+(defn- ed-vim-target (buf op n)
+  "The point after `op` applied `n` times from `buf`."
+  (buffer-point (ed-vim-apply-n buf op n)))
+(defn- ed-vim-remember (m change)
+  "Record the last change for `.` (dot-repeat)."
+  (assoc m :vim-last-change change))
+
+;; The last change (`:vim-last-change`) is a `VimChange` record — `.` (dot-repeat)
+;; replays it via `vim-replay`, one impl per change shape. Sealed: a new replayable
+;; change is a record + impl, and the exhaustiveness check keeps the set honest.
+(defrecord vim-motion-change (op motion-op linewise? count)) ; d/c + motion
+(defrecord vim-linewise-change (op count)) ; the doubled operator (dd/cc)
+(defrecord vim-delete-chars-change (count)) ; x
+(defrecord vim-textobj-change (op around)) ; diw/daw
+(defability VimChange
+  "A recorded Vim change: `vim-replay` re-applies it to the current buffer (`.`)."
+  :sealed [vim-motion-change vim-linewise-change vim-delete-chars-change vim-textobj-change]
+  (vim-replay [self m] :-> any))
+
+(impl VimChange
+  vim-motion-change
+  (vim-replay [lc m]
+    (let (buf (ed-current-buf m)
+          target (ed-vim-target buf (vim-motion-change-motion-op lc) (vim-motion-change-count lc)))
+      (ed-vim-operate m
+        (vim-motion-change-op lc)
+        (buffer-point buf)
+        target
+        (vim-motion-change-linewise? lc)))))
+(impl VimChange
+  vim-linewise-change
+  (vim-replay [lc m]
+    (ed-vim-linewise-current m (vim-linewise-change-op lc) (vim-linewise-change-count lc))))
+(impl VimChange
+  vim-delete-chars-change
+  (vim-replay [lc m] (ed-vim-delete-chars m (vim-delete-chars-change-count lc))))
+(impl VimChange
+  vim-textobj-change
+  (vim-replay [lc m]
+    (ed-vim-word-object m (vim-textobj-change-op lc) (vim-textobj-change-around lc))))
+
+(sig ed-vim-operate (model keyword int int bool -> model))
+(defn- ed-vim-operate (m op s e linewise?)
+  "Apply Vim operator `op` (`:delete`/`:change`/`:yank`) over buffer range [s,e] (expanded
+to whole lines when `linewise?`), reusing the kill-ring region commands by activating the
+range as the point↔mark region. Delete leaves point at the range start; change then enters
+insert; yank leaves point at the start without editing. Clears `:vim-pending`."
+  (let (buf (ed-current-buf m)
+        rope (buffer-rope buf)
+        rb (if linewise?
+             (ed-reselect-lines buf
+               (text/char->line rope (math/min s e))
+               (text/char->line rope (math/max s e)))
+             (assoc buf :point (math/max s e) :mark (math/min s e)))
+        start (math/min (buffer-point rb) (or (buffer-mark rb) (buffer-point rb))) ; both branches set it
+        m1 (ed-set-buf (ed-vim-clear m) rb))
+    (cond
+      (= op :yank)
+        (let (copied (cmd-copy-region m1 nil))
+          (vim-to-normal (ed-set-buf copied (clear-mark (goto-char (ed-current-buf copied) start)))))
+      ;; A linewise CHANGE empties the line but KEEPS it — Vim leaves you on a blank
+      ;; line in insert mode, where `dd` would have removed the line entirely. Killing
+      ;; the same range as delete joined the next line up onto the one you were about
+      ;; to type into ("cc" then "new" gave "newsecond line").
+      ;; `cc` arrives here with its range already trimmed of the trailing newline
+      ;; (`ed-vim-linewise-current`), so the line survives and insert mode opens on it
+      (= op :change) (vim-to-insert (cmd-kill-region m1 nil))
+      :else (vim-to-normal (cmd-kill-region m1 nil)))))
+
+(defn- ed-vim-word-end (b)
+  "Vim's `e`: the word's LAST CHARACTER, where `forward-word` stops just past it.
+
+Two cases, and both matter. From inside a word, back up one from where `forward-word`
+lands. From a word's last character that would not move at all, so step over the word
+first and take the end of the NEXT one — otherwise `e` sticks and a count like `2e`
+never leaves the first word."
+  (let (p0 (buffer-point b)
+        end1 (dec (buffer-point (forward-word b))))
+    (if (> end1 p0)
+      (goto-char b end1)
+      (let (next-end (dec (buffer-point (forward-word (goto-char b (inc p0))))))
+        (goto-char b (math/max p0 next-end))))))
+
+(defn- ed-vim-run-motion (m motion-op linewise? &optional (inclusive? false))
+  "Run a Vim motion: with an operator pending, apply it over [point, target] and record
+the change for `.`; otherwise move point to the target. `count` repeats the motion.
+
+`inclusive?` marks a motion whose target character is part of the range — Vim's `e`
+is the one that matters here: `de` eats the whole word, where an exclusive reading
+stops on its last letter and leaves it behind."
+  (let (op (:operator (ed-vim-pending m))
+        n (ed-vim-count m)
+        buf (ed-current-buf m)
+        target (ed-vim-target buf motion-op n))
+    (if (nil? op)
+      (ed-vim-clear (ed-set-buf m (goto-char buf target)))
+      (let (done (ed-vim-operate m
+                   op
+                   (buffer-point buf)
+                   (if (and inclusive? (> target (buffer-point buf))) (inc target) target)
+                   linewise?))
+        (if (= op :yank)
+          done
+          (ed-vim-remember done (vim-motion-change op motion-op linewise? n)))))))
+
+(sig ed-vim-linewise-current (model keyword int -> model))
+(defn- ed-vim-linewise-current (m op n)
+  "Operate linewise on `n` whole lines from the current line — the `dd`/`cc`/`yy` form."
+  (let (buf (ed-current-buf m)
+        cur (buffer-current-line buf)
+        last (math/min (dec (buffer-line-count buf)) (+ cur (dec (math/max 1 n))))
+        block (ed-reselect-lines buf cur last)
+        ;; `cc` empties the line but KEEPS it — Vim leaves you on a blank line in
+        ;; insert mode, where `dd` removes the line entirely. `ed-reselect-lines`
+        ;; ends the block at the START of the following line, so that range carries
+        ;; the newline; a change has to stop one short of it or the next line joins
+        ;; onto the one you are about to type into.
+        ;; `ed-reselect-lines` set the mark; `(or … point)` says so where `buffer-mark`'s
+        ;; own contract (`nil | int`) cannot.
+        mark (or (buffer-mark block) (buffer-point block))
+        rb (if (and (= op :change)
+                 (> (buffer-point block) mark)
+                 (= (text/slice (buffer-rope block) (dec (buffer-point block)) (buffer-point block))
+                   "\n"))
+             (assoc block :point (dec (buffer-point block)))
+             block)
+        done (ed-vim-operate (ed-set-buf m rb) op mark (buffer-point rb) false))
+    (if (= op :yank) done (ed-vim-remember done (vim-linewise-change op n)))))
+
+(defn- ed-vim-word-region (buf around?)
+  "`[s e)` of the word at point — the inner word, or (when `around?`) the word plus its
+trailing whitespace. Approximate, built on forward-word/backward-word."
+  (let (e (buffer-point (forward-word buf))
+        s (buffer-point (backward-word (goto-char buf e)))
+        ea (if around?
+             (math/max e
+               (buffer-point (backward-word (goto-char buf
+                                              (buffer-point (forward-word (goto-char buf e)))))))
+             e))
+    [s ea]))
+
+(defn- ed-vim-word-object (m op around?)
+  "Apply operator `op` over the word text object at point (`iw`/`aw`)."
+  (let (buf (ed-current-buf m)
+        [s e] (ed-vim-word-region buf around?)
+        done (ed-vim-operate m op s e false))
+    (if (= op :yank) done (ed-vim-remember done (vim-textobj-change op around?)))))
+
+(sig ed-vim-delete-chars (model int -> model))
+(defn- ed-vim-delete-chars (m n)
+  "Delete `n` chars at point (`x`), recording it for `.`"
+  (let (buf (ed-current-buf m)
+        e (math/min (buffer-length buf) (+ (buffer-point buf) (math/max 1 n)))
+        rb (assoc buf :point e :mark (buffer-point buf)))
+    (ed-vim-remember (ed-vim-clear (ed-edit (ed-set-buf m rb) delete-region))
+      (vim-delete-chars-change (math/max 1 n)))))
+
+(sig ed-vim-add-digit (model int -> model))
+(defn- ed-vim-add-digit (m d)
+  "Append count digit `d` to the pre-operator count (`:count1`) or, once an operator is
+pending, the post-operator count (`:count2`)."
+  (let (pend (ed-vim-pending m)
+        slot (if (nil? (:operator pend)) :count1 :count2))
+    (assoc m :vim-pending (assoc pend slot (+ (* (or (get pend slot) 0) 10) d)))))
+
+(defcommand cmd-vim-digit
+  (m key)
+  "Accumulate a Vim count digit (1–9)."
+  (let (d (get *vim-digits* key)) (if (nil? d) m (ed-vim-add-digit m d))))
+
+(defcommand cmd-vim-zero
+  (m key)
+  "`0`: a count digit when a count is already being entered, else the beginning-of-line
+motion (so `d0` deletes to the line start)."
+  (let (pend (ed-vim-pending m))
+    (if (or (:count1 pend) (:count2 pend))
+      (ed-vim-add-digit m 0)
+      (ed-vim-run-motion m beginning-of-line false))))
+
+(defcommand cmd-vim-operator
+  (m key)
+  "Begin a Vim operator (`d`/`c`/`y`): record it as pending so the next motion or text
+object defines the region. A doubled operator (`dd`/`cc`/`yy`) acts linewise on the
+current line(s)."
+  (let (op (cond (= key "d") :delete (= key "c") :change :else :yank)
+        pend (ed-vim-pending m))
+    (if (= (:operator pend) op)
+      (ed-vim-linewise-current m op (ed-vim-count m))
+      (assoc m :vim-pending (assoc pend :operator op)))))
+
+(defcommand cmd-vim-motion
+  (m key)
+  "Dispatch a Vim motion from `*vim-motions*` (operator-aware via `ed-vim-run-motion`).
+When a text object is pending (after `di`/`da`), interpret the key as the object (`w` →
+word) instead."
+  (let (pend (ed-vim-pending m) tobj (:textobj pend) op (:operator pend))
+    (if (and tobj op)
+      (if (= key "w") (ed-vim-word-object m op (= tobj :around)) (ed-vim-clear m))
+      (let (spec (get *vim-motions* key))
+        ;; late binding: the table holds a SYMBOL, resolved here, on this keystroke
+        (if (nil? spec)
+          m
+          (ed-vim-run-motion m (reflect/eval (:op spec)) (:linewise? spec) (:inclusive? spec)))))))
+
+(defn- ed-vim-last-line-start (b)
+  ;; Vim's `G` lands on the LAST LINE, not past the last character. Landing at
+  ;; end-of-buffer put the cursor after the final newline's line — one press of G
+  ;; followed by any horizontal motion behaved as if the file had an extra line.
+  (beginning-of-line (goto-char b (buffer-length b))))
+
+(defcommand cmd-vim-goto-last-line
+  (m key)
+  "The last line (`G`), or operate to it — linewise, so `dG` still takes the line whole."
+  (ed-vim-run-motion m ed-vim-last-line-start true))
+(defcommand cmd-vim-goto-first-line
+  (m key)
+  "Start of buffer, or operate to it (`gg`)."
+  (ed-vim-run-motion m beginning-of-buffer true))
+(defcommand cmd-vim-delete-char
+  (m key)
+  "Delete `count` chars at point (`x`)."
+  (ed-vim-delete-chars m (ed-vim-count m)))
+
+(defcommand cmd-vim-insert
+  (m key)
+  "Enter insert mode at point (`i`); after an operator, begin an *inner* text object (`diw`)."
+  (let (pend (ed-vim-pending m))
+    (if (nil? (:operator pend))
+      (vim-to-insert m)
+      (assoc m :vim-pending (assoc pend :textobj :inner)))))
+
+(defcommand cmd-vim-append
+  (m key)
+  "Enter insert mode after point (`a`); after an operator, begin an *around* text object (`daw`)."
+  (let (pend (ed-vim-pending m))
+    (if (nil? (:operator pend))
+      (vim-to-insert (ed-apply m forward-char))
+      (assoc m :vim-pending (assoc pend :textobj :around)))))
+
+;; check-allow: `vim-replay` re-runs a recorded change through `reflect/eval`, so its result is
+;; unknown to the checker; it is the model it was handed
+(check-allow :trusted
+  (defcommand cmd-vim-dot
+    (m key)
+    "`.`: replay the last change (`vim-replay` on the recorded `VimChange` record) —
+operator+motion, doubled operator, `x`, or text object. (Insert-mode changes aren't
+replayed yet.)"
+    (let (lc (:vim-last-change m))
+      (if (nil? lc) m (vim-replay lc (ed-vim-clear m))))))
+

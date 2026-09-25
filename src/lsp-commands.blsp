@@ -1,0 +1,680 @@
+(defmodule lsp-commands
+  "The editor's side of a language server: jump to a definition and back, find references,
+imenu, hover, signature help, code actions, rename, format — and the event folds that turn
+the server's replies, notices, diagnostics and edits into the model. The connection itself
+(the process, JSON-RPC, what to ask) is `lsp`; the request vocabulary both sides share is
+`lsp-requests`, whose `LspRequest` fold impls live here.
+
+Split out of `commands.blsp` (issues.md X1)."
+  (:use model) ; message / ed-current-buf / ed-set-buf / the diagnostics cache
+  (:use commands) ; ed-find-file / ed-select / ed-name-prompt / ed-lsp-start / ed-lsp-live
+  (:use editor/buffer) ; points, lines and the edits a server's answer applies
+  (:use interactive) ; defcommand — the LSP commands, on M-x
+  (:use lsp-requests)) ; the request-kind records + the LspRequest ability folded here
+;; ---- imenu: jump to a symbol in the buffer via LSP documentSymbol (M-g i) ----
+
+(defn- ed-lsp-ensure (m)
+  "Ensure a language server is connected for the current buffer's file. Returns
+`[m2 ready?]`: `ready?` is true when a LIVE connection is already on the model; false when
+a server was just started (the caller should ask the user to retry once it initialises) or
+there is nothing to start — no file, no server configured, the server not installed — with
+an explanatory message already on `m2` (`ed-lsp-start` writes it)."
+  (if (ed-lsp-live m)
+    [m true]
+    (let ([m2 conn] (ed-lsp-start (dissoc m :lsp)))
+      (if (nil? conn)
+        [m2 false]
+        ;; started, but the handshake has not finished: say so in the voice of the
+        ;; feature that asked rather than reporting a connection it cannot use yet
+        [(message m2 "lsp: starting the server — run that again in a moment") false]))))
+
+(defn- ed-imenu-label (s)
+  "The imenu candidate text for a symbol `{:name :kind …}` — its (qualified) name with a
+short kind tag, e.g. `Foo.bar  (method)`."
+  (str (:name s) "  (" (lsp/lsp-symbol-kind-name (:kind s)) ")"))
+
+(defn- ed-imenu-find (labeled t)
+  "The symbol whose label is `t` in the `[label sym]` pairs `labeled`, or nil."
+  (let (hit (seq/find labeled (fn (p) (= (first p) t))))
+    (when hit (second hit))))
+
+(defn- ed-imenu-jump (m s)
+  "Move point to symbol `s`'s position in the current buffer."
+  (ed-apply m (fn (b) (ed-goto-line-col b (:line s) (:char s)))))
+
+(defn- ed-imenu-prompt (m syms)
+  "A Vertico minibuffer over the buffer's symbols `syms` (`{:name :kind :line :char}`).
+Moving the selection **previews** — point jumps to that symbol live (`:on-preview`);
+accepting keeps it; cancelling restores the point and scroll the prompt opened from
+(`:on-abort`), so an aborted imenu leaves you exactly where you were."
+  (let (labeled (map syms (fn (s) [(ed-imenu-label s) s]))
+        labels (map labeled first)
+        origin {:point (buffer-point (ed-current-buf m)) :top (ed-current-top m)})
+    (assoc m
+      :minibuffer
+        (assoc (ed-name-prompt "Imenu: "
+                 labels
+                 (fn (mm t)
+                   (let (s (ed-imenu-find labeled t))
+                     (if (nil? s)
+                       (message mm (str "imenu: no such symbol: " t))
+                       (ed-imenu-jump mm s)))))
+          :on-preview
+            (fn (mm t)
+              (let (s (ed-imenu-find labeled t))
+                (if (nil? s) mm (ed-imenu-jump mm s))))
+          :on-abort
+            (fn (mm)
+              (ed-set-top (ed-apply mm (fn (b) (goto-char b (:point origin))))
+                (:top origin)))))))
+
+(defcommand cmd-imenu
+  (m key)
+  "Jump to a symbol in the current buffer, picked from the language server's
+`documentSymbol` list (M-g i). Starts the server on first use if one is configured for the
+file type; symbols are nested-name-qualified (Emacs-style `Class.method`). Async — the
+picker opens when the symbol list arrives."
+  (let ([m2 ready?] (ed-lsp-ensure m))
+    (if (not ready?)
+      m2
+      (let (buf (ed-current-buf m2)
+            file (buffer-file buf)
+            conn (:lsp m2))
+        (ed-lsp-ask m2
+          (lsp-symbols)
+          (fn (corr)
+            (lsp/lsp-document-symbols-async conn
+              corr
+              (self)
+              (lsp/lsp-path->uri file)
+              (lsp/lsp-language-id file)
+              (buffer-text buf)))
+          nil
+          "imenu: fetching symbols…")))))
+
+;; ---- LSP navigation + edits: goto-def / back / references / hover / rename / format ----
+;; All ASYNC (§E.2 — services never block the loop): a command registers a pending lookup
+;; under a fresh corr (`ed-lsp-ask` → `:lsp-pending`) and fires the request; the conn's
+;; tagged reply lands on the loop as an event (`ed-ev-lsp-reply`, registered in input.blsp)
+;; and folds by corr — jump/show/apply happen when the answer ARRIVES, the echo says what's
+;; in flight meanwhile, and C-g clears the table (a late reply drops as stale). Mutating
+;; replies (format, rename) carry a rope guard: if the buffer changed while the server
+;; worked, the edits are dropped with a message instead of applied against the wrong text.
+;; `ed-lsp-here` packages the current buffer's (conn, uri, lang, text, line, char);
+;; `ed-lsp-ensure` auto-starts the server on first use. Cross-file jumps open the target
+;; with `ed-find-file` and push a marker (`:lsp-markers`) so M-, returns.
+
+(defn- ed-lsp-ask (m kind fire &optional extra note)
+  "Register a pending LSP lookup of `kind` (an `LspRequest` record, see `lsp-requests`)
+under a fresh corr and `fire` it (a `(corr) -> nil` sender — one of lsp's `-async` fns,
+with `(self)` as reply-to). `extra` merges context the fold will need onto the record
+(a rope guard, the rename's origin); `note` is the in-flight echo — `:quiet` for a lookup
+the reader did not ask for (the idle beat's signature help), which must not narrate itself
+into the echo area every time point moves."
+  (let (corr (ref))
+    (fire corr)
+    (let (m2 (assoc m :lsp-pending (assoc (:lsp-pending m {}) corr (merge kind (or extra {})))))
+      (if (= note :quiet) m2 (message m2 (or note "lsp: resolving…"))))))
+
+(defn ed-ev-lsp-reply (m input textrows cols rows)
+  "An LSP reply landing on the loop (`[:lsp-definition corr locs]`, `[:lsp-hover corr
+s]`, …): fold its payload by corr against `:lsp-pending`; an unknown corr is a
+stale/cancelled lookup (C-g, or a completion's bounded wait that already timed out)
+and drops silently."
+  (let (corr (nth input 1)
+        pend (get-in m [:lsp-pending corr]))
+    (if (nil? pend)
+      m
+      (lsp-request-fold pend
+        (assoc m :lsp-pending (dissoc (:lsp-pending m) corr))
+        (nth input 2)))))
+
+(defn ed-ev-lsp-notice (m input textrows cols rows)
+  "A language server narrating its own startup (`[:lsp-notice line]`) — logged to
+`*Messages*`, and echoed so the reader sees it without going to look.
+
+A server is entitled to be slow before it is useful, and the good ones say so. Expert
+answers `initialize` instantly, advertises a full `completionProvider`, and then ignores
+every request — without answering — until its engine node is compiled and up. Dropping
+its narration made that half-minute indistinguishable from a broken server, which is
+precisely the conclusion it led to here."
+  (message m (str "lsp: " (nth input 1))))
+
+(defn ed-ev-lsp-diagnostics (m input textrows cols rows)
+  "A language server publishing a file's diagnostics (`[:lsp-diagnostics path items]`) —
+shown on that buffer if it is the one on screen.
+
+This is what makes an LSP worth connecting for. bedit already renders diagnostics — the
+underline on the token, the ⚠ note at the end of the line, the gutter mark — and until now
+the only thing that ever produced them was the Brood checker, so every other language had
+the whole apparatus and nothing to put in it. Elixir, Rust, Ruby, Python, Go and
+TypeScript all publish them; none of it was read.
+
+Applied only for the CURRENT buffer, and stamped with its rope. The model holds one
+diagnostic set — it is a view of the buffer you are looking at — so a server publishing
+about a file in the background must not replace what is on screen with findings about
+something else. An empty list is applied like any other: it is how a server says the file
+is clean now, and ignoring it would leave the errors you just fixed sitting there.
+
+The server's own untouched objects are kept beside the rendered ones, on `:lsp-raw-diags`:
+a quickfix is asked for by handing the diagnostic back (see [[cmd-lsp-code-action]]), and
+bedit's flattened shape — all the view needs — is not a thing a server recognises."
+  (let (path (nth input 1)
+        items (nth input 2)
+        raw (nth input 3 [])
+        buf (ed-current-buf m)
+        ;; `buffer-file` is `nil | string` — a scratch buffer has none, and nil never
+        ;; matches a published path
+        here? (= (buffer-file buf) path)
+        idx (ed-buffer-index-by-file m path))
+    (cond
+      ;; the buffer it is about is on screen: the full fold — the model's cache (which is
+      ;; about the buffer you are looking at), the line index, and the raw objects a
+      ;; quickfix request has to hand back
+      here? (assoc (ed-set-diagnostics m items (buffer-rope buf)) :lsp-raw-diags raw)
+      ;; a file that is OPEN but not in front of you still gets its margin marks. This
+      ;; arm did not exist, and its absence is why a stale diagnostic could not clear: a
+      ;; server retracts by publishing an empty list, and that retraction is overwhelmingly
+      ;; likely to arrive after you have moved on from the edit that caused it. Dropped, it
+      ;; left a mark describing text that no longer existed, with nothing able to remove it.
+      (not (nil? idx)) (ed-stamp-diagnostics-at m idx items)
+      ;; about a file we do not have open at all — nothing to mark
+      :else m)))
+
+(defn ed-ev-lsp-capabilities (m input textrows cols rows)
+  "A connected server reporting what it can do (`[:lsp-capabilities caps]`), kept on
+`:lsp-caps`.
+
+Worth keeping for one reason: it is the difference between \"this server does not offer
+that\" and a command that appears to do nothing. Expert advertises code actions, hover,
+definition and references and does NOT advertise signature help — so the argument hints
+are silent in Elixir and loud in Rust, and only its own answer here can say which."
+  (assoc m :lsp-caps (nth input 1 {})))
+
+(defn ed-ev-lsp-apply-edit (m input textrows cols rows)
+  "A server asking to change files itself (`[:lsp-apply-edit wsedit]`) — what a code
+action's `workspace/executeCommand` produces instead of carrying its edits inline.
+
+Applied to whatever those files are, because that is the whole request: unlike a rename,
+nothing here was computed against a buffer we can rope-guard — the action was chosen from
+a list the server offered, and the server is the one that decided what it means. Files not
+already open are opened to receive it, and every touched buffer is left modified for you
+to read before saving."
+  (let (wsedit (nth input 1)
+        paths (keys wsedit))
+    (if (empty? paths)
+      m
+      (message (fold paths m (fn (mm path) (ed-lsp-apply-file-edits mm path (get wsedit path))))
+        (str "applied edits in " (count paths) " file(s)")))))
+
+(defn- ed-lsp-here (m)
+  "The LSP request context for the current buffer at point:
+`{:conn :uri :lang :text :line :char}` (0-based line/char, LSP units)."
+  (let (buf (ed-current-buf m)
+        file (buffer-file buf))
+    {:conn (:lsp m)
+     :uri (lsp/lsp-path->uri file)
+     :lang (lsp/lsp-language-id file)
+     :text (buffer-text buf)
+     :line (buffer-current-line buf)
+     :char (buffer-column buf)}))
+
+(defn- ed-lsp-push-marker (m)
+  "Push the current location onto the LSP jump stack (`:lsp-markers`), so M-, can return."
+  (let (b (ed-current-buf m))
+    (assoc m
+      :lsp-markers (cons {:buffer (buffer-name b) :point (buffer-point b)} (:lsp-markers m '())))))
+
+(defn- ed-lsp-goto-loc (m loc)
+  "Jump to LSP location `loc` (`{:path :line :char}`), opening its file if needed; pushes a
+marker first so M-, returns to where the jump started."
+  (let (m1 (ed-lsp-push-marker m)
+        m2 (ed-find-file m1 (:path loc)))
+    (ed-apply m2 (fn (b) (ed-goto-line-col b (:line loc) (:char loc))))))
+
+(defn- ed-lsp-loc-label (m loc)
+  "A `relpath:line` label for a location (project-relative when possible) for the
+references/definition picker."
+  (let (root (:project-root m)
+        p (:path loc)
+        rel (if (and root (string/starts-with? p (str root "/")))
+              (string/substring p (string/length (str root "/")))
+              p))
+    (str rel ":" (+ 1 (:line loc)))))
+
+(defn- ed-lsp-locations-prompt (m prompt locs)
+  "A Vertico minibuffer over LSP `locs`; the chosen one opens its file and jumps (M-, returns)."
+  (let (labeled (map locs (fn (l) [(ed-lsp-loc-label m l) l]))
+        labels (map labeled first))
+    (assoc m
+      :minibuffer
+        (ed-name-prompt prompt
+          labels
+          (fn (mm t)
+            (let (hit (seq/find labeled (fn (p) (= (first p) t))))
+              (if (nil? hit) (message mm "lsp: location gone") (ed-lsp-goto-loc mm (second hit)))))))))
+
+(defn- ed-lsp-origin (m pend)
+  "The pool index of the buffer a mutating LSP request was made FROM (`:buffer` in
+`pend`), but only while its rope still matches the request-time `:rope` — nil when
+the buffer is gone or has changed (the edits were computed against text that no
+longer exists; applying them would land misaligned). The ORIGIN buffer, not the
+current one: the user may have switched buffers while the server worked."
+  (let (idx (ed-buffer-index-by-name m (:buffer pend)))
+    (if (and idx (= (buffer-rope (ed-buf-at m idx)) (:rope pend)))
+      idx
+      nil)))
+
+;; The fold half of the `LspRequest` ability (see `lsp-requests`): an arrived reply's
+;; payload folds into the model per kind — the action half of the commands below,
+;; unchanged from their synchronous days. Mutating kinds (formatting, rename) verify
+;; the ORIGIN buffer (`ed-lsp-origin`, via the context merged onto the pending
+;; record) still holds the rope the request was computed against, and apply to THAT
+;; buffer — the user may be in another one by now. (Known limitation, as in most LSP
+;; clients: a rename's edits to OTHER open files are guarded only by the origin
+;; buffer; the LSP protocol's per-document versions would close that fully.) The ids
+;; are written qualified — a bare id would qualify to THIS module.
+
+(impl LspRequest
+  lsp-requests/lsp-completion
+  ;; a completion reply is awaited by its bounded synchronous wait (the Tab source),
+  ;; never registered in `:lsp-pending` — folding is a no-op
+  (lsp-request-fold [_ m payload] m))
+
+(impl LspRequest
+  lsp-requests/lsp-definition
+  (lsp-request-fold [_ m payload]
+    (cond
+      (empty? payload) (message m "no definition found")
+      (= (count payload) 1) (ed-lsp-goto-loc m (first payload))
+      else (ed-lsp-locations-prompt m "Definition: " payload))))
+
+(impl LspRequest
+  lsp-requests/lsp-references
+  (lsp-request-fold [_ m payload]
+    (if (empty? payload)
+      (message m "no references found")
+      (ed-lsp-locations-prompt m "References: " payload))))
+
+(impl LspRequest
+  lsp-requests/lsp-hover
+  (lsp-request-fold [_ m payload]
+    (if (string/blank? payload) (message m "no hover info") (message m payload))))
+
+(impl LspRequest
+  lsp-requests/lsp-signature
+  ;; The argument hint goes in the `:eldoc` slot, not the echo: `message` is what the
+  ;; editor says to you and this is not the editor saying anything, it is the signature of
+  ;; the call your cursor is in. The echo row shows it only when nothing louder is there
+  ;; (`view/ed-echo-or-eldoc`), which is exactly the precedence it should have.
+  ;;
+  ;; Dropped unless point is still where the question was asked from: an answer about a
+  ;; call you have already typed past is worse than no answer, because it reads as being
+  ;; about the one you are in now. A blank payload is applied, not dropped — it is how the
+  ;; server says "you are not inside a call any more", and keeping the old hint there
+  ;; would leave a signature under a cursor that has left it.
+  (lsp-request-fold [pend m payload]
+    (let (buf (ed-current-buf m))
+      (if (not (= [(buffer-point buf) (buffer-rope buf)] (:at pend)))
+        m
+        (assoc m :eldoc (if (string/blank? payload) nil payload))))))
+
+(defn- ed-lsp-action-label (action n)
+  "The picker label for a code `action` — its title, with its LSP `kind` after it and the
+1-based ordinal `n` in front when the list needs it to tell two apart.
+
+Titles are the server's prose and are not guaranteed distinct: Expert offers `Add alias`
+once per candidate module. The picker matches the chosen row back to an action BY label,
+so two identical rows would silently mean the first one."
+  (str (if n (str n ". ") "")
+    (:title action)
+    (if (:kind action) (str "  [" (:kind action) "]") "")))
+
+(defn- ed-lsp-action-rows (actions)
+  "`[[label action] …]` for the code-action picker, numbering the rows only when two share
+a title — an ordinal on every row would be noise on the common case of one or two."
+  (let (titles (map actions :title)
+        dup? (not (= (count (seq/distinct titles)) (count titles))))
+    (into []
+      (map (seq/enumerate actions)
+        (fn ([i a]) [(ed-lsp-action-label a (when dup? (+ i 1))) a])))))
+
+(defn- ed-lsp-run-action (m action)
+  "Carry out one chosen code action: apply the edits it carries, and/or ask the server to
+run the command it names. An action may be both (LSP allows it, and `organize imports`
+often is), so neither arm excludes the other."
+  (let (edit (:edit action)
+        m1 (if (or (nil? edit) (empty? edit))
+             m
+             (message (fold (keys edit)
+                        m
+                        (fn (mm path) (ed-lsp-apply-file-edits mm path (get edit path))))
+               (str (:title action) " — " (count (keys edit)) " file(s)"))))
+    (if (nil? (:command action))
+      m1
+      (ed-lsp-ask m1
+        (lsp-execute-command)
+        (fn (corr)
+          (lsp/lsp-execute-command-async (:lsp m1)
+            corr
+            (self)
+            (:command action)
+            (:arguments action)))
+        nil
+        (str (:title action) "…")))))
+
+(impl LspRequest
+  lsp-requests/lsp-code-actions
+  ;; The picker rather than a straight apply, even for one action: a code action REWRITES
+  ;; your file on the server's say-so, and "add missing import" and "delete this clause"
+  ;; arrive through the same door. Reading the title first is the whole safety story.
+  (lsp-request-fold [_ m payload]
+    (if (empty? payload)
+      (message m "lsp: no code actions here")
+      (let (labeled (ed-lsp-action-rows payload)
+            labels (map labeled first))
+        (assoc m
+          :minibuffer
+            (ed-name-prompt "Code action: "
+              labels
+              (fn (mm t)
+                (let (hit (seq/find labeled (fn (p) (= (first p) t))))
+                  (if (nil? hit)
+                    (message mm "lsp: action gone")
+                    (ed-lsp-run-action mm (second hit)))))))))))
+
+(impl LspRequest
+  lsp-requests/lsp-execute-command
+  ;; Nothing to fold: the server answers `null` and sends its edits separately, as a
+  ;; `workspace/applyEdit` request that lands on [[ed-ev-lsp-apply-edit]].
+  (lsp-request-fold [_ m payload] (message m "lsp: action ran")))
+
+(impl LspRequest
+  lsp-requests/lsp-symbols
+  (lsp-request-fold [_ m payload]
+    (if (empty? payload)
+      (message m "imenu: no symbols (is the server ready?)")
+      (ed-imenu-prompt m payload))))
+
+(impl LspRequest
+  lsp-requests/lsp-formatting
+  (lsp-request-fold [pend m payload]
+    (let (idx (ed-lsp-origin m pend))
+      (cond
+        (empty? payload) (message m "lsp: no formatting changes")
+        (nil? idx) (message m "lsp: buffer changed while formatting ran — dropped (re-run C-c C-f)")
+        else
+          (message (assoc m
+                     :buffers
+                       (assoc (:buffers m)
+                         idx (ed-apply-text-edits (ed-buf-at m idx) payload)))
+            "formatted")))))
+
+(impl LspRequest
+  lsp-requests/lsp-rename
+  (lsp-request-fold [pend m payload]
+    (cond
+      (empty? payload) (message m "lsp: rename produced no changes")
+      (nil? (ed-lsp-origin m pend))
+        (message m "lsp: buffer changed while rename ran — dropped (re-run C-c C-r)")
+      else (ed-lsp-apply-rename m pend payload))))
+
+(defcommand cmd-goto-definition
+  (m key)
+  "Jump to the definition of the symbol at point (M-.); M-, returns. Picks among several
+definitions via a minibuffer. Auto-starts the server on first use. Async — the jump
+happens when the location arrives."
+  (let ([m2 ready?] (ed-lsp-ensure m))
+    (if (not ready?)
+      m2
+      (let (cx (ed-lsp-here m2))
+        (ed-lsp-ask m2
+          (lsp-definition)
+          (fn (corr)
+            (lsp/lsp-definition-async (:conn cx)
+              corr
+              (self)
+              (:uri cx)
+              (:lang cx)
+              (:text cx)
+              (:line cx)
+              (:char cx)))
+          nil
+          "resolving definition…")))))
+
+(defcommand cmd-lsp-pop-marker
+  (m key)
+  "Return to the location before the last LSP jump (M-,)."
+  (let (stack (:lsp-markers m '()))
+    (if (empty? stack)
+      (message m "no LSP jump to return from")
+      (let (mk (first stack)
+            m1 (assoc m :lsp-markers (rest stack))
+            idx (ed-buffer-index-by-name m1 (:buffer mk)))
+        (if (nil? idx)
+          (message m1 (str "lsp: buffer gone: " (:buffer mk)))
+          (ed-apply (ed-select m1 idx)
+            (fn (b) (goto-char b (math/min (:point mk) (buffer-length b))))))))))
+
+(defcommand cmd-find-references
+  (m key)
+  "List every reference to the symbol at point and jump to the chosen one (M-?).
+Async — the picker opens when the list arrives."
+  (let ([m2 ready?] (ed-lsp-ensure m))
+    (if (not ready?)
+      m2
+      (let (cx (ed-lsp-here m2))
+        (ed-lsp-ask m2
+          (lsp-references)
+          (fn (corr)
+            (lsp/lsp-references-async (:conn cx)
+              corr
+              (self)
+              (:uri cx)
+              (:lang cx)
+              (:text cx)
+              (:line cx)
+              (:char cx)))
+          nil
+          "finding references…")))))
+
+(defn- ed-lsp-signature-ask (m note)
+  "Fire a `textDocument/signatureHelp` for point and stamp the model with the position it
+was asked from (`:signature-at`), so the same question is not asked twice and the answer
+knows whether it is still about where the cursor is."
+  (let (cx (ed-lsp-here m)
+        buf (ed-current-buf m)
+        at [(buffer-point buf) (buffer-rope buf)])
+    (ed-lsp-ask (assoc m :signature-at at)
+      (lsp-signature)
+      (fn (corr)
+        (lsp/lsp-signature-async (:conn cx)
+          corr
+          (self)
+          (:uri cx)
+          (:lang cx)
+          (:text cx)
+          (:line cx)
+          (:char cx)))
+      {:at at}
+      note)))
+
+(defn ed-launch-signature (m)
+  "The idle beat's argument hints: ask the connected language server what call point is
+inside, and show its signature in the eldoc slot (`model/ed-signature-stale?` decides when).
+
+This is eglot's `eglot-signature-eldoc-function` and it is the feature that makes a server
+worth having open while you TYPE rather than when you stop and ask a question — every
+other LSP command here is one you invoke. Silent in every direction: it never starts a
+server (`ed-lsp-autostart` owns that), never messages, and a server that does not offer
+signature help is never asked — Expert is one, so in Elixir this costs exactly nothing."
+  (if (or (not (:lsp m))
+        (ed-headless?)
+        (not (lsp/lsp-capable? (:lsp-caps m) :signatureHelpProvider))
+        (not (ed-signature-stale? m))
+        (nil? (buffer-file (ed-current-buf m))))
+    m
+    (ed-lsp-signature-ask m :quiet)))
+
+(defcommand cmd-lsp-code-action
+  (m key)
+  "Offer the language server's fixes for the code at point and run the chosen one (C-c C-a).
+
+Emacs' `eglot-code-actions`. The diagnostics on the current line go WITH the request —
+that is how a server knows which quickfix you mean, and without them most servers answer
+with their unconditional refactorings only, which reads as the fix for the error under
+your cursor not existing."
+  (let ([m2 ready?] (ed-lsp-ensure m))
+    (cond
+      (not ready?) m2
+      (not (lsp/lsp-capable? (:lsp-caps m2) :codeActionProvider))
+        (message m2 "lsp: this server does not offer code actions")
+      else
+        (let (cx (ed-lsp-here m2)
+              here (lsp/lsp-diagnostics-at-line (:lsp-raw-diags m2 []) (:line cx)))
+          (ed-lsp-ask m2
+            (lsp-code-actions)
+            (fn (corr)
+              (lsp/lsp-code-actions-async (:conn cx)
+                corr
+                (self)
+                (:uri cx)
+                (:lang cx)
+                (:text cx)
+                (:line cx)
+                (:char cx)
+                here))
+            nil
+            "code actions…")))))
+
+(defcommand cmd-lsp-signature-help
+  (m key)
+  "Show the signature of the call point is inside, in the echo area (C-c C-s).
+
+Normally you never press this — the idle beat asks the same question as you type
+(`ed-launch-signature`). It is here for the buffer whose mode answers eldoc itself, where
+the automatic path stands back, and for asking again after a message has covered the hint."
+  (let ([m2 ready?] (ed-lsp-ensure m))
+    (cond
+      (not ready?) m2
+      ;; said plainly, because the alternative is a key that appears to do nothing
+      (not (lsp/lsp-capable? (:lsp-caps m2) :signatureHelpProvider))
+        (message m2 "lsp: this server does not offer signature help")
+      else (ed-lsp-signature-ask m2 "signature…"))))
+
+(defcommand cmd-lsp-hover
+  (m key)
+  "Show the type / signature / docs of the symbol at point in the echo area (C-c C-d).
+Async — the docs show when they arrive."
+  (let ([m2 ready?] (ed-lsp-ensure m))
+    (if (not ready?)
+      m2
+      (let (cx (ed-lsp-here m2))
+        (ed-lsp-ask m2
+          (lsp-hover)
+          (fn (corr)
+            (lsp/lsp-hover-async (:conn cx)
+              corr
+              (self)
+              (:uri cx)
+              (:lang cx)
+              (:text cx)
+              (:line cx)
+              (:char cx)))
+          nil
+          "hover…")))))
+
+(sig ed-edit-offsets
+  (buffer (record &open :start-line int :start-char int :end-line int :end-char int :text string)
+    ->
+    (record :start int :end int :text string)))
+(defn- ed-edit-offsets (b e)
+  "The char-offset form `{:start :end :text}` of normalised LSP edit `e` in buffer `b`
+(offsets computed against the original buffer, clamped to its length)."
+  (let (rope (buffer-rope b)
+        len (buffer-length b)
+        s (+ (text/line->char rope (:start-line e)) (:start-char e))
+        en (+ (text/line->char rope (:end-line e)) (:end-char e)))
+    {:start (math/min s len) :end (math/min en len) :text (:text e)}))
+
+(defn- ed-apply-text-edits (b edits)
+  "Apply LSP `edits` to buffer `b`. Offsets are resolved against the original buffer, then
+applied last-position-first so each replace can't shift the offsets of edits still to come."
+  (let (os (map edits (fn (e) (ed-edit-offsets b e)))
+        sorted (sort os (fn (a c) (> (:start a) (:start c))))
+        out (fold sorted b (fn (bb e) (replace-region bb (:start e) (:end e) (:text e)))))
+    (goto-char out (math/min (buffer-point b) (buffer-length out)))))
+
+(defcommand cmd-lsp-format-buffer
+  (m key)
+  "Format the current buffer via the language server (C-c C-f). Async, rope-guarded:
+the edits apply when they arrive iff the buffer hasn't changed meanwhile."
+  (let ([m2 ready?] (ed-lsp-ensure m))
+    (if (not ready?)
+      m2
+      (let (cx (ed-lsp-here m2)
+            b (ed-current-buf m2))
+        (ed-lsp-ask m2
+          (lsp-formatting)
+          (fn (corr)
+            (lsp/lsp-format-async (:conn cx)
+              corr
+              (self)
+              (:uri cx)
+              (:lang cx)
+              (:text cx)))
+          {:rope (buffer-rope b) :buffer (buffer-name b)}
+          "formatting…")))))
+
+(defn- ed-lsp-apply-file-edits (m path edits)
+  "Open `path` and apply `edits` to its buffer (left modified for the user to save)."
+  (ed-apply (ed-find-file m path) (fn (b) (ed-apply-text-edits b edits))))
+
+(defn- ed-lsp-apply-rename (m pend wsedit)
+  "Apply an arrived rename's workspace edit across every affected file, returning to
+the buffer/point the rename started in (`:buffer`/`:point` captured in `pend`)."
+  (let (paths (keys wsedit)
+        m2 (fold paths m (fn (mm path) (ed-lsp-apply-file-edits mm path (get wsedit path))))
+        idx (ed-buffer-index-by-name m2 (:buffer pend))
+        m3 (if (nil? idx)
+             m2
+             (ed-apply (ed-select m2 idx)
+               (fn (b) (goto-char b (math/min (:point pend) (buffer-length b)))))))
+    (message m3 (str "renamed in " (count paths) " file(s)"))))
+
+(defn- ed-lsp-do-rename (m new-name)
+  "Fire the rename request for the symbol at point → `new-name` (async); the workspace
+edit applies when it arrives (`lsp-request-fold` on `lsp-rename`), rope-guarded against edits made
+while the server worked, returning to the origin buffer/point."
+  (let (cx (ed-lsp-here m)
+        b (ed-current-buf m))
+    (ed-lsp-ask m
+      (lsp-rename)
+      (fn (corr)
+        (lsp/lsp-rename-async (:conn cx)
+          corr
+          (self)
+          (:uri cx)
+          (:lang cx)
+          (:text cx)
+          (:line cx)
+          (:char cx)
+          new-name))
+      {:rope (buffer-rope b) :buffer (buffer-name b) :point (buffer-point b)}
+      "renaming…")))
+
+(defcommand cmd-lsp-rename
+  (m key)
+  "Rename the symbol at point across the workspace (C-c C-r); prompts for the new name and
+applies the edits to every affected file (left modified for you to save)."
+  (let ([m2 ready?] (ed-lsp-ensure m))
+    (if (not ready?)
+      m2
+      (assoc m2
+        :minibuffer
+          {:edit (ed-mb-edit "Rename to: " "")
+           :on-complete (fn (mm new-name)
+                          (if (string/blank? new-name)
+                            (message mm "rename cancelled")
+                            (ed-lsp-do-rename mm new-name)))}))))
+
