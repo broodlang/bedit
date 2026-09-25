@@ -131,8 +131,8 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
 - [x] **P3 A warm test session keeps its first project's root.** `testrun.blsp:597-613`.
 - [x] **P4 The shared `:sandbox` re-roots back and forth** (`sandbox.blsp:174` turns nil
   into `/tmp`; diagnostics re-root it) — wipes playground state.
-- [~] **P5 Removing a breakpoint can revert a later redefinition** (`debugger.blsp:548-575`); FIXED the revert, and any LOOP process (every window, every `--serve` client — `*ui-loop*`) now runs through a breakpoint, not only the first window. OPEN:
-  other editor-internal processes (buffer processes, the registry) can still be paused.
+- [x] **P5 Removing a breakpoint can revert a later redefinition** (`debugger.blsp:548-575`); FIXED the revert, and any LOOP process (every window, every `--serve` client — `*ui-loop*`) now runs through a breakpoint, not only the first window. OPEN:
+  other editor-internal processes (buffer processes, the registry) can still be paused. — FIXED: brood `proc/flag :no-break` (01fc3822) — a breakpoint passes such a process through; std sets it on every buffer process, the buffer registry and the evalsession worker, and bedit on its collab registry.
 - [x] **P6 LSP URIs not percent-encoded** (`lsp.blsp:257-260,534`).
 - [x] **P7 LSP advertises `workspace/configuration` then answers MethodNotFound.**
 - [x] **P8 LSP handshake drops server messages before the initialize reply.**
