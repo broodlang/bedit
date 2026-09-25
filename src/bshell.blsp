@@ -106,7 +106,7 @@ Best-effort via the shared writer — a failure is swallowed, never breaking the
 ;; by both bshell and compile.
 
 ;; ---- the shell process (one per buffer; mirrors lsp's connection process) ----
-;; State: {:buffer <name> :root <dir> :proc <handle|nil>}. Owns the child `proc` so its
+;; State: {:buffer <name> :root <dir> :proc <handle|nil> :reply <loop>}. Owns the child `proc` so its
 ;; output lands here, not in the editor's mailbox; forwards each chunk to the editor.
 
 (defn- bshell-brood-form? (line)
@@ -135,8 +135,8 @@ a REPL — and off the editor loop), then push the formatted result + a success 
         out (eval-source line))
     ; never throws: captured output then `=> value`, or `error: …`
     (do
-      (send :editor (bshell/bshell-output-event buf (str out "\n")))
-      (send :editor (bshell/bshell-done-event buf 0))
+      (send (:reply state) (bshell/bshell-output-event buf (str out "\n")))
+      (send (:reply state) (bshell/bshell-done-event buf 0))
       (bshell-loop state))))
 
 ;; The record constructors below are named QUALIFIED, and have to be. These sends run
@@ -158,21 +158,33 @@ terminal buffer (term.blsp), under a pty and a real emulator."
                           (let (p (os/spawn "sh" ["-c" line] {:cwd (:root state)}))
                             (bshell-loop (assoc state :proc p)))))
     ([:proc p data] (do
-                      (send :editor (bshell/bshell-output-event (:buffer state) (ansi/strip data)))
+                      (send (:reply state) (bshell/bshell-output-event (:buffer state) (ansi/strip data)))
                       (bshell-loop state)))
     ([:proc-err p data] (do
-                          (send :editor
+                          (send (:reply state)
                             (bshell/bshell-output-event (:buffer state) (ansi/strip data)))
                           (bshell-loop state)))
     ([:proc-closed p code] (do
-                             (send :editor (bshell/bshell-done-event (:buffer state) code))
+                             (send (:reply state) (bshell/bshell-done-event (:buffer state) code))
                              (bshell-loop (assoc state :proc nil))))
+    ;; C-c C-c: Ctrl-C to the command and everything it started (`os/signal` reaches the
+    ;; child's process group); its exit arrives as `[:proc-closed …]` like any other. A
+    ;; Brood form is evaluated in THIS process, so there is nothing to interrupt then.
+    ([:bshell-interrupt] (do (when (:proc state) (os/signal (:proc state) :int)) (bshell-loop state)))
     ([:shutdown] (do (when (:proc state) (os/close (:proc state))) :bshell-stopped))))
 
 (defn bshell-connect (buffer root)
   "Spawn the shell process for `buffer` rooted at `root`; returns its pid (stored on that
-buffer under `:bshell-proc`). `(bshell-shutdown pid)` stops it."
-  (spawn (bshell-loop {:buffer buffer :root root :proc nil})))
+buffer under `:bshell-proc`). `(bshell-shutdown pid)` stops it. Output and exits go to
+the loop that opened the shell (`*ui-loop*`), so a shell opened in a second frame answers
+there — `:editor` only for one started before any loop runs."
+  (let (reply (or *ui-loop* :editor))
+    (spawn (bshell-loop {:buffer buffer :root root :proc nil :reply reply}))))
+
+(defn bshell-interrupt (pid)
+  "Interrupt whatever command shell process `pid` is running (Ctrl-C to its process group);
+a no-op when it is idle."
+  (send pid [:bshell-interrupt]))
 
 (defn bshell-shutdown (pid)
   "Stop a shell process: kill any running child and end the process."
@@ -634,3 +646,14 @@ is sent to this shell's process. Ignored in a non-bshell buffer or while a comma
 
 ;; Turn the completion source on: highest precedence, but inert outside a bshell buffer.
 (complete-add-source! 'bshell/bshell-complete-source)
+
+(defcommand cmd-bshell-interrupt
+  (m key)
+  "C-c C-c in a bshell buffer: interrupt the running command, as Ctrl-C does in a terminal —
+the signal reaches the command and everything it started (`sleep`, `make` and its
+compilers), and its exit is reported as usual. Says so when nothing is running."
+  (let (b (ed-current-buf m))
+    (cond
+      (not (bshell-buffer? b)) m
+      (not (and (:bshell-running b) (:bshell-proc b))) (message m "no command running")
+      :else (do (bshell-interrupt (:bshell-proc b)) (message m "interrupted")))))
