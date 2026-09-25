@@ -1,6 +1,6 @@
 ;; LSP client (src/lsp.blsp) — the pure protocol + connection logic, tested without a
-;; live server: frame encode/decode across chunk boundaries, completion-result shapes,
-;; and request/response correlation. The live proc round-trip is covered by the kernel
+;; live server: completion-result shapes and request/response correlation (the framing
+;; itself is brood's `jsonrpc`, tested there). The live proc round-trip is covered by the kernel
 ;; proc tests (../brood tests/proc_test.blsp); enabling a real server (e.g.
 ;; rust-analyzer) is a manual smoke step, not part of this deterministic suite.
 
@@ -12,44 +12,6 @@
   (:use-internals input) ; ed-event-handlers — the table the loop routes by
   (:use model) ; ed-init / ed-set-buf / ed-current-buf — the sync hook is a model step
   (:use editor/buffer)) ; make-buffer / insert — the edit a sync is about
-(describe "lsp: framing"
-  (test "lsp--frame prefixes a Content-Length header and a blank line"
-    (let (f (lsp/lsp-frame "{}"))
-      (assert= f "Content-Length: 2\r\n\r\n{}")))
-  (test "lsp-request round-trips through lsp-decode"
-    (let (frame (lsp-request 1 "textDocument/completion" {:k "v"})
-          [msgs math/rem] (lsp-decode frame)
-          msg (first msgs))
-      (assert= math/rem "")
-      (assert= (count msgs) 1)
-      (assert= (:id msg) 1)
-      (assert= (:method msg) "textDocument/completion")
-      (assert= (:k (:params msg)) "v"))))
-
-(describe "lsp: decoding a chunked stream"
-  (test "two concatenated frames decode to two messages, no leftover"
-    (let (f (lsp-request 1 "a" {})
-          [msgs math/rem] (lsp-decode (str f f)))
-      (assert= (count msgs) 2)
-      (assert= math/rem "")))
-  (test "an incomplete frame is buffered whole (returned as remaining)"
-    (let (f (lsp-request 1 "a" {})
-          partial (string/substring f 0 (- (string/length f) 3))
-          [msgs math/rem] (lsp-decode partial))
-      (assert= (count msgs) 0)
-      (assert= math/rem partial)))
-  (test "a header with no body yet buffers (no message)"
-    (let ([msgs math/rem] (lsp-decode "Content-Length: 99\r\n\r\n{}"))
-      (assert= (count msgs) 0)))
-  (test "a multi-byte UTF-8 body frames by bytes, not chars (the rust-analyzer bug)"
-    ;; café→𝄞 is more bytes than chars; a char-based length would never see the frame
-    ;; as complete. lsp--frame must Content-Length it in bytes and lsp-decode slice by bytes.
-    (let (body "{\"v\":\"café→𝄞\"}"
-          frame (lsp/lsp-frame body)
-          [msgs math/rem] (lsp-decode frame))
-      (assert= math/rem "")
-      (assert= (count msgs) 1)
-      (assert= (:v (first msgs)) "café→𝄞"))))
 
 (describe "lsp: completion-result shapes"
   (test "a CompletionItem[] vector yields its labels"
@@ -80,7 +42,7 @@
                  :pending {7 [:my-pid :corr-1]}
                  :opened {}
                  :version 1}
-          resp (lsp/lsp-frame (json/encode {:jsonrpc "2.0"
+          resp (jsonrpc/frame (json/encode {:jsonrpc "2.0"
                                             :id 7
                                             :result {:items [{:label "foo"} {:label "bar"}]}}))
           [st2 replies] (lsp/lsp-ingest state resp))
@@ -94,7 +56,7 @@
   ;; forever, which reads as a broken server rather than a missing client feature.
   (test "a request FROM the server is answered, not ignored"
     (let (state {:proc :fake :buf "" :next-id 8 :pending {} :opened {} :version 1}
-          ask (lsp/lsp-frame (json/encode {:jsonrpc "2.0"
+          ask (jsonrpc/frame (json/encode {:jsonrpc "2.0"
                                            :id 1
                                            :method "client/registerCapability"
                                            :params {:registrations []}}))
@@ -110,7 +72,7 @@
     ;; MethodNotFound is a real answer: it unblocks the server just as well as agreement,
     ;; and silence is the only response that does not.
     (let (state {:proc :fake :buf "" :next-id 8 :pending {} :opened {} :version 1}
-          ask (lsp/lsp-frame (json/encode {:jsonrpc "2.0"
+          ask (jsonrpc/frame (json/encode {:jsonrpc "2.0"
                                            :id 4
                                            :method "workspace/somethingElse"
                                            :params {}}))
@@ -123,7 +85,7 @@
   ;; edits this way round, as a request to us rather than as the reply to anything.
   (test "workspace/applyEdit is accepted, and its edits queued for the editor"
     (let (state {:proc :fake :buf "" :next-id 8 :pending {} :opened {} :version 1}
-          ask (lsp/lsp-frame (json/encode {:jsonrpc "2.0"
+          ask (jsonrpc/frame (json/encode {:jsonrpc "2.0"
                                            :id 4
                                            :method "workspace/applyEdit"
                                            :params {:edit {:changes {"file:///a.ex" [{:range {:start {:line 0
@@ -144,7 +106,7 @@
     ;; :method with no :id — publishDiagnostics, logMessage. Answering one would be a
     ;; protocol error in the other direction.
     (let (state {:proc :fake :buf "" :next-id 8 :pending {} :opened {} :version 1}
-          note (lsp/lsp-frame (json/encode {:jsonrpc "2.0"
+          note (jsonrpc/frame (json/encode {:jsonrpc "2.0"
                                             :method "window/logMessage"
                                             :params {:message "hi" :type 3}}))
           [st2 replies] (lsp/lsp-ingest state note))
@@ -187,7 +149,7 @@
 
   (test "publishDiagnostics is routed as diagnostics, not as narration"
     (let (state {:proc :fake :buf "" :next-id 8 :pending {} :opened {} :version 1}
-          note (lsp/lsp-frame (json/encode {:jsonrpc "2.0"
+          note (jsonrpc/frame (json/encode {:jsonrpc "2.0"
                                             :method "textDocument/publishDiagnostics"
                                             :params {:uri "file:///tmp/a.ex"
                                                      :diagnostics [{:range {:start {:line 0
@@ -212,7 +174,7 @@
   ;; now, and dropping it leaves the errors you have just fixed sitting on screen.
   (test "an empty diagnostic list is published like any other"
     (let (state {:proc :fake :buf "" :next-id 8 :pending {} :opened {} :version 1}
-          note (lsp/lsp-frame (json/encode {:jsonrpc "2.0"
+          note (jsonrpc/frame (json/encode {:jsonrpc "2.0"
                                             :method "textDocument/publishDiagnostics"
                                             :params {:uri "file:///tmp/a.ex" :diagnostics []}}))
           [st2 _] (lsp/lsp-ingest state note))
@@ -244,7 +206,7 @@
     (is (nil? (lsp/lsp-progress-text {:method "textDocument/publishDiagnostics" :params {}}))))
 
   (test "a response split across two chunks reassembles, then routes"
-    (let (f (lsp/lsp-frame (json/encode {:jsonrpc "2.0" :id 7 :result {:items []}}))
+    (let (f (jsonrpc/frame (json/encode {:jsonrpc "2.0" :id 7 :result {:items []}}))
           mid (math/quot (string/length f) 2)
           state {:proc :fake
                  :buf ""
@@ -298,7 +260,7 @@
                  :pending {8 [:my-pid :corr-2 (lsp-symbols)]}
                  :opened {}
                  :version 1}
-          resp (lsp/lsp-frame (json/encode {:jsonrpc "2.0"
+          resp (jsonrpc/frame (json/encode {:jsonrpc "2.0"
                                             :id 8
                                             :result [{:name "g"
                                                       :kind 12
@@ -446,7 +408,7 @@
                  :pending {2 [:p :c (lsp-definition)]}
                  :opened {}
                  :version 1}
-          resp (lsp/lsp-frame (json/encode {:jsonrpc "2.0"
+          resp (jsonrpc/frame (json/encode {:jsonrpc "2.0"
                                             :id 2
                                             :result {:uri "file:///d"
                                                      :range {:start {:line 7 :character 3}}}}))
@@ -459,7 +421,7 @@
                  :pending {2 [:p :c (lsp-hover)]}
                  :opened {}
                  :version 1}
-          resp (lsp/lsp-frame (json/encode {:jsonrpc "2.0" :id 2 :result {:contents "the docs"}}))
+          resp (jsonrpc/frame (json/encode {:jsonrpc "2.0" :id 2 :result {:contents "the docs"}}))
           [st2 replies] (lsp/lsp-ingest state resp))
       (assert= replies (list [:p [:lsp-hover :c "the docs"]]))))
   (test "the requests carry the position and the context the server needs"
@@ -488,7 +450,7 @@
                  :pending {2 [:p :c (lsp-signature)]}
                  :opened {}
                  :version 1}
-          resp (lsp/lsp-frame (json/encode {:jsonrpc "2.0"
+          resp (jsonrpc/frame (json/encode {:jsonrpc "2.0"
                                             :id 2
                                             :result {:signatures [{:label "put(map, key, value)"
                                                                    :parameters [{:label "map"}
@@ -505,7 +467,7 @@
                  :pending {2 [:p :c (lsp-rename)]}
                  :opened {}
                  :version 1}
-          resp (lsp/lsp-frame (json/encode {:jsonrpc "2.0"
+          resp (jsonrpc/frame (json/encode {:jsonrpc "2.0"
                                             :id 2
                                             :result {:changes {"file:///a" [{:range {:start {:line 0
                                                                                              :character 0}
@@ -741,23 +703,6 @@
       (assert= (editor/buffer/buffer-text (model/ed-buf-at m2 0)) "zzz")
       (assert= (:echo m2) "formatted"))))
 
-;; A real completion reply from a real project is ~100 kB, and the decoder used to reach its
-;; body with `take`/`drop` over the bytes — which go through the SEQ view, so the body became
-;; a Brood list holding one boxed int per byte. Quadratic (1 kB 0.3 ms, 4 kB 2 ms, 16 kB
-;; 17 ms) and at ~100 kB it exhausted the 2 GB process limit and killed the LSP client. The
-;; body is a native `bytes/slice` now; this pins the size that used to die.
-(describe "a large message decodes (it used to exhaust memory)"
-  (test "an 80 kB completion reply round-trips"
-    (let (body (str "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":["
-                 (string/join (map (range 4000) (fn (i) (str "{\"label\":\"item" i "\"}"))) ",")
-                 "]}")
-          frame (str "Content-Length: " (bytes/length (string/->bytes body)) "\r\n\r\n" body)
-          [msgs leftover] (lsp/lsp-decode frame))
-      (is (> (string/length body) 80000))
-      (assert= (count msgs) 1)
-      (assert= leftover "")
-      (assert= (count (get (first msgs) :result)) 4000))))
-
 ;; The report this exists for (2026-09-18): opening an Elixir file on a machine with no
 ;; `elixir-ls` answered a lookup with a crash trace —
 ;;   [crash] #<pid nonode/15> exited: proc-spawn elixir-ls: No such file or directory
@@ -943,7 +888,7 @@
     (assert= (lsp/lsp-uri->path "file:///p/%40scope/x.ts") "/p/@scope/x.ts"))
   (test "workspace/configuration gets one null per item, not MethodNotFound"
     (let (state {:proc :fake :buf "" :next-id 8 :pending {} :opened {} :version 1}
-          ask (lsp/lsp-frame (json/encode {:jsonrpc "2.0"
+          ask (jsonrpc/frame (json/encode {:jsonrpc "2.0"
                                            :id 4
                                            :method "workspace/configuration"
                                            :params {:items [{:section "a"} {:section "b"}]}}))
