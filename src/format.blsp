@@ -27,7 +27,8 @@ output."
   (:use model) ; ed-mode-service / ed-current-buf / ed-set-buf / message
   (:use commands) ; ed-find-file / save-buffer
   (:use interactive) ; defcommand
-  (:use editor/buffer)) ; buffer-file / buffer-text / goto-char / buffer-point
+  (:use editor/buffer) ; buffer-file / buffer-text / goto-char / buffer-point
+  (:use task)) ; task — the formatter runs off the loop
 (defdyn *format-on-save*
   ;; Off by default: reformatting a file someone did not ask to reformat is a large,
   ;; surprising diff, and in a shared repo it is a diff with someone else's name on the
@@ -43,68 +44,114 @@ it last."
         file (buffer-file buf))
     (when (and cmd file (not (empty? cmd))) (into (into [] cmd) [file]))))
 
-(defn format-file (buf)
-  "Run `buf`'s formatter over its file, in the file's PROJECT root — `mix format` reads
-`.formatter.exs` from the directory it runs in, so run from `lib/foo/` it ignored the
-project's `import_deps` and plugins and reformatted Ecto's `field :x` with parens. Returns
-`[ok? detail]` — `detail` is the formatter's own complaint on failure, which is the useful
-half (a syntax error names the line)."
+(defn format-job (buf)
+  "What running `buf`'s formatter takes, as plain data: `{:argv :root :file}`, or nil when
+it has none. Worked out on the loop — the formatter is a MODE service, and a task can see
+neither the model nor a buffer — so the part that can take seconds carries only this.
+
+`:root` is the file's PROJECT root: `mix format` reads `.formatter.exs` from the directory
+it runs in, so run from `lib/foo/` it ignored the project's `import_deps` and plugins and
+reformatted Ecto's `field :x` with parens."
   (let (argv (format-command-for buf))
-    (if (nil? argv)
-      [false "no formatter for this buffer"]
+    (when argv
       (let (file (buffer-file buf)
-            dir (if file (path/dirname file) (or (:dir buf) "."))
-            root (or (projects/project-root dir) dir)
-            r (os/cmd (first argv) (into [] (rest argv)) {:cwd root})
-            out (string/trim (str (get r :stderr) (get r :stdout))))
-        (if (= (get r :exit) 0)
-          [true (first argv)]
-          [false (if (= out "") (str (first argv) " exited " (get r :exit)) out)])))))
+            dir (if file (path/dirname file) (or (:dir buf) ".")))
+        {:argv argv :root (or (projects/project-root dir) dir) :file file}))))
 
-(defn format-buffer-now (m)
-  "Save, format, re-read — the whole cycle, as a `model -> model`.
+(defn format-run (job)
+  "Run a `format-job`. `[ok? detail]` — `detail` is the formatter's own complaint on
+failure, which is the useful half (a syntax error names the line). Plain data in and out,
+so it runs in a task."
+  (let (argv (:argv job)
+        r (os/cmd (first argv) (into [] (rest argv)) {:cwd (:root job)})
+        out (string/trim (str (get r :stderr) (get r :stdout))))
+    (if (= (get r :exit) 0)
+      [true (first argv)]
+      [false (if (= out "") (str (first argv) " exited " (get r :exit)) out)])))
 
-The write is the plain save (`ed-save-buf-at`), so a format is a save in every respect
-that matters afterwards: the buffer is unmodified, its auto-save file is gone, and it is
-stamped with the file's mtime — also when the formatter then FAILS, which used to leave a
-buffer still marked modified with a stale stamp, and the next C-x C-s warning falsely that
-someone else had changed the file. The re-read stamps again, since the formatter rewrote
-the file.
+(defn format-file (buf)
+  "Run `buf`'s formatter over its file, synchronously: `[ok? detail]`."
+  (let (job (format-job buf))
+    (if (nil? job) [false "no formatter for this buffer"] (format-run job))))
+
+(defn format-land (m saved-rope file result)
+  "Fold a finished formatter run (`result` is `format-run`'s `[ok? detail]`) into the buffer
+visiting `file`: re-read the formatted file into it, keeping point.
+
+Only while the buffer still holds exactly the text the save wrote (`saved-rope`). The
+formatter runs OFF the loop now, so you can type while it runs; if you did, re-reading
+would throw away what you typed. Your edits win, and the message says the file on disk is
+the formatted one — which the next C-x C-s notices and asks about, as it should.
 
 Point is restored by OFFSET rather than by line, deliberately: a formatter may join or
 split lines, so a line number means something different afterwards, while an offset is
 merely approximate. Clamped to the new length, so a formatter that shortened the file
 cannot leave point past its end."
+  (let ([ok detail] result
+        i (ed-buffer-index-by-file m file)
+        buf (if (nil? i) nil (ed-buf-at m i)))
+    (cond
+      (not ok) (message m (str "format failed: " detail))
+      (nil? buf) (message m (str "formatted " file))
+      (not (= (buffer-rope buf) saved-rope))
+        (message m (str "formatted " file " on disk — kept your edits since the save"))
+      :else
+        (check-allow :discarded-catch
+          (try
+            (let (formatted (file/slurp file)
+                  point (math/min (buffer-point buf) (string/length formatted))
+                  reread (goto-char (editor/buffer/replace-region buf 0 (buffer-length buf) formatted)
+                           point)
+                  m2 (ed-set-buf-at m i (buffer-stamp-file (mark-buffer-saved reread))))
+              (message m2
+                (if (= formatted (buffer-text buf))
+                  ;; already canonical: say so rather than reporting a no-op as work
+                  (str "saved " file " (already formatted)")
+                  (str "saved and formatted " file))))
+            (catch e (message m (str "format failed: " (error-message e)))))))))
+
+(defn format-apply (m result)
+  "The `:format-proc` task's reply, folded: the job's `[ok? detail]`, or nil when the task
+errored or timed out."
+  (let (pending (:format-pending m)
+        m1 (dissoc m :format-proc :format-pending))
+    (cond
+      (nil? pending) m1
+      (nil? result) (message m1 (str "format of " (:file pending) " failed or timed out"))
+      :else (format-land m1 (:rope pending) (:file pending) result))))
+
+(defn format-buffer-now (m)
+  "Save, then format — the save at once, the formatter off the loop.
+
+The write is the plain save (`ed-save-buf-at`), so a format is a save in every respect
+that matters afterwards: the buffer is unmodified, its auto-save file is gone, and it is
+stamped with the file's mtime — also when the formatter then FAILS.
+
+The formatter itself runs in a task (`:format-proc`): `mix format` on a real project takes
+seconds, and it used to take them on the loop, with the window frozen until it finished
+(issues.md F1). Headless — a test, a batch run — has no loop for a reply to come back to,
+so it runs inline there, as every other off-loop job does."
   (let (buf (ed-current-buf m)
-        file (buffer-file buf))
+        file (buffer-file buf)
+        job (format-job buf))
     (cond
       (nil? file) (message m "no file to format")
-      (nil? (format-command-for buf))
-        (message m (str "no formatter for " (or (ed-buf-mode-name buf) "this buffer")))
-      else
+      (nil? job) (message m (str "no formatter for " (or (ed-buf-mode-name buf) "this buffer")))
+      ;; still a SAVE: C-x C-s comes through here when format-on-save is on, and a format
+      ;; already in flight must not turn it into a no-op
+      (:format-proc m)
+        (message (ed-save-buf-at m (ed-current-index m))
+          (str "saved " file " — not formatted, a format is still running"))
+      :else
         (let (m1 (ed-save-buf-at m (ed-current-index m))
               saved (ed-current-buf m1))
-          (if (buffer-modified? saved)
-            m1 ; the write failed and said so; there is nothing to format
-            (let ([ok detail] (format-file saved))
-              (if (not ok)
-                (message m1 (str "format failed: " detail))
-                (check-allow :discarded-catch
-                  (try
-                    (let (formatted (file/slurp file)
-                          point (math/min (buffer-point saved) (string/length formatted))
-                          reread (goto-char (editor/buffer/replace-region saved
-                                              0
-                                              (buffer-length saved)
-                                              formatted)
-                                   point)
-                          m2 (ed-set-buf m1 (buffer-stamp-file (mark-buffer-saved reread))))
-                      (message m2
-                        (if (= formatted (buffer-text saved))
-                          ;; already canonical: say so rather than reporting a no-op as work
-                          (str "saved " file " (already formatted)")
-                          (str "saved and formatted " file))))
-                    (catch e (message m1 (str "format failed: " (error-message e)))))))))))))
+          (cond
+            (buffer-modified? saved) m1 ; the write failed and said so; nothing to format
+            (ed-headless?) (format-land m1 (buffer-rope saved) file (format-run job))
+            :else
+              (assoc m1
+                :format-proc (task (fn () (format-run job)) {:timeout 60000})
+                :format-pending {:file file :rope (buffer-rope saved)}))))))
 
 (defcommand cmd-format-buffer
   (m key)
