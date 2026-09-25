@@ -136,7 +136,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
 - [x] **P6 LSP URIs not percent-encoded** (`lsp.blsp:257-260,534`).
 - [x] **P7 LSP advertises `workspace/configuration` then answers MethodNotFound.**
 - [x] **P8 LSP handshake drops server messages before the initialize reply.**
-- [ ] **P9 bshell: no interrupt; non-pty children are not killed as a group.**
+- [x] **P9 bshell: no interrupt; non-pty children are not killed as a group.** — FIXED: brood `os/signal` (3c243c45) signals the child's process group (`os/spawn` already made it one, and `os/close` already killed it); `C-c C-c` in a shell buffer interrupts the running command. The worker now answers the loop that opened it (`*ui-loop*`), not `:editor`.
 
 ### Live eval
 - [~] **L1 Tutor clears pending on ready** (`tutor.blsp:1179`) — FIXED (pending kept, test corrected). OPEN: the tutor is still a second copy of playground-core's launch/reply logic, not a client of it. Was: the bug playground-core
@@ -149,8 +149,8 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
 ### Hosted / collab
 - [ ] **H1 `:shared?` means two things** — registry-owned vs presence-on; `share-session`
   never shares other files from the live editor (`collab.blsp:33-39,257`).
-- [ ] **H2 Hosted edits diff whole text per edit, and misplace splices in runs of equal
-  chars** (`hosted.blsp:124-130`). *Brood:* rope edits report their splice.
+- [x] **H2 Hosted edits diff whole text per edit, and misplace splices in runs of equal
+  chars** (`hosted.blsp:124-130`). *Brood:* rope edits report their splice. — FIXED: brood c16e28a1 — the edit primitives log `[rope-before rope-after lo hi repl]`; `link-propagate-buffers` sends those (no text read), diffing only when the log cannot account for a change (undo).
 - [x] **H3 SSE subscribers never monitored; snapshot per blink tick** (`web.blsp:293-306`). (The snapshot half was already debounced to the idle beat behind `:web-dirty`.)
 - [x] **H4 `:version-format` symbol calls any function** (`about.blsp:139`) — KEPT by design: it is a documented extension point in the user's own config, which is not a trust boundary; FIXED:
   `--attach` writes a default config (`remote.blsp:88`).
