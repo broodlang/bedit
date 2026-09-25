@@ -170,7 +170,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   buffer per key. *Brood:* rope-scanning word motion + rope slice. — FIXED: brood 96c962c9 — `%rope-skip` (`text/skip-forward`/`-backward`) walks the rope from point, so M-f/M-b, M-m and M-SPC read only what they cross, and M-e/M-a slice only the paragraph; the completion preview reads the character after point and the buffer-words source the line before it; query-replace already sliced and searched the rope in place.
 - [x] **X6 Duplicated parsers:** two unified-diff parsers (*Brood:* `diff/parse-unified`),
   LSP JSON-RPC framing in bedit (*Brood:* `std/jsonrpc`). — FIXED: gitdiff reads hunk headers with `diff/hunk-header`; the LSP client builds and decodes through brood's new `std/jsonrpc` (3f87601c), its framing tests moved there.
-- [ ] **T1 No tests for git's destructive commands, format.blsp, the playground send side,
-  undo atomicity, `:modified` after kill/yank.**
+- [x] **T1 No tests for git's destructive commands, format.blsp, the playground send side,
+  undo atomicity, `:modified` after kill/yank.** — DONE: magit_test pins the no-keeps-it answer of every destructive git command; format_test covers format-on-save (F1); playground_test drives the live send side (sent once, pending, a dead session, a held form); undo atomicity and `:modified` after kill/yank were already in editing_test (1104, 1114).
 - [x] **T2 `strict_ratchet_test` tracks the installed nest** (now checks with `os/exe-path`, the nest running the suite); stale references to
   deleted Python drivers (`tools/drive-elixir.blsp:8`, `tools/term-tutor.blsp:27`).
