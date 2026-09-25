@@ -71,9 +71,10 @@ and a dead one (e.g. after a crash) is replaced transparently."
 ;; One long-lived process per editor session, registered as `:compile`.
 ;; `(spawn :compile (compile-loop))` is idempotent: returns the live handle if
 ;; the process is alive, or starts a fresh one if it died. Receives
-;; `[:compile-run cmd root]` to start a compilation; stays alive between compiles.
+;; `[:compile-run cmd root reply]` to start a compilation, its output going to `reply` (the
+;; loop that asked — `ed-loop-address`); stays alive between compiles.
 
-(defn- compile-recv (proc)
+(defn- compile-recv (proc reply)
   "Wait for proc messages after spawning `sh -c cmd`; forward chunks to the editor.
 Messages from a superseded proc (wrong handle) are silently dropped so stale output
 never bleeds into a fresh compilation. Handles `[:compile-run]` mid-flight to kill
@@ -81,24 +82,24 @@ the current proc and immediately restart — re-running compile never queues."
   (receive
     ([:proc p data] (do
                       (when (= p proc)
-                        (send :editor (compile-output-event (ansi/strip data))))
-                      (compile-recv proc)))
+                        (send reply (compile-output-event (ansi/strip data))))
+                      (compile-recv proc reply)))
     ([:proc-err p data] (do
                           (when (= p proc)
-                            (send :editor (compile-output-event (ansi/strip data))))
-                          (compile-recv proc)))
+                            (send reply (compile-output-event (ansi/strip data))))
+                          (compile-recv proc reply)))
     ([:proc-closed p code] (if (= p proc)
                              (do
-                               (send :editor (compile-done-event code))
+                               (send reply (compile-done-event code))
                                (compile-loop))
-                             (compile-recv proc)))
-    ([:compile-run cmd root] (do
+                             (compile-recv proc reply)))
+    ([:compile-run cmd root new-reply] (do
                                (try
                                  (os/close proc)
                                  (catch e
                                    (log/warn (str "compile: close failed: " (error-message e)))))
                                (let (np (os/spawn "sh" ["-c" cmd] {:cwd root}))
-                                 (compile-recv np))))
+                                 (compile-recv np new-reply))))
     ([:shutdown] (do
                    (try
                      (os/close proc)
@@ -106,13 +107,13 @@ the current proc and immediately restart — re-running compile never queues."
                    :compile-stopped))))
 
 (defn- compile-loop ()
-  "Idle — wait for the next `[:compile-run cmd root]` message. Compiles are minutes
+  "Idle — wait for the next `[:compile-run cmd root reply]` message. Compiles are minutes
 apart (human-paced), so `hibernate` while idle: shrink the heap and drop the caches;
 they rebuild on the next run. (Only here — `compile-recv` streams output and must
 stay hot.)"
   (proc/hibernate)
   (receive
-    ([:compile-run cmd root] (let (p (os/spawn "sh" ["-c" cmd] {:cwd root})) (compile-recv p)))
+    ([:compile-run cmd root reply] (let (p (os/spawn "sh" ["-c" cmd] {:cwd root})) (compile-recv p reply)))
     ([:shutdown] :compile-stopped)))
 
 ;; ---- inbound async events (UiEvent records — see model.blsp) ----------------
@@ -165,7 +166,7 @@ change what the next build offers."
   (let (root (or (:project-root m) (file/cwd))
         proc (spawn :compile (compile-loop))
         m2 (compile-reset m cmd))
-    (send proc [:compile-run cmd root])
+    (send proc [:compile-run cmd root (ed-loop-address)])
     (message (assoc m2 :compile-proc proc :compile-errors '() :compile-error-idx -1)
       (str "Running: " cmd))))
 

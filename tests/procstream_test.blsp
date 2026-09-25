@@ -4,31 +4,38 @@
   (:use test)
   (:use-internals procstream))
 
+;; A run as the worker holds it: handlers that BUILD events, delivered to `reply`.
+(defn- run-to (reply on-line on-err)
+  {:handlers {:on-line on-line :on-err-line on-err :on-done (fn (code tok) [:done code tok])}
+   :token :g1
+   :reply reply})
+
 (describe "procstream — line buffering (pure)"
-  (test "complete lines dispatch; the trailing partial is returned, token threaded"
-    (let (me (self)
-          on-line (fn (line tok) (send me [:line line tok]))
-          rest (procstream/procstream-feed "" "a\nb\nc" on-line (fn (l t) nil) :g1))
+  (test "complete lines are delivered; the trailing partial is returned, token threaded"
+    (let (run (run-to (self) (fn (line tok) [:line line tok]) (fn (l t) nil))
+          rest (procstream/procstream-feed run "" "a\nb\nc"))
       (assert= "c" rest) ; the partial carries over
       (assert= ["a" :g1] (receive ([:line l t] [l t]) (after 500 :timeout)))
       (assert= ["b" :g1] (receive ([:line l t] [l t]) (after 500 :timeout)))))
+  (test "a handler that builds nothing delivers nothing"
+    (let (run (run-to (self) (fn (line tok) nil) (fn (l t) nil)))
+      (procstream/procstream-feed run "" "quiet\n")
+      (is (nil? (receive (anything anything) (after 100 nil))))))
   (test "a handler throw is caught and routed to on-err, not fatal"
-    (let (me (self)
-          on-line (fn (line tok) (throw "boom"))
-          on-err (fn (line tok) (send me [:err line])))
-      (procstream/procstream-feed "" "x\n" on-line on-err :g1)
+    (let (run (run-to (self) (fn (line tok) (throw "boom")) (fn (line tok) [:err line])))
+      (procstream/procstream-feed run "" "x\n")
       (is (includes? (receive ([:err l] l) (after 500 :timeout)) "boom")))))
 
 (describe "procstream — end to end (a real nest run child)"
-  :isolated (test "stdout lines and the exit code reach the handlers, tagged with the run token"
-    (let (me (self)
-          script "/tmp/bedit-procstream-probe.blsp")
+  :isolated (test "stdout lines and the exit code reach the run's reply address, tagged with its token"
+    (let (script "/tmp/bedit-procstream-probe.blsp")
       (file/spit script "(io/puts \"line-one\")\n(io/puts \"line-two\")\n")
-      (let (handlers {:on-line (fn (line tok) (send me [:line line tok]))
+      (let (handlers {:on-line (fn (line tok) [:line line tok])
                       :on-err-line (fn (line tok) nil)
-                      :on-done (fn (code tok) (send me [:done code tok]))}
+                      :on-done (fn (code tok) [:done code tok])}
             w (spawn (procstream/procstream-loop handlers)))
-        (send w [:run "nest" ["run" script] "/tmp" :run7])
+        ;; the address is per RUN: the worker is shared, the loop that asked is not
+        (send w [:run "nest" ["run" script] "/tmp" :run7 (self)])
         (let (l1 (receive ([:line l t] [l t]) (after 30000 :timeout))
               l2 (receive ([:line l t] [l t]) (after 30000 :timeout))
               d (receive ([:done c t] [c t]) (after 30000 :timeout)))
@@ -36,3 +43,23 @@
           (assert= ["line-two" :run7] l2)
           (assert= [0 :run7] d))
         (send w [:shutdown])))))
+
+(describe "procstream — one worker, many loops"
+  ;; the worker is a named singleton every frame shares: a run started from a second frame
+  ;; must answer THAT frame, not whichever one happened to start the worker
+  :isolated (test "each run's events go to the address that run was started with"
+    (let (me (self)
+          script "/tmp/bedit-procstream-route.blsp"
+          ;; stands in for another frame's loop: tags what it receives, hands it on
+          other-loop (spawn (letrec (relay (fn () (receive (msg (do (send me [:other msg]) (relay))))))
+                              (relay)))
+          handlers {:on-line (fn (line tok) nil)
+                    :on-err-line (fn (line tok) nil)
+                    :on-done (fn (code tok) [:done tok])}
+          w (spawn (procstream/procstream-loop handlers)))
+      (file/spit script "(io/puts \"x\")\n")
+      (send w [:run "nest" ["run" script] "/tmp" :first other-loop])
+      (assert= [:other [:done :first]] (receive ([:other msg] [:other msg]) (after 30000 :timeout)))
+      (send w [:run "nest" ["run" script] "/tmp" :second me])
+      (assert= [:done :second] (receive ([:done t] [:done t]) (after 30000 :timeout)))
+      (send w [:shutdown]))))

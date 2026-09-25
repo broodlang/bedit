@@ -137,6 +137,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
 - [x] **P7 LSP advertises `workspace/configuration` then answers MethodNotFound.**
 - [x] **P8 LSP handshake drops server messages before the initialize reply.**
 - [x] **P9 bshell: no interrupt; non-pty children are not killed as a group.** — FIXED: brood `os/signal` (3c243c45) signals the child's process group (`os/spawn` already made it one, and `os/close` already killed it); `C-c C-c` in a shell buffer interrupts the running command. The worker now answers the loop that opened it (`*ui-loop*`), not `:editor`.
+- [x] **P10 Off-loop workers answered `:editor`, the first window.** A compile, a test run, a project run, a terminal or a shell started from a second frame (or a `--serve` client) painted its output into the first. — FIXED: `model/ed-loop-address` is captured on the loop when work is handed off; procstream handlers BUILD events and the worker delivers each run's to the address that run came with. Left on purpose: `frames` asks the primary; the LSP connection and the `*Messages*` log are shared by every frame.
 
 ### Live eval
 - [~] **L1 Tutor clears pending on ready** (`tutor.blsp:1179`) — FIXED (pending kept, test corrected). OPEN: the tutor is still a second copy of playground-core's launch/reply logic, not a client of it. Was: the bug playground-core
