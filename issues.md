@@ -126,8 +126,8 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
 - [x] **P1 `C-c t` (cold) and `C-c r` run the project's `:main`.** `apprun.blsp:29`,
   `testrun.blsp:97` — `path/temp` gives no `.blsp` suffix; `nest run` opens it as a
   document.
-- [ ] **P2 BEAM attach: trace/break/resume/pstate act on the local VM.**
-  `elixir/bedit_agent.exs:357-420,490-510`.
+- [x] **P2 BEAM attach: trace/break/resume/pstate act on the local VM.**
+  `elixir/bedit_agent.exs:357-420,490-510`. — FIXED: tracer, suspend, resume and the stopped-process read live in `Bedit.Remote` and run on the node being debugged. Found on the way: RESUME had never worked (only the suspending process may resume — now the tracer does), and every attached observation failed (`:erlang.function_exported?` is not an Erlang function). Live two-node test in beam_test.
 - [x] **P3 A warm test session keeps its first project's root.** `testrun.blsp:597-613`.
 - [x] **P4 The shared `:sandbox` re-roots back and forth** (`sandbox.blsp:174` turns nil
   into `/tmp`; diagnostics re-root it) — wipes playground state.

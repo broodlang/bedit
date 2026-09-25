@@ -649,3 +649,55 @@
       (let (i (or (ed-buffer-index-by-name m3 "*BEAM Processes*")
                 (error "the refill dropped the buffer")))
         (is (includes? (buffer-text (ed-buf-at m3 i)) "c"))))))
+
+;; ---- the debugger on an ATTACHED node (issues.md P2) --------------------------------
+;; The trace, the stop, the read and the resume used to run in the editor's own VM
+;; whatever the session was attached to: a trace on a module only the target defines
+;; said "no such module". And RESUME never worked anywhere — only the process that
+;; suspended another may resume it, and that is the tracer, not the agent.
+
+(when (elixir-sandbox/elixir-available?)
+  (describe "the debugger acts on the node the session is attached to"
+    :isolated (test "a break on the target stops its process, and a resume lets it run on"
+      (let (host (os/cmd-out (os/cmd "hostname" ["-s"]))
+            name (str "bedit_bt_" (os/cmd-out (os/cmd "date" ["+%s%N"])))
+            ;; the target: a module ONLY it defines, called in a loop
+            target (os/spawn "elixir"
+                     ["--sname" name "--cookie" "btsecret" "-e"
+                      "defmodule OnlyThere do\n  def ping(x), do: x + 1\nend\nIO.puts(\"up\")\nStream.repeatedly(fn -> OnlyThere.ping(1); :timer.sleep(100) end) |> Stream.run()"])
+            up (receive ([:proc ^target out] :when (includes? out "up") :up) (after 30000 :timed-out))
+            _ (proc/register :editor (self))
+            _ (elixir-sandbox/elixir-start "/tmp")
+            _ (receive
+                ((record session/session-ready {}) :ready)
+                (after 60000 :timed-out))
+            await (fn (id)
+                    (receive
+                      ((record session/session-reply {:reply r}) :when
+                        (= (get r :id) id)
+                        r)
+                      (after 30000 nil)))
+            ;; the next break on the stream, skipping the returns between
+            await-break (fn ()
+                          (receive
+                            ((record session/session-reply {:reply r}) :when
+                              (and (= (get r :id) 99) (= (get-in r [:spy :kind]) "break"))
+                              (get r :spy))
+                            (after 30000 nil))))
+        (assert= up :up)
+        (assert= (get (do (elixir-sandbox/elixir-attach 1 (str name "@" host) "btsecret") (await 1)) :ok)
+          true)
+        (let (armed (do (elixir-sandbox/elixir-trace 2 99 "OnlyThere.ping/1" "break") (await 2)))
+          (assert= (get armed :error) nil)
+          (assert= (get armed :ok) true))
+        (let (stop (await-break))
+          (assert= (get stop :stopped) true)
+          (let (resumed (do (elixir-sandbox/elixir-resume 3 (get stop :pid)) (await 3)))
+            (assert= (get resumed :ok) true)
+            (assert= (get resumed :gone) nil))
+          ;; it ran on — into the breakpoint again
+          (is (not (nil? (await-break)))))
+        (elixir-sandbox/elixir-detach 4)
+        (await 4)
+        (elixir-sandbox/elixir-shutdown)
+        (os/close target)))))
