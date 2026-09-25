@@ -873,23 +873,13 @@ What the `:idle-recompute` timer (ADR-102) runs once the debounce window has ela
   ;; in a frame and a chip that flickers on every keystroke is worse than no chip). It
   ;; lives here so a new off-loop job is still ONE row: a launch, a fold, and what to call
   ;; it while it runs.
-  ;; The third element is the LABEL the activity indicator shows while the job is in
-  ;; flight, or nil for the ones not worth announcing. It lives here so a new off-loop job
-  ;; is still ONE row: a launch, a fold, and what to call it while it runs.
+  ;;
+  ;; These are the MODEL's own jobs. A feature's rows are not listed here: the feature
+  ;; registers them when it loads ([[register-task-reply]]) — a task can only be running once
+  ;; the module that started it has loaded, so that is exactly when its row is first needed,
+  ;; and the model no longer names every feature that happens to work off the loop (X4).
   {:diag-proc ['model/ed-apply-diag '() nil]
    :gitdiff-proc ['model/ed-apply-gitdiff '() nil]
-   :git-proc ['git/git-apply-status nil nil]
-   ;; a git command that can outlast a frame (pull / push / fetch) and the background
-   ;; upstream watch — both network, both therefore tasks, both folded like any other
-   :git-op-proc ['git/git-apply-op nil "git"]
-   :git-fetch-proc ['git/git-apply-fetch nil "fetching"]
-   ;; the *git-status* buffer's eight subprocesses — 17 s on a mix project, so not on the loop
-   :git-status-proc ['git/git-apply-show-status nil "git status"]
-   ;; M-! / M-| — a shell command is arbitrarily long, so it is a task like the rest
-   :shell-proc ['commands/ed-apply-shell nil "shell"]
-   ;; format-on-save / M-x format-buffer: `mix format` takes seconds, so not on the loop (F1)
-   :format-proc ['format/format-apply nil "formatting"]
-   :project-scan ['commands/ed-apply-project-scan '() "scanning"]
    :eldoc-proc ['model/ed-apply-eldoc nil nil]
    ;; the tree warm has nothing to fold — the cache it filled lives in the runtime, so the
    ;; reply exists only to record which rope is parsed and free the slot
@@ -903,10 +893,26 @@ What the `:idle-recompute` timer (ADR-102) runs once the debounce window has ela
 ;; and that you asked for: a pull, a fetch, a status on a big repo, a shell command, a
 ;; project scan.
 
+(defonce *task-reply-clients* {})
+;; slot -> `[fold failure label]`, the rows FEATURES register ([[register-task-reply]]).
+;; `defonce`: a reload of this file must not forget what other modules registered (C5).
+
+(defn register-task-reply (slot fold failure label)
+  "Declare an off-the-loop job a feature runs: the model field `slot` its task handle is
+parked on, the `fold` symbol that folds the answer in, what to fold instead when the task
+errored or timed out (`failure`), and the activity `label` to show while it runs (nil for a
+job not worth announcing). Called at the feature's load; re-registering replaces the row."
+  (def *task-reply-clients* (assoc *task-reply-clients* slot [fold failure label])))
+
+(defn ed-task-reply-table ()
+  "Every off-the-loop job's row — the model's own ([[ed-task-replies]]) and the ones
+features registered. What the reply dispatcher and the activity indicator read."
+  (merge *task-reply-clients* ed-task-replies))
+
 (defn ed-activity (m)
-  "The labels of every announced job currently in flight, in table order — what the
-activity indicator shows. `()` when the editor is idle or only doing its own upkeep."
-  (seq/keep (%map-pairs ed-task-replies)
+  "The labels of every announced job currently in flight — what the activity indicator
+shows. `()` when the editor is idle or only doing its own upkeep."
+  (seq/keep (%map-pairs (ed-task-reply-table))
     (fn ([slot row])
       (let (label (nth row 2 nil))
         (if (and label (not (nil? (get m slot)))) label nil)))))
@@ -999,21 +1005,35 @@ timer asks this first."
 ;; A TABLE rather than three hardcoded pairs, because there were two and now there are
 ;; three, and the second language was the moment the copy-paste became the design. The
 ;; timer names differ so each buffer's debounce arms and fires on its own; everything else
-;; is the same fold. Symbols are resolved late and `bound?`-guarded: every one of these
-;; modules is deferred-loaded, so an unopened playground simply is not a client yet.
-(def *live-eval-clients*
-  [{:timer :tutor-eval
-    :stale? 'tutor/ed-tutor-stale?
-    :launch 'tutor/ed-tutor-launch
-    :reanchor 'tutor/ed-tutor-reanchor}
-    {:timer :playground-eval
-     :stale? 'playground/ed-playground-stale?
-     :launch 'playground/ed-playground-launch
-     :reanchor 'playground/ed-playground-reanchor}
-    {:timer :elixir-playground-eval
-     :stale? 'elixir-playground/ed-elixir-playground-stale?
-     :launch 'elixir-playground/ed-elixir-playground-launch
-     :reanchor 'elixir-playground/ed-elixir-playground-reanchor}])
+;; is the same fold. Each client REGISTERS itself when its module loads
+;; ([[register-live-eval-client]]): every one of these modules is deferred-loaded, and an
+;; unopened playground is not a client until then — the model need not name them (X4).
+(defonce *live-eval-clients* [])
+;; `defonce`: a reload of this file must not forget the clients other modules registered.
+
+(defn register-live-eval-client (client)
+  "Add a live-evaluating buffer — `{:timer :stale? :launch :reanchor}`, the hooks as
+symbols (resolved late, so a redefinition hot-swaps) — replacing any client registered
+under the same `:timer`. Called when the client's module loads."
+  (def *live-eval-clients*
+    (conj (into [] (seq/reject *live-eval-clients* (fn (c) (= (:timer c) (:timer client)))))
+      client)))
+
+;; ---- timers a feature arms ----------------------------------------------------
+;; A repeating timer a feature wants while it has work: git's background upstream watch
+;; (fires while you are working, so you hear about a remote that moved without asking), a
+;; BEAM view's refresh (while one is on screen). Registered by the feature
+;; ([[register-timer-client]]), so neither the arming here nor the firing in `input` names
+;; the module.
+
+(defonce *timer-clients* {})
+;; timer name -> `{:spec sym :fire sym}`. `defonce`, for the reason every registry here is.
+
+(defn register-timer-client (name spec fire)
+  "A feature's timer: `spec` names a `(model) -> timer spec or nil` function — `{:every ms}`
+while the feature wants the timer, nil while it does not — and `fire` the `(model) -> model`
+it runs when the timer goes off. Called when the feature's module loads."
+  (def *timer-clients* (assoc *timer-clients* name {:spec spec :fire fire})))
 
 (defn- ed-live-eval-call (m sym fallback)
   ;; A live-eval client's hook, through the shared deferred-call guard.
@@ -1087,26 +1107,20 @@ flag once no prefix is pending (what `ed-which-key-arm` used to do)."
                    (if (and (includes? *typing-commands* (:this-command m)) (not (:undo-break m)))
                      {:undo-pause {:after *undo-pause-ms* :idle? true}}
                      {}))))
-        ;; The background upstream watch (`git/git-launch-fetch`): a repeating timer, not
-        ;; an idle one-shot — the point is that it fires while you are working, so you
-        ;; hear about a remote that moved without having to stop and ask. Armed only when
-        ;; git is loaded and the watch is switched on.
         ;; The spinner frame, ticking ONLY while an announced job is in flight. A timer
         ;; armed unconditionally is an editor that never goes idle — this one appears
         ;; with the work and drops itself with it, the `:scrollbar-fade` pattern.
         spin (if (ed-busy? m) {:spinner {:every *spinner-ms*}} {})
-        ;; the BEAM views re-ask the node while one of them is on screen (`beam/beam-tick`)
-        beam-watch (if (and (bound? 'beam/*refresh-ms*)
-                         (int? (reflect/eval 'beam/*refresh-ms*))
-                         ((reflect/eval 'beam/displayed-view) m))
-                     {:beam-refresh {:every (reflect/eval 'beam/*refresh-ms*)}}
-                     {})
-        git-watch (if (and (bound? 'git/*git-fetch-every-ms*)
-                        (int? (reflect/eval 'git/*git-fetch-every-ms*)))
-                    {:git-fetch {:every (reflect/eval 'git/*git-fetch-every-ms*)}}
-                    {})
+        ;; the timers features registered ([[register-timer-client]]) — git's background
+        ;; upstream watch, the BEAM views' refresh — each asked whether it wants one now
+        feature-timers (fold (%map-pairs *timer-clients*)
+                         {}
+                         (fn (acc kv)
+                           (let ([name client] kv
+                                 spec (ed-call-deferred m (:spec client) nil))
+                             (if spec (assoc acc name spec) acc))))
         managed (merge {:cursor-blink {:every *blink-ms* :idle? true}}
-                  spin git-watch beam-watch idle)
+                  spin feature-timers idle)
         ;; Every managed one-shot is dropped here and re-added by `managed` while its work
         ;; is pending — that drop is what RE-ARMS it. A one-shot the loop has already fired
         ;; is dead until its entry is recreated, so a managed timer missing from this list
@@ -1115,9 +1129,8 @@ flag once no prefix is pending (what `ed-which-key-arm` used to do)."
                (or (:timers m) {})
                :cursor-blink :idle-recompute
                :which-key :undo-pause
-               :git-fetch :spinner
-               :beam-refresh :scroll-settle
-               (map *live-eval-clients* :timer)))
+               :spinner :scroll-settle
+               (append (keys *timer-clients*) (map *live-eval-clients* :timer))))
     (assoc m :timers (merge kept managed))))
 
 ;; ---- overlay scrollbar fade (macOS-style auto-hide) -------------------------
