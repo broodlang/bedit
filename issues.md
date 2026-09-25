@@ -60,7 +60,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   node); bare `--listen PORT` binds `0.0.0.0`; `--as NAME` is trusted.
   *Brood:* capability-scoped links. *bedit:* loopback default; docs say attach = full trust.
 
-- [~] **S9 Plugins: checksum only, no authenticity.** FIXED: install/update/startup share the `:enhances` check; refused packages stay off the load path (untested: needs a redirectable config dir). OPEN (Brood std/package): signatures or trust-on-first-use for hosted packages. `packages.blsp:114-120`; the sha256
+- [~] **S9 Plugins: checksum only, no authenticity.** FIXED: install/update/startup share the `:enhances` check; refused packages stay off the load path (tested against a scratch config dir, `config/*config-base*`). OPEN (Brood std/package): signatures or trust-on-first-use for hosted packages. `packages.blsp:114-120`; the sha256
   comes from the same registry response. `install!`/`update!` skip the `:enhances`
   version check startup applies; `load-installed!` adds refused packages to the load path.
 
