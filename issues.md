@@ -72,10 +72,10 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   level. Fix: resolve once, repeat the command.
 - [x] **C2 ✔ `C-u -` on a chord leaves `:pending` set** (the inverse branch bypasses
   `step`: no `:pending`/`:echo` reset, no `try`).
-- [~] **C3 ✔ Theme switch leaves region / hl-line / brackets / scrollbar / isearch in the
+- [x] **C3 ✔ Theme switch leaves region / hl-line / brackets / scrollbar / isearch in the
   old palette.** `view.blsp:59-63,1051`, `isearch.blsp:20` copy faces at load;
   `theme.blsp:173-236` hand-duplicates face formulas and drops `:bold` on 8 faces.
-  *Brood:* palette-derived chrome faces in `std/editor/face`. — FIXED in bedit (aliases gone, `:bold` restored, a drift test). OPEN: the two formula copies in theme.blsp remain — one registry of palette-derived faces in std would remove them.
+  *Brood:* palette-derived chrome faces in `std/editor/face`. — FIXED in bedit (aliases gone, `:bold` restored, a drift test). — and now the formulas are written ONCE: `defchrome` defines each face and registers its formula, and `theme-apply!` re-runs the registry (no std change needed: a macro over the palette vars was the whole registry).
 - [x] **C4 ✔ Read-only yank is silent; `C-k` at EOL pushes `"\n"` before the refusal.**
   (Falls out of S2's single mutation path.)
 - [x] **C5 Registries reset on reload.** `interactive.blsp:269,291`
