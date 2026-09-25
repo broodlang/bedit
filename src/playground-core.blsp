@@ -535,6 +535,45 @@ cannot drift from what it is guarding."
 
 (defn- pending-of (spec m) (get-in m [(get spec :key) :pending] {}))
 
+;; ---- held forms: ready, but not run until asked (issues.md S5) -----------------------------
+;; A playground runs every form as you stop typing — and an electric pair closes
+;; `(file/spit "notes.txt" "")` a moment before the text goes in. So a form whose running
+;; reaches outside the session (the language's `:held?`) waits, noted, until C-c C-c. The
+;; release is keyed by the form's SOURCE: edit the form and it is a new form, held again.
+
+(defn- pg-held-reason (spec b src)
+  "Why form `src` is held — the language's `:held?` answer — or nil when it runs as usual:
+the language holds nothing, or this exact text was released."
+  (when (and (has? spec :held?) (not (contains? (or (:playground-released b) #{}) src)))
+    (svc spec :held? (list src))))
+
+(defn pg-release-at-point (spec m)
+  "C-c C-c in a playground: run the held form at point, once — the next launch sends it.
+Says so when point is not on a form, or the buffer has moved on since the last launch
+parsed it (the form's extent is not known yet; a moment later it is)."
+  (let (b (pg-buf spec m))
+    (cond
+      (nil? b) m
+      (not (= (buffer-rope b) (:playground-rope b))) (message m "still reading the buffer — try again")
+      :else
+        (let (spans (or (:playground-spans b) [])
+              i (form-index-in spans (buffer-point b)))
+          (if (nil? i)
+            (message m "no form at point")
+            (let ([lo hi] (nth spans i)
+                  src (text/slice (buffer-rope b) lo hi))
+              (message (pg-update-buf spec
+                         m
+                         (fn (bb)
+                           (assoc bb
+                             :playground-released (conj (or (:playground-released bb) #{}) src)
+                             ;; not evaluated, so the launch sends it; replay, so a launch
+                             ;; happens although the text has not moved
+                             :playground-evaluated (pg-unevaluate (or (:playground-evaluated bb) {})
+                                                     (list i))
+                             :playground-replay true)))
+                "running the held form")))))))
+
 (defn ed-launch (spec m)
   "The debounce landed: re-evaluate the forms this edit could have changed the answer of —
 the ones whose own text moved, plus the ones that use what those define ([[launch-plan]]).
@@ -612,9 +651,12 @@ blank on its way to the same answer."
                          (let ([m1 next-id pending] acc
                                src (get srcs i "")
                                old (get old-notes i)
-                               state (if (contains? stale? i)
-                                       (svc spec :parse-state (list src))
-                                       :carry))
+                               parsed (if (contains? stale? i)
+                                        (svc spec :parse-state (list src))
+                                        :carry)
+                               ;; ready, but it reaches outside the session and nobody asked
+                               held (when (= parsed :ok) (pg-held-reason spec b src))
+                               state (if held [:held held] parsed))
                            (match state
                              ;; nothing this edit could reach: keep the verdict as it is
                              (:carry (if old [(note-at m1 i old) next-id pending] acc))
@@ -627,6 +669,10 @@ blank on its way to the same answer."
                                                      next-id pending])
                              ([:err msg] [(note-at m1 i (liveeval/syntax-error-note msg))
                                            next-id pending])
+                             ;; Ready, but running it would reach outside the session — a
+                             ;; file written, a program run — and nobody asked yet: say so,
+                             ;; send nothing. C-c C-c releases it ([[pg-release-at-point]]).
+                             ([:held reason] [(note-at m1 i (liveeval/held-note reason)) next-id pending])
                              ;; Live (an `:editor` process exists): fire the request at the
                              ;; session and let the reply land through `sandbox-events`.
                              ;; Headless (tests, no loop to deliver an event to): the

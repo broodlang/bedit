@@ -36,11 +36,11 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   registry (leak; other frames keep the old name).
   *Brood:* key the registry by a stable identity (path / id), name is metadata.
 
-- [ ] **S5 Eval-on-type runs half-typed side-effecting forms.** Electric pairs close
+- [x] **S5 Eval-on-type runs half-typed side-effecting forms.** Electric pairs close
   `(file/spit "notes.txt" "")` early and it runs (`liveeval.blsp:64`,
   `modes.blsp:704-711`). Same for the Elixir playground against a started Repo.
   *Brood:* a restricted eval mode in `eval-server` (no writes / spawns unless explicit),
-  or checker-flagged effectful calls.
+  or checker-flagged effectful calls. — FIXED: brood `reflect/source-deps` answers `:effects` (93748a95); a playground form or tutorial box that writes, deletes or runs something outside the session is HELD — a pending-voice note, nothing sent — and C-c C-c runs it once (edit it and it is held again). Definitions are never held. The Elixir playground holds File / System / Repo writes the same way.
 
 - [x] **S6 A `--serve` session evaluates playground/tutor code inside the daemon.**
   `model.blsp:1813` checks `(whereis :editor)`; only `main.blsp` registers it. In-image
@@ -148,8 +148,8 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
 - [x] **L4 Playground/tutor in a second frame hang** — replies go to `:editor`. — FIXED (with S6): brood `evalsession` routes each answer to the loop that asked and the lifecycle to every subscriber (87c2ef44); `ui-run` binds `*ui-loop*` (593e909a), which `ed-headless?`, `session/start` and `session/request` read, so a second frame or a `--serve` client is a loop like the first. Verified by brood's evalsession tests and every driver; no live second-frame driver yet.
 
 ### Hosted / collab
-- [ ] **H1 `:shared?` means two things** — registry-owned vs presence-on; `share-session`
-  never shares other files from the live editor (`collab.blsp:33-39,257`).
+- [x] **H1 `:shared?` means two things** — registry-owned vs presence-on; `share-session`
+  never shares other files from the live editor (`collab.blsp:33-39,257`). — FIXED: two flags, `:registry?` (another frame holds it) and `:collab?` (presence is on). Every frame-registry slot had counted as collab-shared, which is why share-session never shared the live editor's files (autoshare skipped them), and why stop-sharing unsubscribed frame buffers; autoshare also no longer stops a registry process other frames hold.
 - [x] **H2 Hosted edits diff whole text per edit, and misplace splices in runs of equal
   chars** (`hosted.blsp:124-130`). *Brood:* rope edits report their splice. — FIXED: brood c16e28a1 — the edit primitives log `[rope-before rope-after lo hi repl]`; `link-propagate-buffers` sends those (no text read), diffing only when the log cannot account for a change (undo).
 - [x] **H3 SSE subscribers never monitored; snapshot per blink tick** (`web.blsp:293-306`). (The snapshot half was already debounced to the idle beat behind `:web-dirty`.)
