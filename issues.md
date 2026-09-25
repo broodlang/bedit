@@ -161,15 +161,15 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
 - [ ] **X1 `commands.blsp` (6.5k) split**: dired, LSP nav, vim grammar, collab, web,
   process list, project search, hexl → own modules; an `editing` core that every
   mutation goes through.
-- [ ] **X2 Git status keymap lives in `modes.blsp`** and duplicates
-  `git-dispatch-transient`'s table.
+- [x] **X2 Git status keymap lives in `modes.blsp`** and duplicates
+  `git-dispatch-transient`'s table. — RESOLVED: the keymap STAYS in modes (git is a deferred module, and a git buffer another frame rebuilds from the registry needs its keys before git loads); the two tables are held together by transient_test — every dispatch key, pressed directly, opens the same menu or runs the same command (`g` excepted, as in Magit).
 - [ ] **X3 Global `def` caches** (`wrap.blsp:104`, `view.blsp:107`,
   `complete-at-point.blsp:59`). *Brood:* bounded memo / LRU.
 - [ ] **X4 `model.blsp` names its feature clients.** *Brood:* `autoload` declarations.
 - [ ] **X5 Perf:** word motion / completion preview / `qr-replace` stringify the whole
   buffer per key. *Brood:* rope-scanning word motion + rope slice.
-- [~] **X6 Duplicated parsers:** two unified-diff parsers (*Brood:* `diff/parse-unified` — being added by the parallel magit session on its branch),
-  LSP JSON-RPC framing in bedit (*Brood:* `std/jsonrpc`).
+- [x] **X6 Duplicated parsers:** two unified-diff parsers (*Brood:* `diff/parse-unified`),
+  LSP JSON-RPC framing in bedit (*Brood:* `std/jsonrpc`). — FIXED: gitdiff reads hunk headers with `diff/hunk-header`; the LSP client builds and decodes through brood's new `std/jsonrpc` (3f87601c), its framing tests moved there.
 - [ ] **T1 No tests for git's destructive commands, format.blsp, the playground send side,
   undo atomicity, `:modified` after kill/yank.**
 - [x] **T2 `strict_ratchet_test` tracks the installed nest** (now checks with `os/exe-path`, the nest running the suite); stale references to
