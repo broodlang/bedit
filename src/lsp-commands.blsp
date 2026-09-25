@@ -7,10 +7,11 @@ the server's replies, notices, diagnostics and edits into the model. The connect
 
 Split out of `commands.blsp` (issues.md X1)."
   (:use model) ; message / ed-current-buf / ed-set-buf / the diagnostics cache
-  (:use commands) ; ed-find-file / ed-select / ed-name-prompt / ed-lsp-start / ed-lsp-live
+  (:use commands) ; ed-find-file / ed-select / ed-name-prompt — the prompts and jumps a lookup ends in
   (:use editor/buffer) ; points, lines and the edits a server's answer applies
   (:use interactive) ; defcommand — the LSP commands, on M-x
-  (:use lsp-requests)) ; the request-kind records + the LspRequest ability folded here
+  (:use lsp-requests) ; the request-kind records + the LspRequest ability folded here
+  (:use projects)) ; project-root — a server starts IN the project root
 ;; ---- imenu: jump to a symbol in the buffer via LSP documentSymbol (M-g i) ----
 
 (defn- ed-lsp-ensure (m)
@@ -677,4 +678,126 @@ applies the edits to every affected file (left modified for you to save)."
                           (if (string/blank? new-name)
                             (message mm "rename cancelled")
                             (ed-lsp-do-rename mm new-name)))}))))
+
+
+;; ---- the connection: start, stop, keep the server told what the buffer holds ----------
+(defn ed-lsp-live (m)
+  "The model's LSP connection while its process is still alive, else nil. A server that
+died — or never started — leaves a pid on the model that every later request sends into
+the void and then waits out its timeout, so liveness is asked here rather than in six
+request sites."
+  (let (conn (:lsp m))
+    (when (and conn (proc/alive? conn)) conn)))
+
+(defn ed-lsp-start (m)
+  "Start the language server configured for the current buffer's file, store it on the
+model (`:lsp`) and register the completion source — `[m2 conn]`, with `conn` nil and an
+explanatory message on `m2` when there is nothing to start: the buffer has no file, no
+server is configured for its extension, or the server is not installed.
+
+Every message says `lsp:`, whichever feature asked — six of them share this one server
+(completion, imenu, goto, references, hover, rename), and what went wrong is the server's,
+not theirs; `imenu: expert is not installed` would read as a fact about imenu.
+
+The not-installed case is the one that used to be a crash. `os/spawn` raises when the
+binary is missing, and it is called inside the connection PROCESS — so an Elixir buffer on
+a machine without `elixir-ls` answered a goto-definition with a `[crash] #<pid …> exited:
+proc-spawn expert: No such file or directory` trace where a sentence belongs.
+`os/which` (brood's std/os) asks before spawning."
+  (let (buf (ed-current-buf m)
+        file (buffer-file buf)
+        srv (when file (lsp/lsp-server-for file)))
+    (cond
+      (nil? file) [(message m "lsp: the buffer has no file") nil]
+      (nil? srv) [(message m (str "lsp: no server configured for ." (lsp/lsp-extension file))) nil]
+      :else
+        (let ([cmd args] srv)
+          (if (nil? (os/which cmd))
+            [(message m (str "lsp: " cmd " is not installed (not on PATH)")) nil]
+            ;; a file outside any project is its own root: its directory
+            (let (root (or (project-root (path/dirname file)) (path/dirname file))
+                  conn (lsp/lsp-connect cmd args (lsp/lsp-path->uri root)))
+              (complete-at-point/complete-add-source! 'lsp/lsp-complete-source)
+              [(message (assoc m :lsp conn) (str "lsp: " cmd " connected for " root)) conn]))))))
+
+(defcommand cmd-lsp-connect
+  (m key)
+  "Start a language server for the current buffer's file type and turn its completions
+on (M-x lsp-connect). Looks the file extension up in `lsp/*lsp-servers*` (rust-analyzer,
+ruby-lsp, …), spawns it for the buffer's project root, stores the connection on the model
+(`:lsp`), and registers `lsp-complete-source` so Tab now also offers the server's
+candidates — merged with the mode and buffer-word sources. M-x lsp-disconnect stops it."
+  (if (ed-lsp-live m)
+    (message m "lsp: already connected (M-x lsp-disconnect first)")
+    ;; a `:lsp` whose process is gone is not a connection — drop it and start over,
+    ;; rather than report "already connected" about a pid nothing answers
+    (let ([m2 _] (ed-lsp-start (dissoc m :lsp))) m2)))
+
+(defcommand cmd-lsp-disconnect
+  (m key)
+  "Stop the buffer's language server and drop its completion connection (M-x lsp-disconnect).
+The `lsp-complete-source` stays registered but no-ops with no connection on the model."
+  (let (conn (:lsp m))
+    (if (nil? conn)
+      (message m "lsp: not connected")
+      (do (lsp/lsp-shutdown conn) (message (dissoc m :lsp) "lsp: disconnected")))))
+
+(defdyn *lsp-autostart* true)
+;; Whether opening a file whose language has an installed server starts it.
+;;
+;; It used to be that a server started on the first LOOKUP — the first `M-.`, hover or
+;; rename — which was a fine rule while a server was only ever a lookup. Diagnostics
+;; changed that: the underline on the mistake you just made is the thing you want without
+;; asking, and a reader who never presses `M-.` in a file would never have seen one.
+;;
+;; `(defdyn *lsp-autostart* false)` in `init.blsp` turns it off, for a project where the
+;; server's startup is heavy enough to want on demand — Expert compiles the whole mix
+;; project before it answers anything, which is a real cost to pay unasked. The name is
+;; bare, not `commands/…`: an earmuffed `defdyn` is ambient however deep the module.
+
+(defn ed-lsp-push-text (m)
+  "Tell the connected server the current buffer's text, once it has changed since the last
+push — the idle beat's hook, beside the autostart.
+
+**This is what makes diagnostics appear at all.** A server does not answer a question with
+them: it PUSHES `publishDiagnostics` when it learns the text changed. Every other call into
+`lsp` syncs the document on its way to asking something (`lsp-issue`), so the findings used
+to arrive only for whatever version you happened to invoke a lookup on — and never while
+typing, which is the only time they are worth having. The symptom was exact: imenu worked,
+because asking for symbols synced the text on the way past, and the underline appeared once
+and then never moved.
+
+Gated on the rope, so an idle beat over an unchanged buffer sends nothing: a full-text
+`didChange` is the document on the wire, and a server that gets one re-analyses."
+  (let (conn (:lsp m)
+        buf (ed-current-buf m)
+        file (buffer-file buf))
+    (if (or (nil? conn) (nil? file) (= (buffer-rope buf) (:lsp-pushed-rope m)))
+      m
+      (do
+        (lsp/lsp-sync conn
+          (lsp/lsp-path->uri file)
+          (lsp/lsp-language-id file)
+          (buffer-text buf))
+        (assoc m :lsp-pushed-rope (buffer-rope buf))))))
+
+(defn ed-lsp-autostart (m)
+  "Start the current buffer's language server if it has one and nothing is connected yet —
+the idle beat's hook, so it happens once the buffer has settled rather than in the middle
+of opening it.
+
+Silent about every reason not to: no file, no server configured for the extension, the
+server not installed, one already connected. A message for each of those would fire on
+every idle beat in every buffer that has no server, which is most of them."
+  (if (or (not *lsp-autostart*) (ed-lsp-live m) (ed-headless?))
+    m
+    (let (buf (ed-current-buf m)
+          file (buffer-file buf)
+          srv (when file (lsp/lsp-server-for file)))
+      (if (nil? srv)
+        m
+        (let ([cmd _] srv)
+          (if (nil? (os/which cmd))
+            m
+            (let ([m2 _] (ed-lsp-start (dissoc m :lsp))) m2)))))))
 

@@ -1,0 +1,183 @@
+(defmodule process-list
+  "M-x list-processes — the runtime's live processes in a read-only, killable `*Process
+List*` (Emacs's `list-processes`): mailbox depth and reductions per process, to find a
+runaway evaluation and kill it. The reductions RATE (`ed-rate-procs`) is shared with the
+BEAM process view.
+
+Split out of `commands.blsp` (issues.md X1)."
+  (:use model) ; message / ed-current-buf — the model the list lives on
+  (:use commands) ; ed-show-named / ed-leading-int — the buffer, and a row's process id
+  (:use editor/buffer) ; buffer-line-at / buffer-current-line — the row under point
+  (:use interactive)) ; defcommand — M-x list-processes and the menu keys
+;; ---- process list (M-x list-processes) — a read-only, killable menu ----------
+;; The runtime's live processes in a read-only `*Process List*` buffer, from the
+;; kernel snapshots `list-processes` + `process-info` — to spot a runaway eval (high
+;; mailbox / reductions) and read its id. The buffer is stamped `:process-menu` (see
+;; `modes`): read-only, with `d`/`x`/`k` to kill the process on the current line and
+;; `g` to refresh (Emacs `process-menu-mode`). C-g still cancels a running C-x C-e.
+
+(defn- ed-proc-name (p)
+  "The NAME cell for `process-info` map `p`: its registered name (or `-`), indented
+`2×:depth` spaces in the tree view (clipped to the 14-col field so deeper rows stay
+column-aligned). `:depth` is absent (→ 0, no indent) in the flat view."
+  (let (nm (if (:name p) (->string (:name p)) "-")
+        depth (or (:depth p) 0)
+        s (if (> depth 0) (str (string/repeat "  " depth) nm) nm))
+    (if (> (string/length s) 14) (string/substring s 0 14) s)))
+
+(defn- ed-opt (v f)
+  "Render optional `process-info` field `v` with `f`, or \"-\" when absent (nil) —
+observer parity (`observe-opt`)."
+  (if (nil? v) "-" (f v)))
+
+(sig ed-reds-rate ((or nil int) (or nil int) (or nil int) (or nil int) -> (or nil int)))
+(defn- ed-reds-rate (prev-reds prev-at reds at)
+  "Reductions/second between two `process-info` samples, or nil when it can't be
+computed — no prior sample for this id, missing counters, or no elapsed time. Clamps a
+negative delta (a recycled id) to 0. Mirrors `observe-reds-rate`."
+  (cond
+    (nil? prev-reds) nil
+    (nil? prev-at) nil
+    (nil? reds) nil
+    (nil? at) nil
+    (<= (- at prev-at) 0) nil
+    else (math/quot (* 1000 (math/max 0 (- reds prev-reds))) (- at prev-at))))
+
+(defn ed-rate-procs (prev-reds prev-at infos at &optional (key :id))
+  "Tag each `process-info` map in `infos` with `:reds-rate` — its reductions/second
+since the matching process in the previous snapshot (`prev-reds` a key→reductions map,
+`prev-at` its wall-clock ms). A process new this tick gets nil. Pure; O(n).
+
+`key` is which field identifies a process across two snapshots: `:id` for this runtime's
+own, `:pid` for a BEAM node's, where the identity that comes back over the wire is the
+printed pid. Public for that second caller (`beam`): reductions are the scheduler's own
+measure of work done, so the DIFFERENCE between two snapshots is who is busy right now —
+which is the question a process list exists to answer, and it is the same arithmetic
+whichever runtime is being asked."
+  (map infos
+    (fn (p)
+      (assoc p
+        :reds-rate (ed-reds-rate (get prev-reds (get p key)) prev-at (:reductions p) at)))))
+
+(defn- ed-proc-row (p)
+  "One `*Process List*` row from a `process-info` map. The ID stays flush-left (so
+`ed-leading-int` and the kill keys parse it); the tree shape shows in the NAME cell.
+Columns mirror the observer: id · name · status · mailbox · mem · reds · reds/s · mon
+(`:reds-rate` is tagged on by `ed-rate-procs`; `-` until the first refresh diff)."
+  (str (string/pad-right (str (:id p)) 5)
+    " "
+    (string/pad-right (ed-proc-name p) 14)
+    " "
+    (string/pad-right (->string (:status p)) 8)
+    " "
+    (string/pad-left (str (:mailbox p)) 7)
+    " "
+    (string/pad-left (ed-opt (:memory p) humanize/byte-size) 8)
+    " "
+    (string/pad-left (str (:reductions p)) 12)
+    " "
+    (string/pad-left (ed-opt (:reds-rate p) str) 8)
+    " "
+    (string/pad-left (str (:monitored-by p)) 4)))
+
+(defn ed-process-list-text (view &optional rated-infos)
+  "The `*Process List*` buffer text: a header row plus one `ed-proc-row` per live
+process. `rated-infos` is the snapshot already tagged with `:reds-rate` (passed by
+`ed-show-process-list`); when omitted, a fresh untagged snapshot is taken (so the
+REDS/S column reads `-`). `view` is `:tree` (a parent→child forest, indented by
+depth — `proctree`) or `:flat` (ascending by id). Re-showing after a kill reflects
+the change (the snapshot is fresh)."
+  (let (infos (or rated-infos
+                (seq/keep (proc/list) proc/info))
+        ordered (if (= view :flat) (proctree/by-id infos) (proctree/tree-order infos))
+        rows (map ordered ed-proc-row))
+    (str (string/pad-right "ID" 5)
+      " "
+      (string/pad-right "NAME" 14)
+      " "
+      (string/pad-right "STATUS" 8)
+      " "
+      (string/pad-left "MAILBOX" 7)
+      " "
+      (string/pad-left "MEM" 8)
+      " "
+      (string/pad-left "REDS" 12)
+      " "
+      (string/pad-left "REDS/S" 8)
+      " "
+      (string/pad-left "MON" 4)
+      "\n"
+      (string/join rows "\n")
+      "\n")))
+
+(defn ed-proc-view (m)
+  "The current *Process List* view mode (`:tree` default, or `:flat`), from the model."
+  (or (:proc-view m) :tree))
+
+(defn ed-show-process-list (m)
+  "Build/refresh the read-only `*Process List*` in the selected pane and show it,
+stamped `:process-menu` so its kill/refresh keys and read-only mode apply, in the
+model's current `:proc-view` (tree by default). Computes each process's reductions/
+second against the previous snapshot stashed in `:proc-snapshot` — so the REDS/S
+column shows who's busy *now* (`-` on the first show, a real rate on the next refresh
+`g`) — then records a fresh snapshot for next time. The seam the list / refresh /
+kill / toggle commands all route through."
+  (let (at (os/now)
+        infos (seq/keep (proc/list) proc/info)
+        snap (:proc-snapshot m)
+        rated (ed-rate-procs (:reds snap) (:at snap) infos at)
+        m1 (ed-show-named m
+             "*Process List*"
+             (ed-process-list-text (ed-proc-view m) rated)
+             :process-menu)
+        reds (reduce infos {} (fn (acc p) (assoc acc (:id p) (:reductions p)))))
+    (assoc m1 :proc-snapshot {:at at :reds reds})))
+
+(defcommand cmd-list-processes
+  (m key)
+  "List the runtime's live processes in a read-only *Process List* buffer (M-x
+list-processes): id, registered name, status, mailbox backlog, and reductions — the
+kernel's `process-info` snapshot. Spot a runaway eval by its growing mailbox/
+reductions; press `d`/`x`/`k` on a row to kill it, `g` to refresh."
+  (ed-show-process-list m))
+
+;; ---- process-menu actions (the :process-menu layer's keys: d/x/k kill · g refresh) --
+
+(defn- ed-pid-for-id (id)
+  "The live pid whose process id is `id` (re-snapshotting `list-processes`), or nil
+when no such process exists — so the kill command resolves id→pid statelessly rather
+than caching a side table that could go stale."
+  (let (hit (seq/find (seq/keep (proc/list) proc/info) (fn (p) (= (:id p) id))))
+    (when hit (:pid hit))))
+
+(defcommand cmd-process-menu-kill
+  (m key)
+  "Kill the process named on the current *Process List* line (`d` / `x` / `k`): parse
+its id, resolve the live pid, `exit … :kill`, then refresh the list. Refuses to kill
+the editor's own loop process (that would freeze the editor); reports when the cursor
+isn't on a process row, or the process is already gone."
+  (let (buf (ed-current-buf m)
+        id (ed-leading-int (buffer-line-at buf (buffer-current-line buf))))
+    (if (nil? id)
+      (message m "not on a process line")
+      (let (pid (ed-pid-for-id id))
+        (cond
+          (nil? pid) (ed-show-process-list (message m (str "process " id " is already gone")))
+          (= pid (proc/whereis :editor)) (message m "refusing to kill the editor")
+          else
+            (do
+              (exit pid :kill)
+              (message (ed-show-process-list m) (str "killed process " id))))))))
+
+(defcommand cmd-process-menu-refresh
+  (m key)
+  "Re-snapshot the live processes into the *Process List* (`g`)."
+  (ed-show-process-list m))
+
+(defcommand cmd-process-menu-toggle-tree
+  (m key)
+  "Toggle the *Process List* between the tree (parent→child, indented) and flat
+(id-sorted) views (`t`); the choice persists on the model, so refresh/kill keep it."
+  (let (next (if (= (ed-proc-view m) :tree) :flat :tree))
+    (message (ed-show-process-list (assoc m :proc-view next))
+      (str (if (= next :tree) "tree" "flat") " view"))))

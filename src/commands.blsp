@@ -3381,6 +3381,21 @@ history is **persisted across restarts** via the same recentf mechanism (`recent
           ;; its declared contract, its docstring's first line (`plume/plume-command-annotation`)
           :category :command
           :anno-keys (ed-key-table (editor/layers/scope-keymap (list buf m)))))))
+
+(defn ed-leading-int (line)
+  "The leading integer of `line` (after trimming left whitespace), or nil when it doesn't
+start with a digit. The shared `\"<n> …\"`-row parser: a `*Process List*` row's process id,
+an `*Occur*` row's source line number, and a fuzzy line-search candidate's line number."
+  (let (t (string/triml line)
+        n (string/span t 0 "0123456789"))
+    (if (= n 0)
+      nil
+      ;; The span is all digits, so this parse cannot fail — but `string/->number`
+      ;; answers `number | failure`, and a failure is TRUTHY, so a caller's `(nil? ln)`
+      ;; guard would let one through into `dec`/`goto-line`. Say nil, as promised.
+      (let (v (string/->number (string/substring t 0 n)))
+        (when (int? v) v)))))
+
 ;; ---- fuzzy in-buffer line search (M-s) --------------------------------------
 ;; The same Vertico minibuffer the other completers use, ranking the buffer's own lines
 ;; (consult-line / swiper style): you fuzzy-type, the list narrows, Enter jumps to the
@@ -3424,192 +3439,6 @@ M-x and find-file. Enter jumps point to the selected line; a bare number jumps t
          :rank-cap 40
          :accept-selection true})))
 
-;; ---- process list (M-x list-processes) — a read-only, killable menu ----------
-;; The runtime's live processes in a read-only `*Process List*` buffer, from the
-;; kernel snapshots `list-processes` + `process-info` — to spot a runaway eval (high
-;; mailbox / reductions) and read its id. The buffer is stamped `:process-menu` (see
-;; `modes`): read-only, with `d`/`x`/`k` to kill the process on the current line and
-;; `g` to refresh (Emacs `process-menu-mode`). C-g still cancels a running C-x C-e.
-
-(defn- ed-proc-name (p)
-  "The NAME cell for `process-info` map `p`: its registered name (or `-`), indented
-`2×:depth` spaces in the tree view (clipped to the 14-col field so deeper rows stay
-column-aligned). `:depth` is absent (→ 0, no indent) in the flat view."
-  (let (nm (if (:name p) (->string (:name p)) "-")
-        depth (or (:depth p) 0)
-        s (if (> depth 0) (str (string/repeat "  " depth) nm) nm))
-    (if (> (string/length s) 14) (string/substring s 0 14) s)))
-
-(defn- ed-opt (v f)
-  "Render optional `process-info` field `v` with `f`, or \"-\" when absent (nil) —
-observer parity (`observe-opt`)."
-  (if (nil? v) "-" (f v)))
-
-(sig ed-reds-rate ((or nil int) (or nil int) (or nil int) (or nil int) -> (or nil int)))
-(defn- ed-reds-rate (prev-reds prev-at reds at)
-  "Reductions/second between two `process-info` samples, or nil when it can't be
-computed — no prior sample for this id, missing counters, or no elapsed time. Clamps a
-negative delta (a recycled id) to 0. Mirrors `observe-reds-rate`."
-  (cond
-    (nil? prev-reds) nil
-    (nil? prev-at) nil
-    (nil? reds) nil
-    (nil? at) nil
-    (<= (- at prev-at) 0) nil
-    else (math/quot (* 1000 (math/max 0 (- reds prev-reds))) (- at prev-at))))
-
-(defn ed-rate-procs (prev-reds prev-at infos at &optional (key :id))
-  "Tag each `process-info` map in `infos` with `:reds-rate` — its reductions/second
-since the matching process in the previous snapshot (`prev-reds` a key→reductions map,
-`prev-at` its wall-clock ms). A process new this tick gets nil. Pure; O(n).
-
-`key` is which field identifies a process across two snapshots: `:id` for this runtime's
-own, `:pid` for a BEAM node's, where the identity that comes back over the wire is the
-printed pid. Public for that second caller (`beam`): reductions are the scheduler's own
-measure of work done, so the DIFFERENCE between two snapshots is who is busy right now —
-which is the question a process list exists to answer, and it is the same arithmetic
-whichever runtime is being asked."
-  (map infos
-    (fn (p)
-      (assoc p
-        :reds-rate (ed-reds-rate (get prev-reds (get p key)) prev-at (:reductions p) at)))))
-
-(defn- ed-proc-row (p)
-  "One `*Process List*` row from a `process-info` map. The ID stays flush-left (so
-`ed-leading-int` and the kill keys parse it); the tree shape shows in the NAME cell.
-Columns mirror the observer: id · name · status · mailbox · mem · reds · reds/s · mon
-(`:reds-rate` is tagged on by `ed-rate-procs`; `-` until the first refresh diff)."
-  (str (string/pad-right (str (:id p)) 5)
-    " "
-    (string/pad-right (ed-proc-name p) 14)
-    " "
-    (string/pad-right (->string (:status p)) 8)
-    " "
-    (string/pad-left (str (:mailbox p)) 7)
-    " "
-    (string/pad-left (ed-opt (:memory p) humanize/byte-size) 8)
-    " "
-    (string/pad-left (str (:reductions p)) 12)
-    " "
-    (string/pad-left (ed-opt (:reds-rate p) str) 8)
-    " "
-    (string/pad-left (str (:monitored-by p)) 4)))
-
-(defn ed-process-list-text (view &optional rated-infos)
-  "The `*Process List*` buffer text: a header row plus one `ed-proc-row` per live
-process. `rated-infos` is the snapshot already tagged with `:reds-rate` (passed by
-`ed-show-process-list`); when omitted, a fresh untagged snapshot is taken (so the
-REDS/S column reads `-`). `view` is `:tree` (a parent→child forest, indented by
-depth — `proctree`) or `:flat` (ascending by id). Re-showing after a kill reflects
-the change (the snapshot is fresh)."
-  (let (infos (or rated-infos
-                (seq/keep (proc/list) proc/info))
-        ordered (if (= view :flat) (proctree/by-id infos) (proctree/tree-order infos))
-        rows (map ordered ed-proc-row))
-    (str (string/pad-right "ID" 5)
-      " "
-      (string/pad-right "NAME" 14)
-      " "
-      (string/pad-right "STATUS" 8)
-      " "
-      (string/pad-left "MAILBOX" 7)
-      " "
-      (string/pad-left "MEM" 8)
-      " "
-      (string/pad-left "REDS" 12)
-      " "
-      (string/pad-left "REDS/S" 8)
-      " "
-      (string/pad-left "MON" 4)
-      "\n"
-      (string/join rows "\n")
-      "\n")))
-
-(defn ed-proc-view (m)
-  "The current *Process List* view mode (`:tree` default, or `:flat`), from the model."
-  (or (:proc-view m) :tree))
-
-(defn ed-show-process-list (m)
-  "Build/refresh the read-only `*Process List*` in the selected pane and show it,
-stamped `:process-menu` so its kill/refresh keys and read-only mode apply, in the
-model's current `:proc-view` (tree by default). Computes each process's reductions/
-second against the previous snapshot stashed in `:proc-snapshot` — so the REDS/S
-column shows who's busy *now* (`-` on the first show, a real rate on the next refresh
-`g`) — then records a fresh snapshot for next time. The seam the list / refresh /
-kill / toggle commands all route through."
-  (let (at (os/now)
-        infos (seq/keep (proc/list) proc/info)
-        snap (:proc-snapshot m)
-        rated (ed-rate-procs (:reds snap) (:at snap) infos at)
-        m1 (ed-show-named m
-             "*Process List*"
-             (ed-process-list-text (ed-proc-view m) rated)
-             :process-menu)
-        reds (reduce infos {} (fn (acc p) (assoc acc (:id p) (:reductions p)))))
-    (assoc m1 :proc-snapshot {:at at :reds reds})))
-
-(defcommand cmd-list-processes
-  (m key)
-  "List the runtime's live processes in a read-only *Process List* buffer (M-x
-list-processes): id, registered name, status, mailbox backlog, and reductions — the
-kernel's `process-info` snapshot. Spot a runaway eval by its growing mailbox/
-reductions; press `d`/`x`/`k` on a row to kill it, `g` to refresh."
-  (ed-show-process-list m))
-
-;; ---- process-menu actions (the :process-menu layer's keys: d/x/k kill · g refresh) --
-
-(defn- ed-leading-int (line)
-  "The leading integer of `line` (after trimming left whitespace), or nil when it doesn't
-start with a digit. The shared `\"<n> …\"`-row parser: a `*Process List*` row's process id,
-an `*Occur*` row's source line number, and a fuzzy line-search candidate's line number."
-  (let (t (string/triml line)
-        n (string/span t 0 "0123456789"))
-    (if (= n 0)
-      nil
-      ;; The span is all digits, so this parse cannot fail — but `string/->number`
-      ;; answers `number | failure`, and a failure is TRUTHY, so a caller's `(nil? ln)`
-      ;; guard would let one through into `dec`/`goto-line`. Say nil, as promised.
-      (let (v (string/->number (string/substring t 0 n)))
-        (when (int? v) v)))))
-
-(defn- ed-pid-for-id (id)
-  "The live pid whose process id is `id` (re-snapshotting `list-processes`), or nil
-when no such process exists — so the kill command resolves id→pid statelessly rather
-than caching a side table that could go stale."
-  (let (hit (seq/find (seq/keep (proc/list) proc/info) (fn (p) (= (:id p) id))))
-    (when hit (:pid hit))))
-
-(defcommand cmd-process-menu-kill
-  (m key)
-  "Kill the process named on the current *Process List* line (`d` / `x` / `k`): parse
-its id, resolve the live pid, `exit … :kill`, then refresh the list. Refuses to kill
-the editor's own loop process (that would freeze the editor); reports when the cursor
-isn't on a process row, or the process is already gone."
-  (let (buf (ed-current-buf m)
-        id (ed-leading-int (buffer-line-at buf (buffer-current-line buf))))
-    (if (nil? id)
-      (message m "not on a process line")
-      (let (pid (ed-pid-for-id id))
-        (cond
-          (nil? pid) (ed-show-process-list (message m (str "process " id " is already gone")))
-          (= pid (proc/whereis :editor)) (message m "refusing to kill the editor")
-          else
-            (do
-              (exit pid :kill)
-              (message (ed-show-process-list m) (str "killed process " id))))))))
-
-(defcommand cmd-process-menu-refresh
-  (m key)
-  "Re-snapshot the live processes into the *Process List* (`g`)."
-  (ed-show-process-list m))
-
-(defcommand cmd-process-menu-toggle-tree
-  (m key)
-  "Toggle the *Process List* between the tree (parent→child, indented) and flat
-(id-sorted) views (`t`); the choice persists on the model, so refresh/kill keep it."
-  (let (next (if (= (ed-proc-view m) :tree) :flat :tree))
-    (message (ed-show-process-list (assoc m :proc-view next))
-      (str (if (= next :tree) "tree" "flat") " view"))))
 
 ;; ---- files + quit -----------------------------------------------------------
 
@@ -3929,126 +3758,6 @@ M-x buffer-server-stop tears it down. (The push/render lives in `web`.)"
       (message (assoc m :server (web/web-start m 5000)) "starting web server…")
       (let (url (web/web-url srv))
         (message m (if (nil? url) "web server starting…" (str "already serving on " url)))))))
-
-(defn ed-lsp-live (m)
-  "The model's LSP connection while its process is still alive, else nil. A server that
-died — or never started — leaves a pid on the model that every later request sends into
-the void and then waits out its timeout, so liveness is asked here rather than in six
-request sites."
-  (let (conn (:lsp m))
-    (when (and conn (proc/alive? conn)) conn)))
-
-(defn ed-lsp-start (m)
-  "Start the language server configured for the current buffer's file, store it on the
-model (`:lsp`) and register the completion source — `[m2 conn]`, with `conn` nil and an
-explanatory message on `m2` when there is nothing to start: the buffer has no file, no
-server is configured for its extension, or the server is not installed.
-
-Every message says `lsp:`, whichever feature asked — six of them share this one server
-(completion, imenu, goto, references, hover, rename), and what went wrong is the server's,
-not theirs; `imenu: expert is not installed` would read as a fact about imenu.
-
-The not-installed case is the one that used to be a crash. `os/spawn` raises when the
-binary is missing, and it is called inside the connection PROCESS — so an Elixir buffer on
-a machine without `elixir-ls` answered a goto-definition with a `[crash] #<pid …> exited:
-proc-spawn expert: No such file or directory` trace where a sentence belongs.
-`os/which` (brood's std/os) asks before spawning."
-  (let (buf (ed-current-buf m)
-        file (buffer-file buf)
-        srv (when file (lsp/lsp-server-for file)))
-    (cond
-      (nil? file) [(message m "lsp: the buffer has no file") nil]
-      (nil? srv) [(message m (str "lsp: no server configured for ." (lsp/lsp-extension file))) nil]
-      :else
-        (let ([cmd args] srv)
-          (if (nil? (os/which cmd))
-            [(message m (str "lsp: " cmd " is not installed (not on PATH)")) nil]
-            ;; a file outside any project is its own root: its directory
-            (let (root (or (project-root (path/dirname file)) (path/dirname file))
-                  conn (lsp/lsp-connect cmd args (lsp/lsp-path->uri root)))
-              (complete-at-point/complete-add-source! 'lsp/lsp-complete-source)
-              [(message (assoc m :lsp conn) (str "lsp: " cmd " connected for " root)) conn]))))))
-
-(defcommand cmd-lsp-connect
-  (m key)
-  "Start a language server for the current buffer's file type and turn its completions
-on (M-x lsp-connect). Looks the file extension up in `lsp/*lsp-servers*` (rust-analyzer,
-ruby-lsp, …), spawns it for the buffer's project root, stores the connection on the model
-(`:lsp`), and registers `lsp-complete-source` so Tab now also offers the server's
-candidates — merged with the mode and buffer-word sources. M-x lsp-disconnect stops it."
-  (if (ed-lsp-live m)
-    (message m "lsp: already connected (M-x lsp-disconnect first)")
-    ;; a `:lsp` whose process is gone is not a connection — drop it and start over,
-    ;; rather than report "already connected" about a pid nothing answers
-    (let ([m2 _] (ed-lsp-start (dissoc m :lsp))) m2)))
-
-(defcommand cmd-lsp-disconnect
-  (m key)
-  "Stop the buffer's language server and drop its completion connection (M-x lsp-disconnect).
-The `lsp-complete-source` stays registered but no-ops with no connection on the model."
-  (let (conn (:lsp m))
-    (if (nil? conn)
-      (message m "lsp: not connected")
-      (do (lsp/lsp-shutdown conn) (message (dissoc m :lsp) "lsp: disconnected")))))
-
-(defdyn *lsp-autostart* true)
-;; Whether opening a file whose language has an installed server starts it.
-;;
-;; It used to be that a server started on the first LOOKUP — the first `M-.`, hover or
-;; rename — which was a fine rule while a server was only ever a lookup. Diagnostics
-;; changed that: the underline on the mistake you just made is the thing you want without
-;; asking, and a reader who never presses `M-.` in a file would never have seen one.
-;;
-;; `(defdyn *lsp-autostart* false)` in `init.blsp` turns it off, for a project where the
-;; server's startup is heavy enough to want on demand — Expert compiles the whole mix
-;; project before it answers anything, which is a real cost to pay unasked. The name is
-;; bare, not `commands/…`: an earmuffed `defdyn` is ambient however deep the module.
-
-(defn ed-lsp-push-text (m)
-  "Tell the connected server the current buffer's text, once it has changed since the last
-push — the idle beat's hook, beside the autostart.
-
-**This is what makes diagnostics appear at all.** A server does not answer a question with
-them: it PUSHES `publishDiagnostics` when it learns the text changed. Every other call into
-`lsp` syncs the document on its way to asking something (`lsp-issue`), so the findings used
-to arrive only for whatever version you happened to invoke a lookup on — and never while
-typing, which is the only time they are worth having. The symptom was exact: imenu worked,
-because asking for symbols synced the text on the way past, and the underline appeared once
-and then never moved.
-
-Gated on the rope, so an idle beat over an unchanged buffer sends nothing: a full-text
-`didChange` is the document on the wire, and a server that gets one re-analyses."
-  (let (conn (:lsp m)
-        buf (ed-current-buf m)
-        file (buffer-file buf))
-    (if (or (nil? conn) (nil? file) (= (buffer-rope buf) (:lsp-pushed-rope m)))
-      m
-      (do
-        (lsp/lsp-sync conn
-          (lsp/lsp-path->uri file)
-          (lsp/lsp-language-id file)
-          (buffer-text buf))
-        (assoc m :lsp-pushed-rope (buffer-rope buf))))))
-
-(defn ed-lsp-autostart (m)
-  "Start the current buffer's language server if it has one and nothing is connected yet —
-the idle beat's hook, so it happens once the buffer has settled rather than in the middle
-of opening it.
-
-Silent about every reason not to: no file, no server configured for the extension, the
-server not installed, one already connected. A message for each of those would fire on
-every idle beat in every buffer that has no server, which is most of them."
-  (if (or (not *lsp-autostart*) (ed-lsp-live m) (ed-headless?))
-    m
-    (let (buf (ed-current-buf m)
-          file (buffer-file buf)
-          srv (when file (lsp/lsp-server-for file)))
-      (if (nil? srv)
-        m
-        (let ([cmd _] srv)
-          (if (nil? (os/which cmd))
-            m
-            (let ([m2 _] (ed-lsp-start (dissoc m :lsp))) m2)))))))
 
 ;; ---- major-mode commands (M-x text-mode / brood-mode) ----------------------
 ;; Like Emacs: each major mode is an interactive command that activates it on the

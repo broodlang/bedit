@@ -158,9 +158,9 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
 
 ## P2 — structure, performance, tests
 
-- [ ] **X1 `commands.blsp` (6.5k) split**: dired, LSP nav, vim grammar, collab, web,
+- [x] **X1 `commands.blsp` (6.5k) split**: dired, LSP nav, vim grammar, collab, web,
   process list, project search, hexl → own modules; an `editing` core that every
-  mutation goes through.
+  mutation goes through. — DONE: dired, lsp-commands (navigation, edits, the connection, the LSP event folds), vim, collab-commands, process-list and project-search are modules; commands.blsp is 4.2k lines. The editing core is `model/ed-try-edit` (S2). Left in commands on purpose: hexl (find-file itself opens a binary through it) and the two web-mirror commands (moving them would make `web` deferred for no gain). drive-deferred proves each moved module is still reached in the released image — C-x d, x in the Vim profile, M-x list-processes, M-x share-session, C-x p g.
 - [x] **X2 Git status keymap lives in `modes.blsp`** and duplicates
   `git-dispatch-transient`'s table. — RESOLVED: the keymap STAYS in modes (git is a deferred module, and a git buffer another frame rebuilds from the registry needs its keys before git loads); the two tables are held together by transient_test — every dispatch key, pressed directly, opens the same menu or runs the same command (`g` excepted, as in Magit).
 - [x] **X3 Global `def` caches** (`wrap.blsp:104`, `view.blsp:107`,
