@@ -11,7 +11,7 @@
   (:use pool)
   (:use commands)
   (:use editor/buffer)
-  (:use-internals term)
+  (:use-internals terminal)
   (:use-internals input)
   (:use-internals bshell)) ; bshell-load-history — the shell's history file a terminal must not touch
 
@@ -36,7 +36,7 @@ no worker."
 (defn fold-screen (m lines scr)
   (terminal/ed-ev-term-screen m (terminal/term-screen-event term-name lines scr) 24 80 24))
 
-(defn term-buf (m) (nth (:buffers m) (ed-buffer-index-by-name! m term-name)))
+(defn term-buf (m) (ed-buf-at m (ed-buffer-index-by-name! m term-name)))
 (defn term-text (m) (buffer-text (term-buf m)))
 (defn term-point (m) (buffer-point (ed-current-buf m)))
 
@@ -433,3 +433,63 @@ no worker."
       (assert= (map spans (fn (sp) (take sp 2))) '((0 11) (12 16) (17 18)))
       ;; what the bug drew: "~/src/bedit main ❯ main ❯ echo win"
       (assert= (painted-row (view/ed-view m 60 12) 0) "~/src/bedit main ❯ echo win"))))
+
+;; ---- one terminal in several panes ---------------------------------------------------
+;; Each pane on the buffer used to resize the program to ITS size in turn; the resize made
+;; the program repaint, the repaint synced the sizes again, and the two panes took turns
+;; for ever — the mode line flickering All / Top until the program gave up.
+
+(defn drain-resizes (acc)
+  (receive ([:term-resize c r] (drain-resizes (conj acc [c r]))) (after 0 acc)))
+
+(defn split-term-model (keys)
+  "The terminal (worker = this test process) split into panes by `keys`, painted once so
+the layout is known, with any resizes the split caused drained."
+  (let (m0 (term-model)
+        m (ed-set-buf m0 (assoc (ed-current-buf m0) :term-proc (self)))
+        split (fold keys m (fn (acc k) (ed-update acc k 80 24))))
+    (do (drain-resizes []) split)))
+
+(def three-heights [:ctrl-x "2" :ctrl-x "2"])
+
+(defn pane-sizes (m)
+  "The size each pane showing the terminal would give it on its own."
+  (map (:panes (panes/ed-layout-now m)) (fn (p) (terminal/term-pane-size p (term-buf m)))))
+
+(defn smallest-of (sizes)
+  [(apply math/min (map sizes first)) (apply math/min (map sizes second))])
+
+(defn resync (m)
+  "`m` synced after forgetting the size last sent, so the sync has to send one."
+  (terminal/term-sync-sizes (ed-set-buf-at m
+                              (ed-buffer-index-by-name! m term-name)
+                              (assoc (term-buf m) :term-size [1 1]))))
+
+(describe "a terminal shown in several panes"
+  (test "the panes really differ in size — the case that ping-ponged"
+    (let (sizes (pane-sizes (split-term-model three-heights)))
+      (assert= (count sizes) 3)
+      (is (> (count (into #{} sizes)) 1))))
+  (test "it is sized ONCE, to fit the smallest pane"
+    (let (m (split-term-model three-heights)
+          smallest (smallest-of (pane-sizes m))
+          synced (resync m))
+      (assert= (drain-resizes []) [smallest])
+      (assert= (:term-size (term-buf synced)) smallest)))
+  (test "the narrowest pane gives the width and the shortest the height"
+    ;; C-x 3 C-x 2: two short panes on the left, one tall narrower one on the right — no
+    ;; single pane has the size that fits them all
+    (let (m (split-term-model [:ctrl-x "3" :ctrl-x "2"])
+          sizes (pane-sizes m)
+          smallest (smallest-of sizes)
+          synced (resync m))
+      (is (not (contains? (into #{} sizes) smallest)))
+      (assert= (drain-resizes []) [smallest])
+      (assert= (:term-size (term-buf synced)) smallest)))
+  (test "a repaint after it sends nothing — no resize loop"
+    (let (m (split-term-model three-heights)
+          once (terminal/term-sync-sizes m)
+          _ (drain-resizes [])
+          again (fold-screen once [] (screen "$ " 2)))
+      (assert= (drain-resizes []) [])
+      (assert= (:term-size (term-buf again)) (:term-size (term-buf once))))))
