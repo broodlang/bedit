@@ -1,0 +1,141 @@
+;; The built-in Emacs behaviours the user's init turns on, each behind an init-file setting:
+;; delete-selection-mode, kill-whole-line, a global electric-pair-mode, savehist and
+;; save-place (src/commands.blsp, src/keymaps.blsp, src/savehist.blsp, src/saveplace.blsp).
+(defmodule emacs-defaults-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer))
+
+(defn- text-model (text point &optional (settings {}))
+  ;; a plain text buffer (text-mode, the global keymap's electric pairs) with `settings` on
+  (let (m (ed-init (make-buffer text "*scratch*")))
+    (into (ed-set-buf m (goto-char (ed-current-buf m) point)) settings)))
+
+(defn- with-region (m from to)
+  ;; the region [from, to) active: the mark at `from`, point at `to`
+  (ed-set-buf m (goto-char (set-mark (goto-char (ed-current-buf m) from)) to)))
+
+(defn- keys (m pressed) (fold pressed m (fn (acc key) (input/ed-update acc key 80 24))))
+
+(defn- text-of (m) (buffer-text (ed-current-buf m)))
+
+(describe "delete-selection-mode"
+  (test "typing over a region replaces it, and one undo brings it back"
+    (let (m (with-region (text-model "hello world" 0 {:delete-selection true}) 6 11)
+          typed (keys m ["x"]))
+      (assert= (text-of typed) "hello x")
+      (assert= (text-of (keys typed [:ctrl-/])) "hello world")))
+  (test "a delete takes the whole region"
+    (let (m (with-region (text-model "hello world" 0 {:delete-selection true}) 0 6))
+      (assert= (text-of (keys m [:backspace])) "world")
+      (assert= (text-of (keys m [:delete])) "world")))
+  (test "a yank replaces it"
+    (let (m (with-region (text-model "hello world" 0 {:delete-selection true}) 6 11)
+          with-kill (ed-push-kill m "there" false))
+      (assert= (text-of (keys with-kill [:ctrl-y])) "hello there")))
+  (test "off by default: typing inserts at point and the region text stays"
+    (let (m (with-region (text-model "hello world" 0) 6 11))
+      (assert= (text-of (keys m ["x"])) "hello worldx"))))
+
+(describe "kill-whole-line"
+  (test "C-k at the start of a line takes its newline too"
+    (let (m (text-model "one\ntwo\nthree" 4 {:kill-whole-line true}))
+      (assert= (text-of (keys m [:ctrl-k])) "one\nthree")))
+  (test "mid-line, C-k still kills to the end of the line"
+    (let (m (text-model "one\ntwo\nthree" 5 {:kill-whole-line true}))
+      (assert= (text-of (keys m [:ctrl-k])) "one\nt\nthree")))
+  (test "off by default: at the start of a line C-k leaves the newline"
+    (assert= (text-of (keys (text-model "one\ntwo\nthree" 4) [:ctrl-k])) "one\n\nthree")))
+
+(describe "electric-pair-mode in every buffer"
+  (test "an opener in a plain text buffer types its pair and lands inside"
+    (let (m (keys (text-model "" 0) ["(" "x"]))
+      (assert= (text-of m) "(x)")
+      (assert= (buffer-point (ed-current-buf m)) 2)))
+  (test "a closer already at point is stepped over"
+    (assert= (text-of (keys (text-model "" 0) ["[" "x" "]"])) "[x]"))
+  (test "backspace between an empty pair takes both"
+    (assert= (text-of (keys (text-model "" 0) ["{" :backspace])) "")))
+
+(describe "savehist"
+  :isolated (test "answers are kept per prompt, newest first, and come back after a restart"
+    (let (file (path/join (temp-dir "bedit-savehist-") "history.blsp"))
+      (savehist/activate! file)
+      (savehist/remember! "Find file: " "a.txt" file)
+      (savehist/remember! "Find file: " "b.txt" file)
+      (savehist/remember! "Find file: " "a.txt" file)
+      (assert= (savehist/history-for "Find file: ") (list "a.txt" "b.txt"))
+      ;; a fresh session reads them back
+      (def savehist/*histories* nil)
+      (savehist/activate! file)
+      (assert= (savehist/history-for "Find file: ") (list "a.txt" "b.txt"))
+      (def savehist/*histories* nil)))
+  :isolated (test "a prompt's varying default shares one history; a credential is never kept"
+    (let (file (path/join (temp-dir "bedit-savehist-") "history.blsp"))
+      (savehist/activate! file)
+      (savehist/remember! "Switch to buffer (default a.txt): " "b.txt" file)
+      (assert= (savehist/history-for "Switch to buffer (default c.txt): ") (list "b.txt"))
+      (savehist/remember! "Cookie for node@host: " "hunter2" file)
+      (savehist/remember! "Password: " "hunter2" file)
+      (is (not (includes? (file/slurp file) "hunter2")))
+      (assert= (savehist/history-for "Password: ") '())
+      (def savehist/*histories* nil)))
+  (test "off, nothing is remembered and every prompt starts empty"
+    (is (not (savehist/active?)))
+    (savehist/remember! "Find file: " "a.txt")
+    (assert= (savehist/history-for "Find file: ") '())))
+
+(describe "save-place"
+  (test "a file reopens where it was left, clamped to its text"
+    (let (file (path/join (temp-dir "bedit-saveplace-") "places.blsp")
+          left (goto-char (make-buffer "0123456789" "a.txt" "/tmp/a.txt") 7)
+          _ (saveplace/remember-place! left file)
+          reopened (saveplace/restore-place (make-buffer "0123456789" "a.txt" "/tmp/a.txt") file)
+          shorter (saveplace/restore-place (make-buffer "012" "a.txt" "/tmp/a.txt") file))
+      (assert= (buffer-point reopened) 7)
+      (assert= (buffer-point shorter) 3)))
+  (test "quitting remembers every file's place in one write"
+    (let (file (path/join (temp-dir "bedit-saveplace-") "places.blsp")
+          a (goto-char (make-buffer "0123456789" "a.txt" "/tmp/a.txt") 4)
+          b (goto-char (make-buffer "abcdef" "b.txt" "/tmp/b.txt") 2)
+          scratch (make-buffer "x" "*scratch*"))
+      (saveplace/remember-places! [a b scratch] file)
+      (assert= (saveplace/place-of "/tmp/a.txt" file) 4)
+      (assert= (saveplace/place-of "/tmp/b.txt" file) 2)
+      (assert= (count (projects/persist-read file)) 2)))
+  (test "a file never left opens at the top"
+    (let (file (path/join (temp-dir "bedit-saveplace-") "places.blsp"))
+      (assert= (buffer-point (saveplace/restore-place (make-buffer "abc" "b.txt" "/tmp/b.txt") file))
+        0))))
+
+(describe "M-; in a language with only block comments"
+  (test "a CSS line is wrapped in /* */, and unwrapped again"
+    (let (m (ed-init (make-buffer "  a { color: red; }\nb {}" "x.css" "/tmp/x.css"))
+          once (keys m [(keyword "alt-;")])
+          twice (keys once [(keyword "alt-;")]))
+      (assert= (text-of once) "  /* a { color: red; } */\nb {}")
+      (assert= (text-of twice) "  a { color: red; }\nb {}")))
+  (test "an HTML region comments line by line, blank lines left alone"
+    (let (m (ed-init (make-buffer "<p>a</p>\n\n<p>b</p>" "x.html" "/tmp/x.html"))
+          region (ed-set-buf m (goto-char (set-mark (ed-current-buf m)) 17))
+          commented (keys region [(keyword "alt-;")]))
+      (assert= (text-of commented) "<!-- <p>a</p> -->\n\n<!-- <p>b</p> -->"))))
+
+(describe "C-x b previews like consult-buffer"
+  (defn- three-buffers ()
+    ;; A shown, B the one before it, C opened first
+    (let (m (ed-init (make-buffer "c" "C"))
+          m (pool/ed-open-buffer m (make-buffer "b" "B"))
+          m (keys m [:ctrl-n])
+          m (pool/ed-open-buffer m (make-buffer "a" "A")))
+      (keys m [:ctrl-n])))
+  (test "moving through the list shows each buffer, and C-g puts the window back"
+    (let (m (three-buffers)
+          moved (keys m [:ctrl-x "b" :ctrl-n]))
+      (is (not (= (buffer-name (ed-current-buf moved)) "A")))
+      (assert= (buffer-name (ed-current-buf (keys moved [:ctrl-g]))) "A")))
+  (test "a preview is not a visit: after C-g, C-x b RET still goes to the buffer before"
+    (let (m (three-buffers)
+          aborted (keys m [:ctrl-x "b" :ctrl-n :ctrl-g])
+          back (keys aborted [:ctrl-x "b" :enter]))
+      (assert= (buffer-name (ed-current-buf back)) "B"))))

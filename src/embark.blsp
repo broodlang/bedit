@@ -1,0 +1,432 @@
+;; src/embark.blsp — EMBARK: act on the thing at point (Emacs's embark.el).
+;;
+;; Three commands over one idea — find the TARGET, then look up what can be done to it:
+;;
+;;   C-.    embark-act       a one-key menu of the target's actions
+;;   C-;    embark-dwim      the target's default action, no menu
+;;   C-h B  embark-bindings  every key in force, as a completing prompt that runs the choice
+;;
+;; THE TARGET. In the minibuffer it is the selected candidate (or the typed text), typed by
+;; the prompt's `:category` — a `:file` prompt's candidate is a file, `M-x`'s a command — and
+;; by what it names when the prompt declares nothing (a buffer's name, a URL). In a buffer it
+;; is, by priority: the active region, a URL, a file path that exists, the symbol at point.
+;;
+;; THE ACTIONS are a table (`*embark-actions*`), one row per key, and each row NAMES an
+;; existing command by symbol — embark is a dispatcher, not a second copy of the editor.
+;; How the target reaches the command is the row's `:call`, because bedit's commands take
+;; their argument in one of four ways and embark has to meet each where it is:
+;;
+;;   :point    a `(model key)` command acting at point or on the region — the target IS there
+;;   :target   a `(model text)` function taking the target (`pool/ed-find-file` a path)
+;;   :prompt   a command that opens a minibuffer: run it, then accept the target in it —
+;;             embark's own trick, so `describe-function` needs no target-taking twin
+;;   :dired    a dired command: list the file's directory with point on the file, then run
+;;             it — `dired/cmd-dired-delete` asks and deletes exactly as `D` does in dired
+;;   :visit    a `(model key)` command acting on the current buffer: switch to the target
+;;             buffer, then run it (`C-x k` asks about unsaved changes as it always does)
+;;
+;; THE MENU is a transient (`transient` / `transient-core`, the machinery behind magit's
+;; menus), not the which-key grid. A transient is already a one-key modal overlay with a
+;; titled, labelled card, Esc to dismiss, a key it does not bind closing it with a message,
+;; and a click on a row running it — all wired into `input`'s overlay registry. which-key
+;; is a HINT for a keymap prefix in progress: it would need a temporary keymap layer pushed
+;; on the model, a way to pop it, and still has no title to say what the target is.
+;; A row's command is a closure over the target that resolves the row's symbol when it
+;; runs, so the late binding a keymap gives (redefine a command, the menu follows) holds.
+
+(defmodule embark
+  "Embark — act on the thing at point. `embark-target` finds it (the minibuffer's selected
+candidate, else the region, a URL, an existing file or the symbol at point),
+`*embark-actions*` says what each kind of target offers as `key → command` rows, and
+`cmd-embark-act` (C-.) / `cmd-embark-dwim` (C-;) open the menu or run the default.
+`cmd-embark-bindings` (C-h B) lists every key in force as a completing prompt."
+  (:use model) ; message / ed-current-buf / mb-candidates / ed-push-kill / ed-mb-stop-ranker
+  (:use editor/buffer) ; buffer-point / buffer-region / buffer-line-at — reading the target
+  (:use keyhelp) ; ed-keys-label / ed-command-tail — the C-h B rows
+  (:use interactive) ; defcommand / command-friendly-name
+  (:use pool :only [ed-name-prompt ed-goto-line-col ed-switch-to-named])) ; prompt + dired placement
+;; `transient`, `dired`, `help`, `lsp-commands`, `murforge`, `shell-command` and `input` are
+;; reached QUALIFIED and at run time: each is loaded when an action first needs it, and
+;; none of them names this module, so no header here can close a cycle.
+
+;; ---- the action table -----------------------------------------------------------------
+;; One row per key: `[key call command label]`. `:default` is the key C-; runs (and that
+;; RET runs in the menu). Edit a row, or the whole entry, live to change what a target
+;; offers — the table is read when the menu opens.
+
+(def *embark-actions*
+  {:file {:title "File"
+          :default "o"
+          :actions [["o" :target 'pool/ed-find-file "open"]
+                     ["d" :dired 'dired/cmd-dired-delete "delete (asks)"]
+                     ["r" :dired 'dired/cmd-dired-rename "rename"]
+                     ["C" :dired 'dired/cmd-dired-copy "copy to"]
+                     ["D" :dired nil "dired its directory"]
+                     ["c" :target 'embark/embark-copy "copy path"]]}
+   :buffer {:title "Buffer"
+            :default "b"
+            :actions [["b" :target 'pool/ed-switch-to-named "switch to"]
+                       ["k" :visit 'commands/cmd-kill-buffer "kill"]
+                       ["w" :target 'embark/embark-copy "copy name"]]}
+   :symbol {:title "Symbol"
+            :default "."
+            :actions [["h" :point 'lsp-commands/cmd-lsp-hover "describe (docs)"]
+                       ["." :point 'lsp-commands/cmd-goto-definition "find definition"]
+                       ["r" :point 'lsp-commands/cmd-find-references "find references"]
+                       ["f" :prompt 'help/cmd-describe-function "describe as a command"]
+                       ["w" :target 'embark/embark-copy "copy"]]}
+   :command {:title "Command"
+             :default "x"
+             :actions [["x" :prompt 'commands/cmd-execute-extended-command "run"]
+                        ["h" :prompt 'help/cmd-describe-function "describe"]
+                        ["w" :target 'embark/embark-copy "copy name"]]}
+   :url {:title "URL"
+         :default "b"
+         :actions [["b" :target 'murforge/mur-browse-url "browse"]
+                    ["w" :target 'embark/embark-copy "copy"]]}
+   :region {:title "Region"
+            :default "w"
+            :actions [["w" :point 'commands/cmd-copy-region "copy"]
+                       ["k" :point 'commands/cmd-kill-region "kill"]
+                       ["u" :point 'commands/cmd-upcase-region "upcase"]
+                       ["l" :point 'commands/cmd-downcase-region "downcase"]
+                       [";" :point 'commands/cmd-comment-dwim "comment / uncomment"]
+                       ["s" :point 'commands/cmd-sort-lines "sort lines"]
+                       ["|" :point 'shell-command/cmd-shell-command-on-region "shell command on it"]]}
+   :text {:title "Text"
+          :default "w"
+          :actions [["w" :target 'embark/embark-copy "copy"]
+                     ["i" :target 'embark/embark-insert "insert at point"]]}})
+
+(defn embark-action-of (row)
+  "An action row `[key call command label]` as the map the rest of embark reads.
+
+    (:call (embark/embark-action-of [\"o\" :target 'pool/ed-find-file \"open\"]))   ;=> :target"
+  {:key (nth row 0) :call (nth row 1) :command (nth row 2) :label (nth row 3)})
+
+(defn embark-actions (target)
+  "The actions target `target` offers, as maps, in table order — `[]` for a target kind the
+table does not know."
+  (let (entry (get *embark-actions* (:type target)))
+    (if (nil? entry) [] (into [] (map (:actions entry) embark-action-of)))))
+
+(defn embark-default-action (target)
+  "The action C-; runs on `target` — the row its kind names as `:default` — or nil."
+  (let (key (:default (get *embark-actions* (:type target))))
+    (seq/find (embark-actions target) (fn (action) (= (:key action) key)))))
+
+;; ---- finding the target in a buffer ---------------------------------------------------
+
+(def- token-delimiters #{" " "\t" "\n" "\"" "'" "`" "(" ")" "[" "]" "{" "}" "<" ">" ","})
+;; sentence punctuation, and the closers a URL is wrapped in (`<…>`, `[…]`, quotes) — not `)`,
+;; which ends real URLs (Wikipedia's `…_(disambiguation)`)
+(def- trailing-punctuation #{"." "," ";" ":" "!" "?" ">" "]" "\"" "'"})
+
+(defn- token-start (line index)
+  "Where the run of non-delimiter characters ending before `index` in `line` begins."
+  (if (or (<= index 0) (contains? token-delimiters (string/char-at line (dec index))))
+    index
+    (token-start line (dec index))))
+
+(defn- token-end (line index size)
+  "Where the run of non-delimiter characters starting at `index` in `line` ends."
+  (if (or (>= index size) (contains? token-delimiters (string/char-at line index)))
+    index
+    (token-end line (inc index) size)))
+
+(defn- without-trailing-punctuation (text)
+  "`text` with the sentence punctuation a URL or path in prose is followed by dropped."
+  (if (and (> (string/length text) 0)
+        (contains? trailing-punctuation (string/char-at text (dec (string/length text)))))
+    (without-trailing-punctuation (string/substring text 0 (dec (string/length text))))
+    text))
+
+(defn embark-token-at (line column)
+  "The whitespace- and bracket-delimited run of `line` that `column` is in (or just after),
+trailing punctuation dropped — the text a URL or a path at point is read from. Nil on a
+delimiter.
+
+    (embark/embark-token-at \"see (src/x.blsp:12), then\" 8)   ;=> \"src/x.blsp:12\""
+  (let (size (string/length line)
+        at (math/max 0 (math/min column size))
+        text (without-trailing-punctuation (string/substring line
+                                             (token-start line at)
+                                             (token-end line at size))))
+    (if (= text "") nil text)))
+
+(defn embark-url (text)
+  "The URL `text` holds — from its `http://` / `https://` / `file://` scheme on — or nil.
+
+    (embark/embark-url \"<https://brood.dev/docs>.\")   ;=> \"https://brood.dev/docs\""
+  (let (starts (seq/reject (map ["https://" "http://" "file://"]
+                             (fn (scheme) (index-of text scheme)))
+                 (fn (index) (< index 0))))
+    (when (not (empty? starts))
+      (let (url (without-trailing-punctuation (string/substring text
+                                                (reduce starts math/min)
+                                                (string/length text))))
+        (when (> (string/length url) 8) url)))))
+
+(defn- without-location (text)
+  "`text` without a compiler-style `:line` / `:line:col` suffix — `src/x.blsp:12:3` names
+the file `src/x.blsp`."
+  (let (cut (string/last-index-of text ":"))
+    (if (and (> cut 0)
+          (int? (string/->number (string/substring text (inc cut) (string/length text)))))
+      (without-location (string/substring text 0 cut))
+      text)))
+
+(defn embark-file (text dir)
+  "The absolute path `text` names when it is a file or directory that EXISTS — read
+against `dir` when relative, `~` expanded, a `:line:col` suffix dropped — else nil. A
+bare word is never a path: it has to hold a `/`, a `.` or start with `~`, so a symbol
+that happens to name a file in the directory stays a symbol."
+  (let (candidate (without-location text))
+    (when (and (> (string/length candidate) 0)
+            (or (includes? candidate "/")
+              (includes? candidate ".")
+              (string/starts-with? candidate "~")))
+      (let (path (path/normalize (path/absolute candidate dir)))
+        (when (file/exists? path) path)))))
+
+(def- word-delimiters #{" " "\t" "\n" "/" "(" ")" "[" "]" "{" "}" "\"" ";" ","})
+
+(defn- word-at (line column)
+  "The word around `column` in `line` — a run of anything but whitespace and the
+delimiters, M-f's notion of a word (`editor/buffer/forward-word`) — the fallback when the
+Lisp reader sees no symbol there."
+  (let (word? (fn (character) (not (contains? word-delimiters character)))
+        size (string/length line)
+        start (letrec (back (fn (index)
+                              (if (and (> index 0) (word? (string/char-at line (dec index))))
+                                (back (dec index))
+                                index)))
+                (back (math/min column size)))
+        end (letrec (forward (fn (index)
+                               (if (and (< index size) (word? (string/char-at line index)))
+                                 (forward (inc index))
+                                 index)))
+              (forward (math/min column size))))
+    (if (< start end) (string/substring line start end) nil)))
+
+(defn embark-buffer-target (b dir)
+  "The target in buffer `b` (whose directory is `dir`), by priority: a non-empty region,
+a URL at point, an existing file named at point, the symbol at point
+(`editor/highlight/symbol-at`, else the word) — `{:type :text …}` maps, or nil."
+  (let (bounds (buffer-region-bounds b))
+    (if (and bounds (< (first bounds) (second bounds)))
+      {:type :region :text (buffer-region b)}
+      (let (line (ed-strip-newline (buffer-line-at b (buffer-current-line b)))
+            column (buffer-column b)
+            token (embark-token-at line column)
+            url (when token (embark-url token))
+            file (when (and token (nil? url)) (embark-file token dir))
+            symbol (editor/highlight/symbol-at line (math/min column (string/length line)))
+            symbol-text (if (nil? symbol) (word-at line column) (second symbol)))
+        (cond
+          url {:type :url :text url}
+          file {:type :file :text file}
+          (and symbol-text (not (string/blank? symbol-text))) {:type :symbol :text symbol-text}
+          :else nil)))))
+
+;; ---- finding the target in the minibuffer ---------------------------------------------
+
+(defn- minibuffer-choice (mb)
+  "The candidate the minibuffer's selection rests on, else its typed text — what Enter
+would accept (`input/minibuffer-handle`), read the same way."
+  (let (choices (if (:accept-selection mb) (mb-candidates mb) ())
+        selected (mb-sel mb))
+    (if (or (empty? choices) (< selected 0))
+      (mb-text mb)
+      (nth choices (math/min selected (dec (count choices)))))))
+
+(defn- minibuffer-path (mb text)
+  "The absolute path a `:file` prompt's candidate `text` names: through the prompt's own
+`:path-of` (which knows its `~` and `$$` spellings), else against its `:anno-base`; a
+directory's trailing `/` dropped."
+  (let (bare (if (and (> (string/length text) 1) (string/ends-with? text "/"))
+               (string/substring text 0 (dec (string/length text)))
+               text))
+    (if (:path-of mb)
+      ((:path-of mb) bare)
+      (path/absolute bare (or (:anno-base mb) (file/cwd))))))
+
+(defn- binding-command-name (text)
+  "The command name of a C-h B row, `\"C-x C-f  find-file\"` → `\"find-file\"`."
+  (let (cut (string/last-index-of text "  "))
+    (if (< cut 0) text (string/trim (string/substring text cut (string/length text))))))
+
+(defn embark-minibuffer-target (m)
+  "The target in the open minibuffer: its selected candidate (or typed text), typed by the
+prompt's `:category` — `:file`, `:command`, C-h B's `:binding` (its command) — else by what
+it names: an open buffer, a URL, or plain text. Nil when the line is empty."
+  (let (mb (:minibuffer m)
+        text (minibuffer-choice mb))
+    (when (and (string? text) (not (string/blank? text)))
+      (case (:category mb)
+        :file {:type :file :text (minibuffer-path mb text)}
+        :command {:type :command :text text}
+        :binding {:type :command :text (binding-command-name text)}
+        (cond
+          (ed-buffer-index-by-name m text) {:type :buffer :text text}
+          (embark-url text) {:type :url :text (embark-url text)}
+          :else {:type :text :text text})))))
+
+(defn embark-target (m)
+  "What C-. acts on: the minibuffer's candidate while a prompt is open, else the target at
+point in the current buffer (`embark-buffer-target`). Nil when there is nothing."
+  (if (:minibuffer m)
+    (embark-minibuffer-target m)
+    (embark-buffer-target (ed-current-buf m) (ed-buffer-dir (ed-current-buf m)))))
+
+(defn- leave-minibuffer (m)
+  "`m` with the open prompt closed — its `:on-abort` fired (a previewing prompt puts point
+back) and its ranking session stopped, as Esc would — so the action runs on the buffer
+the prompt was opened over. Unchanged when no prompt is open."
+  (let (mb (:minibuffer m))
+    (if (nil? mb)
+      m
+      (let (aborted (if (:on-abort mb) ((:on-abort mb) m) m))
+        (assoc (ed-mb-stop-ranker aborted) :minibuffer nil)))))
+
+;; ---- running an action ------------------------------------------------------------------
+
+(defn embark-copy (m text)
+  "Put `text` on the kill ring (and the OS clipboard), as M-w would, and say so."
+  (message (ed-push-kill m text true) (str "copied: " text)))
+
+(defn embark-insert (m text)
+  "Insert `text` at point in the current buffer."
+  (ed-edit m (fn (b) (insert b text))))
+
+(defn- dired-at (m path)
+  "Dired on `path`'s directory with point on its line — what a `:dired` action runs its
+command over. The listing lands on its first entry, and the lines follow `:dired-names`
+from there, so the file's line is that one plus its index."
+  (let (listed (dired/ed-show-dired m (path/dirname path))
+        names (or (:dired-names listed) [])
+        index (index-of names (path/basename path))
+        first-entry (buffer-current-line (ed-current-buf listed)))
+    (if (< index 0)
+      (message listed (str (path/basename path) " is not listed"))
+      (ed-apply listed (fn (b) (ed-goto-line-col b (+ first-entry index) 0))))))
+
+(defn- accept-in-prompt (m text)
+  "Accept `text` in the minibuffer the last command opened — as though typed and entered —
+or `m` as it is when the command opened none."
+  (let (mb (:minibuffer m))
+    (if (or (nil? mb) (nil? (:on-complete mb)))
+      m
+      ((:on-complete mb) (assoc (ed-mb-stop-ranker m) :minibuffer nil) text))))
+
+;; check-allow: the command comes back through `reflect/eval`, which the checker reads as
+;; unknown; every row names a `model -> model` command, as a keymap binding does.
+(check-allow :trusted
+  (sig embark-run (model any any -> model))
+  (defn embark-run (m target action)
+    "Run `action` on `target`, the target reaching the action's command the way its `:call`
+says (see the file header). The command symbol is resolved now, so a redefined command is
+the one that runs."
+    (let (command (when (:command action) (reflect/eval (:command action)))
+          text (:text target))
+      (case (:call action)
+        :point (command m nil)
+        :target (command m text)
+        :prompt (accept-in-prompt (command m nil) text)
+        :dired (let (listed (dired-at m text)) (if (nil? command) listed (command listed nil)))
+        :visit
+          (if (nil? (ed-buffer-index-by-name m text))
+            (message m (str "no buffer named " text))
+            (command (ed-switch-to-named m text) nil))
+        (message m (str "embark: unknown action call " (:call action)))))))
+
+(defn- label-of (target)
+  "The target as the menu's title shows it: a path with `~` for the home, one line,
+clipped to fit a card."
+  (let (text (if (= (:type target) :file) (path/abbreviate (:text target)) (:text target))
+        line (first (string/split text "\n")))
+    (if (> (string/length line) 48) (str (string/substring line 0 47) "…") line)))
+
+(defn embark-spec (target)
+  "The transient menu for `target`: one row per action, plus `RET` for the default one,
+under a title naming the target."
+  (let (entry (get *embark-actions* (:type target))
+        default (embark-default-action target)
+        row (fn (action key)
+              {:key key
+               :kind :command
+               :command (fn (m _key) (embark-run m target action))
+               :label (:label action)})
+        rows (into [] (map (embark-actions target) (fn (action) (row action (:key action))))))
+    {:name 'embark
+     :title (str (:title entry) ": " (label-of target))
+     :groups [{:title "Actions"
+               :suffixes (if (nil? default) rows (conj rows (row default [:enter])))}]}))
+
+(defn embark-act (m)
+  "Open the action menu for the target (C-.) — leaving the minibuffer first when the target
+is its candidate — or say there is nothing to act on."
+  (let (target (embark-target m))
+    (if (or (nil? target) (empty? (embark-actions target)))
+      (message m "embark: nothing here to act on")
+      (transient/ed-transient-open (leave-minibuffer m) (embark-spec target)))))
+
+(defn embark-dwim (m)
+  "Run the target's default action (C-;): open a file, browse a URL, find a symbol's
+definition, switch to a buffer, run a command."
+  (let (target (embark-target m)
+        action (when target (embark-default-action target)))
+    (if (nil? action)
+      (message m "embark: nothing here to act on")
+      (embark-run (leave-minibuffer m) target action))))
+
+(defcommand cmd-embark-act
+  (m key)
+  "Act on the thing at point (C-.): a one-key menu of what can be done to the minibuffer's
+selected candidate, else the region, the URL, the file or the symbol at point."
+  (embark-act m))
+
+(defcommand cmd-embark-dwim
+  (m key)
+  "Do the obvious thing to the thing at point (C-;): open the file, browse the URL, find the
+symbol's definition, switch to the buffer — the default action, without the menu."
+  (embark-dwim m))
+
+;; ---- C-h B: every binding, as a prompt ------------------------------------------------
+
+(defn embark-binding-rows (entries)
+  "`scope-bindings` `entries` as C-h B's rows, `{label → entry}` with each label
+`\"C-x C-f  find-file\"` — the bindings in force only (a shadowed one cannot be reached by
+its key, so it is not a binding of this buffer), commands named by symbol only."
+  (fold entries
+    {}
+    (fn (rows entry)
+      (if (or (:shadowed-by entry) (not (symbol? (:command entry))))
+        rows
+        (assoc rows
+          (str (ed-keys-label (:sequence entry))
+            "  "
+            (command-friendly-name (ed-command-tail (:command entry))))
+            entry)))))
+
+(defn- run-binding (m entry)
+  "Run the command `entry` binds, handed the last key of its sequence as a keypress would."
+  (check-allow :discarded-catch
+    (try
+      ((reflect/eval (:command entry)) m (last (:sequence entry)))
+      (catch e (message m (str "error: " e))))))
+
+(defcommand cmd-embark-bindings
+  (m key)
+  "Every key binding in force in this buffer as a completing prompt (C-h B, Emacs's
+`embark-bindings`): type to narrow by key or command, Enter runs the one chosen."
+  (let (rows (embark-binding-rows (editor/layers/scope-bindings (input/ed-scope m))))
+    (assoc m
+      :minibuffer
+        (assoc (ed-name-prompt "Binding: "
+                 (sort (keys rows))
+                 (fn (mm text)
+                   (let (entry (get rows text))
+                     (if (nil? entry) (message mm (str "no binding: " text)) (run-binding mm entry))))
+                 15)
+          :category :binding))))

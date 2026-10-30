@@ -757,10 +757,35 @@ margin; point moves, the view does not."
 
 ;; ---- editing ----------------------------------------------------------------
 
+;; ---- delete-selection-mode ----------------------------------------------------------
+;; Emacs's `delete-selection-mode`: with a region active, what you type, yank or newline
+;; REPLACES it, and a delete takes the region rather than one character. On with the init
+;; file's `:delete-selection` (the model's `:delete-selection`). One undo step each: the region
+;; and what replaced it come back together. A bracket typed over a region still WRAPS it
+;; (`cmd-open-delimiter`), as electric-pair does in Emacs with the mode on.
+
+(defn selection-to-replace? (m b)
+  "True when `b` has a non-empty active region that typing should replace — delete-selection
+is on in `m`."
+  (and (= true (:delete-selection m))
+    (let (bounds (buffer-region-bounds b)) (and bounds (< (first bounds) (second bounds))))))
+
+(defn insert-replacing (m b text)
+  "`text` inserted at point of `b`, replacing its region first when `selection-to-replace?` —
+one undo step."
+  (if (selection-to-replace? m b)
+    (undo-group b (fn (bb) (insert (delete-region bb) text)))
+    (insert b text)))
+
+(defn- deleting-selection (m edit)
+  ;; a delete command's edit: the region when there is one to replace, else `edit`
+  (fn (b) (if (selection-to-replace? m b) (delete-region b) (edit b))))
+
 (defcommand cmd-self-insert
   (m key)
-  "Insert the typed character `key` (a 1-char string) at point."
-  (ed-edit m (fn (b) (insert b key))))
+  "Insert the typed character `key` (a 1-char string) at point — over the region when
+delete-selection is on (`insert-replacing`)."
+  (ed-edit m (fn (b) (insert-replacing m b key))))
 
 (defcommand cmd-close-delimiter
   (m key)
@@ -772,12 +797,24 @@ typing `)` gives you `(+ 1 2)|` rather than `(+ 1 2))`. The condition is about t
 FORM, not the next character, which is what keeps it from eating a delimiter you meant — at
 top level a stray `)` closes nothing and is typed, `[1 2|)` is a mismatch and is typed, and
 inside a string or a comment a bracket is a character and is typed. Bound on brood-keymap
-only: the scan reads Brood syntax (`;` comments, `\"` strings), which is not Ruby's."
+(every other mode has [[cmd-electric-close]], which steps over the closer at point): the scan
+reads Brood syntax (`;` comments, `\"` strings), which is not Ruby's."
   (let (b (ed-current-buf m))
     ;; Over the rope (brood ADR-488): the test reads the char at point first, and only when it
     ;; is this closer the top-level form up to point — never the whole buffer, which a
     ;; `buffer-text` copy and its char-index build cost (~4 ms per keystroke on a 2 MB file).
     (if (and b (editor/highlight/closer-redundant? (buffer-rope b) (buffer-point b) key))
+      (ed-apply m (fn (bb) (goto-char bb (inc (buffer-point bb)))))
+      (cmd-self-insert m key))))
+
+(defcommand cmd-electric-close
+  (m key)
+  "Type the closing bracket `key` — or, with electric-pair-mode on and that closer already at
+point, step over it: Emacs's `electric-pair-mode` skip, for every mode that has no reader of
+its own. A brood buffer binds `cmd-close-delimiter` instead, which also knows whether the
+closer belongs to the form you are in."
+  (let (b (ed-current-buf m))
+    (if (and b (electric-pair? m) (= (buffer-char-after b) key) (not (selection-to-replace? m b)))
       (ed-apply m (fn (bb) (goto-char bb (inc (buffer-point bb)))))
       (cmd-self-insert m key))))
 
@@ -829,8 +866,8 @@ by hand (`\"hello world|` + `\"` → `\"hello world\"`, not a new empty pair)."
 (point lands inside the opener). For a self-closing quote already at point, step over it
 (one `\"` closes the string rather than typing a second). Otherwise, with
 electric-pair-mode on, type the pair and land between — a quote only where one plausibly
-opens ([[self-pair-should-open?]]); else just the character. Bound to `(` `[` `{` `\"` on
-brood-keymap."
+opens ([[self-pair-should-open?]]); else just the character. Bound to `(` `[` `{` `\"` in
+every buffer (the global keymap; brood-keymap too)."
   (let (close (delim-close key)
         b (ed-current-buf m)
         self? (= key close))
@@ -847,9 +884,9 @@ brood-keymap."
 (defcommand cmd-electric-backspace
   (m key)
   "Backspace — and, with electric-pair-mode on and point between an empty pair (`(|)`),
-delete both delimiters. Bound to Backspace on brood-keymap; plain `cmd-delete-backward`
-everywhere else."
-  (if (electric-pair? m)
+delete both delimiters; with a region delete-selection replaces, the region. Bound to
+Backspace in every buffer (the global keymap)."
+  (if (and (electric-pair? m) (not (selection-to-replace? m (ed-current-buf m))))
     (ed-edit m
       (fn (b)
         (let (before (buffer-char-before b))
@@ -933,9 +970,9 @@ block, closing the gap. Yank it back with C-x r y."
         {:edit (ed-mb-edit "String rectangle: " "")
          :on-complete (fn (mm t) (ed-edit mm (fn (b) (string-rectangle b t))))})))
 
-(defcommand cmd-newline (m key) (ed-edit m (fn (b) (insert b "\n"))))
-(defcommand cmd-delete-char (m key) (ed-edit m delete-char))
-(defcommand cmd-delete-backward (m key) (ed-edit m delete-backward-char))
+(defcommand cmd-newline (m key) (ed-edit m (fn (b) (insert-replacing m b "\n"))))
+(defcommand cmd-delete-char (m key) (ed-edit m (deleting-selection m delete-char)))
+(defcommand cmd-delete-backward (m key) (ed-edit m (deleting-selection m delete-backward-char)))
 
 ;; ---- line / word editing (open-line, kill-line/word, transpose, case) -------
 
@@ -997,8 +1034,16 @@ after it (M-u / M-l / M-c)."
 ;; kill (into the kill ring)
 (defcommand cmd-kill-line
   (m key)
-  "Kill from point to end of line (C-k); at end of line, kill the newline."
-  (ed-kill-span m (if (= (buffer-char-after (ed-current-buf m)) "\n") forward-char end-of-line)))
+  "Kill from point to end of line (C-k); at end of line, kill the newline. With the init
+file's `:kill-whole-line` (Emacs's `kill-whole-line`), at the START of a line kill the line
+and its newline, so no empty line is left behind."
+  (let (b (ed-current-buf m))
+    (ed-kill-span m
+      (cond
+        (= (buffer-char-after b) "\n") forward-char
+        (and (= true (:kill-whole-line m)) (= (buffer-column b) 0))
+          (fn (bb) (forward-char (end-of-line bb)))
+        else end-of-line))))
 (defcommand cmd-sexp-kill
   (m key)
   "Structure-aware kill (paredit C-k): kill to end of line, but never past the
@@ -1423,9 +1468,11 @@ so it can't be applied with eval-buffer."
         warns (config/config-warnings cfg)
         m1 (config/apply-to-model m cfg)
         ;; the window-side keys too (:text-aa / :line-height), so a reload re-skins the window
-        _ (config/apply-window! cfg))
+        _ (config/apply-window! cfg)
+        theme-warning (themes/theme-from-config! cfg))
     (message m1
-      (if (empty? warns) "config reloaded" (str "config reloaded (" (first warns) ")")))))
+      (let (problem (or (first warns) theme-warning))
+        (if (nil? problem) "config reloaded" (str "config reloaded (" problem ")"))))))
 
 ;; ---- goto-line (M-g g) / recentf (C-x C-r) ----------------------------------
 
@@ -1536,16 +1583,72 @@ is already commented, else comment. The per-line edit folds over `map-region-lin
                      else (ed-comment-line b l tok)))))
     (goto-char edited (ed-indent-at edited sl))))
 
+;; A language with only BLOCK comments (CSS's `/* */`, HTML's `<!-- -->`, the mode's
+;; `:comment-block` pair) comments a line by wrapping what follows its indent in the pair,
+;; so each line stays a comment on its own and uncommenting one never strands the rest.
+
+(defn- ed-line-parts (buf l)
+  ;; `[bol indent body]`: where line `l` starts, its leading whitespace, and the rest with
+  ;; trailing whitespace dropped
+  (let (rope (buffer-rope buf)
+        bol (text/line->char rope l)
+        text (wrap/rope-line-text rope l)
+        indent (ed-rope-leading-ws rope bol))
+    [bol (string/substring text 0 indent) (string/trimr (string/substring text indent))]))
+
+(defn- ed-block-commented? (body open close)
+  (and (string/starts-with? body (string/trimr open)) (string/ends-with? body (string/triml close))))
+
+(defn- ed-block-strip (body open close)
+  ;; `body` without its pair — the spaced form when it has it, else the bare tokens
+  (let (start (if (string/starts-with? body open)
+                (string/length open)
+                (string/length (string/trimr open)))
+        end (- (string/length body)
+              (if (string/ends-with? body close)
+                (string/length close)
+                (string/length (string/triml close)))))
+    (string/substring body start (math/max start end))))
+
+(defn- ed-toggle-block-comment (buf pair)
+  "`ed-toggle-comment` for a block-comment `pair` (`[open close]`): every non-blank line in
+range wrapped in it, or — when each already is — unwrapped. Point at the first line's indent."
+  (let ([open close] pair
+        [sl el] (region-line-range buf)
+        nonblank (seq/reject (range sl (inc el)) (fn (l) (ed-line-blank? buf l)))
+        all-commented? (and (not (empty? nonblank))
+                         (every? nonblank
+                           (fn (l) (ed-block-commented? (nth (ed-line-parts buf l) 2) open close))))
+        edited (map-region-lines buf
+                 (fn (b l)
+                   (if (ed-line-blank? b l)
+                     b
+                     (let ([bol indent body] (ed-line-parts b l)
+                           eol (+ bol (string/length (wrap/rope-line-text (buffer-rope b) l))))
+                       (replace-region b
+                         bol
+                         eol
+                         (str indent
+                           (if all-commented?
+                             (ed-block-strip body open close)
+                             (str open body close)))))))))
+    (goto-char edited (ed-indent-at edited sl))))
+
 (defcommand cmd-comment-dwim
   (m key)
   "Comment or uncomment the region's lines (or the current line) — M-;. Toggles by
 whether every non-blank line in range is already commented. The comment token comes
-from the buffer mode's `:comment-syntax` service (brood-mode → `\";; \"`); a mode
-that defines none (plain text) reports that it can't comment."
-  (let (tok (ed-mode-service (ed-current-buf m) :comment-syntax))
-    (if (nil? tok)
-      (message m "no comment syntax for this mode")
-      (ed-edit m (fn (b) (ed-toggle-comment b tok))))))
+from the buffer mode's `:comment-syntax` service (brood-mode → `\";; \"`), or, for a language
+with only block comments, its `:comment-block` pair wrapped round each line
+(`ed-toggle-block-comment`); a mode that defines neither (plain text) reports that it can't
+comment."
+  (let (buf (ed-current-buf m)
+        tok (ed-mode-service buf :comment-syntax)
+        pair (ed-mode-service buf :comment-block))
+    (cond
+      tok (ed-edit m (fn (b) (ed-toggle-comment b tok)))
+      (and (vector? pair) (= (count pair) 2)) (ed-edit m (fn (b) (ed-toggle-block-comment b pair)))
+      else (message m "no comment syntax for this mode"))))
 
 ;; ---- incremental search (C-s / C-r) -----------------------------------------
 ;; Open the modal isearch loop; `input/ed-update` then routes keys to it (see
@@ -1844,8 +1947,10 @@ A read-only buffer says so and records no span."
   (let ([m text] (ed-kill-head m))
     (if (nil? text)
       (message m "kill ring is empty")
-      (let (start (buffer-point (ed-current-buf m))
-            [m2 yanked?] (ed-try-edit m (fn (b) (insert b text))))
+      (let (b (ed-current-buf m)
+            ;; over a region delete-selection replaces, the yank starts where the region did
+            start (if (selection-to-replace? m b) (first (buffer-region-bounds b)) (buffer-point b))
+            [m2 yanked?] (ed-try-edit m (fn (bb) (insert-replacing m bb text))))
         (if yanked?
           (assoc m2 :yank {:start start :end (buffer-point (ed-current-buf m2)) :index 0})
           m2)))))
@@ -2225,28 +2330,82 @@ code wrapped), or to scrolling when that was truncation too. The mode line says 
 
 ;; ---- buffer/file prompts (open a minibuffer; see input/minibuffer-handle) ---
 
+(defn- ed-buffer-prompt (m prompt names files on-done)
+  "The `C-x b` minibuffer (Emacs's consult-buffer): `names` (open buffers) then `files`
+(recent files not open), the highlighted one PREVIEWED in the selected pane while you move
+— a buffer shown as it is, the visit it would count as taken back — and `C-g` putting the
+pane and the recency back as they were. `on-done` gets the model and the accepted entry; a file entry opens with
+`ed-find-file`."
+  (let (layout (:layout m)
+        ;; a preview shows a buffer, and showing one counts as a visit (the recency post-step):
+        ;; the visits a preview made are taken back, so only the buffer you choose counts
+        recency (:buffer-mru m)
+        spec (ed-name-prompt prompt
+               (append names files)
+               (fn (mm-previewed entry)
+                 (let (mm (assoc mm-previewed :buffer-mru recency))
+                   (cond
+                     (ed-buffer-index-by-name mm entry) (on-done mm entry)
+                     (includes? files entry) (ed-find-file mm entry)
+                     else (on-done mm entry))))
+               20
+               names))
+    (assoc m
+      :minibuffer
+        (assoc spec
+          :on-preview
+            (fn (mm entry)
+              (let (index (ed-buffer-index-by-name mm entry))
+                (if (nil? index) mm (ed-show-index mm index))))
+          :on-abort (fn (mm) (assoc mm :layout layout :buffer-mru recency))))))
+
 (defcommand cmd-switch-buffer
   (m key)
   "Prompt for a buffer to switch to (C-x b), the Emacs way: the default — named in the
 prompt — is the buffer you were in BEFORE this one (`ed-other-buffer`), so `C-x b RET`
 flips back and forth between two buffers; the candidates are every open buffer but this
-one, most recently selected first (`ed-recent-buffers`); a typed name completes against
-them."
+one, most recently selected first (`ed-recent-buffers`), then the recent files not open
+(consult-buffer's recentf source) — the highlighted entry previewed as you move
+(`ed-buffer-prompt`)."
   (let (cur (buffer-name (ed-current-buf m))
         dflt (ed-other-buffer m)
         names (seq/reject (ed-recent-buffers m) (fn (n) (= n cur)))
+        ;; recent files only in the live editor (recentf is off in tests), and only the ones
+        ;; that are not open already
+        files (if (:recent-files m)
+                (map (seq/reject (projects/recent-files)
+                       (fn (file) (ed-buffer-index-by-file m file)))
+                  path/abbreviate)
+                [])
         prompt (if dflt (str "Switch to buffer (default " dflt "): ") "Switch to buffer: "))
-    (assoc m
-      :minibuffer
-        (ed-name-prompt prompt
-          names
-          (fn (mm t)
-            (let (target (if (string/blank? t) dflt t))
-              (if (nil? target)
-                (message mm "no other buffer")
-                (ed-switch-to-named mm target))))
-          20
-          names))))
+    (ed-buffer-prompt m
+      prompt
+      names
+      files
+      (fn (mm t)
+        (let (target (if (string/blank? t) dflt t))
+          (if (nil? target) (message mm "no other buffer") (ed-switch-to-named mm target)))))))
+
+(defcommand cmd-project-switch-buffer
+  (m key)
+  "Switch to a buffer of the current project (C-x p b, Emacs's project-switch-to-buffer):
+the open buffers whose files are under the project root, most recently selected first,
+previewed as you move."
+  (let (root (ed-project-root m)
+        cur (buffer-name (ed-current-buf m))
+        in-project? (fn (name)
+                      (let (index (ed-buffer-index-by-name m name)
+                            buf (when index (nth (:buffers m) index))
+                            file (when buf (buffer-file buf)))
+                        (and root file (string/starts-with? file (str root "/")))))
+        names (seq/filter (ed-recent-buffers m) (fn (n) (and (not (= n cur)) (in-project? n)))))
+    (if (nil? root)
+      (message m "not in a project")
+      (ed-buffer-prompt m
+        (str "Switch to buffer in " (path/basename root) ": ")
+        names
+        []
+        (fn (mm t) (if (string/blank? t) mm (ed-switch-to-named mm t)))))))
 
 ;; ---- C-x 4: the other-window prefix -----------------------------------------
 ;; Emacs's second-most-used prefix after C-x itself, and it was entirely absent. Every
@@ -3133,6 +3292,9 @@ outright). With unsaved changes to a file it asks first, buffer by buffer, the w
 primary takes every open frame with it. In a FRAME (`:frame?`) this is `delete-frame`: the
 frame closes, the editor and its buffers stay (Emacs closes an emacsclient frame the same
 way). ESC is *not* quit (it's `keyboard-escape-quit`; see `modes`)."
+  ;; save-place: every file's point, for the next session (live editor only; a secondary
+  ;; frame closing leaves the buffers open, so it has nothing to remember yet)
+  (when (and (:save-place m) (not (:frame? m))) (saveplace/remember-places! (:buffers m)))
   (if (:frame? m)
     (assoc m :done true)
     (ed-quit-ask m (ed-modified-file-indices m) false)))
@@ -3490,6 +3652,8 @@ text and the mark after it, so the inserted text is the region."
             (message mm (str "no such file: " t))
             (let (content (file/slurp t)
                   p (buffer-point (ed-current-buf mm)))
-              ;; `insert` leaves point after the text: mark there, point back at the start
-              (message (ed-edit mm (fn (b) (goto-char (set-mark (insert b content)) p)))
+              ;; point back at the start of the inserted text. Emacs leaves its (inactive) mark
+              ;; at the end; bedit has no inactive mark — a set one IS the region, and with
+              ;; delete-selection the next key typed would replace the whole file — so none
+              (message (ed-edit mm (fn (b) (goto-char (insert b content) p)))
                 (str "inserted " t))))))))

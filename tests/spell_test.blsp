@@ -1,0 +1,246 @@
+;; Spell checking (src/spell.blsp): which words are worth checking, the ispell pipe
+;; protocol's answers, which buffers (and which parts of them) are checked, the annotation
+;; the view paints from, the idle job's staleness and fold, and M-$'s target + replacement.
+;; Everything but the last describe runs without a checker installed: a stand-in lookup
+;; judges the words. The last one talks to the machine's real enchant-2 / aspell, or skips.
+(defmodule spell-test
+  (:use spell)
+  (:use brood-mode :only [brood-mode-layer]) ; loaded so a .blsp buffer is typed as code
+  (:use model)
+  (:use editor/buffer)
+  (:use test))
+
+;; A stand-in checker: every word in `wrong` is misspelled (suggesting its reverse), every
+;; other word is fine.
+(defn- st-lookup (wrong)
+  (fn (words)
+    (into {}
+      (map words
+        (fn (w) [w (if (contains? wrong w) [(string/list-> (reverse (string/->list w)))] :ok)])))))
+
+(defn- st-file-model (text name)
+  (ed-init (make-buffer text name (str "/tmp/" name))))
+
+(defn- st-checked (text point errors)
+  (let (m (st-file-model text "n.txt")
+        b (goto-char (ed-current-buf m) point))
+    (ed-set-buf m (annotate b :spell {:top 0 :rows 5 :errors errors}))))
+
+(describe "what is a word worth checking"
+  (test "letters have case; digits and punctuation do not"
+    (is (spell-letter? "a"))
+    (is (spell-letter? "É"))
+    (is (not (spell-letter? "7")))
+    (is (not (spell-letter? "_"))))
+  (test "identifiers, acronyms and single letters are skipped"
+    (is (spell-word? "hello"))
+    (is (spell-word? "Hello"))
+    (is (spell-word? "don't"))
+    (is (not (spell-word? "camelCase")))
+    (is (not (spell-word? "HTTP")))
+    (is (not (spell-word? "snake_case")))
+    (is (not (spell-word? "utf8")))
+    (is (not (spell-word? "a"))))
+  (test "URLs, paths, e-mail addresses, dotted names and inline code are not prose"
+    (is (spell-chunk-skip? "https://example.org/teh"))
+    (is (spell-chunk-skip? "~/src/teh.txt"))
+    (is (spell-chunk-skip? "someone@example.org"))
+    (is (spell-chunk-skip? "file.txt"))
+    (is (spell-chunk-skip? "`tehx`"))
+    (is (not (spell-chunk-skip? "end.")))
+    (is (not (spell-chunk-skip? "(word),"))))
+  (test "a line's words, with their columns"
+    (assert= (spell-line-words "see https://x.org teh fooBar" nil) '([0 3 "see"] [18 21 "teh"]))
+    (assert= (spell-line-words "'quoted' x_y don't 42nd" nil) '([1 7 "quoted"] [13 18 "don't"]))
+    (assert= (spell-line-words "" nil) '()))
+  (test "a code line's words lie inside the allowed ranges"
+    (assert= (spell-line-words "(def tehx 1) ; teh wrold" [[13 24]])
+      '([15 18 "teh"] [19 24 "wrold"]))
+    (assert= (spell-line-words "(def tehx 1)" []) '()))
+  (test "a typographic apostrophe is asked about as the ASCII one"
+    (assert= (spell-lookup-key "don’t") "don't")))
+
+(describe "the ispell pipe protocol"
+  (test "result lines become verdicts"
+    (assert= (spell-parse-line "*") :ok)
+    (assert= (spell-parse-line "+ HELLO") :ok)
+    (assert= (spell-parse-line "& wrold 3 1: world, wold, would") ["world" "wold" "would"])
+    (assert= (spell-parse-line "? wrold 1 1: world") ["world"])
+    (assert= (spell-parse-line "# xyzzy 1") [])
+    (assert= (spell-parse-line "@(#) International Ispell") nil))
+  (test "answers are grouped by their blank line; the banner and an unfinished one are not"
+    (assert= (spell-response-groups "@(#) banner\n*\n\n& teh 1 0: the\n\n")
+      '(("*") ("& teh 1 0: the")))
+    (assert= (spell-response-groups "*\n\n& teh 1 0: the\n") '(("*")))
+    (assert= (spell-response-groups "") '()))
+  (test "a group's verdict is its first misspelling, else ok"
+    (assert= (spell-group-verdict '("*")) :ok)
+    (assert= (spell-group-verdict '("*" "& teh 1 0: the")) ["the"])
+    (assert= (spell-group-verdict '()) :ok))
+  (test "dictionary listings and the backend's arguments"
+    (assert= (spell-parse-dictionaries "en (aspell)\nen_GB (hunspell)\nen (myspell)\n\n")
+      ["en" "en_GB"])
+    (assert= (spell-backend-argv {:kind :enchant} nil) ["-a"])
+    (assert= (spell-backend-argv {:kind :enchant} "en_GB") ["-a" "-d" "en_GB"])
+    (assert= (spell-backend-argv {:kind :aspell} "de") ["-a" "--lang=de"])))
+
+(describe "which buffers, and which parts of them"
+  (test "prose, code and nothing"
+    (is (= (spell-scope (ed-current-buf (st-file-model "hello" "notes.txt"))) :prose))
+    (is (= (spell-scope (ed-current-buf (st-file-model "hello" "notes.md"))) :prose))
+    (is (= (spell-scope (ed-current-buf (st-file-model "(def a 1)" "code.blsp"))) :code))
+    (is (nil? (spell-scope (set-read-only (make-buffer "hello" "notes.txt" "/tmp/notes.txt") true))))
+    (is (nil? (spell-scope (make-buffer "a log line" "*Messages*")))))
+  (test "a code line's comment and string spans, clipped to the line"
+    (assert= (spell-allowed-ranges [[0 4 :syntax/comment] [5 9 :k]] #{:syntax/comment} 2 9)
+      '([0 2]))
+    (assert= (spell-allowed-ranges [[10 20 :syntax/string]] #{:syntax/string} 0 9) '()))
+  (test "the prose faces are matched by name and by their resolved attributes"
+    (is (contains? (spell-text-faces) :syntax/comment))
+    (is (contains? (spell-text-faces) (editor/face/face :syntax/string)))))
+
+(describe "checking a viewport"
+  (test "prose: every misspelled word, by line and column"
+    (let (b (make-buffer "hello wrold\nteh end\nfine" "n.txt" "/tmp/n.txt")
+          v (spell-check-viewport b
+              {:top 0 :rows 10 :language nil}
+              :prose nil
+              (st-lookup #{"wrold" "teh"})))
+      (assert= (:errors v) {0 [[6 11 "wrold"]] 1 [[0 3 "teh"]]})
+      (assert= (:top v) 0)))
+  (test "only the lines in view are checked"
+    (let (b (make-buffer "wrold\nwrold\nwrold" "n.txt" "/tmp/n.txt")
+          v (spell-check-viewport b
+              {:top 1 :rows 1 :language nil}
+              :prose nil
+              (st-lookup #{"wrold"})))
+      (assert= (:errors v) {1 [[0 5 "wrold"]]})))
+  (test "code: only words inside comment / string / doc spans"
+    (let (src "(def tehx \"a wrold\") ; teh note"
+          b (make-buffer src "c.blsp" "/tmp/c.blsp")
+          spans (into [] (editor/highlight/highlight-spans src))
+          v (spell-check-viewport b
+              {:top 0 :rows 5 :language nil}
+              :code spans
+              (st-lookup #{"wrold" "teh" "def"})))
+      (assert= (:errors v) {0 [[13 18 "wrold"] [23 26 "teh"]]})))
+  (test "code without spans checks nothing"
+    (let (b (make-buffer "; teh" "c.blsp" "/tmp/c.blsp"))
+      (assert= (:errors (spell-check-viewport b {:top 0 :rows 5} :code nil (st-lookup #{"teh"})))
+        {}))))
+
+(describe "painting from the annotation"
+  (test "ranges for the words still where they were found"
+    (let (b (make-buffer "hello wrold\nteh" "n.txt" "/tmp/n.txt")
+          a (annotate b
+              :spell {:top 0 :rows 5 :language nil :errors {0 [[6 11 "wrold"]] 1 [[0 3 "teh"]]}}))
+      (assert= (spell-errors a) '([6 11 "wrold"] [12 15 "teh"]))
+      (assert= (map (spell-ranges a) (fn (r) [(first r) (second r)])) '([6 11] [12 15]))))
+  (test "a word edited since the check is no longer underlined"
+    (let (b (make-buffer "hello wrold" "n.txt" "/tmp/n.txt")
+          a (annotate b :spell {:top 0 :rows 5 :errors {0 [[6 11 "wrold"]]}})
+          edited (insert (goto-char a 7) "x"))
+      (assert= (spell-errors edited) '())))
+  (test "an unchecked buffer paints nothing"
+    (assert= (spell-ranges (make-buffer "teh")) '())))
+
+(describe "the idle job"
+  (test "off unless the model says so — no checker is spawned in a test"
+    (is (not (ed-spell-stale? (st-file-model "teh" "n.txt")))))
+  (test "on, an unchecked prose buffer is due, a checked one is not, an edit re-arms it"
+    (let (m (assoc (st-file-model "teh" "n.txt") :spell-check? true))
+      (if (nil? (spell-backend))
+        (is (not (ed-spell-stale? m)))
+        (let (b (ed-current-buf m)
+              checked (ed-set-buf m (annotate b :spell (assoc (spell-view m) :errors {})))
+              edited (ed-set-buf checked (insert (ed-current-buf checked) "x"))
+              scrolled-language (assoc checked :spell-language "de"))
+          (is (ed-spell-stale? m))
+          (is (not (ed-spell-stale? checked)))
+          (is (ed-spell-stale? edited))
+          (is (ed-spell-stale? scrolled-language))))))
+  (test "a read-only buffer is never due"
+    (let (m (assoc (ed-init (set-read-only (make-buffer "teh" "n.txt" "/tmp/n.txt") true))
+              :spell-check? true))
+      (is (not (ed-spell-stale? m)))))
+  (test "a result folds onto the buffer whose text it checked"
+    (let (m (assoc (st-file-model "teh" "n.txt") :spell-proc :handle)
+          rope (buffer-rope (ed-current-buf m))
+          folded (ed-apply-spell m
+                   {:rope rope :value {:top 0 :rows 5 :language nil :errors {0 [[0 3 "teh"]]}}}))
+      (is (nil? (:spell-proc folded)))
+      (assert= (spell-errors (ed-current-buf folded)) '([0 3 "teh"]))))
+  (test "a result for text since edited, or a failed check, is dropped"
+    (let (m (assoc (st-file-model "teh" "n.txt") :spell-proc :handle)
+          folded (ed-apply-spell m
+                   {:rope (buffer-rope (make-buffer "other")) :value {:errors {0 [[0 3 "teh"]]}}}))
+      (assert= (spell-errors (ed-current-buf folded)) '())
+      (is (nil? (:spell-proc (ed-apply-spell m '())))))))
+
+(describe "M-$: the word to correct, and correcting it"
+  (test "the underlined word point is in, else the nearest before it, else the word at point"
+    (let (errors {0 [[0 3 "teh"] [8 13 "wrold"]]})
+      (assert= (spell-target (ed-current-buf (st-checked "teh big wrold here" 9 errors)))
+        [8 13 "wrold"])
+      (assert= (spell-target (ed-current-buf (st-checked "teh big wrold here" 16 errors)))
+        [8 13 "wrold"])
+      (assert= (spell-target (ed-current-buf (st-checked "teh big wrold here" 5 errors)))
+        [0 3 "teh"])
+      (assert= (spell-target (ed-current-buf (st-checked "fine words" 6 {}))) [5 10 "words"])))
+  (test "choosing a suggestion replaces the word and keeps point by the text around it"
+    (let (m (st-checked "teh big wrold here" 16 {0 [[8 13 "wrold"]]})
+          m2 (spell-choose m [8 13 "wrold"] "world"))
+      (assert= (buffer-text (ed-current-buf m2)) "teh big world here")
+      (assert= (buffer-point (ed-current-buf m2)) 16)))
+  (test "a word changed since is not replaced"
+    (let (m (st-checked "teh big wrold here" 0 {})
+          m2 (spell-choose m [8 13 "wrxld"] "world"))
+      (assert= (buffer-text (ed-current-buf m2)) "teh big wrold here")))
+  (test "the dictionary entries are labelled with the word"
+    (is (includes? (spell-save-label "wrold") "wrold"))
+    (is (not (= (spell-save-label "wrold") (spell-session-label "wrold")))))
+  (test "an empty choice does nothing"
+    (let (m (st-checked "teh" 0 {}))
+      (assert= (buffer-text (ed-current-buf (spell-choose m [0 3 "teh"] ""))) "teh"))))
+
+(describe "the real checker"
+  :isolated (test "enchant-2 / aspell judge words through the server, and the cache answers again"
+    (if (nil? (spell-backend))
+      (io/puts "  (skipped: neither enchant-2 nor aspell is installed)")
+      (let (answer (spell-lookup nil ["hello" "wrold" "hello"])
+            again (spell-lookup nil ["wrold"]))
+        (assert= (get answer "hello") :ok)
+        (is (vector? (get answer "wrold")))
+        (is (includes? (get answer "wrold") "world"))
+        (assert= (get again "wrold") (get answer "wrold"))
+        (send :spell [:stop])))))
+
+(describe "the idle job end to end"
+  :isolated (test "a code buffer's comment is checked from the selected pane's span band; its code is not"
+    (if (nil? (spell-backend))
+      (io/puts "  (skipped: neither enchant-2 nor aspell is installed)")
+      (let (src "; teh comment\n(def tehx 1)"
+            m (assoc (st-file-model src "c.blsp") :spell-check? true)
+            ;; the band `panes/ed-refresh-spans` keeps, under the selected pane's path
+            band {:spans (into [] (editor/highlight/highlight-spans src))}
+            m (assoc m :span-cache {(editor/pane/pane-selected-path (:layout m)) band})
+            checked (ed-launch-spell m))
+        (assert= (spell-errors (ed-current-buf checked)) '([2 5 "teh"]))
+        (is (not (ed-spell-stale? checked)))
+        (send :spell [:stop])))))
+
+(describe "what is not prose, even in a prose buffer"
+  (test "every word of an inline code span is skipped, spaces and all"
+    (assert= (map (spell/spell-line-words "run `git rebase -i` then teh rest" nil)
+               (fn (w) (nth w 2)))
+      (list "run" "then" "teh" "rest")))
+  (test "a Markdown fence and an Org source block are code, fence lines included"
+    (let (rope (text/from-string (string/join ["prose"
+                                                "```elixir" "defmodule Foo" "```" "more prose"
+                                                "#+BEGIN_SRC sh" "ls -la" "#+END_SRC" "end"]
+                                   "\n")))
+      (assert= (spell/spell-code-lines rope 0 9) #{1 2 3 5 6 7})
+      ;; asked for a window part-way down, the state above it still counts
+      (assert= (spell/spell-code-lines rope 2 5) #{2 3})))
+  (test "a file no mode claims is not spell checked"
+    (is (nil? (spell/spell-scope (make-buffer "some log line" "out.log" "/tmp/out.log"))))))

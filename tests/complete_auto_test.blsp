@@ -1,0 +1,251 @@
+;; The Corfu + cape behaviour of completion-at-point (src/complete-at-point.blsp, src/cape.blsp):
+;; the popup that opens on its own after a pause in typing, the documentation panel beside it,
+;; words from the other open buffers, and paths completed against the disk.
+
+(defmodule complete-auto-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use complete-at-point)
+  (:use cape))
+
+(defn- typed-model (text &optional (name "x.blsp") (file nil))
+  "A model whose point is at the end of `text`, auto popup on, just after typing — the
+post-step a keystroke ends in has noted the spot it typed at (`close-stale-popup`)."
+  (close-stale-popup (assoc (ed-init (goto-char (make-buffer text name (or file name))
+                                       (string/length text)))
+                       :completion-auto true
+                       :this-command :self-insert
+                       :command-count 1)))
+
+(defn- text-of (m) (buffer-text (ed-current-buf m)))
+
+(defn- auto-popup (text)
+  "The model after the auto timer fired on `text`."
+  (completion-auto-open (typed-model text)))
+
+(defn- ops-text (ops)
+  "Every string the render ops paint, joined — enough to ask whether something is on screen."
+  (string/join (seq/keep ops (fn (op) (when (= (first op) :text) (nth op 3)))) "|"))
+
+(describe "the auto popup opens on its own after a pause (corfu-auto)"
+  (test "off unless the model says so — a model without the setting arms nothing"
+    (let (m (dissoc (typed-model "(def alpha-one 1) al") :completion-auto))
+      (is (nil? (completion-auto-timer m)))
+      (is (nil? (map/get-in (ed-sync-timers m) [:timers :completion-auto])))))
+
+  (test "after typing, an idle one-shot at the configured delay is armed"
+    (let (m (typed-model "(def alpha-one 1) al"))
+      (assert= (completion-auto-timer m) {:after 200 :idle? true})
+      (assert= (completion-auto-timer (assoc m :completion-auto-delay 350))
+        {:after 350 :idle? true})
+      ;; through the model's own reconciliation: the timer client is registered
+      (assert= (map/get-in (ed-sync-timers m) [:timers :completion-auto]) {:after 200 :idle? true})))
+
+  (test "moving point is not asking for completion"
+    (is (nil? (completion-auto-timer (assoc (typed-model "(def alpha-one 1) al")
+                                       :this-command 'commands/cmd-forward-char)))))
+
+  (test "two word characters open it, with nothing selected"
+    (let (m (auto-popup "(def alpha-one 1) (def alpha-two 2) al"))
+      (assert= (:items (:completion m)) (list "alpha-one" "alpha-two"))
+      (assert= (:index (:completion m)) -1)
+      (is (:auto (:completion m)))
+      ;; the text is untouched: an uninvited popup never edits
+      (assert= (text-of m) "(def alpha-one 1) (def alpha-two 2) al")))
+
+  (test "one word character does not, and the spot is not looked at again until you type"
+    (let (m (auto-popup "(def alpha-one 1) a"))
+      (is (nil? (:completion m)))
+      (is (nil? (completion-auto-timer m)))))
+
+  (test "the prefix length is a setting"
+    (let (m (completion-auto-open (assoc (typed-model "(def alpha-one 1) alp")
+                                    :completion-auto-prefix 4)))
+      (is (nil? (:completion m)))))
+
+  (test "a read-only buffer gets none"
+    (let (m (typed-model "(def alpha-one 1) al")
+          ro (ed-set-buf m (set-read-only (ed-current-buf m) true)))
+      (is (nil? (:completion (completion-auto-open ro))))))
+
+  (test "once open, the timer is quiet"
+    (is (nil? (completion-auto-timer (auto-popup "(def alpha-one 1) (def alpha-two 2) al")))))
+
+  (test "the inline preview stands down while the auto popup is on"
+    (let (m (complete-index-refresh (typed-model "alpha alphabet alp" "notes.txt")))
+      (is (nil? (completion-preview m)))
+      (is (not (nil? (completion-preview (dissoc m :completion-auto))))))))
+
+(describe "keys in an auto popup (corfu-preselect 'prompt, corfu-cycle)"
+  (test "RET is not the popup's while nothing is selected — it stays a newline"
+    (let (m (auto-popup "(def alpha-one 1) (def alpha-two 2) al"))
+      (is (not (complete-owns? m :enter)))
+      (is (complete-owns? m :tab))
+      (is (complete-owns? m :ctrl-n))))
+
+  (test "after C-n selects, RET takes the candidate"
+    (let (m (complete-handle (auto-popup "(def alpha-one 1) (def alpha-two 2) al") :ctrl-n))
+      (assert= (:index (:completion m)) 0)
+      (is (complete-owns? m :enter))
+      (assert= (text-of (complete-handle m :enter)) "(def alpha-one 1) (def alpha-two 2) alpha-one")))
+
+  (test "a popup you asked for with Tab still owns RET"
+    (let (m (cmd-complete (typed-model "(def alpha-one 1) (def alpha-two 2) alpha-") :tab))
+      (assert= (:index (:completion m)) 0)
+      (is (complete-owns? m :enter))))
+
+  (test "C-p from nothing selects the last; C-n past the last wraps to the first"
+    (let (m (auto-popup "(def alpha-one 1) (def alpha-two 2) al")
+          up (complete-handle m :ctrl-p))
+      (assert= (:index (:completion up)) 1)
+      (assert= (:index (:completion (complete-handle up :ctrl-n))) 0)))
+
+  (test "Tab with nothing selected takes the first"
+    (assert= (text-of (complete-handle (auto-popup "(def alpha-one 1) (def alpha-two 2) al") :tab))
+      "(def alpha-one 1) (def alpha-two 2) alpha-one"))
+
+  (test "typing narrows and the popup stays unselected"
+    (let (m (complete-handle (auto-popup "(def alpha-one 1) (def alpha-two 2) (def beta 3) al") "p"))
+      (assert= (:items (:completion m)) (list "alpha-one" "alpha-two"))
+      (assert= (:index (:completion m)) -1)
+      (is (:auto (:completion m)))))
+
+  (test "C-g closes it and it does not come straight back"
+    (let (m (complete-handle (auto-popup "(def alpha-one 1) (def alpha-two 2) al") :ctrl-g))
+      (is (nil? (:completion m)))
+      (is (nil? (completion-auto-timer m)))))
+
+  (test "an accepted word is not offered completions until you type again"
+    (let (m (complete-handle (auto-popup "(def alpha-one 1) (def alpha-one-more 2) al") :tab))
+      (is (nil? (completion-auto-timer m))))))
+
+(describe "the info panel beside the popup (corfu-popupinfo)"
+  (test "nothing selected, nothing to document"
+    (is (nil? (completion-info-timer (auto-popup "(def alpha-one 1) (def alpha-two 2) al")))))
+
+  (test "a selected candidate arms the panel's delay; once shown, the next follows sooner"
+    (let (m (complete-handle (auto-popup "(string/starts-wi") :ctrl-n))
+      (assert= (completion-info-timer m) {:after 500 :idle? true})
+      (let (loaded (completion-info-load m))
+        (is (nil? (completion-info-timer loaded)))
+        (assert= (map/get-in loaded [:completion :info :candidate]) "string/starts-with?"))))
+
+  (test "brood-mode's doc service documents a candidate: arglist first, then the docstring"
+    (let (lines (completion-doc-lines (typed-model "x") "string/starts-with?"))
+      (is (string/starts-with? (first lines) "(string/starts-with?"))
+      (is (> (count lines) 2))))
+
+  (test "a source's own documentation wins (a language server's item docs)"
+    (let (m (map/assoc-in (typed-model "x")
+              [:completion :docs]
+              {"frob" {:kind "markdown" :value "Frobs it.\n"}}))
+      (assert= (completion-doc-lines m "frob") (list "Frobs it."))))
+
+  (test "the panel paints beside the popup, and only for the selected candidate"
+    (let (m (completion-info-load (complete-handle (auto-popup "(string/starts-wi") :ctrl-n))
+          shown (ops-text (complete-popup-ops m 120 30)))
+      (is (includes? shown "(string/starts-with?"))
+      ;; a panel about some other row is never painted
+      (is (not (includes? (ops-text (complete-popup-ops (map/assoc-in m
+                                                          [:completion :info :candidate]
+                                                          "other")
+                                      120 30))
+                 "(string/starts-with? s")))))
+
+  (test "turned off, it arms nothing"
+    (is (nil? (completion-info-timer (assoc (complete-handle (auto-popup "(string/starts-wi")
+                                              :ctrl-n)
+                                       :completion-popupinfo false))))))
+
+(describe "cape-dabbrev: words from the other open buffers"
+  (defn- with-other (m text)
+    (assoc m :buffers (conj (:buffers m) (make-buffer text "other.txt"))))
+
+  (test "another buffer's words complete, after this buffer's own"
+    (let (m (with-other (typed-model "zebra-local zeb" "notes.txt") "zebra-elsewhere zebu")
+          found (completion-auto-open m))
+      (assert= (:items (:completion found)) (list "zebra-local" "zebra-elsewhere" "zebu"))))
+
+  (test "a word both have is offered once, in this buffer's place"
+    (let (m (with-other (typed-model "zebra zeb" "notes.txt") "zebra zebu"))
+      (assert= (:items (:completion (completion-auto-open m))) (list "zebra" "zebu"))))
+
+  (test "the current buffer is never read as an other buffer"
+    (let (m (typed-model "zebra zeb" "notes.txt"))
+      (is (not (includes? (cape-dabbrev-buffers m) 0)))))
+
+  (test "a buffer past the size cap is skipped"
+    (let (m (with-other (typed-model "zeb" "notes.txt") "zebu"))
+      ;; index 2 is `other.txt`, 4 characters; *Messages* (1) is empty and stays
+      (is (includes? (cape-dabbrev-buffers m) 2))
+      (binding (*cape-dabbrev-max-chars* 2) (assert= (cape-dabbrev-buffers m) (list 1))))))
+
+(describe "cape-file: paths complete against the disk"
+  (defn- tree ()
+    (let (dir (temp-dir "bedit-cape-"))
+      (file/mkdir (path/join dir "src"))
+      (file/spit (path/join dir "src" "main.blsp") "")
+      (file/spit (path/join dir "src" "model.blsp") "")
+      (file/spit (path/join dir "README.md") "")
+      (file/spit (path/join dir ".hidden") "")
+      dir))
+
+  (test "what looks like a path"
+    (assert= (cape-path-token "(load \"./src/ma") "./src/ma")
+    (assert= (cape-path-token "see ~/") "~/")
+    (assert= (cape-path-token "cd ../x") "../x")
+    (assert= (cape-path-token "open /us") "/us")
+    (is (nil? (cape-path-token "(/ 1 2")))
+    (is (nil? (cape-path-token "(/")))
+    (is (nil? (cape-path-token "math/floor")))
+    (is (nil? (cape-path-token "https://x"))))
+
+  (test "a directory's entries, directories with a trailing slash, hidden ones only when asked"
+    (let (dir (tree))
+      (assert= (cape-file-candidates "./" dir) (list "./README.md" "./src/"))
+      (assert= (cape-file-candidates "./.h" dir) (list "./.hidden"))
+      (assert= (cape-file-candidates "./src/m" dir) (list "./src/main.blsp" "./src/model.blsp"))
+      (assert= (cape-file-candidates "./nowhere/" dir) '())))
+
+  (test "the path wins the region over the mode's idea of the word"
+    (let (dir (tree)
+          m (typed-model "(load \"./sr" "x.blsp" (path/join dir "x.blsp"))
+          popup (completion-auto-open m))
+      ;; `./sr` is two characters short of nothing: the path trigger opens it anyway
+      (assert= (:items (:completion popup)) (list "./src/"))
+      (assert= (:prefix (:completion popup)) "./sr")))
+
+  (test "Tab inserts a path whole, not to its next `.` or `/`"
+    (let (dir (tree)
+          m (typed-model "see ./src/mai" "notes.txt" (path/join dir "notes.txt")))
+      (assert= (text-of (cmd-complete m :tab)) "see ./src/main.blsp")))
+
+  (test "accepting a directory continues inside it"
+    (let (dir (tree)
+          m (completion-auto-open (typed-model "see ./s" "notes.txt" (path/join dir "notes.txt")))
+          inside (complete-handle m :tab))
+      (assert= (text-of inside) "see ./src/")
+      (assert= (:items (:completion inside)) (list "./src/main.blsp" "./src/model.blsp")))))
+
+(describe "the auto popup follows typing, through real events"
+  (defn- keys (m pressed) (fold pressed m (fn (acc key) (input/ed-update acc key 80 24))))
+  (defn- auto-model (text)
+    ;; `text` in the buffer, point at its end, auto popup on
+    (let (m (ed-init (make-buffer text "x.blsp" "x.blsp")))
+      (assoc (ed-set-buf m (goto-char (ed-current-buf m) (string/length text)))
+        :completion-auto true)))
+  (test "a click after typing does not open it where the click landed"
+    (let (typed (keys (auto-model "(def alpha-one 1)\n(def alpha-two 2)\n") ["a" "l"])
+          clicked (input/ed-update typed [:mouse :press :left 0 9] 80 24))
+      (is (not (nil? (completion-auto-timer typed))))
+      (is (nil? (completion-auto-timer clicked)))))
+  (test "a letter typed into an open popup is ordinary typing, and the popup narrows"
+    (let (typed (keys (auto-model "(def alpha-one 1)\n(def alpha-two 2)\n(def beta 3)\n") ["a" "l"])
+          opened (completion-auto-open typed)
+          narrowed (keys opened ["p" "h" "a" "-" "t"]))
+      (is (not (nil? (:completion opened))))
+      (assert= (:items (:completion narrowed)) (list "alpha-two"))
+      ;; the letters went through self-insert: one undo step takes the whole word back
+      (assert= (buffer-text (ed-current-buf (keys narrowed [:ctrl-g :ctrl-/])))
+        "(def alpha-one 1)\n(def alpha-two 2)\n(def beta 3)\n"))))

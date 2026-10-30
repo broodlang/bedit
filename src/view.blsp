@@ -362,7 +362,7 @@ scrollback) — the two as `ed-span-sources`, never joined."
   (let (history (:history-spans buf))
     (if (or (nil? history) (empty? history)) spans (ed-span-sources [history spans]))))
 
-(def ed-face-diagnostic {:underline true}) ; merged onto the token's syntax face
+(def ed-face-diagnostic {:underline {:style :wave}}) ; merged onto the token's syntax face: a wave, as flymake draws one (brood ADR-513)
 (defn- ed-word-end (text i)
   (if (and (< i (string/length text)) (complete-word-char? (string/char-at text i)))
     (ed-word-end text (inc i))
@@ -621,13 +621,18 @@ one plain `text` op when `plain?`, else the tiled `[substring face]` chunks of t
 row's LAST cells and the truncation face — so the marks of a column of truncated lines line
 up at the pane's edge, as Emacs's fringe `$` does. `ops` as they were for a row that shows
 its whole line (nil or `\"\"`: a line that scrolls is clipped by the edge, unmarked)."
-  (if (or (nil? ellipsis) (= ellipsis ""))
-    ops
-    (append ops
-      (list (text row
-              (+ x (math/max 0 (- w (string/display-width ellipsis))))
-              ellipsis
-              face-truncation)))))
+  (cond
+    (or (nil? ellipsis) (= ellipsis "")) ops
+    ;; a wrapped row's continuation mark sits OUTSIDE the text, in the scrollbar column every
+    ;; pane keeps, as Emacs's arrow sits in the fringe: the row keeps its whole width
+    (= ellipsis wrap/continuation-mark)
+      (append ops (list (text row (+ x w) ellipsis face-truncation)))
+    else
+      (append ops
+        (list (text row
+                (+ x (math/max 0 (- w (string/display-width ellipsis))))
+                ellipsis
+                face-truncation)))))
 
 (sig ed-slice-ops (buffer int int int int any any any int (or nil int) -> any))
 (defn ed-slice-ops (buf line row x w hl-ranges spans overrides from to)
@@ -802,7 +807,15 @@ deps (`ed-visible-lines`) are read back rather than rebuilt; a wrapped pane's ro
                 clip (nth row 4 nil))
             (if (nil? inlay)
               (let ([vis from-col base] (ed-row-slice rope line from (if clip (first clip) to) w)
-                    ellipsis (when clip (second clip))
+                    ;; a wrapped row its line goes on past ends in the continuation mark,
+                    ;; painted just past the text (`ed-with-ellipsis`: the scrollbar column)
+                    ellipsis (cond
+                               clip (second clip)
+                               (and (not (nil? rows))
+                                 (not (nil? to))
+                                 (< (+ (text/line->char rope line) to) (ed-line-end rope line)))
+                                 wrap/continuation-mark
+                               else nil)
                     line-spans (get by-line line)
                     ;; the spans CLIPPED to the text the row shows: a docstring's one span
                     ;; runs over many lines and lengthens with every character typed in it,
@@ -1106,7 +1119,8 @@ describe, so their click must land there."
 the pointer's hit-tests read. A mouse move asks for the layout three times over — the bar's
 hover, the diagnostic hover, the link hover — and nothing about a move changes the pane
 tree, so each of those reads back the one already laid out."
-  (ed-pointer-layout-at (:layout m) [0 0 cols (- rows (ed-echo-rows m rows))]))
+  (ed-header-layout (ed-pointer-layout-at (:layout m) [0 0 cols (- rows (ed-echo-rows m rows))])
+    (:header-line m)))
 
 ;; check-allow: a hit comes back out of the memo's store, which the checker reads as
 ;; unknown; the store only ever holds what `pane-layout` built.
@@ -1253,29 +1267,52 @@ predicate (`panes/ed-scrollbar-hit?`)."
 
 (defn- ed-row-cells (cells rows top &optional (top-continued false))
   "The gutter `cells` (one per buffer line from `top`) re-keyed per ROW of a wrapped
-pane's table: a line's first row gets its cell, a continuation row an empty one (no
-number, as Emacs shows none on a continuation line). `cells` itself when `rows` is nil.
+pane's table: a line's first row gets its cell, a continuation row no number (as Emacs
+shows none on a continuation line) but the `wrap/continued-mark` (`ed-continued-cell`). `cells` itself when `rows` is nil.
 With `top-continued` the pane starts part-way through line `top`'s text, so its first rows
-continue that line and get none either."
+continue that line and get the mark too."
   (if (or (nil? rows) (nil? cells))
     cells
     ;; a line's FIRST text row is the one after a row of another line (or an inlay): not
     ;; `from = 0`, since the line at point may be shown scrolled sideways
     ;; (`wrap/follow-point`) and is still the line its number names
-    (letrec (walk (fn (left previous acc)
-                    (if (empty? left)
-                      (into [] (reverse acc))
-                      (let (row (first left)
-                            line (first row)
-                            inlay (nth row 3 nil)
-                            first? (and (nil? inlay) (not (= line previous))))
-                        (walk (rest left)
-                          (if (nil? inlay) line previous)
-                          (cons (if (and first? (< (- line top) (count cells)))
-                                  (nth cells (- line top))
-                                  '())
-                            acc))))))
-      (walk (seq rows) (if top-continued top -1) '()))))
+    (let (continued (ed-continued-cell cells))
+      (letrec (walk (fn (left previous acc)
+                      (if (empty? left)
+                        (into [] (reverse acc))
+                        (let (row (first left)
+                              line (first row)
+                              inlay (nth row 3 nil)
+                              first? (and (nil? inlay) (not (= line previous))))
+                          (walk (rest left)
+                            (if (nil? inlay) line previous)
+                            (cons (cond
+                                    (not first?) (if (nil? inlay) continued '())
+                                    (< (- line top) (count cells)) (nth cells (- line top))
+                                    else '())
+                              acc))))))
+        (walk (seq rows) (if top-continued top -1) '())))))
+
+(defn- ed-continued-cell (cells)
+  "The gutter cell of a row that continues a wrapped line: no number, the
+`wrap/continued-mark` in the number's last column (Emacs's left fringe arrow) — as wide as
+the line-number cells in `cells`, so the text after it does not move. Empty when no cell
+has a width to match."
+  (let (sample (seq/find cells (fn (cell) (not (empty? cell))))
+        chunks (cond
+                 (nil? sample) '()
+                 (string? (first sample)) (list sample)
+                 else sample)
+        ;; a change bar `[:bar colour]` is one column (`ed-gutter-line-ops`), a text chunk its width
+        width (fold chunks
+                0
+                (fn (acc [text _]) (+ acc (if (string? text) (string/display-width text) 1)))))
+    (if (<= width gutter/line-number-right-margin)
+      '()
+      [(string/pad-right (string/pad-left wrap/continued-mark
+                           (- width gutter/line-number-right-margin))
+         width)
+        face-truncation])))
 
 ;; `gui?` is `(:gui m)` — absent (nil) in a terminal model, never `false` — so the
 ;; declaration admits nil: as a plain `bool` the runtime contract (ADR-380, on by default
@@ -1775,10 +1812,15 @@ selected buffer is plenty)."
     (ed-overrides-by-line rope overrides)))
 
 (defn- ed-pane-hl-ranges (m pane buf)
-  "The pane's highlight ranges in priority order: the region and overlays, other
-participants' selections tinted in their colour, and the hovered clickable row's
-underscore (a proper font underline)."
-  (append (ed-hl-ranges m buf (:selected pane))
+  "The pane's highlight ranges in priority order: whitespace made visible for a mode the
+init file's `:show-whitespace` names (`whitespace/ranges`, under everything), the region and
+overlays, other participants' selections tinted in their colour, and the hovered clickable
+row's underscore (a proper font underline)."
+  (append (if (= true (ed-mode-setting (:show-whitespace m) buf false))
+            (whitespace/ranges buf (ed-pane-top pane buf) (ed-pane-vrows pane buf))
+            '())
+    (if (= true (:spell-check? m)) (spell/spell-ranges buf) '())
+    (ed-hl-ranges m buf (:selected pane))
     (ed-remote-selection-ranges m pane)
     (ed-link-hover-range m pane buf)))
 
@@ -2038,11 +2080,47 @@ you type in this one."
         scroll-frac (if (nil? geometry) 0.0 (:scroll-frac geometry))
         layers (ed-pane-layers m pane buf geometry)
         scrollbar (ed-pane-scrollbar m pane buf geometry)
-        modeline (ed-pane-modeline m pane buf))
+        modeline (ed-pane-modeline m pane buf)
+        header (ed-pane-header pane buf)
+        pulse (ed-pane-pulse m pane geometry))
     ;; built as a list directly, not `append`ed: this runs per pane per frame
     (if (and (nil? (get (:payload pane) :zoom)) (<= scroll-frac 0.001))
-      (list (first layers) (second layers) scrollbar modeline)
-      (list (ed-pane-region-group pane scroll-frac layers) scrollbar modeline))))
+      (list (first layers) (second layers) pulse scrollbar modeline header)
+      (list (ed-pane-region-group pane scroll-frac layers) pulse scrollbar modeline header))))
+
+(defn- ed-avy-ops (m cols rows)
+  ;; avy's labels over the panes; `:avy` is only ever set by avy.blsp, so a frame never loads
+  ;; avy unless a jump is in progress
+  (if (:avy m) (avy/avy-ops m cols rows) []))
+
+(defn- ed-pane-pulse (m pane geometry)
+  "The pulse (`pulse/note-jump`) on the selected pane's line after a jump: a translucent band
+over the rows the line takes, as opaque as the pulse's fading `:level`. `()` with no pulse,
+for another buffer, in a zoomed pane (its rows are the region's), or in a terminal."
+  (let (pulse (:pulse m))
+    (if (or (nil? pulse)
+          (nil? geometry)
+          (not (:selected pane))
+          (not (:gui m))
+          (not (nil? (get (:payload pane) :zoom)))
+          (not (= (:buffer pulse) (:buffer (:payload pane)))))
+      '()
+      (map (ed-line-screen-rows geometry (:line pulse) (:text-height geometry))
+        (fn ([row _ _])
+          (frect (+ (:x geometry) 0.0)
+            (+ (:y geometry) row 0.0)
+            (+ (- (:width geometry) 1) 0.0)
+            1.0
+            pulse/face-pulse
+            (* 0.45 (:level pulse))))))))
+
+(defn- ed-pane-header (pane buf)
+  "The pane's header line (`headerline/header-ops`) in the row the layout gave it
+(`:header-row`), across the pane's width; `()` when it has none."
+  (let (row (:header-row pane))
+    (if (nil? row)
+      '()
+      (let ([x _ w _] (:rect pane)) (headerline/header-ops buf x row w)))))
 
 ;; ---- remote participant carets (collab presence) ----------------------------
 ;; On a shared buffer (`--serve --collab`), the model's `:hosted` slot carries every
@@ -2564,8 +2642,8 @@ A focused caret carries its blink (`cursor-blink`, brood ADR-469): the GUI windo
 its own clock for [[model/ed-blink-count]] cycles and restarts it on every key, click and
 caret move, so a blink costs no turn of the loop. The terminal and the web mirror ignore it."
   (if (:unfocused m)
-    (cursor row col :hollow *text*)
-    (cursor row col shape *text* (cursor-blink *blink-ms* (ed-blink-count m)))))
+    (cursor row col :hollow *cursor*)
+    (cursor row col shape *cursor* (cursor-blink *blink-ms* (ed-blink-count m)))))
 
 (defn ed-cursor (m panes cols rows)
   "Place the MINIBUFFER's caret: at its point (prompt + `:point`). A buffer pane's caret is
@@ -2737,7 +2815,7 @@ fills the body — identical to the old full-screen layout."
           ;; Copy/Cut/Paste menu, the hovered status-bar segment's tooltip, and the hovered
           ;; diagnostic's message over the squiggle or the margin mark
           (map [ed-mb-candidates-ops
-                 ed-which-key-ops complete-popup-ops ed-transient-ops ed-menu-ops
+                 ed-avy-ops ed-which-key-ops complete-popup-ops ed-transient-ops ed-menu-ops
                  ed-modeline-tooltip-ops ed-diag-tooltip-ops]
             (fn (overlay) (overlay m cols rows)))
           ;; The caret is drawn every frame and the window blinks it (`ed-caret`, brood

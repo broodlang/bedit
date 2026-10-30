@@ -1,0 +1,782 @@
+(defmodule spell
+  "Spell checking the way Emacs's jinx does it: the words in the VISIBLE part of the
+buffer are checked off the loop, and the misspelled ones underlined.
+
+What is checked depends on the buffer:
+- a PROSE buffer (plain text, Markdown, Org, a commit message, mail) — every word;
+- a CODE buffer (one whose mode colours it) — only the words inside a comment, a string or
+  a docstring, read off the syntax spans the pane already has (`:span-cache`), which is how
+  jinx decides it too (by face);
+- anything else (a read-only report, a terminal, a `*…*` log) — nothing.
+
+A word is a run of letters with inner apostrophes. A token carrying a digit or an
+underscore, or a capital past its first letter (`camelCase`, `HTTP`), is an identifier or
+an acronym and is skipped, and so is every whitespace-separated chunk that is a URL, a path,
+an e-mail address, a dotted name (`file.txt`, `mod.fn`) or inline `code`.
+
+The checker is a long-lived ispell-protocol child — `enchant-2 -a` when installed, else
+`aspell -a` — owned by one named green process, `:spell` ([[spell-server]]), which caches
+every verdict for the language it was asked in. Without either program the feature is inert.
+
+The verdicts land on the buffer as an annotation (`:spell`, `{:top :rows :language
+:errors {line [[from to word] …]}}`, columns within the line), so the view needs only the
+buffer to paint them ([[spell-ranges]]), and a word whose text has changed since stops
+being underlined at once.
+
+`M-$` ([[cmd-spell-correct]], jinx-correct): suggestions for the misspelled word at point
+(or the nearest one before it), plus saving it to the personal dictionary or accepting it
+for the session. `C-M-$` ([[cmd-spell-languages]], jinx-languages): pick the dictionary.
+`M-x spell-mode` turns the whole thing on and off (global-jinx-mode)."
+  (:use editor/buffer) ; buffer-rope / buffer-line-at / buffer-point / replace-region / annotate
+  (:use model) ; ed-current-buf / ed-set-buf / message / the idle-job and task-reply registries
+  (:use interactive) ; defcommand — M-$ / C-M-$ / M-x spell-mode
+  (:use memo) ; defmemo — the backend lookup and the painted ranges, remembered
+  (:use task)) ; task — the check runs off the loop
+;; `pool/ed-name-prompt` is referenced qualified: the prompts are the only thing taken from it.
+;; `theme` (loaded with the image) provides the palette (`*red*`) read bare below.
+
+(theme/defchrome face-spell-error {:underline {:color *red* :style :wave}})
+;; A misspelled word: a red WAVY underline, the word keeping its own colour — jinx's look
+;; (an underline with a colour and a style of its own is brood ADR-513).
+
+;; ---- words: what is a word worth checking -------------------------------------------
+
+(defn spell-letter? (c)
+  "Whether the one-character string `c` is a letter — a character with case. Brood has no
+Unicode letter class (`regex` has no `\\p{L}`, `string` no `alphabetic?`), so a cased
+character stands in for one: every Latin, Greek and Cyrillic letter, none of the digits or
+punctuation. Uncased scripts (CJK, Arabic) answer no — and an ispell checker does not
+handle them anyway.
+
+    (spell/spell-letter? \"é\")   ;=> true
+    (spell/spell-letter? \"7\")   ;=> false"
+  (not (= (string/upper c) (string/lower c))))
+
+(defn- spell-run-char? (c)
+  "A character a token runs through: a letter, a digit, `_` or an apostrophe. Digits and
+underscores are taken INTO the token so the whole identifier is seen, and refused."
+  (or (spell-letter? c) (includes? "0123456789_'’" c)))
+
+(defn spell-chunk-skip? (chunk)
+  "Whether a whitespace-separated `chunk` is a URL, a path, an e-mail address, a dotted
+name or inline code — never prose, so none of its tokens is checked.
+
+    (spell/spell-chunk-skip? \"https://example.org\")   ;=> true
+    (spell/spell-chunk-skip? \"src/spell.blsp\")   ;=> true
+    (spell/spell-chunk-skip? \"word,\")   ;=> false"
+  (or (includes? chunk "://")
+    (includes? chunk "/")
+    (includes? chunk "\\")
+    (includes? chunk "@")
+    (includes? chunk "`")
+    (string/starts-with? chunk "www.")
+    (regex/match? "[A-Za-z0-9_]\\.[A-Za-z]" chunk)))
+
+(defn spell-word? (word)
+  "Whether the token `word` is a word to check: two characters or more, only letters and
+apostrophes, and no capital past the first (so `camelCase`, `HTTP` and `snake_case` — an
+identifier or an acronym — are left alone).
+
+    (spell/spell-word? \"Hello\")   ;=> true
+    (spell/spell-word? \"camelCase\")   ;=> false
+    (spell/spell-word? \"utf8\")   ;=> false"
+  (let (chars (string/->list word))
+    (and (>= (count chars) 2)
+      (every? chars (fn (c) (or (spell-letter? c) (= c "'") (= c "’"))))
+      (not (string/has-upper? (string/list-> (rest chars)))))))
+
+(defn- spell-trim-apostrophes (token start)
+  "`[start end word]` for `token` (at column `start`) with its leading and trailing
+apostrophes cut — a quotation mark is not part of the word — or nil when nothing is left."
+  (let (chars (into [] (string/->list token))
+        n (count chars)
+        quote? (fn (c) (or (= c "'") (= c "’")))
+        lead (letrec (go (fn (i) (if (and (< i n) (quote? (nth chars i))) (go (inc i)) i)))
+               (go 0))
+        tail (letrec (go (fn (j) (if (and (> j lead) (quote? (nth chars (dec j)))) (go (dec j)) j)))
+               (go n)))
+    (when (< lead tail)
+      [(+ start lead) (+ start tail) (string/list-> (seq/subvec chars lead tail))])))
+
+(defn- spell-chunk-tokens (chunk start)
+  "Every run of [[spell-run-char?]] characters in `chunk` (its first character at column
+`start`), as `[from to token]`, in order."
+  (let (chars (into [] (string/->list chunk))
+        n (count chars))
+    (letrec (go (fn (i run-start acc)
+                  (cond
+                    (>= i n)
+                      (reverse (if (nil? run-start)
+                                 acc
+                                 (cons [(+ start run-start)
+                                         (+ start n)
+                                         (string/list-> (seq/subvec chars run-start n))]
+                                   acc)))
+                    (spell-run-char? (nth chars i)) (go (inc i) (or run-start i) acc)
+                    (nil? run-start) (go (inc i) nil acc)
+                    :else
+                      (go (inc i)
+                        nil
+                        (cons [(+ start run-start)
+                                (+ start i)
+                                (string/list-> (seq/subvec chars run-start i))]
+                          acc)))))
+      (go 0 nil '()))))
+
+(defn- spell-inside? (allowed from to)
+  "Whether `[from to)` lies inside one of the `allowed` `[lo hi]` column ranges; nil
+`allowed` allows the whole line."
+  (or (nil? allowed)
+    (any? allowed (fn (range) (and (>= from (first range)) (<= to (second range)))))))
+
+(defn spell-line-words (text allowed)
+  "The words worth checking on one line of `text`, as `[from to word]` (columns, `to`
+exclusive), in order. `allowed` is nil for every word on the line (prose), or a list of
+`[lo hi]` column ranges a word must lie inside (a code line's comments and strings).
+
+    (spell/spell-line-words \"see https://x.org teh fooBar\" nil)   ;=> ([0 3 \"see\"] [18 21 \"teh\"])"
+  (let (inline-code (map (regex/find-all "`[^`]*`" text) (fn (found) [(:start found) (:end found)])))
+    (mapcat (regex/tokens [["\\S+" :chunk]] text)
+      (fn (chunk)
+        ;; a chunk inside `inline code` — the middle words of `a b c` too — is code
+        (if (or (spell-chunk-skip? (:text chunk))
+              (any? inline-code (fn ([lo hi]) (and (>= (:start chunk) lo) (< (:start chunk) hi)))))
+          '()
+          (seq/keep (spell-chunk-tokens (:text chunk) (:start chunk))
+            (fn (token)
+              (let (trimmed (spell-trim-apostrophes (nth token 2) (first token)))
+                (when (and trimmed
+                        (spell-word? (nth trimmed 2))
+                        (spell-inside? allowed (first trimmed) (second trimmed)))
+                  trimmed)))))))))
+
+(defn spell-lookup-key (word)
+  "The form of `word` the checker is asked about: a typographic apostrophe (’) as the ASCII
+one, which is the one every dictionary spells its contractions with."
+  (string/replace word "’" "'"))
+
+;; ---- which buffers, and which parts of them -----------------------------------------
+
+(def spell-prose-types #{:text :markdown :org :git-commit :eml :mbox :fundamental})
+;; The buffer types whose every word is prose. `:fundamental` is a file no mode claims — a
+;; `.txt`, a README — but not a fileless `*…*` buffer (a log, `*Messages*`) nor a DATA file
+;; (`spell-data-file?`: a log, a CSV), which jinx leaves alone too. In Markdown and Org the
+;; lines of a code block are not prose either (`spell-code-lines`).
+
+(def spell-data-extensions #{".log" ".csv" ".tsv" ".out" ".dat"})
+
+(defn spell-data-file? (buf)
+  "Whether `buf`'s file is data rather than writing — its extension is one of
+`spell-data-extensions`."
+  (let (file (buffer-file buf))
+    (and (string? file)
+      (contains? spell-data-extensions (string/lower (or (path/extension file) ""))))))
+
+(defn spell-code-lines (rope from to)
+  "The lines of `[from, to)` inside a code block — a Markdown fence (```, ~~~) or an Org
+`#+BEGIN_SRC` / `#+BEGIN_EXAMPLE` block, their fence lines included — found by reading from
+the document's start, since whether a line is inside one is the text above it. Runs in the
+spell check's task, off the loop."
+  (letrec (walk (fn (line inside? acc)
+                  (if (>= line to)
+                    acc
+                    (let (text (string/lower (string/trim (wrap/rope-line-text rope line)))
+                          fence? (or (string/starts-with? text "```")
+                                   (string/starts-with? text "~~~"))
+                          opens? (or (string/starts-with? text "#+begin_src")
+                                   (string/starts-with? text "#+begin_example"))
+                          closes? (string/starts-with? text "#+end_")
+                          code? (or inside? fence? opens? closes?)
+                          inside-next? (cond
+                                         fence? (not inside?)
+                                         opens? true
+                                         closes? false
+                                         else inside?))
+                      (walk (inc line)
+                        inside-next?
+                        (if (and code? (>= line from)) (conj acc line) acc))))))
+    (walk 0 false #{})))
+
+(def spell-text-face-names [:syntax/comment :syntax/string :syntax/doc])
+;; The faces whose text is prose inside code — jinx's `jinx-include-faces` for prog-mode.
+
+(defn- spell-generated? (buf)
+  "A fileless `*name*` buffer — the editor's own log or report, not something you wrote."
+  (let (name (or (buffer-name buf) ""))
+    (and (nil? (buffer-file buf)) (string/starts-with? name "*") (string/ends-with? name "*"))))
+
+(defn spell-scope (buf)
+  "What of `buf` is spell checked: `:prose` (every word), `:code` (the words in its
+comments and strings), or nil (none of it — read-only, a generated `*…*` buffer, or a mode
+that colours nothing)."
+  (let (type (editor/layers/buffer-type-for buf))
+    (cond
+      (read-only? buf) nil
+      (and (= type :fundamental) (or (spell-generated? buf) (spell-data-file? buf))) nil
+      (contains? spell-prose-types type) :prose
+      (or (:face-spans buf) (ed-mode-service buf :fontify)) :code
+      :else nil)))
+
+(defn spell-text-faces ()
+  "The set of faces a code buffer's prose is painted in — each of [[spell-text-face-names]]
+both as its name and as the attribute map it resolves to (a lexer's span carries the map,
+a tree-sitter face table may carry the name). Resolved when asked, so a theme switch is
+seen by the next check."
+  (into #{} (mapcat spell-text-face-names (fn (name) [name (editor/face/face name)]))))
+
+(defn spell-allowed-ranges (spans faces bol eol)
+  "The `[lo hi]` column ranges of the line `[bol, eol)` (buffer offsets) that `spans`
+(absolute `[start end face]`) paint in one of `faces`, clipped to the line.
+
+    (spell/spell-allowed-ranges [[0 4 :syntax/comment] [5 9 :k]] #{:syntax/comment} 2 9)   ;=> ([0 2])"
+  (seq/keep spans
+    (fn (span)
+      (let (start (first span)
+            end (second span))
+        (when (and (contains? faces (nth span 2)) (< start eol) (> end bol))
+          [(- (math/max start bol) bol) (- (math/min end eol) bol)])))))
+
+;; ---- the ispell pipe protocol --------------------------------------------------------
+
+(defn spell-parse-line (line)
+  "One ispell `-a` result line as a verdict: `:ok` for a known word (`*`, a root `+`, a
+compound `-`), a vector of suggestions for a misspelling (`& word n offset: a, b` — or `?`,
+a guess — and `[]` for `# word offset`, none), nil for anything else (the banner, a blank).
+
+    (spell/spell-parse-line \"& teh 3 0: the, tech, Te\")   ;=> [\"the\" \"tech\" \"Te\"]
+    (spell/spell-parse-line \"# xyzzy 0\")   ;=> []
+    (spell/spell-parse-line \"*\")   ;=> :ok"
+  (cond
+    (or (= line "*") (string/starts-with? line "+") (string/starts-with? line "-")) :ok
+    (or (string/starts-with? line "& ") (string/starts-with? line "? "))
+      (let (colon (index-of line ": "))
+        (if (< colon 0)
+          []
+          (into []
+            (seq/reject (map (string/split (string/substring line (+ colon 2) (string/length line))
+                               ",")
+                          string/trim)
+              (fn (s) (= s ""))))))
+    (string/starts-with? line "# ") []
+    :else nil))
+
+(defn spell-response-groups (text)
+  "The complete answers in the ispell output `text`, in order: one per input line, each the
+list of its result lines — an answer ends at a blank line. The banner (`@(#) …`) is not an
+answer, and an unfinished one (no blank line yet) is not counted.
+
+    (spell/spell-response-groups \"@(#) Ispell\\n*\\n\\n& teh 1 0: the\\n\\n#\")   ;=> ((\"*\") (\"& teh 1 0: the\"))"
+  (let (lines (string/split text "\n")
+        complete (take lines (dec (count lines))))
+    (reverse (first (fold complete
+                      ['() '()]
+                      (fn (state line)
+                        (let ([groups current] state)
+                          (cond
+                            (string/starts-with? line "@(#)") state
+                            (= (string/trim line) "") [(cons (reverse current) groups) '()]
+                            :else [groups (cons line current)]))))))))
+
+(defn spell-group-verdict (group)
+  "The verdict for one word from its answer `group` (its result lines): the first
+misspelling's suggestions, else `:ok`."
+  (or (seq/find (map group spell-parse-line) vector?) :ok))
+
+;; ---- the backend ----------------------------------------------------------------------
+
+(defn spell-find-backend ()
+  "`{:kind :program}` for the ispell-protocol checker this machine has — `enchant-2`
+preferred, `aspell` else — or nil when it has neither (and the feature does nothing)."
+  (let (enchant (os/which "enchant-2")
+        aspell (os/which "aspell"))
+    (cond
+      enchant {:kind :enchant :program enchant}
+      aspell {:kind :aspell :program aspell}
+      :else nil)))
+
+;; check-allow: a hit comes back out of the memo's store, which the checker reads as
+;; unknown; it only ever holds what `spell-find-backend` answered.
+(check-allow :trusted
+  (defmemo spell-backend-at 1 (key)
+    "[[spell-find-backend]], looked up once — it is asked on every event (the idle beat's
+staleness test), and a PATH walk per key is not free. `key` is ignored."
+    (spell-find-backend)))
+
+(defn spell-backend ()
+  "The checker backend ([[spell-find-backend]]), remembered."
+  (spell-backend-at :backend))
+
+(defn spell-backend-argv (backend language)
+  "The arguments that start `backend` in pipe mode, in `language` (a dictionary name such
+as `en_GB`) or, for nil, the one the locale picks.
+
+    (spell/spell-backend-argv {:kind :aspell} \"de\")   ;=> [\"-a\" \"--lang=de\"]"
+  (cond
+    (nil? language) ["-a"]
+    (= (:kind backend) :aspell) ["-a" (str "--lang=" language)]
+    :else ["-a" "-d" language]))
+
+(defn spell-parse-dictionaries (output)
+  "The dictionary names in a listing — `enchant-lsmod-2 -list-dicts` (`en_GB (aspell)`) or
+`aspell dicts` (`en_GB`) — first field of each line, distinct, sorted.
+
+    (spell/spell-parse-dictionaries \"en (aspell)\\nen_GB (hunspell)\\nen (myspell)\\n\")   ;=> [\"en\" \"en_GB\"]"
+  (into []
+    (sort (seq/distinct (seq/keep (string/split output "\n")
+                          (fn (line)
+                            (let (field (first (string/fields (string/trim line))))
+                              (when (and field (not (= field ""))) field))))))))
+
+(defn spell-dictionaries (backend)
+  "The dictionaries `backend` can check in (`[]` without one) — asked of
+`enchant-lsmod-2 -list-dicts` beside enchant, `aspell dicts` otherwise. A short
+subprocess, run when C-M-$ is pressed."
+  (let (lister (when (= (:kind backend) :enchant) (os/which "enchant-lsmod-2"))
+        result (cond
+                 lister (os/cmd lister ["-list-dicts"] {:timeout-ms 3000})
+                 (= (:kind backend) :aspell)
+                   (os/cmd (:program backend) ["dicts"] {:timeout-ms 3000})
+                 :else nil))
+    (if (and result (os/cmd-ok? result)) (spell-parse-dictionaries (:stdout result)) [])))
+
+;; ---- the server: one checker child, shared ---------------------------------------------
+;; One named green process owns the child (a `[:proc …]` message goes to the process that
+;; spawned it) and a verdict cache for the language it was last asked in. Every exchange is
+;; one batch: the words, one `^word` line each, then their answers, one group each. A child
+;; that does not answer in `*spell-reply-ms*` is closed and started again on the next ask;
+;; its words go unjudged (not underlined) rather than wrong.
+
+(defdyn *spell-reply-ms* 3000)
+(def *spell-answer-ms* 4000)
+;; How long a caller waits for the server — its own wait on the child, `*spell-reply-ms*`,
+;; and a second more.
+(def *spell-retry-ms* 60000)
+;; After a child that closed or stalled (a dictionary that does not exist: `enchant-2 -a -d xx`
+;; exits at once), how long before another is started for the same language — so a bad
+;; `:spell-language` costs one failed start a minute, not one per pause in typing.
+(def *spell-cache-max* 50000)
+;; Verdicts the server keeps before it starts over — words, so a few megabytes at most.
+
+(defn- spell-server-close (state)
+  "`state` with its child closed and forgotten."
+  (when (:proc state)
+    ;; a child that will not close is gone either way; the server must outlive it
+    (check-allow :discarded-catch (try (os/close (:proc state)) (catch _ nil))))
+  (assoc state :proc nil))
+
+(defn- spell-server-ready (state language)
+  "`state` with a running child for `language` — the one it has when the language matches,
+else a fresh one (and a fresh cache: a verdict is per dictionary). `:proc` is nil when the
+child cannot be started, and for `*spell-retry-ms*` after one closed or stalled."
+  (let (state (if (= language (:language state))
+                state
+                (assoc (spell-server-close state) :language language :cache {} :failed-at nil)))
+    (if (or (:proc state)
+          (and (:failed-at state) (< (- (os/now) (:failed-at state)) *spell-retry-ms*)))
+      state
+      (let (backend (spell-backend)
+            proc (when backend
+                   (check-allow :discarded-catch
+                     (try
+                       (os/spawn (:program backend) (spell-backend-argv backend language))
+                       (catch _ nil)))))
+        (assoc state :proc proc)))))
+
+(defn- spell-server-write (state text)
+  "Write `text` to the child; `state` without the child when the write failed (it died)."
+  (if (check-allow :discarded-catch (try (do (os/write (:proc state) text) true) (catch _ false)))
+    state
+    (spell-server-close state)))
+
+(defn- spell-collect (proc n)
+  "The `n` answer groups the child `proc` gives to the batch just written, or nil when it
+closes or stalls past `*spell-reply-ms*` first."
+  (letrec (go (fn (text)
+                (let (groups (spell-response-groups text))
+                  (if (>= (count groups) n)
+                    groups
+                    (receive
+                      ([:proc ^proc data] (go (str text data)))
+                      ([:proc-closed ^proc _] nil)
+                      (after *spell-reply-ms* nil))))))
+    (go "")))
+
+(defn- spell-known (cache words)
+  "The verdicts `cache` holds for `words`, as `{word verdict}`."
+  (into {} (seq/keep words (fn (w) (when (contains? cache w) [w (get cache w)])))))
+
+(defn- spell-server-check (state language words)
+  "`[state answer]` for the lookup keys `words` in `language`: `answer` maps each word the
+server could judge to `:ok` or its suggestions; the cache answers what it already knows,
+the child the rest, in one batch."
+  (let (state (spell-server-ready state language)
+        cache (:cache state)
+        unknown (seq/distinct (seq/reject words (fn (w) (contains? cache w)))))
+    (if (or (empty? unknown) (nil? (:proc state)))
+      [state (spell-known cache words)]
+      (let (written (spell-server-write state
+                      (string/join (map unknown (fn (w) (str "^" w "\n"))) ""))
+            groups (when (:proc written) (spell-collect (:proc written) (count unknown))))
+        (if (nil? groups)
+          [(assoc (spell-server-close written) :failed-at (os/now)) (spell-known cache words)]
+          (let (fresh (into {}
+                        (map (seq/zip unknown groups) (fn ([w g]) [w (spell-group-verdict g)])))
+                base (if (> (count cache) *spell-cache-max*) {} cache)
+                merged (merge base fresh))
+            [(assoc written :cache merged) (spell-known merged words)]))))))
+(defn- spell-server-accept (state language word personal?)
+  "`state` once `word` is accepted: for the session (`@word`) or saved to the personal
+dictionary (`*word`, then `#` to write it out) — and known good in the cache either way."
+  (let (state (spell-server-ready state language))
+    (if (:proc state)
+      (let (written (spell-server-write state
+                      (if personal? (str "*" word "\n#\n") (str "@" word "\n")))
+            cache (or (:cache written) {}))
+        (assoc written :cache (assoc cache word :ok)))
+      state)))
+
+(defn spell-server (state)
+  "The `:spell` server's loop over `state` `{:proc :language :cache}`:
+
+  [:check language words reply ref]  answer `[:spell-answer ref answer]` to `reply`
+                                     ([[spell-server-check]])
+  [:accept language word personal?]  accept `word` ([[spell-server-accept]])
+  [:stop]                            close the child and end
+
+Stray output (stderr, an exit report) is dropped."
+  (receive
+    ([:check language words reply ref] (let ([next answer] (spell-server-check state language words))
+                                         (send reply [:spell-answer ref answer])
+                                         (spell-server next)))
+    ([:accept language word personal?] (spell-server (spell-server-accept state
+                                                       language word personal?)))
+    ([:proc-closed p _] (spell-server (if (= p (:proc state)) (assoc state :proc nil) state)))
+    ([:stop] (do (spell-server-close state) :spell-stopped))
+    (_ (spell-server state))))
+
+(defn spell-server-pid ()
+  "The `:spell` server, started on first use (a named spawn is idempotent)."
+  (spawn :spell (spell-server {:proc nil :language :unset :cache {}})))
+
+(defn spell-lookup (language words)
+  "`{word -> :ok | [suggestion …]}` for the lookup keys `words` in `language` (nil: the
+locale's), asked of the `:spell` server; a word it could not judge is absent. Blocks the
+CALLER for one exchange — a task for the idle check, the loop only for M-$, one word.
+`{}` when there is no backend or no answer in time."
+  (if (or (empty? words) (nil? (spell-backend)))
+    {}
+    (let (ref (ref)
+          server (spell-server-pid))
+      (send server [:check language (into [] words) (self) ref])
+      (receive
+        ([:spell-answer ^ref answer] answer)
+        (after *spell-answer-ms* {})))))
+
+(defn spell-accept (language word personal?)
+  "Tell the server `word` is right — for the session, or (`personal?`) for good, in the
+personal dictionary. Asynchronous: nothing waits on it."
+  (when (spell-backend)
+    (send (spell-server-pid) [:accept language (spell-lookup-key word) personal?])))
+
+;; ---- checking a viewport (pure but for the lookup) ---------------------------------------
+
+(defn spell-viewport-words (buf top rows scope spans)
+  "`[line [from to word] …]` for each line of `buf`'s `[top, top+rows)` that has words to
+check — every word for `:prose` scope, those inside a comment / string / doc span for
+`:code` (`spans`, absolute; `[]` or nil checks nothing in code)."
+  (let (rope (buffer-rope buf)
+        last-line (math/min (buffer-line-count buf) (+ top rows))
+        faces (spell-text-faces)
+        text-spans (if (= scope :code)
+                     (seq/filter (if (or (vector? spans) (list? spans)) spans [])
+                       (fn (s) (contains? faces (nth s 2))))
+                     nil)
+        code-lines (if (= scope :prose) (spell-code-lines rope (math/max 0 top) last-line) #{}))
+    (seq/keep (seq/reject (range (math/max 0 top) last-line)
+                (fn (line) (contains? code-lines line)))
+      (fn (line)
+        (let (text (buffer-line-at buf line)
+              bol (text/line->char rope line)
+              allowed (if (= scope :code)
+                        (spell-allowed-ranges text-spans faces bol (+ bol (string/length text)))
+                        nil)
+              words (if (and (= scope :code) (empty? allowed)) '() (spell-line-words text allowed)))
+          (when (not (empty? words)) [line words]))))))
+
+(defn spell-check-viewport (buf view scope spans lookup)
+  "The `:spell` annotation value for `buf`'s viewport `view` (`{:top :rows :language}`):
+`view` with `:errors`, `{line [[from to word] …]}` for every word `lookup` judged
+misspelled. `lookup` is `(words) -> {word verdict}` ([[spell-lookup]] in the editor, a
+stand-in in a test). Plain data in and out, so it runs in a task."
+  (let (lines (spell-viewport-words buf (:top view) (:rows view) scope spans)
+        keys (seq/distinct (mapcat lines
+                             (fn ([_ words]) (map words (fn (w) (spell-lookup-key (nth w 2)))))))
+        verdicts (if (empty? keys) {} (lookup keys))
+        bad? (fn (w) (vector? (get verdicts (spell-lookup-key (nth w 2)))))
+        errors (into {}
+                 (seq/keep lines
+                   (fn ([line words])
+                     (let (wrong (into [] (seq/filter words bad?)))
+                       (when (not (empty? wrong)) [line wrong]))))))
+    (assoc view :errors errors)))
+
+;; ---- painting --------------------------------------------------------------------------
+
+(defn- spell-verified (rope errors)
+  "`[start end word]` (buffer offsets into `rope`) for each of `errors` whose word is still
+where it was found — the check is a viewport old, and a word since edited or moved is not
+underlined."
+  (let (line-count (text/line-count rope))
+    (mapcat (sort (%map-pairs errors))
+      (fn ([line words])
+        (if (>= line line-count)
+          '()
+          (let (text (text/line rope line)
+                bol (text/line->char rope line)
+                length (string/length text))
+            (seq/keep words
+              (fn (w)
+                (let ([from to word] w)
+                  (when (and (<= to length) (= (string/substring text from to) word))
+                    [(+ bol from) (+ bol to) word]))))))))))
+
+;; check-allow: a hit comes back out of the memo's store, which the checker reads as
+;; unknown; it only ever holds what `spell-verified` built.
+(check-allow :trusted
+  (defmemo spell-verified-at 4 (rope errors)
+    "[[spell-verified]], remembered per text and verdicts — asked every frame, and keyed on
+the rope (a handle) rather than the buffer, so moving point is a hit."
+    (spell-verified rope errors)))
+
+(defn spell-errors (buf)
+  "The misspelled words the last check found in `buf` that are still there, as `[start end
+word]` buffer offsets, ascending; `()` when it was never checked."
+  (let (a (editor/buffer/annotation buf :spell)
+        errors (when a (:errors (:value a))))
+    (if (or (nil? errors) (empty? errors))
+      '()
+      (spell-verified-at (buffer-rope buf) errors))))
+
+(defn spell-ranges (buf)
+  "The `[start end face-spell-error]` highlight ranges underlining `buf`'s misspelled words
+— what the view merges into a pane's `hl-ranges`. `()` when there are none."
+  (map (spell-errors buf) (fn (e) [(first e) (second e) face-spell-error])))
+
+;; ---- the idle job ----------------------------------------------------------------------
+
+(defn spell-enabled? (m)
+  "Whether spell checking is on: the `:spell-check?` setting (off on a model that never
+said — a test, a batch run — so nothing spawns a checker there), and a backend exists."
+  (and (= true (:spell-check? m false)) (not (nil? (spell-backend)))))
+
+(defn spell-view (m)
+  "`{:top :rows :language}` — what a check of the current buffer covers now: the selected
+pane's first line, the frame's text rows (a split pane shows fewer; checking a few more is
+harmless), and the `:spell-language` setting (nil: the locale's)."
+  {:top (ed-current-top m) :rows (or (:view-rows m) 60) :language (:spell-language m)})
+
+(defn ed-spell-stale? (m)
+  "Whether the current buffer wants a check: spell checking is on, the buffer has something
+to check ([[spell-scope]]), and its last check was of other text, another part of it or in
+another language."
+  (and (spell-enabled? m)
+    (let (b (ed-current-buf m))
+      (and (not (nil? (spell-scope b)))
+        (let (a (editor/buffer/annotation b :spell))
+          (or (nil? a)
+            (:stale? a)
+            (not (= (dissoc (:value a) :errors) (spell-view m)))))))))
+
+(defn- spell-pane-spans (m buf)
+  "The syntax spans the selected pane has for `buf` — its `:span-cache` band (refreshed
+every event, so current by the idle beat), or the buffer's own `:face-spans` — `[]` when
+neither."
+  (let (static (:face-spans buf)
+        entry (map/get-in m [:span-cache (editor/pane/pane-selected-path (:layout m))])
+        spans (if static static (:spans entry)))
+    (if (or (vector? spans) (list? spans)) spans [])))
+
+(defn- spell-job (buf view scope spans)
+  "One check, as a task runs it: the rope it is for (so the fold finds the buffer) and the
+annotation value."
+  {:rope (buffer-rope buf)
+   :value (spell-check-viewport buf
+            view
+            scope
+            spans
+            (fn (words) (spell-lookup (:language view) words)))})
+
+(defn ed-launch-spell (m)
+  "Check the current buffer's viewport when stale, OFF THE LOOP (a task asks the server and
+waits for the child; the loop only notes the handle on `:spell-proc`). One check at a time;
+headless, it runs inline."
+  (if (or (:spell-proc m) (not (ed-spell-stale? m)))
+    m
+    (let (b (ed-current-buf m)
+          view (spell-view m)
+          scope (spell-scope b)
+          spans (if (= scope :code) (spell-pane-spans m b) []))
+      (spell-server-pid)
+      (if (ed-headless?)
+        (ed-apply-spell m (spell-job b view scope spans))
+        (assoc m :spell-proc (task (fn () (spell-job b view scope spans)) {:timeout 15000}))))))
+
+(sig ed-apply-spell (model any -> model))
+(defn ed-apply-spell (m result)
+  "Fold a finished check `result` (`{:rope :value}`, or `()` on error / timeout) into the
+buffer whose text it checked — found by rope, so a buffer switch meanwhile still stamps the
+right one, and a buffer edited meanwhile gets nothing (it is stale, and checked again)."
+  (let (m1 (dissoc m :spell-proc))
+    (if (not (map? result))
+      m1
+      (let (rope (:rope result)
+            idx (seq/index-where (:buffers m1) (fn (b) (= (buffer-rope b) rope))))
+        (if (< idx 0)
+          m1
+          (ed-set-buf-at m1 idx (editor/buffer/annotate (ed-buf-at m1 idx) :spell (:value result))))))))
+
+(register-task-reply :spell-proc 'spell/ed-apply-spell '() nil)
+(register-idle-job :spell {:order 85 :run 'spell/ed-launch-spell :stale? 'spell/ed-spell-stale?})
+
+;; ---- M-$: correct the word ----------------------------------------------------------------
+
+(defn spell-word-at (buf)
+  "`[start end word]` for the checkable word around point on its line (point inside it or
+just past it), or nil."
+  (let (line (buffer-current-line buf)
+        bol (text/line->char (buffer-rope buf) line)
+        column (- (buffer-point buf) bol)
+        words (spell-line-words (buffer-line-at buf line) nil))
+    (when-let (w (seq/find words (fn (w) (and (<= (first w) column) (<= column (second w))))))
+      [(+ bol (first w)) (+ bol (second w)) (nth w 2)])))
+
+(defn spell-target (buf)
+  "The word M-$ corrects: the underlined one point is in, else the nearest underlined one
+before point, else the word at point — `[start end word]`, or nil."
+  (let (point (buffer-point buf)
+        errors (spell-errors buf)
+        inside (seq/find errors (fn (e) (and (<= (first e) point) (<= point (second e)))))
+        before (last (seq/filter errors (fn (e) (<= (second e) point)))))
+    (or inside before (spell-word-at buf))))
+
+(defn spell-save-label (word)
+  "The M-$ entry that saves `word` to the personal dictionary."
+  (str "+ save “" word "” to the personal dictionary"))
+
+(defn spell-session-label (word)
+  "The M-$ entry that accepts `word` for this session."
+  (str "+ accept “" word "” for this session"))
+
+(defn- spell-forget-word (m word)
+  "`m` with `word` no longer underlined in the current buffer — when its check is current;
+a stale one is about to be redone anyway, and re-stamping it would hide that."
+  (let (b (ed-current-buf m)
+        a (editor/buffer/annotation b :spell))
+    (if (or (nil? a) (:stale? a))
+      m
+      (let (value (:value a)
+            errors (into {}
+                     (seq/keep (%map-pairs (or (:errors value) {}))
+                       (fn ([line words])
+                         (let (kept (into [] (seq/reject words (fn (w) (= (nth w 2) word)))))
+                           (when (not (empty? kept)) [line kept]))))))
+        (ed-set-buf m (editor/buffer/annotate b :spell (assoc value :errors errors)))))))
+
+(defn spell-replace (m target replacement)
+  "`m` with the word `target` (`[start end word]`) replaced by `replacement` in the current
+buffer — when it is still there — and point where it was relative to the text around it."
+  (let (b (ed-current-buf m)
+        [start end word] target
+        point (buffer-point b))
+    ;; the int? guards tell the checker what the target and point are: offsets
+    (if (and (int? start)
+          (int? end)
+          (int? point)
+          (<= end (buffer-length b))
+          (= (text/slice (buffer-rope b) start end) word))
+      (let (replaced (replace-region b start end replacement)
+            delta (- (string/length replacement) (- end start))
+            point2 (cond
+                     (>= point end) (+ point delta)
+                     (> point start) (+ start (string/length replacement))
+                     :else point))
+        (ed-set-buf m (goto-char replaced point2)))
+      (message m (str "spell: “" word "” has changed since; nothing replaced")))))
+
+(defn spell-choose (m target choice)
+  "What choosing `choice` in M-$'s list does for `target` `[start end word]`: save the word
+or accept it (the two `+` entries), else replace the word with `choice`."
+  (let (word (nth target 2)
+        language (:spell-language m))
+    (cond
+      (or (nil? choice) (= (string/trim choice) "")) m
+      (= choice (spell-save-label word))
+        (do
+          (spell-accept language word true)
+          (message (spell-forget-word m word)
+            (str "spell: saved “" word "” to the personal dictionary")))
+      (= choice (spell-session-label word))
+        (do
+          (spell-accept language word false)
+          (message (spell-forget-word m word) (str "spell: “" word "” accepted for this session")))
+      :else (spell-replace m target choice))))
+
+(defcommand cmd-spell-correct
+  (m key)
+  "Correct the misspelled word at point, or the nearest one before it (M-$, Emacs's
+jinx-correct): a list of the checker's suggestions — choose one, or type your own — and two
+entries to save the word to your personal dictionary or accept it for this session."
+  (let (b (ed-current-buf m)
+        target (spell-target b))
+    (cond
+      (nil? (spell-backend)) (message m "spell: no checker found — install enchant-2 or aspell")
+      (nil? target) (message m "spell: no word here")
+      :else
+        (let (word (nth target 2)
+              verdict (get (spell-lookup (:spell-language m) [(spell-lookup-key word)])
+                        (spell-lookup-key word)))
+          (cond
+            (nil? verdict) (message m "spell: the checker did not answer")
+            (= verdict :ok)
+              (message (spell-forget-word m word) (str "spell: “" word "” is spelled correctly"))
+            :else
+              (assoc m
+                :minibuffer
+                  (pool/ed-name-prompt (str "Correct “" word "”: ")
+                    (append verdict [(spell-save-label word) (spell-session-label word)])
+                    (fn (mm choice) (spell-choose mm target choice))
+                    30)))))))
+
+(defcommand cmd-spell-languages
+  (m key)
+  "Choose the dictionary spell checking uses (C-M-$, Emacs's jinx-languages), from those the
+checker reports; every buffer is checked again in it."
+  (let (backend (spell-backend))
+    (if (nil? backend)
+      (message m "spell: no checker found — install enchant-2 or aspell")
+      (let (dictionaries (spell-dictionaries backend))
+        (if (empty? dictionaries)
+          (message m "spell: the checker reports no dictionaries")
+          (assoc m
+            :minibuffer
+              (pool/ed-name-prompt (str "Spell language"
+                                     (if (:spell-language m) (str " (" (:spell-language m) ")") "")
+                                     ": ")
+                dictionaries
+                (fn (mm choice)
+                  (if (contains? (into #{} dictionaries) choice)
+                    (message (assoc mm :spell-language choice) (str "spell: checking in " choice))
+                    (message mm (str "spell: no dictionary “" choice "”"))))
+                40)))))))
+
+(defcommand cmd-spell-mode
+  (m key)
+  "Turn spell checking on or off in every buffer (Emacs's global-jinx-mode)."
+  (if (spell-enabled? m)
+    (message (assoc m
+               :spell-check? false
+               :buffers (into [] (map (:buffers m) (fn (b) (dissoc b :spell)))))
+      "spell: off")
+    (if (nil? (spell-backend))
+      (message m "spell: no checker found — install enchant-2 or aspell")
+      (message (assoc m :spell-check? true) "spell: on"))))

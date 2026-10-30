@@ -1,0 +1,147 @@
+(defmodule cape
+  "Extra completion-at-point sources, after Emacs's cape: `cape-file` (a path before point
+completes against the disk) and `cape-dabbrev` (words from the OTHER open buffers). Each is a
+`complete-at-point` source — `(model) -> nil | [start prefix items opts]` — added to
+`*completion-sources*` when this module loads, so Tab and the auto popup both draw on them.
+
+- **file**: when the token before point starts like a path — `./`, `../`, `~/`, or `/` and a
+  name — the entries of its directory that start with what follows the last `/`, a directory
+  ending in `/`. Its answer CLAIMS the region (`:claims-region`), so it wins over the mode's
+  and a server's idea of the word at point, and CONTINUES (`:continue \"/\"`): accepting a
+  directory reopens the popup inside it.
+- **dabbrev**: the words starting with the word before point in the buffers on screen, then
+  the most recently used ones — at most [[*cape-dabbrev-max-buffers*]], skipping any over
+  [[*cape-dabbrev-max-chars*]], each scan capped at [[*cape-dabbrev-max-hits*]] prefix hits.
+  It ranks AFTER every other source (`:rank :after`), and its answer is cached for the
+  popup's life (`:cache`) — the other buffers do not change while you type in this one.
+
+Mechanism-free on purpose: both are plain sources over `complete-at-point`'s protocol."
+  (:use editor/buffer) ; buffer-rope / buffer-point / buffer-name
+  (:use editor/pane) ; pane-leaf-paths / pane-payload-at — the buffers on screen
+  (:use model) ; ed-current-buf / ed-buf-at / ed-recent-buffers / ed-buffer-dir
+  (:use complete-at-point)) ; the source protocol, the shared word scan, the trigger registry
+;; ---- cape-file ------------------------------------------------------------------
+
+(def *cape-path-delimiters* " \t\n\r\"'`()[]{},;<>|=")
+;; What ends a path token, scanning back from point: whitespace, quotes, brackets and the
+;; separators a path sits between in code and prose. `~ . / - _ @ + :` are path characters.
+
+(defn cape-path-token (line)
+  "The path-like token ending `line` (the current line up to point), or nil: the run of
+non-delimiter characters before point when it starts `./`, `../`, `~/`, or `/` followed by a
+character that is not another `/` or a space.
+
+    (cape/cape-path-token \"(load \\\"./src/ma\")   ;=> \"./src/ma\"
+    (cape/cape-path-token \"(/ 1 2\")               ;=> nil
+
+A lone `/` is not a path: Brood's `(/ a b)` and a prose slash would offer the root directory
+under every division."
+  (let (n (string/length line)
+        start (letrec (back (fn (i)
+                              (if (and (> i 0)
+                                    (not (includes? *cape-path-delimiters*
+                                           (string/char-at line (dec i)))))
+                                (back (dec i))
+                                i)))
+                (back n))
+        token (string/substring line start n))
+    (when (or (string/starts-with? token "./")
+            (string/starts-with? token "../")
+            (string/starts-with? token "~/")
+            (and (string/starts-with? token "/")
+              (> (string/length token) 1)
+              (not (includes? "/ " (string/char-at token 1)))))
+      token)))
+
+(defn- cape-line-to-point (buf)
+  "`[line-start line]` — the current line up to point and the offset it starts at."
+  (let (line-start (buffer-point (beginning-of-line buf)))
+    [line-start (text/slice (buffer-rope buf) line-start (buffer-point buf))]))
+
+(defn cape-file-candidates (token base)
+  "The completions of path `token` (as typed, `~` and relative forms included) against the
+disk, relative paths read under directory `base`: every entry of the token's directory that
+starts with what follows its last `/`, spelled as the token spells its directory, a directory
+with a trailing `/`. Hidden entries only when that name starts with `.`. Sorted; `()` when the
+directory does not exist."
+  (let (cut (inc (string/last-index-of token "/"))
+        dir-part (string/substring token 0 cut)
+        name-part (string/substring token cut (string/length token))
+        dir (path/absolute dir-part base))
+    (if (not (file/dir? dir))
+      '()
+      ;; a folder that cannot be listed (no permission) offers nothing — `file/ls` raises there
+      (seq/keep (check-allow :discarded-catch (try (file/ls dir) (catch e '())))
+        (fn (entry)
+          (when (and (string/starts-with? entry name-part)
+                  (or (string/starts-with? name-part ".") (not (string/starts-with? entry "."))))
+            (str dir-part entry (if (file/dir? (path/join dir entry)) "/" ""))))))))
+
+(defn cape-file-source (m)
+  "The file source: `[start token candidates {:claims-region :continue}]` when the token
+before point looks like a path ([[cape-path-token]]) and its directory has entries that extend
+it, else nil (so the other sources answer). Relative paths resolve under the buffer's
+directory (`model/ed-buffer-dir`, Emacs's `default-directory`)."
+  (let (buf (ed-current-buf m)
+        [line-start line] (cape-line-to-point buf)
+        token (cape-path-token line))
+    (when token
+      (let (items (seq/reject (cape-file-candidates token (ed-buffer-dir buf))
+                    (fn (candidate) (= candidate token))))
+        (when (not (empty? items))
+          [(+ line-start (- (string/length line) (string/length token)))
+            token
+            items
+            {:claims-region true :continue "/"}])))))
+
+(defn cape-file-trigger? (m)
+  "An auto-popup trigger (`complete-at-point/*completion-auto-triggers*`): the text before
+point is a path, however short its last name — `~/` alone is worth a listing."
+  (not (nil? (cape-path-token (second (cape-line-to-point (ed-current-buf m)))))))
+
+;; ---- cape-dabbrev ---------------------------------------------------------------
+
+(defdyn *cape-dabbrev-max-buffers* 8) ; how many other buffers one ask reads
+(defdyn *cape-dabbrev-max-chars* 2000000) ; a buffer larger than this is not read
+(defdyn *cape-dabbrev-max-hits* 2000) ; prefix hits looked at per buffer
+
+(defn cape-dabbrev-buffers (m)
+  "The pool indices dabbrev reads, best first: the buffers on screen, then the most recently
+used — never the current buffer (the buffer-words source has it), each once, at most
+[[*cape-dabbrev-max-buffers*]], none larger than [[*cape-dabbrev-max-chars*]]."
+  (let (layout (:layout m)
+        current (:buffer (ed-current-pane m))
+        shown (map (pane-leaf-paths layout) (fn (path) (:buffer (pane-payload-at layout path))))
+        recent (seq/keep (ed-recent-buffers m) (fn (name) (ed-buffer-index-by-name m name)))
+        order (seq/distinct (append shown recent)))
+    (take (seq/filter order
+            (fn (i)
+              (and (int? i)
+                (not (= i current))
+                (< i (count (:buffers m)))
+                (<= (text/length (buffer-rope (ed-buf-at m i))) *cape-dabbrev-max-chars*))))
+      *cape-dabbrev-max-buffers*)))
+
+(defn cape-dabbrev-source (m)
+  "The dabbrev source: `[start prefix words {:rank :after :cache …}]` — the distinct words
+starting with the word before point in the other open buffers ([[cape-dabbrev-buffers]]),
+not the word itself — or nil when there is no word or none matches."
+  (let ([start prefix] (complete-symbol-at-point m))
+    (when (not (= prefix ""))
+      (let (per-buffer (map (cape-dabbrev-buffers m)
+                         (fn (i)
+                           (complete-prefix-words (ed-buf-at m i) prefix *cape-dabbrev-max-hits*)))
+            words (completion-candidates-of (apply append per-buffer) prefix)
+            ;; a buffer that hit the cap may hold more words than were read: the answer is not
+            ;; the whole set, so the popup must ask again as the prefix grows, not filter it
+            capped? (any? per-buffer (fn (hits) (>= (count hits) *cape-dabbrev-max-hits*))))
+        (when (not (empty? words)) [start prefix words {:rank :after :cache (not capped?)}])))))
+
+;; ---- registration ---------------------------------------------------------------
+;; The file source goes FIRST and claims its region; dabbrev goes LAST and ranks last.
+
+(complete-add-source! 'cape/cape-file-source)
+(complete-append-source! 'cape/cape-dabbrev-source)
+(when (not (includes? *completion-auto-triggers* 'cape/cape-file-trigger?))
+  (defdyn *completion-auto-triggers*
+    (append *completion-auto-triggers* (list 'cape/cape-file-trigger?))))

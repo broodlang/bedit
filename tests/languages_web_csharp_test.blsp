@@ -1,0 +1,271 @@
+;; CSS, HTML, C# and go.mod (src/languages.blsp): four `deflanguage` tree-sitter modes, the
+;; HTML page's `<style>` / `<script>` injections, their language-server rows
+;; (src/lsp.blsp), and git's pattern files as line-lexer modes (src/lex-gitignore.blsp).
+;; The mode half needs no grammar. The parsed half needs
+;; `~/.config/bedit/grammars/libtree-sitter-<lang>.so` (M-x grammar-install css / html /
+;; c-sharp / gomod) and SKIPS without it, as every runtime-loaded language's tests do — a
+;; grammar Emacs already built (`~/.config/emacs/tree-sitter`) is used when bedit has none,
+;; read in place, so the parsed half runs on a machine that has either.
+(defmodule languages-web-csharp-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer))
+
+;; loaded here, at file load, so the `when`s below see what is installed
+(purge-stale-temp "bedit-lsp-marker-")
+
+(grammars/load-user-grammars)
+
+(defn- load-emacs-grammar (lang)
+  ;; Emacs's build of `lang`'s grammar, when bedit has none and Emacs does
+  (let (path (path/join (or (os/env "HOME") "/")
+               ".config/emacs/tree-sitter"
+               (str "libtree-sitter-" (->string lang) ".so")))
+    (when (and (not (grammars/grammar-loaded? lang)) (file/exists? path))
+      (check-allow :discarded-catch (try (%tree-sitter-load-grammar path lang) (catch e nil))))))
+
+(doseq (lang [:css :html :c-sharp :gomod :javascript]) (load-emacs-grammar lang))
+
+(defn- file-model (text file) (ed-init (make-buffer text file file)))
+(defn- file-buffer (text file) (ed-current-buf (file-model text file)))
+
+(defn- face-at (spans src needle)
+  "The face of the span that starts exactly where `needle` first occurs in `src`, or nil."
+  (let (at (index-of src needle)
+        hit (seq/find spans (fn (span) (= (first span) at))))
+    (when hit (nth hit 2))))
+
+(defn- face-of (name) (editor/face/face name))
+
+(defn- indents (src file)
+  "`[got want]`: the column the mode's indenter answers for every non-blank line of `src`,
+and the column the line already has."
+  (let (indent (ed-mode-service (file-buffer src file) :indent)
+        lines (string/split src "\n")
+        rows (seq/filter (range (count lines)) (fn (i) (not (= (string/trim (nth lines i "")) ""))))
+        bol-of (fn (i) (fold (range i) 0 (fn (a k) (+ a (string/length (nth lines k "")) 1))))
+        want (into []
+               (map rows
+                 (fn (i)
+                   (let (line (nth lines i ""))
+                     (- (string/length line) (string/length (string/triml line)))))))
+        got (into [] (map rows (fn (i) (indent src (bol-of i))))))
+    [got want]))
+
+;; ---- the modes, whatever is installed ----------------------------------------------------
+(describe "the modes, chosen by file name"
+  (test "CSS, HTML, C# and go.mod each open in their own mode"
+    (assert= (ed-buf-mode-name (file-buffer "" "/p/site.css")) "css")
+    (doseq (file ["/p/index.html" "/p/old.htm"])
+      (assert= (ed-buf-mode-name (file-buffer "" file)) "html"))
+    (doseq (file ["/p/Program.cs" "/p/build.csx"])
+      (assert= (ed-buf-mode-name (file-buffer "" file)) "csharp"))
+    (assert= (ed-buf-mode-name (file-buffer "" "/p/go.mod")) "gomod"))
+  (test "a `.cs` pattern does not take a `.css` file, nor go.mod a `.mod` file"
+    (assert= (ed-buf-mode-name (file-buffer "" "/p/a.css")) "css")
+    (is (not (= (ed-buf-mode-name (file-buffer "" "/p/x.mod")) "gomod"))))
+  (test "each parses with its grammar, which says where it lives"
+    (assert= (ed-mode-service (file-buffer "" "/p/a.css") :ts-lang) :css)
+    (assert= (ed-mode-service (file-buffer "" "/p/a.html") :ts-lang) :html)
+    (assert= (ed-mode-service (file-buffer "" "/p/A.cs") :ts-lang) :c-sharp)
+    (assert= (ed-mode-service (file-buffer "" "/p/go.mod") :ts-lang) :gomod)
+    (assert= (grammars/grammar-source :css) "https://github.com/tree-sitter/tree-sitter-css")
+    (assert= (grammars/grammar-source :html) "https://github.com/tree-sitter/tree-sitter-html")
+    (assert= (grammars/grammar-source :c-sharp)
+      "https://github.com/tree-sitter/tree-sitter-c-sharp")
+    (assert= (grammars/grammar-source :gomod)
+      "https://github.com/camdencheek/tree-sitter-go-mod"))
+  (test "C# and go.mod comment with //; CSS and HTML have only a block comment"
+    (assert= (ed-mode-service (file-buffer "" "/p/A.cs") :comment-syntax) "// ")
+    (assert= (ed-mode-service (file-buffer "" "/p/go.mod") :comment-syntax) "// ")
+    (is (nil? (ed-mode-service (file-buffer "" "/p/a.css") :comment-syntax)))
+    (assert= (ed-mode-service (file-buffer "" "/p/a.css") :comment-block) ["/* " " */"])
+    (assert= (ed-mode-service (file-buffer "" "/p/a.html") :comment-block) ["<!-- " " -->"]))
+  (test "go.mod indents with tabs, as `go mod tidy` writes it"
+    (is (ed-mode-service (file-buffer "" "/p/go.mod") :indent-tabs))
+    (is (not (ed-mode-service (file-buffer "" "/p/A.cs") :indent-tabs))))
+  (test "the formatters: prettier for the web, csharpier for C#, go mod edit for go.mod"
+    (assert= (ed-mode-service (file-buffer "" "/p/a.css") :format-command)
+      ["prettier" "--write" "--log-level" "warn"])
+    (assert= (ed-mode-service (file-buffer "" "/p/A.cs") :format-command)
+      [["csharpier" "format"] ["dotnet-csharpier"]])
+    (assert= (ed-mode-service (file-buffer "" "/p/go.mod") :format-command)
+      ["go" "mod" "edit" "-fmt"]))
+  (test "HTML embeds CSS and JavaScript, and only HTML holds a held tree's injections"
+    (is (ed-mode-service (file-buffer "" "/p/a.html") :ts-injections))
+    (is (nil? (ed-mode-service (file-buffer "" "/p/a.css") :ts-injections)))
+    (assert= (into #{} (map languages/html-injections :lang)) #{:css :javascript})))
+
+(describe "the fontify restart"
+  (test "CSS: the previous column-0 selector or at-rule"
+    (let (src "a {\n  color: red;\n}\n\n.b {\n  margin: 0;\n}\n")
+      (assert= (languages/css-restart src (index-of src "  margin")) (index-of src ".b"))))
+  (test "CSS: a block comment opened above declines the cut"
+    (let (src "/*\n.x {\n*/\n.b {\n  margin: 0;\n}\n")
+      (assert= (languages/css-restart src (index-of src "  margin")) 0)))
+  (test "C#: a column-0 declaration, unless a verbatim string opened above"
+    (let (src "using System;\n\npublic class A\n{\n    int x;\n}\n")
+      (assert= (languages/csharp-restart src (index-of src "    int"))
+        (index-of src "public class")))
+    (let (src "var s = @\"\npublic class A\n\";\n{\n    int x;\n}\n")
+      (assert= (languages/csharp-restart src (index-of src "    int")) 0))))
+
+;; ---- parsed ------------------------------------------------------------------------------
+(def css-src
+  "/* the card */\n@media (max-width: 600px) {\n  .card > #main:hover, a[href=\"x\"] {\n    color: #fff !important;\n    margin: 0 auto 10px;\n    width: calc(100% - var(--gap));\n  }\n}\n\n.grid {\n  font-family:\n    \"A\",\n    sans-serif;\n}\n")
+
+(when (grammars/grammar-loaded? :css)
+  (describe "css, parsed"
+    (def css-spans (languages/css-fontify css-src))
+    (test "a comment, an at-rule and a property"
+      (assert= (face-at css-spans css-src "/* the card") (face-of :syntax/comment))
+      (assert= (face-at css-spans css-src "@media") (face-of :syntax/keyword))
+      (assert= (face-at css-spans css-src "color:") (face-of :syntax/keyword)))
+    (test "a selector's tag, class and id are functions, an attribute's name special"
+      (assert= (face-at css-spans css-src ".card") (face-of :syntax/function))
+      (assert= (face-at css-spans css-src "#main") (face-of :syntax/function))
+      (assert= (face-at css-spans css-src "a[") (face-of :syntax/function))
+      (assert= (face-at css-spans css-src "href") (face-of :syntax/special)))
+    (test "values: a colour and a length are numbers, a string a string, !important special"
+      (assert= (face-at css-spans css-src "#fff") (face-of :syntax/number))
+      (assert= (face-at css-spans css-src "10px") (face-of :syntax/number))
+      (assert= (face-at css-spans css-src "\"A\"") (face-of :syntax/string))
+      (assert= (face-at css-spans css-src "!important") (face-of :syntax/special)))
+    (test "a called function"
+      (assert= (face-at css-spans css-src "calc(") (face-of :syntax/function)))
+    (test "it indents every line where prettier puts it — a continued declaration too"
+      (let ([got want] (indents css-src "/p/a.css")) (assert= got want)))))
+
+(def html-src
+  "<!DOCTYPE html>\n<!-- note -->\n<html lang=\"en\">\n  <head>\n    <style>\n      body { color: red; }\n    </style>\n    <script>\n      const answer = compute(1);\n    </script>\n  </head>\n  <body>\n    <p class='a' hidden>Hi &amp; bye<br/></p>\n    <img\n      src=\"a.png\"\n      alt=\"b\" />\n  </body>\n</html>\n")
+
+(when (grammars/grammar-loaded? :html)
+  (describe "html, parsed"
+    (def html-spans (languages/html-fontify html-src))
+    (test "the doctype, a comment, a tag, an attribute and its value"
+      (assert= (face-at html-spans html-src "<!DOCTYPE") (face-of :syntax/special))
+      (assert= (face-at html-spans html-src "<!-- note") (face-of :syntax/comment))
+      (assert= (face-at html-spans html-src "html lang") (face-of :syntax/keyword))
+      (assert= (face-at html-spans html-src "lang=") (face-of :syntax/special))
+      (assert= (face-at html-spans html-src "\"en\"") (face-of :syntax/string))
+      (assert= (face-at html-spans html-src "&amp;") (face-of :syntax/special)))
+    (test "it indents every line: elements, a closing tag, attributes over several lines"
+      (let ([got want] (indents html-src "/p/index.html")) (assert= got want)))))
+
+(when (and (grammars/grammar-loaded? :html) (grammars/grammar-loaded? :css))
+  (describe "a <style> element is CSS"
+    (test "its property is coloured with CSS's table"
+      (let (spans (languages/html-fontify html-src))
+        (assert= (face-at spans html-src "color: red") (face-of :syntax/keyword))
+        (assert= (face-at spans html-src "body {") (face-of :syntax/function))))))
+
+(when (and (grammars/grammar-loaded? :html) (grammars/grammar-loaded? :javascript))
+  (describe "a <script> element is JavaScript"
+    (test "its call and its number are coloured with JavaScript's table"
+      (let (spans (languages/html-fontify html-src))
+        (assert= (face-at spans html-src "const") (face-of :syntax/keyword))
+        (assert= (face-at spans html-src "compute(") (face-of :syntax/function))
+        (assert= (face-at spans html-src "1);") (face-of :syntax/number))))))
+
+(def csharp-src
+  "// the greeter\nusing System;\n\nnamespace App\n{\n    [Serializable]\n    public class Greeter<T> : IGreeter\n    {\n        private readonly string name = \"x\";\n\n        public async Task<string> Greet(int n)\n        {\n            var s = $\"hi {name}\";\n            switch (n)\n            {\n                case 1:\n                    return @\"one\";\n                default:\n                    break;\n            }\n            Console.WriteLine('c', 1.5m, null, true);\n            return s;\n        }\n    }\n}\n")
+
+(when (grammars/grammar-loaded? :c-sharp)
+  (describe "c#, parsed"
+    (def csharp-spans (languages/csharp-fontify csharp-src))
+    (test "a comment, the keywords, an attribute"
+      (assert= (face-at csharp-spans csharp-src "// the") (face-of :syntax/comment))
+      (assert= (face-at csharp-spans csharp-src "using") (face-of :syntax/keyword))
+      (assert= (face-at csharp-spans csharp-src "public class") (face-of :syntax/keyword))
+      (assert= (face-at csharp-spans csharp-src "Serializable") (face-of :syntax/special)))
+    (test "a type's name, a base type, a generic's name and a predefined type are specials"
+      (assert= (face-at csharp-spans csharp-src "Greeter<") (face-of :syntax/special))
+      (assert= (face-at csharp-spans csharp-src "IGreeter") (face-of :syntax/special))
+      (assert= (face-at csharp-spans csharp-src "Task<") (face-of :syntax/special))
+      (assert= (face-at csharp-spans csharp-src "string name") (face-of :syntax/special)))
+    (test "a method's name and a called one are functions"
+      (assert= (face-at csharp-spans csharp-src "Greet(") (face-of :syntax/function))
+      (assert= (face-at csharp-spans csharp-src "WriteLine") (face-of :syntax/function))
+      (is (nil? (face-at csharp-spans csharp-src "Console."))))
+    (test "literals; an interpolated string's text is a string, its braces special"
+      (assert= (face-at csharp-spans csharp-src "\"x\"") (face-of :syntax/string))
+      (assert= (face-at csharp-spans csharp-src "@\"one\"") (face-of :syntax/string))
+      (assert= (face-at csharp-spans csharp-src "'c'") (face-of :syntax/string))
+      (assert= (face-at csharp-spans csharp-src "1.5m") (face-of :syntax/number))
+      (assert= (face-at csharp-spans csharp-src "null") (face-of :syntax/special))
+      (assert= (face-at csharp-spans csharp-src "hi ") (face-of :syntax/string))
+      (assert= (face-at csharp-spans csharp-src "{name}") (face-of :syntax/special)))
+    (test "it indents every line: Allman braces, a switch's cases and their statements"
+      (let ([got want] (indents csharp-src "/p/Greeter.cs")) (assert= got want)))))
+
+(def gomod-src
+  "module example.com/app\n\ngo 1.22\n\n// deps\nrequire (\n\tgithub.com/a/b v1.2.3 // indirect\n)\n\nreplace github.com/a/b => ../b\n")
+
+(when (grammars/grammar-loaded? :gomod)
+  (describe "go.mod, parsed"
+    (def gomod-spans (languages/gomod-fontify gomod-src))
+    (test "a directive is a keyword, a module path a string, a version a number"
+      (assert= (face-at gomod-spans gomod-src "module") (face-of :syntax/keyword))
+      (assert= (face-at gomod-spans gomod-src "example.com/app") (face-of :syntax/string))
+      (assert= (face-at gomod-spans gomod-src "1.22") (face-of :syntax/number))
+      (assert= (face-at gomod-spans gomod-src "v1.2.3") (face-of :syntax/number))
+      (assert= (face-at gomod-spans gomod-src "// deps") (face-of :syntax/comment))
+      (assert= (face-at gomod-spans gomod-src "=>") (face-of :syntax/special))
+      (assert= (face-at gomod-spans gomod-src "../b") (face-of :syntax/string)))
+    (test "a require block's line is one level in, its closer back out"
+      (let (indent (ed-mode-service (file-buffer gomod-src "/p/go.mod") :indent))
+        (assert= (indent gomod-src (index-of gomod-src "\tgithub")) 8)
+        (assert= (indent gomod-src (index-of gomod-src ")\n")) 0)
+        (assert= (indent gomod-src (index-of gomod-src "replace")) 0)))))
+
+;; ---- git's pattern files -----------------------------------------------------------------
+(defn- spans-of (spans src role)
+  "The texts of the spans painted in `role`'s face, in order."
+  (let (painted (editor/face/face (get editor/lexer/lexer-roles role)))
+    (map (seq/filter spans (fn ([_ _ face]) (= face painted)))
+      (fn ([start end _]) (string/substring src start end)))))
+
+(describe "git's pattern files"
+  (test "an ignore file and the tools' copies of its syntax open in gitignore-mode"
+    (doseq (file ["/p/.gitignore" "/p/.dockerignore" "/p/web/.npmignore" "/p/.prettierignore"])
+      (assert= (ed-buf-mode-name (file-buffer "" file)) "gitignore"))
+    (assert= (ed-buf-mode-name (file-buffer "" "/p/.gitattributes")) "gitattributes")
+    (assert= (ed-mode-service (file-buffer "" "/p/.gitignore") :comment-syntax) "# "))
+  (test "gitignore: a comment line, the negating !, the globs, the directory slash"
+    (let (src "# build output\n/target/\n*.log\n!keep.log\n**/node_modules\nfile?.[ch]\nname\\#1\nnot # a comment\n"
+          spans (lex-gitignore/gitignore-spans src))
+      (assert= (spans-of spans src :comment) (list "# build output"))
+      (assert= (spans-of spans src :special) (list "!"))
+      (assert= (spans-of spans src :keyword) (list "*" "**" "?" "[ch]"))
+      (assert= (spans-of spans src :string) (list "\\#"))
+      (assert= (spans-of spans src :function) (list "/"))))
+  (test "gitattributes: the pattern's globs and each attribute, set, unset or valued"
+    (let (src "# eol\n*.sh text eol=lf\n*.png binary -diff\n[attr]bin -diff -merge\n"
+          spans (lex-gitignore/gitattributes-spans src))
+      (assert= (spans-of spans src :comment) (list "# eol"))
+      (assert= (spans-of spans src :keyword) (list "*" "*"))
+      (assert= (spans-of spans src :special) (list "[attr]bin"))
+      (assert= (map (spans-of spans src :function) string/trim)
+        (list "text" "eol=lf" "binary" "-diff" "-diff" "-merge"))))
+  (test "both are line lexers the pane's line cache keeps"
+    (is (fn? (ed-mode-service (file-buffer "" "/p/.gitignore") :line-lexer)))
+    (is (fn? (ed-mode-service (file-buffer "" "/p/.gitattributes") :line-lexer)))))
+
+;; ---- the language servers ---------------------------------------------------------------
+(describe "the language servers"
+  (test "a C# file reaches csharp-ls, a stylesheet and a page VS Code's servers"
+    (assert= (into [] (map (lsp/lsp-specs-for "/p/Program.cs") :name)) ["csharp-ls"])
+    (assert= (into [] (map (lsp/lsp-specs-for "/p/a.css") :name)) ["css"])
+    (assert= (into [] (map (lsp/lsp-specs-for "/p/index.html") :name)) ["html"]))
+  (test "the language ids the servers expect"
+    (assert= (lsp/lsp-language-id "/p/Program.cs") "csharp")
+    (assert= (lsp/lsp-language-id "/p/a.css") "css")
+    (assert= (lsp/lsp-language-id "/p/old.htm") "html"))
+  (test "a `*.sln` marker is any solution file in the folder, a plain one a file name"
+    (let (dir (temp-dir "bedit-lsp-marker-")
+          _ (file/mkdir dir))
+      (file/spit (path/join dir "Shop.sln") "")
+      (is (lsp/lsp-marker-in? dir "*.sln"))
+      (is (not (lsp/lsp-marker-in? dir "*.csproj")))
+      (is (lsp/lsp-marker-in? dir "Shop.sln"))
+      (is (not (lsp/lsp-marker-in? (path/join dir "nowhere") "*.sln"))))))

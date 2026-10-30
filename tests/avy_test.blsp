@@ -1,0 +1,156 @@
+;; tests/avy_test.blsp — avy (src/avy.blsp): the label tree, the targets found in what a
+;; pane SHOWS (scrolled, wrapped, the gutter counted), the jump, and the keys driven
+;; through `input/ed-update` — the read-char reader, the pause timer, C-g.
+(defmodule avy-test
+  (:use test)
+  (:use model)
+  (:use input)
+  (:use panes)
+  (:use avy)
+  (:use editor/buffer)
+  (:use editor/pane))
+
+(defn m-of (text) (assoc (ed-init (make-buffer text)) :frame [80 24]))
+(defn cur (m) (ed-current-buf m))
+(defn press (m keys) (fold keys m (fn (acc k) (ed-update acc k 80 24))))
+(defn layout-of (m) (ed-body-layout m 80 24))
+(defn text-x (m)
+  ;; where the selected pane's text starts: its rect's x past the gutter
+  (let (pane (ed-selected-pane (:panes (layout-of m))))
+    (+ (first (:rect pane)) (ed-pane-gutter-width (ed-pane-buf m pane) pane))))
+(defn offsets (targets) (vec (map targets :offset)))
+(defn prefix? (a b) (and (not (= a b)) (string/starts-with? b a)))
+
+(describe "avy-labels — avy's tree over the home row"
+  (test "no more targets than keys: one key each, in alphabet order"
+    (assert= (avy-labels 3 *avy-keys*) ["a" "s" "d"])
+    (assert= (count (avy-labels 9 *avy-keys*)) 9))
+  (test "one more than the keys: the last key becomes a prefix, the rest stay single"
+    (assert= (avy-labels 10 *avy-keys*) ["a" "s" "d" "f" "g" "h" "j" "k" "la" "ls"]))
+  (test "any count: distinct, none a prefix of another, the short ones first"
+    (doseq (n [2 17 40 81 82 200])
+      (let (labels (avy-labels n *avy-keys*))
+        (assert= (count labels) n)
+        (assert= (count (seq/distinct labels)) n)
+        (is (not (any? labels (fn (a) (any? labels (fn (b) (prefix? a b)))))))
+        (assert= (into [] (seq/sort-by labels string/length)) labels)))))
+
+(describe "targets: what each pane shows"
+  (test "a query's matches, nearest point first, at the cell the glyph is painted in"
+    (let (m (m-of "foo bar\nbaz foo\nfoo")
+          targets (avy-targets m (layout-of m) (avy-query-matcher "foo")))
+      (assert= (offsets targets) [0 12 16])
+      (assert= (vec (map targets (fn (t) [(:row t) (:col t)])))
+        [[0 (text-x m)] [1 (+ (text-x m) 4)] [2 (text-x m)]])))
+  (test "case folds unless the query has a capital"
+    (let (m (m-of "Foo foo")
+          layout (layout-of m))
+      (assert= (offsets (avy-targets m layout (avy-query-matcher "foo"))) [0 4])
+      (assert= (offsets (avy-targets m layout (avy-query-matcher "Foo"))) [0])))
+  (test "word starts: every one, or the ones beginning with a character"
+    (let (m (m-of "alpha beta(gamma) a_b")
+          layout (layout-of m))
+      (assert= (vec (sort (offsets (avy-targets m layout (avy-word-matcher nil))))) [0 6 11 18])
+      (assert= (vec (sort (offsets (avy-targets m layout (avy-word-matcher "A"))))) [0 18])))
+  (test "a scrolled pane: lines above its top are not on screen, rows count from it"
+    (let (m (m-of (string/join (map (range 60) (fn (i) (str "line" i))) "\n"))
+          scrolled (ed-set-top m 40)
+          targets (avy-targets scrolled (layout-of scrolled) (avy-query-matcher "line4")))
+      ;; line4 and line40..49 exist; only line40.. are shown (line4 is above the top)
+      (is (every? targets (fn (t) (>= (text/char->line (buffer-rope (cur m)) (:offset t)) 40))))
+      (assert= (count targets) 10)
+      (assert= (vec (sort (map targets :row))) (into [] (range 10)))))
+  (test "a wrapped line: a match on its second row is labelled on that row"
+    (let (line (str (string/join (map (range 30) (fn (_) "abcd")) " ") " zzz")
+          m (assoc (ed-init (assoc (make-buffer line) :long-lines :wrap)) :frame [80 24])
+          layout (layout-of m)
+          pane (ed-selected-pane (:panes layout))
+          width (ed-pane-text-cols pane (ed-pane-buf m pane))
+          segments (wrap/segments line width)
+          index (index-of line "zzz")
+          [from _] (last segments)
+          targets (avy-targets m layout (avy-query-matcher "zzz")))
+      (is (> (count segments) 1))
+      (assert= (offsets targets) [index])
+      (assert= (:row (first targets)) (dec (count segments)))
+      (assert= (:col (first targets)) (+ (text-x m) (- index from))))))
+
+(describe "the keys, through ed-update"
+  (test "C-': type, pause, pick a label — point jumps and the mark keeps where you were"
+    (let (m (m-of "foo bar\nbaz foo\nfoo")
+          typing (press (cmd-avy-goto-char-timer m nil) ["f" "o"])
+          labelled (press typing [[:timer :avy-pause]])
+          label (first (seq/find (:targets (avy-state labelled)) (fn ([_ t]) (= (:offset t) 12))))
+          jumped (press labelled [label]))
+      (assert= (count (:matches (avy-state typing))) 3)
+      (is (not (nil? (map/get-in typing [:timers :avy-pause]))))
+      (assert= (:phase (avy-state labelled)) :labels)
+      (assert= (count (avy-ops labelled 80 24)) 3)
+      (assert= (buffer-point (cur jumped)) 12)
+      (is (nil? (:avy jumped)))
+      (is (nil? (:read-char jumped)))
+      (assert= (buffer-point (pop-mark (cur jumped))) 0)))
+  (test "a label is painted over the glyph it names"
+    (let (m (press (cmd-avy-goto-char-timer (m-of "xx foo\nfoo") nil) ["f" :enter])
+          ops (avy-ops m 80 24)
+          target (second (first (:targets (avy-state m)))))
+      (is (any? ops (fn (op) (and (= (nth op 1) (:row target)) (= (nth op 2) (:col target))))))))
+  (test "one match jumps at once; none says so"
+    (let (m (m-of "abc xyz"))
+      (assert= (buffer-point (cur (press (cmd-avy-goto-char-timer m nil) ["x" :enter]))) 4)
+      (let (none (press (cmd-avy-goto-char-timer m nil) ["q" :enter]))
+        (is (nil? (:avy none)))
+        (is (includes? (:echo none) "no candidates")))))
+  (test "the pause timer waits for a query, and goes with the labels"
+    (let (m (m-of "foo foo")
+          started (press (cmd-avy-goto-char-timer m nil) [:ctrl-f]))
+      ;; :ctrl-f is not a query character: it quits
+      (is (nil? (:avy started)))
+      (is (nil? (avy-pause-spec (cmd-avy-goto-char-timer m nil))))
+      (is (not (nil? (avy-pause-spec (press (cmd-avy-goto-char-timer m nil) ["f"])))))
+      (is (nil? (avy-pause-spec (press (cmd-avy-goto-char-timer m nil) ["f" :enter]))))))
+  (test "C-g cancels: point stays, the reader and the state are gone"
+    (let (m (m-of "foo bar foo")
+          labelled (press (cmd-avy-goto-char-timer m nil) ["f" :enter])
+          cancelled (press labelled [:ctrl-g]))
+      (is (not (nil? (avy-state labelled))))
+      (assert= (buffer-point (cur cancelled)) 0)
+      (is (nil? (:avy cancelled)))
+      (is (nil? (:read-char cancelled)))
+      (assert= (avy-ops cancelled 80 24) [])))
+  (test "a key that is no label ends it"
+    (let (m (press (cmd-avy-goto-char-timer (m-of "foo bar foo") nil) ["f" :enter "z"]))
+      (is (nil? (:avy m)))
+      (is (includes? (:echo m) "no such candidate"))))
+  (test "M-g w: one character, then the word starts beginning with it"
+    (let (m (press (cmd-avy-goto-word-1 (m-of "one two three") nil) ["t"])
+          label (first (seq/find (:targets (avy-state m)) (fn ([_ t]) (= (:offset t) 8)))))
+      (assert= (count (:targets (avy-state m))) 2)
+      (assert= (buffer-point (cur (press m [label]))) 8)))
+  (test "M-g e: every word start, labelled at once"
+    (let (m (cmd-avy-goto-word-0 (m-of "one two three") nil))
+      (assert= (vec (sort (map (:targets (avy-state m)) (fn ([_ t]) (:offset t))))) [0 4 8]))))
+
+(describe "panes"
+  (test "a target in the other pane selects it and moves its point, not this one's"
+    (let (m (press (m-of "here\nthere") [:ctrl-x "3"])
+          here (pane-selected-path (:layout m))
+          labelled (press (cmd-avy-goto-char-timer m nil) ["t" "h" "e" "r" :enter])
+          other (seq/find (:targets (avy-state labelled))
+                  (fn ([_ t]) (not (= (:path t) here))))
+          jumped (press labelled [(first other)]))
+      ;; "ther" is on screen once in each pane
+      (assert= (count (:targets (avy-state labelled))) 2)
+      (is (not (= (pane-selected-path (:layout jumped)) here)))
+      (assert= (buffer-point (cur jumped)) 5)
+      (is (not (= (:point (pane-payload-at (:layout jumped) here)) 5))))))
+
+(describe "avy never labels what the pane does not show"
+  (test "a word pushed past the edge by tabs gets no label"
+    ;; ten tabs are 80 cells: every word after them is beyond an 80-column window's text area
+    (let (m (m-of (str "seen\n" (string/join (seq/repeat 10 "\t") "") "hidden"))
+          layout (layout-of m)
+          width (ed-pane-text-cols (ed-selected-pane (:panes layout)) (cur m))
+          targets (avy-targets m layout (avy-query-matcher "e")))
+      (is (every? targets (fn (target) (< (- (:col target) (text-x m)) width))))
+      (assert= (offsets targets) [1 2]))))

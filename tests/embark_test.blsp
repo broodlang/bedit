@@ -1,0 +1,208 @@
+;; src/embark.blsp — act on the thing at point. What is tested here is the part that is
+;; embark's own: which target wins (region > URL > file > symbol, the minibuffer's
+;; candidate by its category), the action table's shape, the default C-; picks, and that a
+;; menu key reaches the command its row names with the target in hand.
+
+(defmodule embark-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use embark))
+
+(defn- model-of (text point)
+  "A model over one buffer holding `text`, point at `point`."
+  (ed-apply (ed-init (make-buffer text)) (fn (b) (goto-char b point))))
+
+(defn- model-with-region (text from to)
+  "A model whose region runs from `from` (the mark) to `to` (point)."
+  (ed-apply (ed-init (make-buffer text)) (fn (b) (goto-char (set-mark (goto-char b from)) to))))
+
+(defn- target-of (m) (embark-target m))
+
+(defn- project-file () (path/join (file/cwd) "project.blsp"))
+
+(defn- press (m keys) (fold keys m (fn (acc key) (transient/ed-transient-key acc key))))
+
+;; ---- the target, by priority ------------------------------------------------------
+
+(describe "the target at point"
+  (test "an active region beats everything under it"
+    (assert= (target-of (model-with-region "https://brood.dev/docs" 0 22))
+      {:type :region :text "https://brood.dev/docs"}))
+  (test "an empty region is no region"
+    (assert= (:type (target-of (model-with-region "https://brood.dev/x" 3 3))) :url))
+  (test "a URL beats the file and the symbol, trailing punctuation dropped"
+    (assert= (target-of (model-of "see <https://brood.dev/docs>. ok" 10))
+      {:type :url :text "https://brood.dev/docs"}))
+  (test "a path that exists is a file, absolute, its :line:col dropped"
+    (assert= (target-of (model-of "error at ./project.blsp:12:3, fix it" 12))
+      {:type :file :text (project-file)}))
+  (test "an absolute path is a file too"
+    (assert= (:text (target-of (model-of (str "open " (project-file)) 8))) (project-file)))
+  (test "a path that does not exist falls through to the symbol"
+    (assert= (target-of (model-of "open nothere.blsp now" 8)) {:type :symbol :text "nothere.blsp"}))
+  (test "a bare word naming a directory entry stays a symbol"
+    ;; `src` is a directory here, but a word with no `/` or `.` is not read as a path
+    (assert= (:type (target-of (model-of "look in src" 9))) :symbol))
+  (test "the Lisp symbol at point"
+    (assert= (target-of (model-of "(seq/filter xs pred)" 3)) {:type :symbol :text "seq/filter"}))
+  (test "point just after a symbol is on it"
+    (assert= (:text (target-of (model-of "(map xs f)" 4))) "map"))
+  (test "a blank line has no target, and C-. says so"
+    (assert= (target-of (model-of "   \n" 1)) nil)
+    (is (includes? (:echo (embark-act (model-of "   \n" 1))) "nothing here"))))
+
+(describe "the target in the minibuffer"
+  (test "a prompt with no category names an open buffer by its candidate"
+    (let (m (assoc (model-of "x" 0)
+              :minibuffer
+                (pool/ed-name-prompt "Buffer: " ["*Messages*" "nowhere"] (fn (mm text) mm))))
+      (assert= (target-of m) {:type :buffer :text "*Messages*"})))
+  (test "a candidate that is neither a buffer nor a URL is text"
+    (let (m (assoc (model-of "x" 0)
+              :minibuffer (pool/ed-name-prompt "Pick: " ["alpha"] (fn (mm text) mm))))
+      (assert= (target-of m) {:type :text :text "alpha"})))
+  (test "a :command prompt's candidate is a command"
+    (let (m (assoc (model-of "x" 0)
+              :minibuffer
+                (assoc (pool/ed-name-prompt "M-x " ["find-file"] (fn (mm text) mm))
+                  :category :command)))
+      (assert= (target-of m) {:type :command :text "find-file"})))
+  (test "a C-h B row is the command it binds"
+    (let (m (assoc (model-of "x" 0)
+              :minibuffer
+                (assoc (pool/ed-name-prompt "Binding: " ["C-x C-f  find-file"] (fn (mm text) mm))
+                  :category :binding)))
+      (assert= (target-of m) {:type :command :text "find-file"})))
+  (test "a :file prompt's typed text is the absolute path it names"
+    (let (m (assoc (model-of "x" 0)
+              :minibuffer
+                {:edit (ed-mb-edit "Find file: " "project.blsp")
+                 :category :file
+                 :anno-base (file/cwd)
+                 :on-complete (fn (mm text) mm)}))
+      (assert= (target-of m) {:type :file :text (project-file)})))
+  (test "acting from the minibuffer closes it and opens the menu"
+    (let (m (embark-act (assoc (model-of "x" 0)
+                          :minibuffer
+                            (pool/ed-name-prompt "Buffer: " ["*Messages*"] (fn (mm text) mm)))))
+      (assert= (:minibuffer m) nil)
+      (is (not (nil? (:transient m))))))
+  (test "C-; on a buffer candidate switches to it"
+    (let (m (embark-dwim (assoc (model-of "x" 0)
+                           :minibuffer
+                             (pool/ed-name-prompt "Buffer: " ["*Messages*"] (fn (mm text) mm)))))
+      (assert= (buffer-name (ed-current-buf m)) "*Messages*")
+      (assert= (:minibuffer m) nil))))
+
+;; ---- the action table -------------------------------------------------------------
+
+(def- calls #{:point :target :prompt :dired :visit})
+
+(describe "the action table"
+  (test "every row has a key, a known call, a label, and a command named by symbol"
+    (each (keys *embark-actions*)
+      (fn (kind)
+        (each (embark-actions {:type kind})
+          (fn (action)
+            (is (string? (:key action)))
+            (is (contains? calls (:call action)))
+            (is (string? (:label action)))
+            ;; only a `:dired` row may name no command: it is the listing itself
+            (is (or (symbol? (:command action)) (= (:call action) :dired))))))))
+  (test "no kind binds one key twice"
+    (each (keys *embark-actions*)
+      (fn (kind)
+        (let (keys-of (map (embark-actions {:type kind}) :key))
+          (assert= (count (seq/distinct keys-of)) (count keys-of))))))
+  (test "the kinds the menu promises"
+    (assert= (into [] (map (embark-actions {:type :file}) :key)) ["o" "d" "r" "C" "D" "c"])
+    (assert= (into [] (map (embark-actions {:type :buffer}) :key)) ["b" "k" "w"])
+    (assert= (into [] (map (embark-actions {:type :symbol}) :key)) ["h" "." "r" "f" "w"])
+    (assert= (into [] (map (embark-actions {:type :url}) :key)) ["b" "w"])
+    (assert= (into [] (map (embark-actions {:type :region}) :key)) ["w" "k" "u" "l" ";" "s" "|"]))
+  (test "the region's rows are the existing region commands"
+    (assert= (:command (seq/find (embark-actions {:type :region}) (fn (a) (= (:key a) "|"))))
+      'shell-command/cmd-shell-command-on-region))
+  (test "an unknown kind offers nothing"
+    (assert= (embark-actions {:type :nonsense}) [])))
+
+(describe "C-; runs the default action"
+  (test "the default each kind names"
+    (assert= (:command (embark-default-action {:type :file})) 'pool/ed-find-file)
+    (assert= (:command (embark-default-action {:type :url})) 'murforge/mur-browse-url)
+    (assert= (:command (embark-default-action {:type :symbol})) 'lsp-commands/cmd-goto-definition)
+    (assert= (:command (embark-default-action {:type :buffer})) 'pool/ed-switch-to-named)
+    (assert= (:command (embark-default-action {:type :command}))
+      'commands/cmd-execute-extended-command))
+  (test "on a file it opens the file"
+    (let (m (embark-dwim (model-of "see ./project.blsp" 7)))
+      (assert= (buffer-file (ed-current-buf m)) (project-file))))
+  (test "on a URL it browses (headless: says what it would open)"
+    (is (includes? (:echo (embark-dwim (model-of "go https://brood.dev/docs" 6)))
+          "would open https://brood.dev/docs")))
+  (test "with nothing at point it says so"
+    (is (includes? (:echo (embark-dwim (model-of "" 0))) "nothing here"))))
+
+;; ---- the menu ---------------------------------------------------------------------
+
+(describe "the menu"
+  (test "its title names the kind and the target"
+    (let (m (embark-act (model-of "go https://brood.dev/docs" 6)))
+      (assert= (transient-core/transient-title (:transient m)) "URL: https://brood.dev/docs")))
+  (test "a key runs its row's command on the target, and closes the menu"
+    (let (m (press (embark-act (model-of "see ./project.blsp" 7)) ["c"]))
+      (assert= (first (:kill-ring m)) (project-file))
+      (assert= (:transient m) nil)))
+  (test "a region row runs the region command it names"
+    (let (m (press (embark-act (model-with-region "abc def" 0 3)) ["u"]))
+      (assert= (buffer-text (ed-current-buf m)) "ABC def")))
+  (test "a dired row lists the file's directory, point on the file, and asks before deleting"
+    (let (m (press (embark-act (model-of "see ./project.blsp" 7)) ["d"]))
+      (assert= (:dired-dir m) (file/cwd))
+      (is (not (nil? (:read-char m))))
+      (assert= (:echo m) "Delete project.blsp? (y/n)")))
+  (test "RET runs the default action"
+    (is (includes? (:echo (press (embark-act (model-of "go https://brood.dev/x" 6)) [:enter]))
+          "would open https://brood.dev/x")))
+  (test "a :prompt row accepts the target in the prompt its command opens"
+    (let (m (press (embark-act (assoc (model-of "x" 0)
+                                 :minibuffer
+                                   (assoc (pool/ed-name-prompt "M-x "
+                                            ["find-file"]
+                                            (fn (mm text) mm))
+                                     :category :command)))
+              ["h"]))
+      (assert= (:minibuffer m) nil)
+      (is (string/starts-with? (:echo m) "find-file"))))
+  (test "Esc dismisses it without acting"
+    (let (m (press (embark-act (model-of "see ./project.blsp" 7)) [:escape]))
+      (assert= (:transient m) nil)
+      (assert= (:kill-ring m) ()))))
+
+;; ---- C-h B ------------------------------------------------------------------------
+
+(describe "C-h B: the bindings in force, as a prompt"
+  (test "rows are labelled key-then-command; shadowed and non-command bindings are left out"
+    (assert= (into []
+               (keys (embark-binding-rows [{:sequence [:ctrl-x :ctrl-f]
+                                            :command 'commands/cmd-find-file
+                                            :layer :emacs
+                                            :shadowed-by nil}
+                                            {:sequence [:ctrl-f]
+                                             :command 'commands/cmd-forward-char
+                                             :layer :emacs
+                                             :shadowed-by :vim}
+                                            {:sequence [:ctrl-c]
+                                             :command 3
+                                             :layer :emacs
+                                             :shadowed-by nil}])))
+      ["C-x C-f  find-file"]))
+  (test "the prompt lists the live keymap's bindings and Enter runs the one chosen"
+    (let (opened (cmd-embark-bindings (model-of "abc" 0) nil)
+          mb (:minibuffer opened)
+          row (seq/find (:rank-source mb) (fn (label) (= label "C-e  end-of-line"))))
+      (assert= (:category mb) :binding)
+      (assert= row "C-e  end-of-line")
+      (assert= (buffer-point (ed-current-buf ((:on-complete mb) (assoc opened :minibuffer nil) row)))
+        3))))

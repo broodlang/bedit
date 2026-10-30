@@ -11,10 +11,18 @@ SOURCES are **multi**: `cmd-complete` merges candidates from an ordered list,
 `*completion-sources*` (Emacs' `completion-at-point-functions`) — the always-on
 buffer-word source, the buffer's language mode (`:complete-at` → brood-mode globals),
 and any added source (an LSP server via `src/lsp.blsp`). Each is a fn
-`(model) -> nil | [start prefix items]` (plus an optional `{:cache true}` fourth element: the
-popup then narrows by filtering those items rather than asking again); the first non-nil
-fixes the region and the rest merge in. The LOOK (`*completion-max*`) and the menu
-rendering live in the shared `completion` framework, which the minibuffer also uses.
+`(model) -> nil | [start prefix items]` plus an optional OPTIONS map as a fourth element:
+`:cache true` (the popup narrows by filtering these items rather than asking again),
+`:docs {candidate doc}` (the info panel), `:rank :after` (below every other source's
+candidates), `:claims-region true` (this answer's region wins) and `:continue \"/\"` (a
+candidate ending so completes on). The first non-nil answer — or the one claiming it — fixes
+the region and the rest merge in. `cape` adds file and other-buffer sources. The LOOK
+(`*completion-max*`) and the menu rendering live in the shared `completion` framework, which
+the minibuffer also uses.
+
+Corfu's behaviour on top: the AUTO popup (`corfu-auto`) opens after a pause in typing, with
+nothing selected so RET stays a newline, and the INFO panel (`corfu-popupinfo`) shows the
+selected candidate's documentation beside it — both feature timers registered here.
 
 Pure (data→data) apart from reading the buffer and (for an LSP source) a bounded
 synchronous request; the popup is plain render ops, unit-testable without a window."
@@ -67,19 +75,24 @@ after a delimiter?"
 ;; now: the preview reads a word index built off the loop (see "the buffer's word index"
 ;; below), cut by a native `regex/split` rather than a walk in Brood, and Tab reads it too
 ;; whenever it is current.
-(defn- complete-prefix-words (buf prefix)
+(defn complete-prefix-words (buf prefix &optional (limit nil))
   "Every word of `buf` that starts with `prefix` (non-empty), with duplicates — read at
-each occurrence of `prefix` that begins a word, through to the next delimiter."
+each occurrence of `prefix` that begins a word, through to the next delimiter. With a
+`limit`, the scan stops once that many prefix HITS have been looked at (words or not), so a
+short prefix in a large buffer costs a bounded walk — what a source reading buffers you are
+not editing (`cape`'s dabbrev) needs."
   (let (rope (buffer-rope buf))
-    (letrec (scan (fn (from acc)
-                    (let (hit (buffer-search-forward buf prefix from))
+    (letrec (scan (fn (from acc seen)
+                    (let (hit (if (and limit (>= seen limit))
+                                nil
+                                (buffer-search-forward buf prefix from)))
                       (cond
                         (nil? hit) acc
                         (complete-word-start? rope hit)
                           (let (end (text/skip-forward rope hit *complete-word-delimiters* false))
-                            (scan end (cons (text/slice rope hit end) acc)))
-                        :else (scan (inc hit) acc)))))
-      (scan 0 '()))))
+                            (scan end (cons (text/slice rope hit end) acc) (inc seen)))
+                        :else (scan (inc hit) acc (inc seen))))))
+      (scan 0 '() 0))))
 
 (defn completion-candidates-of (words prefix)
   "The `words` that start with `prefix` and aren't exactly it, sorted — the pure
@@ -224,12 +237,17 @@ end of a line is where you want it anyway.
 A read-only buffer gets none because nothing typed there can accept it: a char-mode
 terminal's point is the PROGRAM's cursor, and a suggestion painted after it is the editor
 guessing at the program's input. A buffer narrowed to an input region (a line-mode
-terminal, a shell) is not read-only, so its input still gets one."
+terminal, a shell) is not read-only, so its input still gets one.
+
+Nil, too, while the auto popup is on ([[completion-auto?]]): the two are alternatives, as
+Corfu's `corfu-auto` and `completion-preview-mode` are in Emacs. Both would answer the same
+pause, the ghost at the idle beat and the popup a moment later, and a suggestion that
+appears only to be covered by a list of the same words is flicker, not help."
   (let (buf (ed-current-buf m)
         ;; one character, not the document: this runs on every keystroke
         after (buffer-char-after buf)
         eol? (or (nil? after) (= after "\n")))
-    (when (and eol? (not (read-only? buf)))
+    (when (and eol? (not (read-only? buf)) (not (completion-auto? m)))
       (let (results (seq/keep *preview-sources* (fn (s) ((reflect/eval s) m))))
         (when (not (empty? results))
           (let ([start prefix _] (first results))
@@ -301,6 +319,14 @@ idempotently — the way a feature turns its source on (e.g. `lsp` adds its sour
 server connects). Highest precedence; redefining the global directly also works."
   (when (not (includes? *completion-sources* sym))
     (defdyn *completion-sources* (cons sym *completion-sources*)))
+  nil)
+
+(defn complete-append-source! (sym)
+  "Add completion source `sym` to the END of `*completion-sources*`, idempotently — for a
+source that should only fill in after the others (`cape`'s dabbrev: words from other
+buffers rank after the mode's own and this buffer's)."
+  (when (not (includes? *completion-sources* sym))
+    (defdyn *completion-sources* (append *completion-sources* (list sym))))
   nil)
 
 (defn- complete-line-to-point (buf)
@@ -535,16 +561,6 @@ and doubles nothing:
                           :else (back (dec k)))))
           (back (dec n))))))
 
-(defn- complete-apply (m start word)
-  "Replace the text in [start, point) with `word` — and as much of the word after point as
-it takes over ([[complete-absorbed]]) — and close the popup. Point ends after `word`."
-  (let (buf (ed-current-buf m)
-        p (buffer-point buf)
-        typed (text/slice (buffer-rope buf) start p)
-        taken (complete-absorbed typed (complete-word-suffix buf) word (completion-separators m))
-        buf2 (replace-region buf start (+ p taken) word))
-    (assoc (ed-set-buf m buf2) :completion nil :status "modified")))
-
 ;; ---- narrowing without asking again (company's / Corfu's cache) ---------------
 ;; A source may answer a FOURTH element, an options map: `{:cache true}` says "these items
 ;; are every candidate I have for any extension of this prefix" — the LSP source says so
@@ -556,7 +572,7 @@ it takes over ([[complete-absorbed]]) — and close the popup. Point ends after 
 ;; A source that answers three elements — every local one — is asked every time, exactly
 ;; as before.
 
-(defn- complete-symbol-at-point (m)
+(defn complete-symbol-at-point (m)
   "`[start prefix]` — the symbol before point by the shared boundary rule, read from the
 current line only (`complete-line-to-point`)."
   (let ([line-start line] (complete-line-to-point (ed-current-buf m))
@@ -570,17 +586,24 @@ symbol at point `here` (`[start prefix]`)? Only while it is the same word and wh
 now extends what the source was asked about."
   (and (= (first entry) (first here)) (string/starts-with? (second here) (second entry))))
 
+(defn- answer-opts (answer)
+  "The options map a source's answer carries as its fourth element, or nil."
+  (nth answer 3 nil))
+
 (defn- complete-ask-source (m sym cache here)
   "Source `sym`'s answer at point: its cached answer filtered to the current prefix when the
-popup's `cache` still covers `here` ([[complete-cache-covers?]]), else the source itself."
+popup's `cache` still covers `here` ([[complete-cache-covers?]]), else the source itself. A
+filtered answer keeps the options the source gave (its docs, its rank). A symbol nothing is
+bound under yet — a source whose module has not loaded — answers nil, so a feature may name
+its source before it is there."
   (let (entry (get cache sym))
     (if (and entry here (complete-cache-covers? entry here))
       (let (prefix (second here))
         [(first here)
           prefix
           (seq/filter (nth entry 2) (fn (item) (string/starts-with? item prefix)))
-          {:cached entry}])
-      ((reflect/eval sym) m))))
+          (assoc (or (answer-opts entry) {}) :cached entry)])
+      (reflect/call-if-bound sym nil m))))
 
 (defn- complete-next-cache (sources results)
   "The popup's cache after a query: for each source in `sources` whose answer in `results`
@@ -591,37 +614,65 @@ one."
     {}
     (fn (acc pair)
       (let ([sym result] pair
-            opts (when result (nth result 3 nil)))
+            opts (when result (answer-opts result)))
         (cond
           (nil? opts) acc
           (:cached opts) (assoc acc sym (:cached opts))
           (:cache opts) (assoc acc sym result)
           :else acc)))))
 
-(defn- complete-at (m &optional (cache {}))
-  "`[start prefix items cache]` for completion at point, **merged across every applicable
-source** (`*completion-sources*`). The first non-nil source fixes the region `[start
-prefix]`; the others contribute items only if they agree on `start` (deduped, source
-order kept). `[point \"\" () {}]` when nothing applies. The seam that lets a language
-mode (or LSP) supply completions without `complete` naming the language.
+(defn- complete-order (items &optional (late '()))
+  "Completion candidates in presentation order: distinct, alphabetical — Emacs'
+`completions-sort`. Every source already prefix-filters, so no fuzzy re-ranking here (that
+stays the minibuffer's, `mincomplete`): a prefix completer that reorders its own prefix
+matches by fuzzy score puts `foo-bar-baz` above `foo-bar` for no reason a user can see.
+
+`late` are the candidates of sources that rank AFTER the rest (`{:rank :after}`, cape's
+dabbrev): alphabetical among themselves, below every other candidate, and only those the
+others did not already offer."
+  (let (first-tier (sort (seq/distinct items)))
+    (if (empty? late)
+      first-tier
+      (let (seen (into #{} first-tier))
+        (append first-tier (sort (seq/distinct (seq/reject late (fn (w) (contains? seen w))))))))))
+
+(defn- complete-at (m &optional (cache {}) (sources *completion-sources*))
+  "`{:start :prefix :items :cache :docs :continue}` for completion at point, **merged across
+every applicable source** (`sources`, [[*completion-sources*]] by default), `:items` in
+presentation order ([[complete-order]]). `:prefix` is \"\" and `:items` empty when nothing
+applies. The seam that lets a language mode (or LSP) supply completions without `complete`
+naming the language.
+
+The REGION `[start prefix]` is the first answer's — unless an answer CLAIMS it (`{:claims-region
+true}`): a source that recognises the text at point as its own kind (cape's file source, on a
+path) wins the region wherever it sits in the list, so a server answering every position
+cannot shadow it. The others contribute items only if they agree on `start`. Their `:docs`
+(candidate -> documentation) merge for the popup's info panel; the region's own source says
+whether a candidate ending in `:continue` (a directory's `/`) completes on.
 
 `cache` is the open popup's (see the section above): a source it still covers is filtered
 locally instead of asked. The `cache` answered is what the popup keeps for next time."
-  (let (sources *completion-sources*
-        ;; the symbol at point is only needed to test the cache; skip the read when empty
-        here (when (not (empty? cache)) (complete-symbol-at-point m))
+  (let (here (when (not (empty? cache)) (complete-symbol-at-point m))
         answers (map sources (fn (s) (complete-ask-source m s cache here)))
         results (seq/reject answers nil?)
         next-cache (complete-next-cache sources answers))
     (if (empty? results)
-      [(buffer-point (ed-current-buf m)) "" '() next-cache]
+      {:start (buffer-point (ed-current-buf m)) :prefix "" :items '() :cache next-cache :docs {}}
       ;; read by position, not a `[start prefix _]` pattern: an answer may carry a fourth
       ;; element (its options), and a tuple pattern matches only its own length
-      (let (start (first (first results))
-            prefix (second (first results))
-            items (seq/distinct (apply append
-                                  (map results (fn (r) (if (= (first r) start) (nth r 2) '()))))))
-        [start prefix items next-cache]))))
+      (let (lead (or (seq/find results (fn (r) (:claims-region (answer-opts r)))) (first results))
+            start (first lead)
+            agreeing (seq/filter results (fn (r) (= (first r) start)))
+            late? (fn (r) (= :after (:rank (answer-opts r))))
+            items-of (fn (rs) (mapcat rs (fn (r) (nth r 2))))
+            docs (fold agreeing {} (fn (acc r) (merge acc (or (:docs (answer-opts r)) {})))))
+        {:start start
+         :prefix (second lead)
+         :items (complete-order (items-of (seq/reject agreeing late?))
+                  (items-of (seq/filter agreeing late?)))
+         :cache next-cache
+         :docs docs
+         :continue (:continue (answer-opts lead))}))))
 
 (defdyn *completion-prepare*
   ;; Steps `(model) -> model` run before the sources are ASKED (not when the popup merely
@@ -650,25 +701,34 @@ refresh will ask none of the sources that needed preparing?"
     (let (here (complete-symbol-at-point m))
       (every? (vals cache) (fn (entry) (complete-cache-covers? entry here))))))
 
-(defn- complete-order (items)
-  "Completion candidates in presentation order: distinct, alphabetical — Emacs'
-`completions-sort`. Every source already prefix-filters, so no fuzzy re-ranking here (that
-stays the minibuffer's, `mincomplete`): a prefix completer that reorders its own prefix
-matches by fuzzy score puts `foo-bar-baz` above `foo-bar` for no reason a user can see."
-  (sort (seq/distinct items)))
-
 (defn- popup-anchor (m)
   "Where the popup currently BELONGS — `[buffer-name point]`, the two things that decide
 whether its list still answers the question you are asking."
   (let (buf (ed-current-buf m)) [(buffer-name buf) (buffer-point buf)]))
 
-(defn- popup-state (m start prefix items &optional (cache {}))
-  "The popup, stamped with the anchor it describes. One constructor, so the stamp cannot be
-forgotten at a site that opens one — which is exactly how the popup came to outlive its
-own line. `cache` is what narrowing may filter instead of asking again (`complete-at`)."
+(defn- popup-state (m found &optional (opts {}))
+  "The popup for `found` (a [[complete-at]] answer), stamped with the anchor it describes.
+One constructor, so the stamp cannot be forgotten at a site that opens one — which is
+exactly how the popup came to outlive its own line. `found`'s `:cache` is what narrowing may
+filter instead of asking again.
+
+`opts`: `:auto` for a popup the auto trigger opened (`:index` -1: nothing selected, so RET is not its —
+see [[complete-owns?]]); `:sources` when it asks other than [[*completion-sources*]] (the
+auto popup's, [[completion-auto-sources]]), so narrowing asks the same ones; `:info` the
+doc panel to carry over (it paints only while its candidate is the selected one)."
   (assoc m
     :completion
-      {:items items :index 0 :start start :prefix prefix :at (popup-anchor m) :cache cache}))
+      {:items (:items found)
+       :index (if (:auto opts) -1 0)
+       :start (:start found)
+       :prefix (:prefix found)
+       :at (popup-anchor m)
+       :cache (:cache found)
+       :docs (:docs found)
+       :continue (:continue found)
+       :auto (:auto opts)
+       :sources (:sources opts)
+       :info (:info opts)}))
 
 (defn popup-stale? (m)
   "Has the popup stopped describing where you are?
@@ -686,9 +746,21 @@ covers the mouse, every movement command and a buffer switch alike."
   (let (c (:completion m)) (and c (not (= (:at c) (popup-anchor m))))))
 
 (defn close-stale-popup (m)
-  "Close the popup if it no longer describes where point is ([[popup-stale?]]) — the
-post-step's one call."
-  (if (popup-stale? m) (assoc m :completion nil) m))
+  "The post-step's one call: close the popup if it no longer describes where point is
+([[popup-stale?]]), and note, for the auto trigger, where the last typing command left point
+(`:completion-auto-typed`)."
+  (let (m (note-typed m)) (if (popup-stale? m) (assoc m :completion nil) m)))
+
+(defn- note-typed (m)
+  ;; after a command (`:command-count` moved): the spot a typing command left point at, or
+  ;; nil after any other — the one spot the auto popup may open at. O(1) between commands.
+  (let (count (:command-count m)
+        typed (:completion-auto-typed m))
+    (if (= count (first typed))
+      m
+      (assoc m
+        :completion-auto-typed
+          [count (when (includes? *completion-auto-commands* (:this-command m)) (auto-stamp m))]))))
 
 ;; …run after every event. The overlays dismiss the popup for a key it does not own, but a
 ;; MOUSE click never reaches them (`ed-mouse` folds it directly), so clicking away left the
@@ -714,23 +786,27 @@ differently."
 
 (defn- cmd-complete-sources (m key)
   "`cmd-complete` proper: prepare (`*completion-prepare*`), ask every source and act on what
-comes back."
+comes back. A region whose source continues (a path: `:continue`) inserts the candidate or
+the common prefix WHOLE — a path's `/` and `.` are not segments to stop at."
   (let (m (complete-prepare m)
-        [start prefix items0 cache] (complete-at m)
-        items (complete-order items0))
+        found (complete-at m)
+        start (:start found)
+        prefix (:prefix found)
+        items (:items found)
+        step (fn (word)
+               (if (:continue found) word (complete-step prefix word (completion-separators m)))))
     (if (= prefix "")
       (message m "nothing to complete")
       (cond
         (empty? items) (message m (str "no completions for \"" prefix "\""))
         ;; one candidate, or a common prefix that extends what was typed: Tab goes to the end
         ;; of the next segment of it ([[complete-step]]), not the whole word
-        (= (count items) 1)
-          (complete-apply m start (complete-step prefix (first items) (completion-separators m)))
+        (= (count items) 1) (complete-apply m start (step (first items)))
         else
           (let (common (lcp items))
             (if (> (string/length common) (string/length prefix))
-              (complete-apply m start (complete-step prefix common (completion-separators m)))
-              (popup-state m start prefix items cache)))))))
+              (complete-apply m start (step common))
+              (popup-state m found)))))))
 
 ;; ---- popup navigation (input routes control keys here) ----------------------
 
@@ -746,22 +822,70 @@ Backspace (narrow back). Any other key dismisses the popup and is processed norm
     (= input :backspace)
     (and (string? input) (complete-word-char? input))))
 
-(defn complete-cancel (m) "Dismiss the completion popup." (assoc m :completion nil))
+(defn complete-owns? (m input)
+  "Whether the open popup in `m` consumes `input` — [[complete-control-key?]], except RET
+while NOTHING is selected. That is a popup the auto trigger opened and you have not moved
+in: it is a suggestion beside your typing, and RET there means the newline you were about
+to type (Corfu's `corfu-preselect 'prompt`). RET dismisses it and goes through. Once C-n /
+C-p has selected a candidate, RET takes it, as it always does in a popup you asked for."
+  (and (complete-control-key? input)
+    (not (and (= input :enter) (nil? (completion-selected m))))))
+
+(defn- auto-stamp (m)
+  "`[buffer-name point rope]` — where the auto trigger last looked (or the popup last closed),
+so it does not look again until you type."
+  (let (buf (ed-current-buf m)) [(buffer-name buf) (buffer-point buf) (buffer-rope buf)]))
+
+(defn complete-cancel (m)
+  "Dismiss the completion popup. The auto trigger is told this spot is answered, so C-g is not
+followed by the same popup a moment later."
+  (assoc m :completion nil :completion-auto-at (auto-stamp m)))
+
+(defn- complete-apply (m start word)
+  "Replace the text in [start, point) with `word` — and as much of the word after point as
+it takes over ([[complete-absorbed]]) — and close the popup. Point ends after `word`, which
+is marked as answered for the auto trigger: a word just completed is not one to offer
+completions for until you type again."
+  (let (buf (ed-current-buf m)
+        p (buffer-point buf)
+        typed (text/slice (buffer-rope buf) start p)
+        taken (complete-absorbed typed (complete-word-suffix buf) word (completion-separators m))
+        buf2 (replace-region buf start (+ p taken) word)
+        m2 (assoc (ed-set-buf m buf2) :completion nil :status "modified"))
+    (assoc m2 :completion-auto-at (auto-stamp m2))))
 
 (defn- complete-motion (m motion)
-  ;; C-n / C-p step (wrapping), M-< / M-> the ends — `editor/list-motion`, the keys every
-  ;; list in the editor reads the same way
+  ;; C-n / C-p step (wrapping — Corfu's `corfu-cycle`), M-< / M-> the ends —
+  ;; `editor/list-motion`, the keys every list in the editor reads the same way. With
+  ;; nothing selected (an auto popup), C-n selects the first and C-p the last.
   (let (c (:completion m))
     (if (nil? c)
       m ; no popup to move in
-      (assoc m
-        :completion
-          (assoc c
-            :index (editor/list-motion/motion-index (:index c) (count (:items c)) motion))))))
+      (let (n (count (:items c))
+            i (:index c)
+            from (cond
+                   (>= i 0) i
+                   (= motion :previous) 0
+                   :else -1))
+        (assoc m
+          :completion (assoc c :index (editor/list-motion/motion-index from n motion)))))))
+
+(defn- complete-reopen (m c found)
+  "The popup `c` was, reopened on `found` — or closed when `found` has nothing."
+  (if (or (= (:prefix found) "") (empty? (:items found)))
+    (assoc m :completion nil)
+    (popup-state m found {:auto (:auto c) :sources (:sources c) :info (:info c)})))
 
 (defn complete-accept (m)
-  (let (c (:completion m))
-    (complete-apply m (:start c) (nth (:items c) (:index c)))))
+  "Insert the selected candidate (the first when none is selected — Tab in an auto popup).
+A candidate ending in its source's `:continue` (a directory's `/`) completes on: the popup
+reopens on what is inside it, as cape-file under Corfu does."
+  (let (c (:completion m)
+        word (nth (:items c) (math/max 0 (:index c)))
+        m2 (complete-apply m (:start c) word))
+    (if (and (:continue c) (string/ends-with? word (:continue c)))
+      (complete-reopen m2 c (complete-at m2 {} (or (:sources c) *completion-sources*)))
+      m2)))
 
 (defn- complete-edit (m f)
   "Apply a `buffer -> buffer` edit `f` to the current buffer (marking it modified) —
@@ -774,26 +898,220 @@ prefix is empty or nothing matches. Re-queries every source through `complete-at
 merge stays correct across all of them — the word at point changed, so the sources rescan
 it — EXCEPT a source whose answer the popup cached and which still covers the new prefix:
 that one is filtered locally, so a server-backed popup narrows without a round-trip.
-`*completion-prepare*` runs only when a cached source is about to be asked again."
-  (let (cache (:cache (:completion m) {})
-        m (if (complete-cache-current? m cache) m (complete-prepare m))
-        [start prefix items0 next-cache] (complete-at m cache)
-        items (complete-order items0))
-    (if (or (= prefix "") (empty? items))
-      (assoc m :completion nil)
-      (popup-state m start prefix items next-cache))))
+`*completion-prepare*` runs only when a cached source is about to be asked again. An auto
+popup stays one (nothing selected, its own sources)."
+  (let (c (:completion m)
+        cache (:cache c {})
+        m (if (complete-cache-current? m cache) m (complete-prepare m)))
+    (complete-reopen m c (complete-at m cache (or (:sources c) *completion-sources*)))))
+
+(defn complete-typing-key? (input)
+  "True for a key that TYPES into the buffer while the popup is open — a word character or a
+backspace — which the popup narrows on rather than handles itself."
+  (or (= input :backspace) (and (string? input) (complete-word-char? input))))
+
+(defn complete-narrow (m)
+  "The open popup re-narrowed to the word at point after a typing key (the key itself ran as
+ordinary typing, `input`'s completion overlay), or `m` when no popup is open."
+  (if (:completion m) (complete-refresh m) m))
 
 (defn complete-handle (m input)
-  "Fold a popup-control key: C-n/↓ C-p/↑ move; Enter/Tab accept; a word-char inserts and
-re-narrows; Backspace deletes and re-narrows; Esc/C-g cancel. M-< / M-> jump to the
-ends of the list, as they do everywhere else."
+  "Fold a popup-control key: C-n/↓ C-p/↑ move (wrapping); Tab accepts (the first candidate
+when none is selected); Enter accepts the selected one — with none selected it only
+dismisses (the fallback when the dispatcher asks [[complete-control-key?]] rather than
+[[complete-owns?]]); a word-char inserts and re-narrows; Backspace deletes and re-narrows;
+Esc/C-g cancel. M-< / M-> jump to the ends of the list, as they do everywhere else."
   (cond
     (editor/list-motion/motion-of input) (complete-motion m (editor/list-motion/motion-of input))
-    (or (= input :enter) (= input :tab)) (complete-accept m)
+    (= input :tab) (complete-accept m)
+    (= input :enter) (if (nil? (completion-selected m)) (complete-cancel m) (complete-accept m))
     (= input :backspace) (complete-refresh (complete-edit m delete-backward-char))
     (and (string? input) (complete-word-char? input))
       (complete-refresh (complete-edit m (fn (b) (insert b input))))
     else (complete-cancel m))) ; :escape / :ctrl-g
+
+;; ---- the auto popup (Corfu's `corfu-auto`) -----------------------------------------
+;; After a typing command and a short quiet, the popup opens on its own when the word before
+;; point is long enough — no Tab. It is a feature timer (`model/register-timer-client`): an
+;; idle one-shot `:completion-auto-delay` ms after the last key, armed only while there is a
+;; spot the trigger has not looked at yet (`:completion-auto-at`), so it fires once per pause
+;; and an editor at rest runs no timer for it.
+;;
+;; The choices, against Corfu's defaults:
+;;  - `corfu-preselect`: an auto popup selects NOTHING (Corfu's `'prompt`, not its `'valid`).
+;;    It opened without being asked, so RET keeps meaning newline until you move into the
+;;    list with C-n / C-p ([[complete-owns?]]); Tab takes the first candidate. A popup you
+;;    asked for with Tab selects the first, and RET takes it, as before.
+;;  - `corfu-on-exact-match`: no rule needed — no source offers the word already typed, so a
+;;    popup never holds just the input.
+;;  - `corfu-cycle`: C-n past the last wraps to the first (`editor/list-motion`).
+;;  - the inline preview (`completion-preview-mode`) is off while the auto popup is on.
+;;
+;; Settings, read off the model (the init file's `:model-key`s): `:completion-auto` (absent =
+;; off, like every model-seeded toggle — the setting's default turns it on),
+;; `:completion-auto-delay` (ms) and `:completion-auto-prefix` (word characters).
+
+(def *completion-auto-delay-ms* 200) ; Corfu's `corfu-auto-delay` 0.2, the user's setting
+(def *completion-auto-min-prefix* 2) ; Corfu's `corfu-auto-prefix`
+
+(defdyn *completion-auto-commands*
+  ;; The commands after which the auto trigger looks (Corfu's `corfu-auto-commands`):
+  ;; typing and deleting backwards. Moving point is not asking for completion.
+  (list :self-insert 'commands/cmd-delete-backward 'commands/cmd-electric-backspace))
+
+(defdyn *completion-auto-triggers*
+  ;; Predicates `(model) -> bool`, as symbols resolved late: the auto popup opens when ANY
+  ;; says the text before point is worth completing. The word-length rule always; cape adds
+  ;; "this is a path" when it loads.
+  (list 'complete-at-point/completion-auto-prefix-trigger?))
+
+(defdyn *completion-auto-skip*
+  ;; Sources the AUTO popup does not ask (Tab still does). The language server: its request is
+  ;; answered synchronously on the UI loop (up to `lsp/*lsp-timeout-ms*`), and the auto popup
+  ;; asks on every pause in typing — and again per key while the server calls its list
+  ;; incomplete — so a slow server would stall typing. Off until the source is asynchronous
+  ;; (a request sent on the pause, the popup opened when the reply lands).
+  (list 'lsp/lsp-complete-source))
+
+(defn completion-auto? (m)
+  "Whether the auto popup is on: the model's `:completion-auto` is `true`."
+  (= true (:completion-auto m)))
+
+(defn completion-auto-delay (m)
+  "The quiet, in ms, before the auto popup opens: `:completion-auto-delay`, else
+[[*completion-auto-delay-ms*]]."
+  (let (d (:completion-auto-delay m)) (if (and (int? d) (>= d 0)) d *completion-auto-delay-ms*)))
+
+(defn completion-auto-min-prefix (m)
+  "How many word characters before point open the auto popup: `:completion-auto-prefix`,
+else [[*completion-auto-min-prefix*]]."
+  (let (n (:completion-auto-prefix m)) (if (and (int? n) (> n 0)) n *completion-auto-min-prefix*)))
+
+(def- *auto-modal-keys*
+  ;; while any of these is open, a key is not typing into the buffer
+  [:minibuffer :isearch :query-replace :transient :menu :describe-key :read-char :pending])
+
+(defn completion-auto-due? (m)
+  "Is there a spot the auto trigger has not looked at — auto on, no popup or prompt open, the
+last command one that types ([[*completion-auto-commands*]]) and point or text moved since it
+last looked? Asked after every event (it arms the timer), so it is a few field reads."
+  (and (completion-auto? m)
+    (nil? (:completion m))
+    (not (any? *auto-modal-keys* (fn (k) (get m k))))
+    (includes? *completion-auto-commands* (:this-command m))
+    ;; point is where a TYPING command left it — not moved since by a click or a scroll
+    (= (second (:completion-auto-typed m)) (auto-stamp m))
+    (not (= (:completion-auto-at m) (auto-stamp m)))))
+
+(defn completion-auto-timer (m)
+  "The auto popup's timer, for `model/register-timer-client`: an idle one-shot
+[[completion-auto-delay]] ms after the last key while [[completion-auto-due?]], else nil."
+  (when (completion-auto-due? m) {:after (completion-auto-delay m) :idle? true}))
+
+(defn completion-auto-prefix-trigger? (m)
+  "The word-length trigger: at least [[completion-auto-min-prefix]] word characters before
+point."
+  (>= (string/length (second (complete-symbol-at-point m))) (completion-auto-min-prefix m)))
+
+(defn completion-auto-sources ()
+  "The sources the auto popup asks: [[*completion-sources*]] less [[*completion-auto-skip*]]."
+  (seq/reject *completion-sources* (fn (s) (includes? *completion-auto-skip* s))))
+
+(defn completion-auto-open (m)
+  "The auto timer fired: open the popup at point when a trigger says the text is worth it
+([[*completion-auto-triggers*]]) and the sources have something — nothing selected, so RET
+stays yours. Whatever the outcome, this spot is marked looked-at, so the timer stops until
+you type again. A read-only buffer gets none (nothing typed there can accept it)."
+  (if (not (completion-auto-due? m))
+    m
+    (let (m (assoc m :completion-auto-at (auto-stamp m)))
+      (if (or (read-only? (ed-current-buf m))
+            (not (any? *completion-auto-triggers* (fn (sym) (reflect/call-if-bound sym false m)))))
+        m
+        (let (sources (completion-auto-sources)
+              m (complete-prepare m)
+              ;; a source that raises (a folder it cannot list) answers nothing: the spot stays
+              ;; marked looked-at, where a raise would roll the model back and the timer would
+              ;; fire again at the same spot every delay
+              found (check-allow :discarded-catch
+                      (try (complete-at m {} sources) (catch e nil))))
+          (if (or (nil? found) (= (:prefix found) "") (empty? (:items found)))
+            m
+            (popup-state m found {:auto true :sources sources})))))))
+
+(register-timer-client :completion-auto
+  'complete-at-point/completion-auto-timer 'complete-at-point/completion-auto-open)
+
+;; ---- the info panel (Corfu's `corfu-popupinfo-mode`) ----------------------------------
+;; The selected candidate's documentation in a card beside the popup, after a short quiet:
+;; the source's own (`:docs` in its answer — a language server's item documentation) or else
+;; the mode's `:doc-at` service asked about the candidate (brood-mode: arglist, signature,
+;; docstring from the live image). Delayed, as Corfu's is, so stepping through the list with
+;; C-n does not look up every row on the way; once a panel has shown, the next one follows
+;; sooner (Corfu's `corfu-popupinfo-delay` pair). A panel only paints while its candidate is
+;; the selected one, so it never documents the wrong row. `:completion-popupinfo false` on
+;; the model turns it off.
+
+(defdyn *completion-info-delay-ms* 500) ; the quiet before the first panel
+(defdyn *completion-info-again-ms* 150) ; …and before each one after it, while the popup is open
+(def *completion-info-max-lines* 14)
+(def *completion-info-max-width* 64)
+
+(defn completion-info? (m)
+  "Whether the info panel is on: unless the model's `:completion-popupinfo` is `false`."
+  (not (= false (:completion-popupinfo m))))
+
+(defn completion-selected (m)
+  "The popup's selected candidate, or nil (no popup, or nothing selected)."
+  (let (c (:completion m))
+    (when (and c (>= (:index c) 0)) (nth (:items c) (:index c) nil))))
+
+(defn- completion-info-due? (m)
+  ;; a candidate is selected and the panel is not (yet) about it
+  (let (selected (completion-selected m))
+    (and selected
+      (completion-info? m)
+      (not (= selected (map/get-in m [:completion :info :candidate]))))))
+
+(defn completion-info-timer (m)
+  "The info panel's timer, for `model/register-timer-client`: an idle one-shot while the
+selected candidate has no panel yet — [[*completion-info-delay-ms*]] for the first,
+[[*completion-info-again-ms*]] once one has shown in this popup."
+  (when (completion-info-due? m)
+    {:after (if (map/get-in m [:completion :info])
+              *completion-info-again-ms*
+              *completion-info-delay-ms*)
+     :idle? true}))
+
+(defn completion-doc-lines (m candidate)
+  "`candidate`'s documentation as lines: the popup's `:docs` entry for it (a string, or an LSP
+`MarkupContent` map), else the current buffer's `:doc-at` service asked about the candidate
+alone, else `()`. A service that raises costs the panel, never the frame."
+  (let (doc (get (map/get-in m [:completion :docs] {}) candidate))
+    (cond
+      (string? doc) (string/split (string/trim doc) "\n")
+      (and (map? doc) (string? (:value doc))) (string/split (string/trim (:value doc)) "\n")
+      :else
+        (let (svc (ed-mode-service (ed-current-buf m) :doc-at))
+          (or (when svc
+                (check-allow :discarded-catch
+                  (try (svc candidate (string/length candidate)) (catch _ nil))))
+            '())))))
+
+(defn completion-info-load (m)
+  "The info timer fired: look up the selected candidate's documentation
+([[completion-doc-lines]]) and keep it on the popup as `:info {:candidate :lines}` — an
+empty `:lines` too, so a candidate with no docs is not asked again."
+  (if (not (completion-info-due? m))
+    m
+    (let (selected (completion-selected m))
+      (map/assoc-in m
+        [:completion :info]
+        {:candidate selected :lines (completion-doc-lines m selected)}))))
+
+(register-timer-client :completion-info
+  'complete-at-point/completion-info-timer 'complete-at-point/completion-info-load)
+
 ;; ---- rendering (overlay the menu; view splices these ops in) ----------------
 
 (def ed-popup-style
@@ -802,12 +1120,52 @@ ends of the list, as they do everywhere else."
   ;; look as the right-click context menu, so the two read identically.
   {:fg :on-surface :bg :surface :pad [0 1 0 1] :radius *completion-card-radius*})
 
+(def- ed-info-style
+  ;; the info card: the popup's surface, with a hairline so it reads as a separate card
+  {:fg :on-surface :bg :surface :pad [0 1 0 1] :radius *completion-card-radius* :border true})
+
+(defn- complete-info-ops (m c area cols rows ctx)
+  "The info panel's ops beside the popup card at `area`: right of it when it fits, else left,
+else none. Empty unless the panel is about the selected candidate and has lines."
+  (let (info (:info c))
+    (if (or (nil? info)
+          (not (completion-info? m))
+          (not (= (:candidate info) (completion-selected m)))
+          (empty? (:lines info)))
+      []
+      (let ([pcol prow pw _] area
+            lines (into []
+                    (take (:lines info)
+                      (math/min *completion-info-max-lines* (math/max 1 (- rows 2)))))
+            w (+ 2
+                (math/min *completion-info-max-width*
+                  (fold lines 1 (fn (widest line) (math/max widest (string/length line))))))
+            right (+ pcol pw 1)
+            left (- pcol w 1)
+            col (cond
+                  (<= (+ right w) cols) right
+                  (>= left 0) left
+                  :else nil))
+        (if (nil? col)
+          []
+          (let (face (ui-face (:theme ctx) {:fg :on-surface :bg :surface})
+                panel (ui-panel (ui-clamp [col prow w (count lines)] cols rows)
+                        ctx
+                        ed-info-style
+                        (fn (inner _ctx)
+                          (let ([icol irow iw _] inner)
+                            {:ops (map (seq/enumerate lines)
+                                    (fn ([i line]) (text (+ irow i) icol (ui-clip line iw) face)))
+                             :zones []}))))
+            (:ops panel)))))))
+
 (sig complete-popup-ops (model int int -> any))
 (defn complete-popup-ops (m cols rows)
   "Render ops for the completion menu (empty when no popup is open): a windowed `ui-list`
 in a frameless `ui-panel` (src/ui-kit.blsp) anchored at point — `*completion-max*` items
-scrolled around the selection, flipped above point when there's no room below. One widget
-paints AND hit-tests the card, the same one behind the context menu."
+scrolled around the selection, flipped above point when there's no room below — and beside
+it the selected candidate's info panel when one has loaded. One widget paints AND hit-tests
+the card, the same one behind the context menu."
   (let (c (:completion m))
     (if (nil? c)
       []
@@ -819,23 +1177,30 @@ paints AND hit-tests the card, the same one behind the context menu."
             ;; over the mode line / echo (or off the bottom edge). The frameless card
             ;; is exactly `vis` rows tall, so no frame rows to reserve.
             vis (math/max 1 (math/min *completion-max* total (- rows 2)))
-            wstart (completion-window-start total idx vis)
+            ;; nothing selected (an auto popup) scrolls as if the first were
+            wstart (completion-window-start total (math/max 0 idx) vis)
             window (take (drop items wstart) vis)
             ;; label field width; the card is +3 (1 pad each side + the pill's 1-cell inset)
             textw (completion-menu-width window)
             rowfn (fn (it i sel?) {:label (ui-clip it textw) :enabled true})
-            crow (- (buffer-current-line buf) (ed-current-top m))
+            ;; point's window cell: the pane's place, its header row and gutter, wrapping and
+            ;; sideways scroll — the buffer's line and column alone put the card on the cursor's
+            ;; own row under a header, and at the wrong column beside a gutter or in a split
+            cell (panes/ed-point-screen-cell m cols rows)
+            crow (if cell (first cell) (- (buffer-current-line buf) (ed-current-top m)))
+            ccol (if cell (second cell) (buffer-column buf))
             ;; place the vis-tall card below the cursor line if it fits, else above
             below? (<= (+ crow 1 vis) (- rows 2))
             row0 (if below? (+ crow 1) (- crow vis))
-            area (ui-clamp [(buffer-column buf) (math/max 0 row0) (+ textw 3) vis] cols rows)
+            area (ui-clamp [ccol (math/max 0 row0) (+ textw 3) vis] cols rows)
+            ctx (ui-ctx (:gui m))
             res (ui-panel area
-                  (ui-ctx (:gui m))
+                  ctx
                   ed-popup-style
                   (ui-list {:items window
-                            :selected idx
+                            :selected (when (>= idx 0) idx)
                             :base wstart
                             :row rowfn
                             :tag :complete-run
                             :style ed-popup-style})))
-        (:ops res)))))
+        (append (:ops res) (complete-info-ops m c area cols rows ctx))))))

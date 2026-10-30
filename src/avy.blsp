@@ -1,0 +1,398 @@
+(defmodule avy
+  "Avy: jump to any position on screen by typing a short label (Emacs's `avy`).
+
+- `C-'` [[cmd-avy-goto-char-timer]]: type one or more characters; after a pause of
+  [[*avy-timeout-ms*]] every match in the VISIBLE text of every pane carries a label, and
+  typing it jumps there — selecting that pane when it is another.
+- `M-g w` [[cmd-avy-goto-word-1]]: one character, then the word starts beginning with it.
+- `M-g e` [[cmd-avy-goto-word-0]]: every word start on screen.
+
+A jump in the same pane pushes the mark where you were, as isearch does. C-g cancels.
+
+The keys are read through the read-char overlay (`model/ed-read-char`'s
+`:read-char {:then …}`), re-armed after each one, so the mode needs no overlay row of its
+own: C-g there drops `:read-char`, and the post-step [[avy-drop-orphan]] then drops the
+state that came with it. The pause is a feature timer (`model/register-timer-client`), an
+`:idle?` one-shot that every key pushes out.
+
+Targets are found in what each pane SHOWS, through the same geometry the view paints with —
+the pane's row table (`panes/ed-pane-rows`: wrapped, truncated and scrolled lines), its
+gutter (`panes/ed-pane-gutter-width`) and its text width — so a label lands on the glyph it
+names. A zoomed pane is skipped: its cells are not the window's. The labels are painted by
+[[avy-ops]], a view overlay."
+  (:use editor/buffer) ; buffer-point / goto-char / push-mark / clear-mark / buffer-line-count
+  (:use editor/pane) ; pane-selected-path / pane-select-path
+  (:use model) ; message / ed-current-buf / ed-set-buf / the registries
+  (:use panes) ; ed-body-layout / ed-pane-rows / ed-pane-top / ed-pane-gutter-width / …
+  (:use theme) ; defchrome and the palette the label faces are written over
+  (:use interactive)) ; defcommand — the three commands, on M-x
+
+;; ---- settings --------------------------------------------------------------------
+
+(defdyn *avy-timeout-ms* 300)
+;; How long avy-goto-char-timer waits after the last typed character before it labels the
+;; matches (Emacs's `avy-timeout-seconds`, 0.5 there; shorter reads better with a GUI).
+
+(def *avy-keys* ["a" "s" "d" "f" "g" "h" "j" "k" "l"])
+;; The label alphabet — the home row, Emacs's `avy-keys` default.
+
+(defchrome face-avy-lead {:fg *base* :bg *peach* :bold true}) ; the label key to type next
+(defchrome face-avy-rest {:fg *base* :bg *green* :bold true}) ; the keys after it
+(defchrome face-avy-match {:fg *base* :bg *yellow*}) ; a match while the query is typed
+
+;; ---- labels ----------------------------------------------------------------------
+;; avy's tree: with `k` keys and `n` targets, as many targets as possible get ONE key, and
+;; the last keys of the alphabet become prefixes, each opening a subtree labelled the same
+;; way. The first targets — the ones nearest point — get the short labels.
+
+(defn- avy-power (base exponent)
+  (fold (range exponent) 1 (fn (acc _) (* acc base))))
+
+(sig avy-depth (int int -> int))
+(defn- avy-depth (n k)
+  "The fewest label keys that tell `n` targets apart with `k` keys: the smallest `d` with
+`k^d >= n`."
+  (letrec (go (fn (d) (if (>= (avy-power k d) n) d (go (inc d))))) (go 1)))
+
+(sig avy-split (int int -> list))
+(defn- avy-split (total parts)
+  "`total` shared out over `parts` as evenly as can be, the larger shares first."
+  (let (base (math/quot total parts)
+        extra (math/rem total parts))
+    (map (range parts) (fn (i) (if (< i extra) (inc base) base)))))
+
+(sig avy-label-tree (int vector -> vector))
+(check-allow :non-tail-recursion
+  (defn- avy-label-tree (n keys)
+    "`n` distinct labels over `keys` (strings), none a prefix of another, in tree order:
+the first keys stand alone, the last ones prefix a subtree."
+    (let (k (count keys))
+      (cond
+        (<= n 0) []
+        (< k 2) (error "avy-labels: need at least two keys: " keys)
+        (<= n k) (into [] (take keys n))
+        :else
+          (let (capacity (avy-power k (dec (avy-depth n k)))
+                singles (math/max 0
+                          (math/min (dec k) (math/quot (- (* k capacity) n) (dec capacity))))
+                prefixes (- k singles)
+                shares (avy-split (- n singles) prefixes))
+            (into (into [] (take keys singles))
+              (mapcat (range prefixes)
+                (fn (i)
+                  (let (prefix (nth keys (+ singles i)))
+                    (map (avy-label-tree (nth shares i 0) keys) (fn (label) (str prefix label))))))))))))
+
+(sig avy-labels (int vector -> vector))
+(defn avy-labels (n keys)
+  "`n` distinct labels over `keys` (strings), none a prefix of another, SHORTEST FIRST —
+the order the targets nearest point are dealt them in.
+
+    (avy/avy-labels 3 [\"a\" \"s\" \"d\"])   ;=> [\"a\" \"s\" \"d\"]
+    (avy/avy-labels 4 [\"a\" \"s\" \"d\"])   ;=> [\"a\" \"s\" \"da\" \"ds\"]"
+  (into [] (seq/sort-by (avy-label-tree n keys) string/length)))
+
+;; ---- targets: what each pane shows -----------------------------------------------
+;; A target is `{:path :offset :row :col :avail :text}`: the pane it is in, the buffer
+;; offset it names, the window cell its first glyph is painted at, the cells from there to
+;; the text area's right edge (a label never paints past it), and the visible text of the
+;; match (what the typing phase highlights).
+
+(defn- avy-visible-rows (pane buf)
+  "`[k line from end]` for each text row `pane` shows: row index `k` from the pane's top,
+the buffer `line`, and the chars `[from, end)` of it painted on that row — `end` nil for an
+unwrapped row, whose reach is the text width. Inlay rows are skipped (no buffer text)."
+  (let (rows (ed-pane-rows pane buf)
+        vrows (ed-pane-vrows pane buf))
+    (if (nil? rows)
+      (let (top (ed-pane-top pane buf)
+            last-line (buffer-line-count buf)
+            hscroll (ed-pane-hscroll pane))
+        (for (k (range vrows) :when (< (+ top k) last-line)) [k (+ top k) hscroll nil]))
+      (seq/keep (range (math/min vrows (count rows)))
+        (fn (k)
+          (let (entry (nth rows k)
+                clip (nth entry 4 nil))
+            (when (nil? (nth entry 3 nil))
+              [k (first entry) (second entry) (if (vector? clip) (first clip) (nth entry 2))])))))))
+
+(defn- avy-row-cells (text from end width)
+  "The chars of `text` a row painted from char `from` shows within `width` cells, up to
+`end` (nil: the line's end): `[stop base]` — the first char NOT shown, and the cell width
+of the text before `from` (the base a tab's stop is measured from)."
+  (let (length (string/length text)
+        limit (math/min length (if (nil? end) (+ from width) end) (+ from width))
+        base (if (= from 0) 0 (string/display-width (string/substring text 0 from))))
+    [(if (< limit from) from limit) base]))
+
+(defn- avy-cell-of (text from base index)
+  "The cells between char `from` and char `index` of `text`, laid out from cell `base`."
+  (if (<= index from)
+    0
+    (- (string/display-width (string/substring text 0 index))
+      base)))
+
+(defn- avy-word-char? (s)
+  (regex/matches? "\\w" s))
+
+(defn- avy-row-starts (text from stop matcher)
+  "The char indices in `[from, stop)` of `text` where `matcher` says a target starts —
+`matcher` is `(text index) -> length` of the target there, or nil."
+  (fold (range from stop)
+    []
+    (fn (acc index)
+      (let (length (matcher text index)) (if (nil? length) acc (conj acc [index length]))))))
+
+(sig avy-query-at (string bool int string int -> (or nil int)))
+(defn- avy-query-at (wanted fold? n text index)
+  "`n` when the `n` chars of `text` at `index` are `wanted` (folded when `fold?`), else nil."
+  (let (stop (+ index n))
+    (when (<= stop (string/length text))
+      (let (here (string/substring text index stop))
+        (when (= (if fold? (string/fold-case here) here) wanted) n)))))
+
+(defn avy-query-matcher (query)
+  "A matcher for the typed `query`: its length where `query` begins, case-folded unless it
+holds a capital (`isearch/search-fold?`, the search rule)."
+  (let (fold? (isearch/search-fold? query)
+        wanted (if fold? (string/fold-case query) query)
+        n (string/length query))
+    (fn (text index) (avy-query-at wanted fold? n text index))))
+
+(sig avy-word-at ((or nil string) string int -> (or nil int)))
+(defn- avy-word-at (wanted text index)
+  "1 when a word starts at char `index` of `text` — a word character with none before it —
+and, given `wanted`, its first character folds to that; else nil."
+  (let (here (string/substring text index (inc index)))
+    (when (and (avy-word-char? here)
+            (or (= index 0) (not (avy-word-char? (string/substring text (dec index) index))))
+            (or (nil? wanted) (= (string/fold-case here) wanted)))
+      1)))
+
+(defn avy-word-matcher (initial)
+  "A matcher for word starts — a word character with none before it — beginning with
+`initial` (case-folded like a query), or any word start when `initial` is nil."
+  (let (wanted (when initial (string/fold-case initial)))
+    (fn (text index) (avy-word-at wanted text index))))
+
+(defn avy-pane-targets (m pane matcher)
+  "Every target `matcher` finds in the text `pane` shows, in screen order."
+  (if (get (:payload pane) :zoom)
+    []
+    (let (buf (ed-pane-buf m pane)
+          [x y _ _] (:rect pane)
+          text-x (+ x (ed-pane-gutter-width buf pane))
+          width (ed-pane-text-cols pane buf)
+          rope (buffer-rope buf))
+      (mapcat (avy-visible-rows pane buf)
+        (fn ([k line from end])
+          (let (text (wrap/line-text buf line)
+                [stop base] (avy-row-cells text from end width)
+                bol (text/line->char rope line))
+            ;; `stop` bounds the row by characters; a tab or a wide character takes more cells
+            ;; than one, so a match can still start past the pane's edge — not shown, not labelled
+            (seq/keep (avy-row-starts text from stop matcher)
+              (fn ([index length])
+                (let (cell (avy-cell-of text from base index))
+                  (when (< cell width)
+                    {:path (:path pane)
+                     :offset (+ bol index)
+                     :row (+ y k)
+                     :col (+ text-x cell)
+                     :avail (math/max 1 (- width cell))
+                     :text (string/substring text index (math/min stop (+ index length)))}))))))))))
+
+(defn avy-targets (m layout matcher)
+  "Every target `matcher` finds on screen, over `layout`'s panes, NEAREST FIRST: the
+selected pane's by distance from point, then the other panes' in screen order. The order
+the labels are dealt in, so the short ones land closest."
+  (let (panes (:panes layout)
+        selected (pane-selected-path (:layout m))
+        point (buffer-point (ed-current-buf m))
+        here (mapcat (seq/filter panes (fn (pane) (= (:path pane) selected)))
+               (fn (pane) (avy-pane-targets m pane matcher)))
+        elsewhere (mapcat (seq/reject panes (fn (pane) (= (:path pane) selected)))
+                    (fn (pane) (avy-pane-targets m pane matcher))))
+    (into (into [] (seq/sort-by here (fn (target) (math/abs (- (:offset target) point)))))
+      elsewhere)))
+
+(defn- avy-layout (m)
+  "The panes as this frame lays them out: over the window `ed-update` recorded (`:frame`),
+else as the last frame painted them."
+  (let (frame (:frame m))
+    (if (vector? frame) (ed-body-layout m (first frame) (second frame)) (ed-layout-now m))))
+
+;; ---- the state, and keeping the reader -------------------------------------------
+;; `:avy` is `{:kind :phase :query :matches :targets :typed}`:
+;;   :kind     :char-timer · :word-1 · :word-0
+;;   :phase    :reading (a query is typed) · :labels (the labels are up)
+;;   :query    what was typed so far (char-timer, word-1)
+;;   :matches  the targets the query finds while it is typed (highlighted)
+;;   :targets  `[label target]` once the labels are up
+;;   :typed    the label keys typed so far
+
+(defn avy-state (m)
+  "The avy state, when avy is the one reading keys — else nil (a C-g in the read-char
+overlay drops the reader and leaves `:avy` for [[avy-drop-orphan]])."
+  (when (map/get-in m [:read-char :avy]) (:avy m)))
+
+(defn- avy-read (m state prompt)
+  "`m` with `state` stored and the next key coming to [[avy-key]] — `model/ed-read-char`'s
+reader, marked as avy's (`:avy`) so [[avy-state]] can tell it from another's."
+  (assoc (message m prompt) :avy state :read-char {:then avy-key :avy true}))
+
+(defn- avy-done (m)
+  (dissoc m :avy :read-char))
+
+(defn avy-drop-orphan (m)
+  "Post-step: drop `:avy` once nothing reads its keys (the read-char overlay was cancelled).
+O(1) when avy is not running."
+  (if (and (:avy m) (nil? (avy-state m))) (dissoc m :avy) m))
+
+;; ---- the jump --------------------------------------------------------------------
+
+(defn avy-jump (m target)
+  "Point to `target`'s offset, in its pane. In the pane you are in, the mark is pushed where
+you were (C-u C-SPC returns); another pane is selected and its point moved."
+  (let (m (avy-done m))
+    (if (= (:path target) (pane-selected-path (:layout m)))
+      (let (buf (ed-current-buf m))
+        (message (ed-set-buf m (clear-mark (goto-char (push-mark buf) (:offset target)))) ""))
+      (let (moved (assoc m :layout (pane-select-path (:layout m) (:path target))))
+        (message (ed-set-buf moved (goto-char (ed-current-buf moved) (:offset target))) "")))))
+
+(defn avy-offer (m state targets)
+  "Put `targets` up for picking: none says so, one is jumped to at once (avy's
+`avy-single-candidate-jump`), more are labelled."
+  (case (count targets)
+    0 (message (avy-done m) "avy: no candidates")
+    1 (avy-jump m (first targets))
+    (let (labels (avy-labels (count targets) *avy-keys*))
+      (avy-read m
+        (assoc state
+          :phase :labels
+          :typed ""
+          :matches []
+          :targets (into [] (map (range (count targets)) (fn (i) [(nth labels i) (nth targets i)]))))
+        "avy: "))))
+
+(defn- avy-matcher (state)
+  (case (:kind state)
+    :char-timer (avy-query-matcher (:query state))
+    :word-1 (avy-word-matcher (:query state))
+    (avy-word-matcher nil)))
+
+(defn avy-label (m)
+  "Find the targets for the state's query on screen and offer them."
+  (let (state (:avy m))
+    (avy-offer m state (avy-targets m (avy-layout m) (avy-matcher state)))))
+
+(defn- avy-typing (m state query)
+  "The char-timer query is now `query`: its matches highlighted, the pause timer waiting."
+  (let (next (assoc state :query query))
+    (avy-read m
+      (assoc next
+        :matches (if (= query "") [] (avy-targets m (avy-layout m) (avy-matcher next))))
+      (str "char: " query))))
+
+(defn- avy-pick (m state key)
+  "A label key typed while the labels are up."
+  (let (typed (str (:typed state) key)
+        left (seq/filter (:targets state) (fn ([label _]) (string/starts-with? label typed))))
+    (cond
+      (empty? left) (message (avy-done m) "avy: no such candidate")
+      (and (= 1 (count left)) (= typed (first (first left)))) (avy-jump m (second (first left)))
+      :else (avy-read m (assoc state :typed typed :targets (into [] left)) "avy: "))))
+
+(defn avy-key (m key)
+  "The read-char continuation: one key folded into the running avy."
+  (let (state (:avy m))
+    (cond
+      (nil? state) m
+      (= (:phase state) :labels)
+        (if (string? key) (avy-pick m state key) (message (avy-done m) "avy: no such candidate"))
+      (= (:kind state) :word-1)
+        (if (string? key)
+          (avy-label (assoc m :avy (assoc state :query key)))
+          (message (avy-done m) "avy: quit"))
+      ;; char-timer, reading the query
+      (string? key) (avy-typing m state (str (:query state) key))
+      (= key :backspace)
+        (let (query (:query state))
+          (avy-typing m
+            state
+            (if (= query "") "" (string/substring query 0 (dec (string/length query))))))
+      (= key :enter) (if (= (:query state) "") (message (avy-done m) "avy: quit") (avy-label m))
+      :else (message (avy-done m) "avy: quit"))))
+
+;; ---- the pause (avy-goto-char-timer) ---------------------------------------------
+
+(defn avy-pause-spec (m)
+  "The pause timer while a char-timer query is being typed: an idle one-shot, so every key
+pushes it out and it fires once typing stops."
+  (let (state (avy-state m))
+    (when (and state
+            (= (:kind state) :char-timer)
+            (= (:phase state) :reading)
+            (not (= "" (:query state))))
+      {:after *avy-timeout-ms* :idle? true})))
+
+(defn avy-pause-fire (m)
+  "The pause ended: label what the query matches."
+  (let (state (avy-state m))
+    (if (and state (= (:phase state) :reading)) (avy-label m) m)))
+
+(register-timer-client :avy-pause 'avy/avy-pause-spec 'avy/avy-pause-fire)
+(register-post-step :avy-orphan {:order 900 :run 'avy/avy-drop-orphan})
+
+;; ---- painting --------------------------------------------------------------------
+
+(defn- avy-label-ops (state)
+  (let (typed (string/length (:typed state)))
+    (mapcat (:targets state)
+      (fn ([label target])
+        (let (shown (string/substring label typed (string/length label))
+              fits (string/substring shown 0 (math/min (string/length shown) (:avail target)))
+              row (:row target)
+              col (:col target))
+          (if (= fits "")
+            []
+            (cons (editor/display/text row col (string/substring fits 0 1) face-avy-lead)
+              (if (> (string/length fits) 1)
+                (list (editor/display/text row
+                        (inc col)
+                        (string/substring fits 1 (string/length fits))
+                        face-avy-rest))
+                '()))))))))
+
+(defn avy-ops (m cols rows)
+  "Render ops for avy over the panes: the labels while they are up, the query's matches
+while it is typed; `[]` when avy is not running. A view overlay."
+  (let (state (avy-state m))
+    (cond
+      (nil? state) []
+      (= (:phase state) :labels) (into [] (avy-label-ops state))
+      :else
+        (into []
+          (map (:matches state)
+            (fn (target)
+              (editor/display/text (:row target) (:col target) (:text target) face-avy-match)))))))
+
+;; ---- the commands ----------------------------------------------------------------
+
+(defcommand cmd-avy-goto-char-timer
+  (m key)
+  "Jump to a visible match of typed characters (Emacs `avy-goto-char-timer`): type one or
+more characters; after a short pause every match on screen, in every pane, is labelled, and
+typing a label jumps there. RET labels at once; C-g cancels."
+  (avy-read m {:kind :char-timer :phase :reading :query "" :matches []} "char: "))
+
+(defcommand cmd-avy-goto-word-1
+  (m key)
+  "Jump to a visible word start beginning with a typed character (Emacs `avy-goto-word-1`)."
+  (avy-read m {:kind :word-1 :phase :reading :query "" :matches []} "char: "))
+
+(defcommand cmd-avy-goto-word-0
+  (m key)
+  "Jump to any visible word start (Emacs `avy-goto-word-0`): every one is labelled."
+  (avy-label (assoc m :avy {:kind :word-0 :phase :reading :query "" :matches []})))

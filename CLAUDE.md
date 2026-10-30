@@ -158,6 +158,31 @@ src/hittest.blsp            the mouse side of the view: every hit-test / hover f
                             a model and returns one (:hover, :diag-hover, :link-hover, a chip
                             click, the context menu's hit) — recomputed from the same widget /
                             segments / layout the view drew, so input never imports the renderer
+src/headerline.blsp         the HEADER LINE above each pane (Emacs breadcrumb-mode, on with `:header-line`):
+                            the file by its project and path, then the mode's `:breadcrumbs` at point
+                            (an Org heading's path); the layout takes the pane's top row for it
+                            (`panes/ed-header-layout`), so nothing below knows it is there
+src/pulse.blsp              a flash on the line after a JUMP (Emacs pulsar, `:pulse`): a post-step row tells a
+                            key command's jump (another window or buffer, 5+ lines) from typing and
+                            the mouse by `:command-count`, a timer fades the band the view lays over it
+src/winner.blsp             C-c ← / C-c → window-layout undo and redo (Emacs winner-mode, `:winner`): a
+                            post-step row keeps the layouts the window SHAPE changed from
+src/whitespace.blsp         trailing whitespace and tabs as highlight ranges (Emacs whitespace-mode,
+                            `:show-whitespace`, per mode through `scroll/ed-mode-setting`)
+src/avy.blsp                jump to a visible position by label (Emacs avy): C-' char-timer, M-g w / e
+                            word starts — targets from each pane's row table, over the read-char overlay
+src/embark.blsp             C-. act on the thing at point or the selected candidate (Emacs embark): the
+                            target (region > URL > file > symbol), a transient of actions that NAME
+                            existing commands, C-; its default, C-h B every binding as a prompt
+src/spell.blsp              spell checking (Emacs jinx, `:spell-check`): the visible prose, and the
+                            comments and strings of code, checked off the loop by a long-lived
+                            `enchant-2 -a` (else aspell); M-$ correct, C-M-$ the dictionary
+src/cape.blsp               completion sources beside the mode's (Emacs cape): file paths, and words
+                            from other open buffers, ranked after this buffer's
+src/savehist.blsp           minibuffer answers kept per prompt across sessions (Emacs savehist,
+                            `:savehist`): seeds the prompt's ↑ / M-p history; off until `main` turns it on
+src/saveplace.blsp          a file reopens where it was left (Emacs save-place, `:save-place`): its
+                            point kept when its buffer is killed or the editor quits
 src/statusbar.blsp          the mode line as extensible segments (render ops + click/hover zones in one pass),
                             and the chip REGISTRY (`register-modeline-segment`): a feature puts
                             its chip on the bar when its module loads — presence (collab), the
@@ -256,6 +281,7 @@ src/mail.blsp               mail: mbox-mode (C-c C-n / C-c C-p between messages,
 src/mail-message.blsp       Internet mail messages: RFC 5322 headers, the MIME part tree,
                             encoded words, quoted-printable / base64, legacy charsets — what
                             mail.blsp decodes with (std's `mime` until brood ADR-417)
+src/lex-gitignore.blsp       .gitignore-style ignore files and .gitattributes (Emacs git-modes)
 src/lex-*.blsp              the lexical highlighters, each a pure `[start end face]` span fn
                             for a `:fontify` service: `lex-configs` (JSON / YAML / TOML /
                             Makefile / INI / commit, as `editor/lexer` tables), `lex-shell`,

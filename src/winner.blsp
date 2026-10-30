@@ -1,0 +1,100 @@
+(defmodule winner
+  "Undo and redo of window layouts (Emacs's `winner-mode`): `C-c ←` goes back to the
+layout before the last change to the windows — a split, a close, another buffer shown — and
+`C-c →` forward again. A post-step row watches the layout's SHAPE (`shape`: the splits and
+the buffer each window shows — not a divider's position, the selected window, scrolling or
+point) and keeps the layouts it left, newest first, up to `*winner-max*`. On with the init
+file's `:winner` (the model's `:winner-on`).
+
+A kept layout names its buffers (`:buffer-name` on each window) rather than holding their
+pool indexes, which move when a buffer is killed: restoring resolves the names, and a layout
+whose buffer is gone is skipped, as Emacs's winner skips one with a dead buffer. Nothing is
+recorded while a prompt is open, so `C-x b` previewing buffers is not a change of windows."
+  (:use editor/buffer) ; buffer-name
+  (:use editor/pane) ; pane-map / pane-leaf?
+  (:use interactive) ; defcommand
+  (:use model)) ; register-post-step / message / ed-buffer-index-by-name
+
+(def *winner-max* 200) ; layouts kept to go back to — Emacs's winner-ring-size
+
+(defn- name-at (m index)
+  ;; the name of pool buffer `index`, nil when there is none
+  (let (buf (when (int? index) (nth (:buffers m) index nil))) (when buf (buffer-name buf))))
+
+(defn shape (m layout)
+  "What a layout change is measured by: each split as its direction and its two sides, each
+window as the NAME of the buffer it shows."
+  (letrec (walk (fn (node)
+                  (if (pane-leaf? node)
+                    [:window (name-at m (:buffer (:payload node)))]
+                    [(:dir node) (walk (:a node)) (walk (:b node))])))
+    (walk layout)))
+
+(defn- named (m layout)
+  ;; `layout` with each window carrying its buffer's name, for keeping across kills
+  (pane-map layout (fn (payload) (assoc payload :buffer-name (name-at m (:buffer payload))))))
+
+(defn- resolved (m layout)
+  ;; a kept `layout` with each window's buffer index found again by name, or nil when one of
+  ;; its buffers is gone
+  (let (found (pane-map layout
+                (fn (payload)
+                  (assoc payload :buffer (ed-buffer-index-by-name m (:buffer-name payload))))))
+    (letrec (whole? (fn (node)
+                      (if (pane-leaf? node)
+                        (int? (:buffer (:payload node)))
+                        (and (whole? (:a node)) (whole? (:b node))))))
+      (when (whole? found) found))))
+
+(defn note-layout (m)
+  "The post-step row: when the layout's `shape` changed since the last step, keep the
+layout it changed FROM for `C-c ←` and forget the redo list (a new change ends a run of
+undos, as in Emacs); when it did not, keep the current layout (point and scroll moved on) as
+the one a change would leave. Nothing while winner is off or a prompt is open."
+  (if (or (not (:winner-on m)) (:minibuffer m))
+    m
+    (let (now (shape m (:layout m))
+          seen (:winner-seen m))
+      (cond
+        (nil? seen)
+          (assoc m :winner-seen {:shape now :layout (named m (:layout m)) :live (:layout m)})
+        (= now (:shape seen))
+          (if (= (:layout m) (:live seen))
+            m
+            (assoc m :winner-seen {:shape now :layout (named m (:layout m)) :live (:layout m)}))
+        else
+          (assoc m
+            :winner-seen {:shape now :layout (named m (:layout m)) :live (:layout m)}
+            :winner-undo (take (cons (:layout seen) (or (:winner-undo m) '())) *winner-max*)
+            :winner-redo '())))))
+
+(defn- step (m from to empty-message)
+  ;; restore the newest layout on `from` whose buffers all still exist, the current one moved
+  ;; onto `to`; skip the ones that name a killed buffer
+  (let (layouts (or (get m from) '()))
+    (if (empty? layouts)
+      (message m empty-message)
+      (let (layout (resolved m (first layouts)))
+        (if (nil? layout)
+          (step (assoc m from (rest layouts)) from to empty-message)
+          (assoc m
+            :layout layout
+            :winner-seen {:shape (shape m layout) :layout (first layouts) :live layout}
+            from (rest layouts)
+            to (cons (named m (:layout m)) (or (get m to) '()))))))))
+
+(defcommand cmd-winner-undo
+  (m key)
+  "Back to the window layout before the last change (C-c ←, Emacs's winner-undo)."
+  (if (:winner-on m)
+    (step m :winner-undo :winner-redo "no earlier window layout")
+    (message m "winner is off")))
+
+(defcommand cmd-winner-redo
+  (m key)
+  "Forward again to the layout `C-c ←` left (C-c →, Emacs's winner-redo)."
+  (if (:winner-on m)
+    (step m :winner-redo :winner-undo "no later window layout")
+    (message m "winner is off")))
+
+(register-post-step :winner {:order 95 :run 'winner/note-layout})
