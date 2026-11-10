@@ -811,31 +811,121 @@ loop (`said-here?`)."
 ;; ---- a status buffer, shown before its collection lands -----------------------------
 ;; *git-status* and *mur-status* collect in a task and render when it answers; meanwhile the
 ;; buffer is already there, so the reader's keys go to it.
+;;
+;; ONE STATUS BUFFER PER REPO, as Magit keeps one per repository: C-x g in project B opens B's
+;; beside A's rather than repainting A's. A status buffer is found by the repo it SHOWS (its
+;; type and its `:section-ctx :root`, stamped on the `Loading…` placeholder too), never by its
+;; name, which is only what the reader sees: `*git-status: bedit*`, the parent directory added
+;; when another repo of that name has one (`*git-status: bedit<src>*`), else the whole path.
+;;
+;; A repo arrives spelled however its caller had it — the walk up from a file's directory, a
+;; path typed at `git-init`'s prompt (`~/src/foo/`), a worktree's — so it is CLEANED where a
+;; status is shown (`vcs-clean-root`) and COMPARED by its real path (`vcs-same-root?`), never
+;; as a string: one repo reached two ways is one status buffer.
 
-(defn vcs-status-focus (m name)
-  "`:here` when the reader is looking at status buffer `name` (or it is not open yet, so this
-is the first show), else `:none` — a refresh the background asked for lands quietly."
-  (let (i (ed-buffer-index-by-name m name))
+(defn vcs-clean-root (root)
+  "`root` absolute, with no trailing slash and no `.` / `..` — what a status buffer stamps
+and names itself after. Symlinks are left as they are, so the path shown is the one walked.
+
+    (vcsproc/vcs-clean-root \"/src/foo/\")   ;=> \"/src/foo\"
+    (vcsproc/vcs-clean-root \"/src/foo/bar/..\")   ;=> \"/src/foo\""
+  (when root (path/normalize (path/absolute root))))
+
+(defn vcs-root-key (root)
+  "The identity of repo `root`: its real path (`os/canonicalize` — symlinks, `..` and a trailing
+slash resolved), else `root` itself."
+  (or (os/canonicalize root) root))
+
+(defn vcs-same-root? (a b)
+  "Whether `a` and `b` name the same repo, however each is spelled ([[vcs-root-key]])."
+  (and (not (nil? a)) (not (nil? b)) (or (= a b) (= (vcs-root-key a) (vcs-root-key b)))))
+
+(sig vcs-status-index (model keyword any -> (or nil int)))
+(defn vcs-status-index (m type root)
+  "The pool index of the status buffer of `type` (`:git-status`, `:mur-status`) showing repo
+`root` ([[vcs-same-root?]]), or nil when it has none open."
+  (when root
+    (let (key (vcs-root-key root)
+          i (seq/index-where (:buffers m)
+              (fn (b)
+                (and (= (:type b) type)
+                  (let (shown (map/get-in b [:section-ctx :root]))
+                    (and (not (nil? shown)) (or (= shown root) (= (vcs-root-key shown) key))))))))
+      (if (< i 0) nil i))))
+
+(sig vcs-status-indices (model keyword -> seqable))
+(defn vcs-status-indices (m type)
+  "The pool indices of every status buffer of `type`, whichever repo each shows."
+  (seq/filter (range (count (:buffers m))) (fn (i) (= (:type (nth (:buffers m) i)) type))))
+
+(defn vcs-status-name (m label type root)
+  "The name of repo `root`'s status buffer: the one it has, else the first of
+`*LABEL: repo*`, `*LABEL: repo<parent>*` and `*LABEL: ~/the/path*` no buffer has taken."
+  (let (i (vcs-status-index m type root))
+    (if i
+      (editor/buffer/buffer-name (ed-buf-at m i))
+      (let (base (path/basename root)
+            parent (path/basename (path/dirname root))
+            names [(str "*" label ": " base "*")
+                    (str "*" label ": " base "<" parent ">*")
+                    (str "*" label ": " (path/abbreviate root) "*")])
+        (or (seq/find names (fn (nm) (nil? (ed-buffer-index-by-name m nm)))) (last names))))))
+
+(defn vcs-status-focus (m type root)
+  "`:here` when the reader is looking at repo `root`'s status buffer (or it is not open yet,
+so this is the first show), else `:none` — a refresh the background asked for lands quietly."
+  (let (i (vcs-status-index m type root))
     (if (or (nil? i) (= i (ed-current-index m))) :here :none)))
 
-(defn vcs-status-show-now (m name type action)
-  "Show status buffer `name` (of buffer `type`) at once, for a collection launched off the
-loop: `Loading…` the first time, else what it holds until the refresh lands — a flicker back
-to `Loading…` on every `g` is worse than a stale half-second. The reader asked for it, so it
-is shown and selected NOW: selected only when the collection came back, their keys went to the
-buffer they came from for seconds (`C-x g l l` typed `ll` there). `action` is `:pop`, `:here`,
-or `:none` for a refresh behind the reader, which leaves it where it is."
-  (let (existing (ed-buffer-index-by-name m name))
+(defn vcs-status-show-now (m label type root action)
+  "Show repo `root`'s status buffer (of buffer `type`, named after `label` —
+[[vcs-status-name]]) at once, for a collection launched off the loop: `Loading…` the first
+time, else what it holds until the refresh lands — a flicker back to `Loading…` on every `g`
+is worse than a stale half-second. The reader asked for it, so it is shown and selected NOW:
+selected only when the collection came back, their keys went to the buffer they came from
+for seconds (`C-x g l l` typed `ll` there). `action` is `:pop`, `:here`, or `:none` for a
+refresh behind the reader, which leaves it where it is.
+
+The placeholder carries `root` as its `:section-ctx` already, so it is found as this repo's
+status, and a key pressed in it runs in this repo, before the collection lands."
+  (let (existing (vcs-status-index m type root))
     (cond
       (nil? existing)
-        (pool/ed-display-buffer m
-          name
-          "Loading…\n"
-          type
-          {:action (if (= action :none) :display action)})
+        (let (name (vcs-status-name m label type root))
+          (ed-update-named (pool/ed-display-buffer m
+                             name
+                             "Loading…\n"
+                             type
+                             {:action (if (= action :none) :display action)})
+            name
+            (fn (b) (assoc b :section-ctx {:root root}))))
       (= action :pop) (pool/ed-pop-to-index m existing)
       (= action :here) (pool/ed-select m existing)
       else m)))
+
+;; One collection in flight per porcelain (its task slot); a status of ANOTHER repo asked for
+;; meanwhile waits its turn rather than cancelling it — that repo's buffer would otherwise sit
+;; on `Loading…` — and the landing starts the next. A newer ask of the SAME repo replaces the
+;; one waiting: the waiting are keyed by the repo's identity (`vcs-root-key`), each request
+;; keeping the root as it was asked.
+
+(defn vcs-status-defer (m waiting-key root request)
+  "`m` with a status of `root` (`request`: what the launch needs again) waiting under
+`waiting-key` for the collection in flight to land."
+  (assoc m
+    waiting-key (assoc (get m waiting-key {}) (vcs-root-key root) (assoc request :root root))))
+
+;; check-allow: `launch` is a caller-supplied `(model root request) -> model`; the declaration
+;; is the contract.
+(check-allow :trusted
+  (sig vcs-status-next (model keyword fn -> model))
+  (defn vcs-status-next (m waiting-key launch)
+    "Start the next status waiting under `waiting-key` (`(launch model root request)`), if any."
+    (let (waiting (get m waiting-key {}))
+      (if (empty? waiting)
+        m
+        (let ([key request] (first waiting))
+          (launch (assoc m waiting-key (dissoc waiting key)) (:root request) request))))))
 
 (defn vcs-status-landing (action)
   "Where a status collection launched with `action` lands: where the buffer now is (`:here`)

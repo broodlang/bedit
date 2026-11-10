@@ -201,7 +201,7 @@
                                                          (path/join dir "a.txt")))
                   nil)
               shown (buffer-text (ed-current-buf m)))
-          (assert= (buffer-name (ed-current-buf m)) "*mur-status*")
+          (assert= (buffer-name (ed-current-buf m)) (str "*mur-status: " (path/basename dir) "*"))
           (is (includes? shown "mur cannot read this working copy"))
           (is (includes? shown "mur is not installed"))))))
   (test "a report runs mur in the working copy it names, whatever buffer it is asked from"
@@ -260,3 +260,146 @@
     (assert= (mur-show-diff "snapshot x\nauthor a\n\n    --- not a diff\n\n--- f\n+++ f\n@@ -1 +1 @@\n-a\n+b")
       "--- f\n+++ f\n@@ -1 +1 @@\n-a\n+b")
     (assert= (mur-show-diff "snapshot x\n\n    nothing\n") "")))
+
+;; ---- one *mur-status* per working copy -------------------------------------------------
+;; A stand-in `mur` answers from files in the working copy it runs in (`.mur/status.json`,
+;; `.mur/log.json`), so two working copies answer differently and a test can change what one
+;; says between two keys.
+
+(defn- mt-program ()
+  "The stand-in `mur`: `status` and `log` read the working copy's own answers, the rest say
+nothing."
+  (let (dir (fresh-dir "bedit-mur-program-")
+        program (path/join dir "mur"))
+    (do
+      (file/spit program
+        "#!/bin/sh\ncase \"$1\" in\n  status) cat .mur/status.json ;;\n  log) cat .mur/log.json ;;\n  *) ;;\nesac\n")
+      (os/cmd "chmod" ["+x" program] {:cwd "/"})
+      program)))
+
+(defn- mt-says (dir title)
+  "Working copy `dir`'s `mur status --json` from now on: STATUS, its change titled `title`."
+  (file/spit (path/join dir ".mur" "status.json")
+    (json/encode (assoc STATUS :title title :here []))))
+
+(defn- mt-working-copy (prefix title trunk)
+  "A working copy whose change is titled `title` and whose trunk's one snapshot is `trunk`."
+  (let (dir (fresh-dir prefix))
+    (do
+      (file/mkdir (path/join dir ".mur"))
+      (file/spit (path/join dir "a.txt") "a\n")
+      (mt-says dir title)
+      (file/spit (path/join dir ".mur" "log.json") (json/encode [(assoc trunk-entry :title trunk)]))
+      dir)))
+
+(defn- mt-visit (m dir) (pool/ed-find-file m (path/join dir "a.txt")))
+
+(defn- mt-status-buffers (m)
+  "`{root text}` for every *mur-status* in the pool."
+  (into {}
+    (map (vcsproc/vcs-status-indices m :mur-status)
+      (fn (i)
+        (let (b (ed-buf-at m i)) [(map/get-in b [:section-ctx :root]) (buffer-text b)])))))
+
+(defn- mt-live (thunk)
+  "Run `thunk` as the live loop would: its mur off the loop, the replies to this process, and
+every blocking call on this process refused."
+  (let (previous (proc/flag :responsive :refuse))
+    (try (binding (editor/ui/*loop* (self)) (thunk)) (finally (proc/flag :responsive previous)))))
+
+(defn- mt-settle (m)
+  "Deliver every reply the model waits on through the loop's own update, until nothing is in
+flight — each reply a barrier, never a sleep."
+  (let (slot (seq/find (keys (ed-task-reply-table)) (fn (s) (not (nil? (get m s))))))
+    (if (nil? slot)
+      m
+      (let (handle (get m slot)
+            event (receive
+                    ([:task-done ^handle value] [:task-done handle value])
+                    ([:task-error ^handle reason] [:task-error handle reason])
+                    ([:task-timeout ^handle] [:task-timeout handle])
+                    (after 30000 (error "mt-settle: no reply for " slot))))
+        (mt-settle (mt-live (fn () (input/ed-update m event 80 24))))))))
+
+(describe "*mur-status*: one per working copy"
+  (test "C-x g in a second working copy opens its own status beside the first's"
+    (binding (*mur-program* (mt-program))
+      (let (a (mt-working-copy "bedit-mur-per-a-" "work in A" "trunk of A")
+            b (mt-working-copy "bedit-mur-per-b-" "work in B" "trunk of B")
+            in-a (murstatus/cmd-mur-status (mt-visit (model/ed-init (make-buffer "")) a) nil)
+            m (murstatus/cmd-mur-status (mt-visit in-a b) nil)
+            shown (mt-status-buffers m))
+        (assert= (count shown) 2)
+        (is (includes? (get shown a) "work in A"))
+        (is (includes? (get shown a) "trunk of A"))
+        (is (not (includes? (get shown a) "work in B")))
+        (is (includes? (get shown b) "work in B"))
+        (is (includes? (get shown b) "trunk of B"))
+        (assert= (buffer-name (ed-current-buf m)) (str "*mur-status: " (path/basename b) "*"))
+        ;; C-x g back in A goes to A's buffer, not a third
+        (let (again (murstatus/cmd-mur-status (mt-visit m a) nil))
+          (assert= (count (mt-status-buffers again)) 2)
+          (assert= (map/get-in (ed-current-buf again) [:section-ctx :root]) a)))))
+  (test "g in one working copy's status reads it again and leaves the other's alone"
+    (binding (*mur-program* (mt-program))
+      (let (a (mt-working-copy "bedit-mur-refresh-a-" "work in A" "trunk of A")
+            b (mt-working-copy "bedit-mur-refresh-b-" "work in B" "trunk of B")
+            in-a (murstatus/cmd-mur-status (mt-visit (model/ed-init (make-buffer "")) a) nil)
+            in-b (murstatus/cmd-mur-status (mt-visit in-a b) nil)
+            _ (mt-says a "A moved on")
+            _ (mt-says b "B moved on")
+            ;; in B's status: B is read again, A is not
+            refreshed (murstatus/cmd-mur-refresh in-b nil)
+            shown (mt-status-buffers refreshed))
+        (is (includes? (get shown b) "B moved on"))
+        (is (includes? (get shown a) "work in A"))
+        (is (not (includes? (get shown a) "A moved on"))))))
+  (test "a working copy spelled with a trailing slash is the same status"
+    (binding (*mur-program* (mt-program))
+      (let (a (mt-working-copy "bedit-mur-spelled-" "work in A" "trunk of A")
+            in-a (murstatus/cmd-mur-status (mt-visit (model/ed-init (make-buffer "")) a) nil)
+            m (murstatus/mur-show-status in-a (str a "/") nil :here))
+        (assert= (count (mt-status-buffers m)) 1)
+        (assert= (map/get-in (ed-current-buf m) [:section-ctx :root]) a))))
+  (test "trunk's log lands in the status of the working copy it was asked for"
+    (binding (*mur-program* (mt-program))
+      (let (a (mt-working-copy "bedit-mur-log-a-" "work in A" "trunk of A")
+            b (mt-working-copy "bedit-mur-log-b-" "work in B" "trunk of B")
+            in-a (murstatus/cmd-mur-status (mt-visit (model/ed-init (make-buffer "")) a) nil)
+            in-b (murstatus/cmd-mur-status (mt-visit in-a b) nil)
+            ;; A's log is out; B's status, landing meanwhile, waits for it rather than replacing it
+            out (assoc in-b :mur-log-proc :a-handle :mur-log-root a)
+            asked (murstatus/mur-launch-log out b)
+            ;; asked again for A, spelled another way: the ask out covers it
+            same (murstatus/mur-launch-log out (str a "/"))
+            ;; A's answer lands while B is the reader's
+            landed (murstatus/mur-apply-log asked [(assoc trunk-entry :title "newer trunk")])
+            shown (mt-status-buffers landed))
+        (do
+          (assert= [(:mur-log-root asked) (:mur-log-next asked)] [a b])
+          (is (nil? (:mur-log-next same)))
+          (is (includes? (get shown a) "newer trunk"))
+          (is (not (includes? (get shown b) "newer trunk")))
+          (is (includes? (get shown b) "trunk of B"))
+          ;; then B's is asked for
+          (assert= (:mur-log-root landed) b)
+          (is (nil? (:mur-log-next landed)))
+          (is (not (nil? (:mur-log-proc landed))))
+          (task/cancel (:mur-log-proc landed))))))
+  (test "C-x g in A, then in B before A's lands: B waits, and both land"
+    ;; whatever mur answers here — a task does not see this process's bindings, so the
+    ;; collection runs the mur on PATH, or says there is none — each copy's status lands
+    (let (a (mt-working-copy "bedit-mur-live-a-" "work in A" "trunk of A")
+          b (mt-working-copy "bedit-mur-live-b-" "work in B" "trunk of B")
+          in-a (mt-live (fn ()
+                          (murstatus/cmd-mur-status (mt-visit (model/ed-init (make-buffer "")) a)
+                            nil)))
+          in-b (mt-live (fn () (murstatus/cmd-mur-status (mt-visit in-a b) nil)))
+          done (mt-settle in-b)
+          shown (mt-status-buffers done))
+      (is (not (nil? (get (:mur-status-waiting in-b) (vcsproc/vcs-root-key b)))))
+      (assert= (:mur-status-root in-b) a)
+      (assert= (into #{} (keys shown)) #{a b})
+      (is (not (any? (vals shown) (fn (text) (string/starts-with? text "Loading")))))
+      (assert= (map/get-in (ed-current-buf done) [:section-ctx :root]) b)
+      (is (empty? (:mur-status-waiting done {}))))))

@@ -89,7 +89,7 @@
     (let (dir (mg-repo "open" {"a.txt" "one\n"})
           _ (file/spit (path/join dir "a.txt") "ONE\n")
           m (mg-status dir))
-      (assert= (buffer-name (ed-current-buf m)) "*git-status*")
+      (assert= (buffer-name (ed-current-buf m)) (str "*git-status: " (path/basename dir) "*"))
       (is (includes? (buffer-text (ed-current-buf m)) "modified   a.txt"))
       (is (not (includes? (buffer-text (ed-current-buf m)) "+ONE")))))
   (test "TAB on a file fetches its diff and shows the hunks"
@@ -724,6 +724,109 @@
     (let (m (smerge/cmd-smerge-next (ed-init (make-buffer mg-conflict)) nil))
       (assert= (buffer-point (ed-current-buf m)) 4))))
 
+(defn- mg-status-buffers (m)
+  "`{root text}` for every *git-status* in the pool."
+  (into {}
+    (map (vcsproc/vcs-status-indices m :git-status)
+      (fn (i)
+        (let (b (ed-buf-at m i)) [(map/get-in b [:section-ctx :root]) (buffer-text b)])))))
+
+(describe "magit: one status buffer per repo"
+  (test "C-x g in a second repo opens its own status beside the first's"
+    (let (a (mg-repo "per-repo-a" {"a.txt" "a\n"})
+          b (mg-repo "per-repo-b" {"b.txt" "b\n"})
+          _ (file/spit (path/join a "a.txt") "A\n")
+          _ (file/spit (path/join b "b.txt") "B\n")
+          in-a (mg-status a)
+          m (gitstatus/cmd-git-status (ed-find-file in-a (path/join b "b.txt")) nil)
+          shown (mg-status-buffers m))
+      (assert= (count shown) 2)
+      (is (includes? (get shown a) "a.txt"))
+      (is (not (includes? (get shown a) "b.txt")))
+      (is (includes? (get shown b) "b.txt"))
+      (assert= (buffer-name (ed-current-buf m)) (str "*git-status: " (path/basename b) "*"))
+      ;; C-x g back in repo A goes to A's buffer, not a third
+      (let (again (gitstatus/cmd-git-status (ed-find-file m (path/join a "a.txt")) nil))
+        (assert= (count (mg-status-buffers again)) 2)
+        (assert= (map/get-in (ed-current-buf again) [:section-ctx :root]) a))))
+  (test "staging in one repo refreshes its status and leaves the other repo's alone"
+    (let (a (mg-repo "per-repo-stage-a" {"a.txt" "a\n"})
+          b (mg-repo "per-repo-stage-b" {"b.txt" "b\n"})
+          _ (file/spit (path/join b "b.txt") "B\n")
+          in-a (mg-status a)
+          in-b (gitstatus/cmd-git-status (ed-find-file in-a (path/join b "b.txt")) nil)
+          ;; A changes on disk, unseen: a refresh of A's status would show it
+          _ (file/spit (path/join a "a.txt") "A\n")
+          staged (gitstage/cmd-git-stage (mg-goto in-b
+                                           (mg-heading :file
+                                             (fn (v)
+                                               (and (= (:path v) "b.txt")
+                                                 (= (:section v) :unstaged)))))
+                   nil)
+          shown (mg-status-buffers staged))
+      (assert= (mg-out b ["diff" "--cached" "--name-only"]) "b.txt")
+      (is (includes? (get shown b) "Staged changes"))
+      (is (not (includes? (get shown a) "a.txt")))))
+  (test "two repos of the same name are told apart by their parent directory"
+    (let (p1 (path/temp "bedit-magit-test-same-1-")
+          p2 (path/temp "bedit-magit-test-same-2-")
+          _ (os/cmd "rm" ["-rf" p1 p2] {:cwd "/"})
+          _ (file/mkdir p1)
+          _ (file/mkdir p2)
+          make (fn (parent)
+                 (let (dir (path/join parent "proj"))
+                   (do
+                     (file/mkdir dir)
+                     (mg-git dir ["init" "-q" "-b" "main"])
+                     (file/spit (path/join dir "x.txt") "x\n")
+                     dir)))
+          a (make p1)
+          b (make p2)
+          m (gitstatus/cmd-git-status (ed-find-file (mg-status a) (path/join b "x.txt")) nil)
+          names (into []
+                  (map (vcsproc/vcs-status-indices m :git-status)
+                    (fn (i) (buffer-name (ed-buf-at m i))))))
+      (assert= names ["*git-status: proj*" (str "*git-status: proj<" (path/basename p2) ">*")])))
+  (test "one repo spelled two ways is one status: a trailing slash, a `..`, a symlinked route"
+    (let (a (mg-repo "per-repo-spelled" {"a.txt" "a\n"})
+          ;; what git-init's prompt hands over when `~/src/foo/` is typed
+          typed (gitstatus/git-show-status (ed-init (make-buffer "")) (str a "/") nil :here)
+          dotted (gitstatus/git-show-status typed (path/join a "sub/..") nil :here)
+          link (path/temp "bedit-magit-test-link-")
+          _ (os/cmd "rm" ["-rf" link] {:cwd "/"})
+          _ (os/cmd "ln" ["-s" a link] {:cwd "/"})
+          linked (gitstatus/cmd-git-status (ed-find-file dotted (path/join link "a.txt")) nil))
+      (assert= (map/get-in (ed-current-buf typed) [:section-ctx :root]) a)
+      (assert= (buffer-name (ed-current-buf typed)) (str "*git-status: " (path/basename a) "*"))
+      (assert= (count (mg-status-buffers linked)) 1)
+      (assert= (:type (ed-current-buf linked)) :git-status)))
+  (test "staging from a file refreshes the status a typed path opened"
+    (let (a (mg-repo "per-repo-typed-stage" {"a.txt" "a\n"})
+          _ (file/spit (path/join a "a.txt") "A\n")
+          opened (gitstatus/git-show-status (ed-init (make-buffer "")) (str a "/") nil :here)
+          visiting (ed-find-file opened (path/join a "a.txt"))
+          staged (git/cmd-git-file-stage visiting nil)
+          shown (mg-status-buffers staged))
+      (assert= (mg-out a ["diff" "--cached" "--name-only"]) "a.txt")
+      (assert= (count shown) 1)
+      (is (includes? (get shown a) "Staged changes"))))
+  (test "another frame's copy of a status is that repo's: C-x g there opens no second one"
+    (let (a (mg-repo "per-repo-frame" {"a.txt" "a\n"})
+          status (ed-current-buf (mg-status a))
+          ;; the copy a second frame (or a restarted loop) builds from the registry's entry
+          copy (frames/frames-slot-from-entry (buffer-name status)
+                 nil
+                 (hosted/hosted-meta status)
+                 a)
+          other (assoc (ed-init (make-buffer "")) :buffers [(make-buffer "") copy])
+          m (gitstatus/cmd-git-status (ed-find-file other (path/join a "a.txt")) nil)
+          names (into []
+                  (map (vcsproc/vcs-status-indices m :git-status)
+                    (fn (i) (buffer-name (ed-buf-at m i))))))
+      (assert= (map/get-in copy [:section-ctx :root]) a)
+      (assert= names [(buffer-name status)])
+      (is (includes? (buffer-text (ed-current-buf m)) "Head:")))))
+
 (describe "magit: a repository to begin with"
   (test "git-init makes a repository and opens its status"
     (let (dir (path/temp "bedit-magit-test-init-"))
@@ -732,7 +835,7 @@
         (file/mkdir dir)
         (let (m (mg-answer (git/cmd-git-init (ed-init (make-buffer "")) nil) dir))
           (is (file/exists? (path/join dir ".git")))
-          (assert= (buffer-name (ed-current-buf m)) "*git-status*")))))
+          (assert= (:type (ed-current-buf m)) :git-status)))))
   (test "git-clone clones into the directory the URL names, and opens it"
     (let (origin (mg-repo "clone-src" {"a.txt" "a\n"})
           target (path/temp "bedit-magit-test-cloned-")
@@ -742,7 +845,7 @@
       (assert= (git/git-clone-name "https://example.com/org/thing.git") "thing")
       (assert= (git/git-clone-name "git@example.com:org/other") "other")
       (is (file/exists? (path/join target "a.txt")))
-      (assert= (buffer-name (ed-current-buf m)) "*git-status*"))))
+      (assert= (:type (ed-current-buf m)) :git-status))))
 
 ;; ---- the commands that destroy work (issues.md T1) --------------------------------------
 ;; What matters about each is the question in front of it: nothing goes until you say so,

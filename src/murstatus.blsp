@@ -255,26 +255,30 @@ lines tinted across the pane, as git's are."
     (if (>= i 0) (inc i) 1)))
 
 (defn- mur-render-status (m root collected line action &optional (tree nil))
-  "PURE: fold a collection into *mur-status* for working copy `root` — its `tree` when the
+  "PURE: fold a collection into working copy `root`'s *mur-status* — its `tree` when the
 task built it already, else built here. The collection rides on the buffer (`:ctx`), so the
-forge's log, which lands after it, can redraw its own section of the same view."
-  (let (fresh? (nil? (ed-buffer-index-by-name m "*mur-status*")))
+forge's log, which lands after it, can redraw its own section of the same view. One buffer
+per working copy (`*mur-status: name*`, `vcsproc/vcs-status-name`)."
+  (let (fresh? (nil? (map/get-in (mur-status-buf m root) [:section-tree])))
     (sb-show m
-      "*mur-status*"
+      (vcs-status-name m "mur-status" :mur-status root)
       (or tree (mur-status-tree collected))
       :mur-status {:action action
        :ctx {:root root :collected collected}
        :line (if (and (nil? line) fresh?) mur-first-line line)})))
 
-(defn- mur-status-collected (m)
-  "The collection *mur-status* shows now (on its buffer), or nil when it is not open."
-  (let (i (ed-buffer-index-by-name m "*mur-status*"))
-    (if (nil? i) nil (map/get-in (ed-buf-at m i) [:section-ctx :collected]))))
+(defn- mur-status-buf (m root)
+  "Working copy `root`'s *mur-status* buffer, or nil."
+  (let (i (vcs-status-index m :mur-status root)) (when i (ed-buf-at m i))))
 
-(defn- mur-status-focus (m)
-  "`:here` when the reader is looking at *mur-status* (or it is not open yet), else `:none`
-([[vcsproc/vcs-status-focus]])."
-  (vcs-status-focus m "*mur-status*"))
+(defn- mur-status-collected (m root)
+  "The collection `root`'s *mur-status* shows now (on its buffer), or nil when it is not open."
+  (map/get-in (mur-status-buf m root) [:section-ctx :collected]))
+
+(defn- mur-status-focus (m root)
+  "`:here` when the reader is looking at `root`'s *mur-status* (or it is not open yet), else
+`:none` ([[vcsproc/vcs-status-focus]])."
+  (vcs-status-focus m :mur-status root))
 
 (defn mur-collect-log (root)
   "Trunk's newest snapshots for *mur-status* (`mur log --json`): the forge's, so asked
@@ -282,31 +286,46 @@ separately from the rest and bounded — offline, nil, and the status shows with
   (mur-json root ["log" "-n" (str *mur-log-count*) "--json"] {:timeout-ms *mur-log-timeout-ms*}))
 
 (defn mur-show-status (m root &optional (line nil) (action nil))
-  "Show or refresh *mur-status* for `root`, collecting OFF the loop in two steps: the
+  "Show or refresh `root`'s *mur-status*, collecting OFF the loop in two steps: the
 working copy (status and diff, this machine only) lands first and is shown at once, beside
 the reader on a first open; trunk's log, which asks the forge, fills in when it arrives — a
-refresh keeps the log it had meanwhile. Headless collects both inline."
-  (let (act (or action (mur-status-focus m)))
-    (if (ed-headless?)
-      (mur-render-status m
-        root
-        (assoc (mur-collect-status root) :log (mur-collect-log root))
-        line
-        act)
-      (let (log (:log (mur-status-collected m))
-            ;; the tree too, under the log on screen now — painting its hunks is work the
-            ;; loop need not wait for
-            job (task (fn ()
-                        (let (collected (mur-collect-status root))
-                          {:collected collected
-                           :log log
-                           :tree (mur-status-tree (assoc collected :log log))}))
-                  {:timeout *vcs-op-timeout-ms*}))
-        (assoc (vcs-status-show-now m "*mur-status*" :mur-status act)
-          :mur-status-proc job
-          :mur-status-root root
-          :mur-status-line line
-          :mur-status-action (vcs-status-landing act))))))
+refresh keeps the log it had meanwhile. Headless collects both inline. One collection runs at
+a time; another working copy's asked for meanwhile waits for it (`vcs-status-defer`)."
+  (let (root (vcs-clean-root root)
+        act (or action (mur-status-focus m root)))
+    (cond
+      (ed-headless?)
+        (mur-render-status m
+          root
+          (assoc (mur-collect-status root) :log (mur-collect-log root))
+          line
+          act)
+      (and (:mur-status-proc m) (not (vcs-same-root? root (:mur-status-root m))))
+        (vcs-status-defer (vcs-status-show-now m "mur-status" :mur-status root act)
+          :mur-status-waiting root
+          {:line line :action (vcs-status-landing act)})
+      else
+        (let (log (:log (mur-status-collected m root))
+              ;; the tree too, under the log on screen now — painting its hunks is work the
+              ;; loop need not wait for
+              job (task (fn ()
+                          (let (collected (mur-collect-status root))
+                            {:collected collected
+                             :log log
+                             :tree (mur-status-tree (assoc collected :log log))}))
+                    {:timeout *vcs-op-timeout-ms*}))
+          (assoc (vcs-status-show-now m "mur-status" :mur-status root act)
+            :mur-status-proc job
+            :mur-status-root root
+            :mur-status-line line
+            :mur-status-action (vcs-status-landing act))))))
+
+(defn- mur-launch-waiting (m root request)
+  ;; a status that waited for another working copy's to land, launched now
+  (mur-show-status m
+    root
+    (:line request)
+    (if (= :here (mur-status-focus m root)) (:action request) :none)))
 
 (register-task-reply :mur-status-proc 'murstatus/mur-apply-show-status nil "mur status")
 (defn mur-apply-show-status (m answer)
@@ -320,62 +339,71 @@ if they have since moved, landing it there would drag them back."
         action (:mur-status-action m :none)
         m1 (dissoc m :mur-status-proc :mur-status-root :mur-status-line :mur-status-action)
         ;; the log it had, until the forge answers again
-        log (:log (mur-status-collected m1))
+        log (:log (mur-status-collected m1 root))
         shown (assoc collected :log log))
-    (if (nil? answer)
-      (message m1 "mur status: no answer (timed out)")
-      (mur-launch-log
-        (mur-render-status m1
-          root
-          shown
-          line
-          (if (= :here (mur-status-focus m1)) action :none)
-          ;; built under the log there was then; one that has landed since
-          ;; is drawn in by building again
-          (if (= log (:log answer)) (:tree answer) nil))
-        root))))
+    (vcs-status-next
+      (if (nil? answer)
+        (message m1 "mur status: no answer (timed out)")
+        (mur-launch-log
+          (mur-render-status m1
+            root
+            shown
+            line
+            (if (= :here (mur-status-focus m1 root)) action :none)
+            ;; built under the log there was then; one that has landed since
+            ;; is drawn in by building again
+            (if (= log (:log answer)) (:tree answer) nil))
+          root))
+      :mur-status-waiting mur-launch-waiting)))
 
 (defn- mur-launch-log (m root)
-  "Ask the forge for trunk's log off the loop, unless an ask is already out."
-  (if (:mur-log-proc m)
-    m
-    (assoc m
-      :mur-log-proc (task (fn () (mur-collect-log root)) {:timeout vcsproc/*vcs-op-timeout-ms*})
-      :mur-log-root root)))
+  "Ask the forge for trunk's log off the loop. An ask already out for the same working copy
+covers this one; one out for another leaves this working copy's asked for next
+(`:mur-log-next`)."
+  (cond
+    (and (:mur-log-proc m) (vcs-same-root? root (:mur-log-root m))) m
+    (:mur-log-proc m) (assoc m :mur-log-next root)
+    else
+      (assoc m
+        :mur-log-proc (task (fn () (mur-collect-log root)) {:timeout vcsproc/*vcs-op-timeout-ms*})
+        :mur-log-root root)))
 
 (register-task-reply :mur-log-proc 'murstatus/mur-apply-log nil nil)
 (defn mur-apply-log (m log)
-  "Fold trunk's log into *mur-status* — the same view, re-rendered in place and quietly
-(point kept, no pane moved) — when it is still about the same working copy."
+  "Fold trunk's log into its working copy's *mur-status* — the same view, re-rendered in
+place and quietly (point kept, no pane moved) — when that status is still open. Then ask for
+the log another working copy's status was left waiting for."
   (let (root (:mur-log-root m)
-        m1 (dissoc m :mur-log-proc :mur-log-root)
-        collected (mur-status-collected m1))
-    (if (or (nil? collected) (not (= (:root collected) root)) (nil? log))
-      m1
-      (mur-splice-log m1 root (assoc collected :log log)))))
+        next-root (:mur-log-next m)
+        m1 (dissoc m :mur-log-proc :mur-log-root :mur-log-next)
+        collected (mur-status-collected m1 root)
+        landed (if (or (nil? collected) (nil? log))
+                 m1
+                 (mur-splice-log m1 root (assoc collected :log log))))
+    (if (nil? next-root) landed (mur-launch-log landed next-root))))
 
 (defn- mur-splice-log (m root collected)
   "*mur-status* with its Trunk section redrawn from `collected` (which carries the log) and
 the collection kept on the buffer — the section alone, spliced in place (`sb-splice`), since
 nothing else changed. A status that had no Trunk section yet is rendered whole."
-  (let (i (ed-buffer-index-by-name! m "*mur-status*")
+  (let (i (or (vcs-status-index m :mur-status root) (error (str "no *mur-status* for " root)))
         b (ed-buf-at m i)
         tree (:section-tree b)
         id [[:root nil] [:trunk "Trunk"]]
         fresh (when (and tree (section-at tree id))
                 (mur-group :trunk "Trunk" (or (:log collected) []) mur-snapshot-section)))
     (if (nil? fresh)
-      (mur-render-status m root collected nil (mur-status-focus m))
+      (mur-render-status m root collected nil (mur-status-focus m root))
       (let (spliced (sb-splice m i id (section-replace tree id fresh) (or (:section-vis b) {})))
         (ed-set-buf-at spliced
           i
           (assoc (ed-buf-at spliced i) :section-ctx (assoc (:section-ctx b) :collected collected)))))))
 
 (defn mur-refresh (m)
-  "Refresh *mur-status* — in place, point kept on the line it was on."
-  (let (i (ed-buffer-index-by-name m "*mur-status*")
-        root (if (nil? i) nil (map/get-in (ed-buf-at m i) [:section-ctx :root])))
-    (if (nil? root) m (mur-show-status m root nil nil))))
+  "Refresh the *mur-status* of the working copy the buffer is about (`mur-resolve-root`) when
+it is open — in place, point kept on the line it was on."
+  (let (root (mur-resolve-root m))
+    (if (nil? (vcs-status-index m :mur-status root)) m (mur-show-status m root nil nil))))
 
 ;; ---- what is at point --------------------------------------------------------------
 

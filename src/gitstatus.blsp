@@ -12,7 +12,6 @@ take seconds, and rendered when the answer lands.
   (:use model) ; ed-current-buf / ed-buf-at / message / ed-read-char / ed-apply
   (:use pool) ; ed-show-named / ed-default-dir / ed-pop-to-file
   (:use interactive) ; defcommand
-  (:use editor/buffer) ; buffer-name / clear-mark
   (:use section) ; section — the status tree
   (:use sectionbuf) ; sb-show / sb-at / sb-region-rows — the section buffer
   (:use task) ; task — the collection, off the loop
@@ -252,7 +251,7 @@ reads; an untracked file is diffed against nothing, one at a time."
 (defn git-status-inputs (m root)
   "Everything the collection needs from the model, as plain data — read on the loop before
 the task starts, because a task cannot see the model and a rope cannot cross to it."
-  (let (i (ed-buffer-index-by-name m "*git-status*")
+  (let (i (git-status-index m root)
         vis (if (nil? i) {} (or (:section-vis (ed-buf-at m i)) {})))
     {:root root :open (git-open-files vis)}))
 
@@ -310,26 +309,32 @@ cursor, hover underline and click that *Tests* rows have (read by the SHARED
       else 1)))
 
 (defn- git-render-status (m root collected &optional (line nil) (action :here) (tree nil))
-  "PURE: fold a finished `git-collect-status` into `*git-status*` for repo `root` — its
+  "PURE: fold a finished `git-collect-status` into repo `root`'s *git-status* — its
 `tree` when the task built it already, else built here. `line` places point — a 1-based
 number, nil (the first file on a first open, else where it was), or `(rows -> line)` (see
 `git-stay-in-section`). `action` is `:here` when the reader asked for the buffer, `:none` for
 a refresh behind them, which must not move their pane."
-  (let (fresh? (nil? (ed-buffer-index-by-name m "*git-status*")))
+  (let (fresh? (nil? (map/get-in (git-status-buf m root) [:section-tree])))
     (sectionbuf/sb-show (assoc m :git-root root)
-      "*git-status*"
+      (vcsproc/vcs-status-name m "git-status" :git-status root)
       (or tree (git-status-tree collected))
       :git-status {:action action
        :ctx {:root root}
        :line (if (and (nil? line) fresh?) git-first-file-line line)})))
 
-(defn- git-status-focus (m)
-  "`:here` when the reader is looking at *git-status* (or it is not open yet), else `:none`
-([[vcsproc/vcs-status-focus]])."
-  (vcsproc/vcs-status-focus m "*git-status*"))
+(defn- git-status-buf (m root)
+  "Repo `root`'s *git-status* buffer, or nil."
+  (let (i (git-status-index m root)) (when i (ed-buf-at m i))))
+
+(defn- git-status-focus (m root)
+  "`:here` when the reader is looking at repo `root`'s *git-status* (or it is not open yet),
+else `:none` ([[vcsproc/vcs-status-focus]])."
+  (vcsproc/vcs-status-focus m :git-status root))
 
 (defn git-show-status (m root &optional (line nil) (action nil))
-  "Show/refresh `*git-status*` for `root` — collecting OFF the loop.
+  "Show/refresh repo `root`'s *git-status* — collecting OFF the loop. Each repo has its own
+(`*git-status: bedit*`, `vcsproc/vcs-status-name`); one collection runs at a time, and another
+repo's asked for meanwhile waits for it to land (`vcsproc/vcs-status-defer`).
 
 The editor gets the buffer immediately (the previous contents while a refresh is in flight,
 a `Loading…` placeholder the first time — [[vcsproc/vcs-status-show-now]]) and the real thing
@@ -338,43 +343,65 @@ frozen for five seconds and one that says so and keeps working.
 
 Headless collects inline: no loop means no reply, and every git test wants the real answer
 synchronously."
-  (let (act (or action (git-status-focus m)))
-    (if (model/ed-headless?)
-      (git-render-status m root (git-collect-status (git-status-inputs m root)) line act)
-      (let (inputs (git-status-inputs m root)
-            ;; the tree too — painting its hunks is work the loop need not wait for
-            job (task (fn ()
-                        (let (collected (git-collect-status inputs))
-                          {:collected collected :tree (git-status-tree collected)}))
-                  {:timeout *git-op-timeout-ms*}))
-        (assoc (vcsproc/vcs-status-show-now (assoc m :git-root root) "*git-status*" :git-status act)
-          :git-status-proc job
-          :git-status-line line
-          :git-status-action (vcsproc/vcs-status-landing act))))))
+  (let (root (vcsproc/vcs-clean-root root)
+        act (or action (git-status-focus m root)))
+    (cond
+      (model/ed-headless?)
+        (git-render-status m root (git-collect-status (git-status-inputs m root)) line act)
+      ;; another repo's collection is in flight: show this one's buffer now, collect after
+      (and (:git-status-proc m) (not (vcsproc/vcs-same-root? root (:git-status-root m))))
+        (vcsproc/vcs-status-defer (vcsproc/vcs-status-show-now (assoc m :git-root root)
+                                    "git-status" :git-status root act)
+          :git-status-waiting root
+          {:line line :action (vcsproc/vcs-status-landing act)})
+      else
+        (let (inputs (git-status-inputs m root)
+              ;; the tree too — painting its hunks is work the loop need not wait for
+              job (task (fn ()
+                          (let (collected (git-collect-status inputs))
+                            {:collected collected :tree (git-status-tree collected)}))
+                    {:timeout *git-op-timeout-ms*}))
+          (assoc (vcsproc/vcs-status-show-now (assoc m :git-root root)
+                   "git-status" :git-status root act)
+            :git-status-proc job
+            :git-status-root root
+            :git-status-line line
+            :git-status-action (vcsproc/vcs-status-landing act))))))
+
+(defn- git-launch-waiting (m root request)
+  ;; a status that waited for another repo's to land, launched now — landing where its buffer
+  ;; is, quietly unless the reader is looking at it
+  (git-show-status m
+    root
+    (:line request)
+    (if (= :here (git-status-focus m root)) (:action request) :none)))
 
 ;; the *git-status* buffer's eight subprocesses — 17 s on a mix project, so not on the loop
 (register-task-reply :git-status-proc 'gitstatus/git-apply-show-status nil "git status")
 (defn git-apply-show-status (m answer)
-  "Fold a finished status collection (`{:collected :tree}`) into the buffer. A nil answer
-(the task errored or timed out) says so rather than rendering an empty repo, which is what a
-blank `entries` would look like — a clean working tree, confidently wrong. The answer is
-always the newest asked for — a later C-x g replaces the task, and the loop drops a reply
-whose handle is not in the slot — so it lands whatever repo `:git-root` names by now (a
-command run in another repo meanwhile moves it)."
+  "Fold a finished status collection (`{:collected :tree}`) into its repo's buffer, then start
+the status another repo waited with. A nil answer (the task errored or timed out) says so
+rather than rendering an empty repo, which is what a blank `entries` would look like — a clean
+working tree, confidently wrong. The answer is the newest asked of its repo — a later C-x g
+there replaces the task, and the loop drops a reply whose handle is not in the slot."
   (let (collected (:collected answer)
+        root (:git-status-root m)
         line (:git-status-line m)
         action (:git-status-action m :here)
-        m1 (dissoc m :git-status-proc :git-status-line :git-status-action))
-    (if (nil? answer)
-      (message m1 "git status failed or timed out")
-      ;; `:here` was decided when the refresh STARTED; if the reader has since moved to
-      ;; another buffer, landing it `:here` would drag them back
-      (git-render-status m1
-        (:root collected)
-        collected
-        line
-        (if (= :here (git-status-focus m1)) action :none)
-        (:tree answer)))))
+        m1 (dissoc m :git-status-proc :git-status-root :git-status-line :git-status-action)
+        landed (if (nil? answer)
+                 (message m1
+                   (str "git status failed or timed out"
+                     (if root (str " in " (path/basename root)) "")))
+                 ;; `:here` was decided when the refresh STARTED; if the reader has since moved
+                 ;; to another buffer, landing it `:here` would drag them back
+                 (git-render-status m1
+                   (:root collected)
+                   collected
+                   line
+                   (if (= :here (git-status-focus m1 (:root collected))) action :none)
+                   (:tree answer))))
+    (vcsproc/vcs-status-next landed :git-status-waiting git-launch-waiting)))
 
 (defn- git-stay-in-section (m)
   "A `(new-rows -> 1-based line)` that keeps point in the file LIST it was in, across a
@@ -402,15 +429,19 @@ the next file to stage instead of chasing the staged one into another section."
       (let (row (nth rows i))
         (and row (:heading? row) (= (:type row) :file) (= (git-list-of row) list-type))))))
 
-(defn- git-in-status? (m)
-  "Whether the reader is in *git-status* right now."
-  (= (buffer-name (ed-current-buf m)) "*git-status*"))
+(defn- git-in-status? (m root)
+  "Whether the reader is in repo `root`'s *git-status* right now."
+  (let (i (git-status-index m root)) (and i (= i (ed-current-index m)))))
 
 (defn git-refresh (m)
-  "Refresh `*git-status*` — in place, and keeping point in its file list when the reader is
-in it (`git-stay-in-section`); behind them, quietly, when they are not."
-  (let (root (or (git-status-root m) (:git-root m)))
-    (if (nil? root) m (git-show-status m root (if (git-in-status? m) (git-stay-in-section m) nil)))))
+  "Refresh the *git-status* of the repo the buffer is about (`git-resolve-root`) when it is
+open — in place, and keeping point in its file list when the reader is in it
+(`git-stay-in-section`); behind them, quietly, when they are not. Another repo's status is
+not touched."
+  (let (root (git-resolve-root m))
+    (if (nil? (git-status-index m root))
+      m
+      (git-show-status m root (if (git-in-status? m root) (git-stay-in-section m) nil)))))
 
 (defcommand cmd-git-status
   (m key)
@@ -460,10 +491,10 @@ data in and out."
     (git-file-section value lst diff true paint?)))
 
 (defn- git-splice-file (m answer)
-  "Put a fetched file section (`{:root :id :section}`) into *git-status* in place of the
-lazy one it was fetched for — unless the status has since moved on (another repo, or a
+  "Put a fetched file section (`{:root :id :section}`) into its repo's *git-status* in place
+of the lazy one it was fetched for — unless the status has since moved on (closed, or a
 refresh that fetched it already)."
-  (let (i (ed-buffer-index-by-name m "*git-status*"))
+  (let (i (git-status-index m (:root answer)))
     (if (nil? i)
       m
       (let (b (ed-buf-at m i)
@@ -480,13 +511,27 @@ refresh that fetched it already)."
             (section-replace tree id (:section answer))
             (or (:section-vis b) {})))))))
 
+(defn- git-lazy-target (m)
+  "`[root found]` for the first file open in a *git-status* whose diff was never fetched — the
+current buffer's status first, then any other repo's — or nil."
+  (let (here (ed-current-index m)
+        indices (vcsproc/vcs-status-indices m :git-status)
+        ordered (append (seq/filter indices (fn (i) (= i here)))
+                  (seq/filter indices (fn (i) (not (= i here))))))
+    (first (seq/keep ordered
+             (fn (i)
+               (let (b (ed-buf-at m i)
+                     found (git-lazy-open-file b)
+                     root (map/get-in b [:section-ctx :root]))
+                 (when (and found root) [root found])))))))
+
 (defn git-fetch-lazy (m)
-  "Fetch the diff of a file open in *git-status* that has none yet, and splice it in — off
-the loop, one at a time (headless: inline, every such file)."
-  (let (i (ed-buffer-index-by-name m "*git-status*")
-        b (when i (ed-buf-at m i))
-        found (when b (git-lazy-open-file b))
-        root (when b (map/get-in b [:section-ctx :root])))
+  "Fetch the diff of a file open in a *git-status* that has none yet, and splice it in — off
+the loop, one at a time (headless: inline, every such file). The landing looks again, in
+every repo's status, so a file opened in another meanwhile is fetched next."
+  (let (target (git-lazy-target m)
+        root (first target)
+        found (second target))
     (cond
       (or (nil? found) (nil? root)) m
       ;; in flight: its landing looks again
