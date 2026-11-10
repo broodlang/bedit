@@ -1,0 +1,230 @@
+;; tests/wdired_test.blsp — a Dired listing edited as text (Emacs's wdired): C-x C-q makes the
+;; file names editable and nothing else, every letter types (the reported bug: `m` marked a
+;; file instead of typing an m), C-c C-c renames — several, swaps, into directories — asking
+;; before it replaces a file, an erased name flags its entry, C-c C-k puts the names back.
+
+(defmodule wdired-test
+  (:use test)
+  (:use model)
+  (:use input)
+  (:use pool)
+  (:use editor/buffer)
+  (:use-internals wdired)
+  (:use dired :only [ed-show-dired dired-entry-rows ed-dired-state]))
+
+(purge-stale-temp "bedit-wdired-")
+
+(defn- fixture ()
+  ;; a directory holding `sub/`, `a.txt` ("hello") and `b.txt` ("bee")
+  (let (dir (temp-dir "bedit-wdired-"))
+    (do
+      (file/mkdir (path/join dir "sub"))
+      (file/spit (path/join dir "a.txt") "hello")
+      (file/spit (path/join dir "b.txt") "bee")
+      dir)))
+
+(defn- cur (m) (ed-current-buf m))
+(defn- press (m keys) (fold keys m (fn (acc key) (ed-update acc key 80 24))))
+(defn- type-str (m text) (press m (string/->list text)))
+
+(defn- listed (dir &optional (base nil))
+  ;; Dired on `dir`, folders first — `.` `..` `sub` `a.txt` `b.txt` on lines 2 to 6
+  (ed-show-dired (assoc (or base (ed-init (make-buffer "")))
+                   :dired-listing-switches "-al --group-directories-first")
+    dir 2))
+
+(defn- at-entry (m name)
+  ;; point on entry `name`'s row
+  (let (index (index-of (ed-dired-state m :dired-names) name))
+    (ed-apply m (fn (buffer) (ed-goto-line buffer (+ index 2))))))
+
+(defn- editing (dir &optional (base nil))
+  ;; `dir`'s listing with its names open for editing (C-x C-q), point on `a.txt`
+  (press (at-entry (listed dir base) "a.txt") [:ctrl-x :ctrl-q]))
+
+(defn- rename-row (m name new)
+  ;; the name on `name`'s row replaced by `new`, typed
+  (type-str (press (at-entry m name) [:ctrl-a :ctrl-k]) new))
+
+(defn- finish (m) (press m [:ctrl-c :ctrl-c]))
+
+(describe "wdired: the names become text"
+  (test "C-x C-q in Dired makes the names editable, and m types an m"
+    (let (dir (fixture)
+          typed (type-str (editing dir) "m"))
+      (assert= (editor/layers/buffer-type-for (cur typed)) :wdired)
+      (is (includes? (buffer-text (cur typed)) " ma.txt\n"))
+      (is (empty? (or (ed-dired-state typed :dired-marks) '())))))
+
+  (test "point lands at the start of its line's name"
+    (let (dir (fixture)
+          m (editing dir)
+          row (seq/find (dired-entry-rows (cur m)) (fn (row) (= (:name row) "a.txt"))))
+      (assert= (buffer-point (cur m)) (:start row))))
+
+  (test "only the names are editable: the header, the columns and . / .. are not"
+    (let (dir (fixture)
+          m (editing dir)
+          buffer (cur m)
+          a-row (or (seq/find (dired-entry-rows buffer) (fn (row) (= (:name row) "a.txt")))
+                  (error "no a.txt row"))
+          line-start (text/line->char (buffer-rope buffer) (:line a-row))
+          ;; a letter typed at the start of a.txt's row, in the mark cell
+          refused (type-str (ed-apply m (fn (b) (goto-char b line-start))) "z"))
+      (assert= (count (editable-regions buffer)) 3)
+      (is (position-read-only? buffer 0))
+      (is (position-read-only? buffer line-start))
+      (assert= (buffer-text (cur refused)) (buffer-text buffer))))
+
+  (test "RET and C-o insert nothing: a name holds no line break"
+    (let (dir (fixture)
+          m (editing dir)
+          pressed (press m [:enter :ctrl-o]))
+      (assert= (buffer-text (cur pressed)) (buffer-text (cur m)))
+      (is (includes? (:echo pressed) "line break"))))
+
+  (test "C-n and C-p keep point in the name column"
+    (let (dir (fixture)
+          m (press (at-entry (listed dir) "sub") [:ctrl-x :ctrl-q])
+          down (press m [:ctrl-n])
+          rows (dired-entry-rows (cur m))
+          start-of (fn (name) (:start (seq/find rows (fn (row) (= (:name row) name))))))
+      (assert= (buffer-point (cur m)) (start-of "sub"))
+      (assert= (buffer-point (cur down)) (start-of "a.txt"))
+      (assert= (buffer-point (cur (press down [:ctrl-p]))) (start-of "sub"))))
+
+  (test "undo takes back an edit to a name"
+    (let (dir (fixture)
+          m (editing dir)
+          undone (press (type-str m "x") [:ctrl-/]))
+      (assert= (buffer-text (cur undone)) (buffer-text (cur m))))))
+
+(describe "wdired: C-c C-c renames"
+  (test "one name changed renames its file, and the buffer is Dired again"
+    (let (dir (fixture)
+          done (finish (rename-row (editing dir) "a.txt" "c.txt")))
+      (assert= (file/slurp (path/join dir "c.txt")) "hello")
+      (refute (file/exists? (path/join dir "a.txt")))
+      (assert= (editor/layers/buffer-type-for (cur done)) :dired)
+      (is (read-only? (cur done)))
+      (is (includes? (ed-dired-state done :dired-names) "c.txt"))
+      (is (includes? (:echo done) "Renamed a.txt"))))
+
+  (test "several names at once"
+    (let (dir (fixture)
+          done (finish (rename-row (rename-row (editing dir) "a.txt" "x.txt") "b.txt" "y.txt")))
+      (assert= (file/slurp (path/join dir "x.txt")) "hello")
+      (assert= (file/slurp (path/join dir "y.txt")) "bee")
+      (is (includes? (:echo done) "Renamed 2 entries"))))
+
+  (test "two names swapped swap the files"
+    (let (dir (fixture)
+          done (finish (rename-row (rename-row (editing dir) "a.txt" "b.txt") "b.txt" "a.txt")))
+      (assert= (file/slurp (path/join dir "a.txt")) "bee")
+      (assert= (file/slurp (path/join dir "b.txt")) "hello")
+      (refute (any? (file/ls dir) (fn (name) (string/starts-with? name ".wdired"))))
+      (is (includes? (:echo done) "Renamed 2 entries"))))
+
+  (test "a directory in the name moves the entry into it, making the ones missing"
+    (let (dir (fixture)
+          done (finish (rename-row (rename-row (editing dir) "a.txt" "sub/a.txt")
+                         "b.txt" "new/deep/b.txt")))
+      (assert= (file/slurp (path/join dir "sub" "a.txt")) "hello")
+      (assert= (file/slurp (path/join dir "new" "deep" "b.txt")) "bee")
+      (refute (includes? (ed-dired-state done :dired-names) "a.txt"))))
+
+  (test "a file already at the new name is asked about: n keeps both"
+    (let (dir (fixture)
+          _ (file/spit (path/join dir "c.txt") "other")
+          asked (finish (rename-row (editing dir) "a.txt" "c.txt"))
+          declined (press asked ["n"]))
+      (is (includes? (:echo asked) "exists; overwrite it?"))
+      (assert= (file/slurp (path/join dir "a.txt")) "hello")
+      (assert= (file/slurp (path/join dir "c.txt")) "other")
+      (is (includes? (:echo declined) "rename canceled"))
+      (assert= (editor/layers/buffer-type-for (cur declined)) :dired)))
+
+  (test "and y replaces it"
+    (let (dir (fixture)
+          _ (file/spit (path/join dir "c.txt") "other"))
+      (press (finish (rename-row (editing dir) "a.txt" "c.txt")) ["y"])
+      (refute (file/exists? (path/join dir "a.txt")))
+      (assert= (file/slurp (path/join dir "c.txt")) "hello")))
+
+  (test "a directory at the new name is never replaced"
+    (let (dir (fixture)
+          done (finish (rename-row (editing dir) "a.txt" "sub")))
+      (is (includes? (:echo done) "is a directory, not replaced"))
+      (is (file/exists? (path/join dir "a.txt")))))
+
+  (test "two entries given one name are refused"
+    (let (dir (fixture)
+          done (finish (rename-row (rename-row (editing dir) "a.txt" "z.txt") "b.txt" "z.txt")))
+      (is (includes? (:echo done) "two entries would be named"))
+      (is (file/exists? (path/join dir "a.txt")))
+      (is (file/exists? (path/join dir "b.txt")))))
+
+  (test "an erased name flags its entry for deletion, deleting nothing"
+    (let (dir (fixture)
+          done (finish (rename-row (editing dir) "b.txt" "")))
+      (is (file/exists? (path/join dir "b.txt")))
+      (assert= (ed-dired-state done :dired-flags) (list "b.txt"))
+      (is (regex/find "\nD[^\n]* b\\.txt\n" (buffer-text (cur done))))
+      (is (includes? (:echo done) "1 file flagged for deletion"))))
+
+  (test "C-x C-s applies the changes as C-c C-c does"
+    (let (dir (fixture))
+      (press (rename-row (editing dir) "a.txt" "saved.txt") [:ctrl-x :ctrl-s])
+      (assert= (file/slurp (path/join dir "saved.txt")) "hello")))
+
+  (test "nothing changed: back to Dired, saying so"
+    (let (dir (fixture)
+          done (finish (editing dir)))
+      (assert= (editor/layers/buffer-type-for (cur done)) :dired)
+      (is (includes? (:echo done) "No changes"))))
+
+  (test "a buffer visiting a renamed file follows it"
+    (let (dir (fixture)
+          old (path/join dir "a.txt")
+          visiting (ed-find-file (ed-init (make-buffer "")) old)
+          done (finish (rename-row (editing dir visiting) "a.txt" "moved.txt")))
+      (is (int? (ed-buffer-index-by-file done (path/join dir "moved.txt"))))
+      (assert= (ed-buffer-index-by-file done old) nil)))
+
+  (test "a marked entry keeps its mark under its new name"
+    (let (dir (fixture)
+          marked (press (at-entry (listed dir) "a.txt") ["m"])
+          edited (rename-row (press (at-entry marked "a.txt") [:ctrl-x :ctrl-q]) "a.txt" "kept.txt")
+          done (finish edited))
+      (assert= (ed-dired-state marked :dired-marks) (list "a.txt"))
+      (assert= (ed-dired-state done :dired-marks) (list "kept.txt"))
+      (is (regex/find "\n\\*[^\n]* kept\\.txt\n" (buffer-text (cur done)))))))
+
+(describe "wdired: leaving without applying"
+  (test "C-c C-k puts every name back and returns to Dired"
+    (let (dir (fixture)
+          m (editing dir)
+          aborted (press (rename-row m "a.txt" "zzz") [:ctrl-c :ctrl-k]))
+      (assert= (buffer-text (cur aborted)) (buffer-text (cur m)))
+      (assert= (editor/layers/buffer-type-for (cur aborted)) :dired)
+      (is (read-only? (cur aborted)))
+      (is (file/exists? (path/join dir "a.txt")))
+      (is (includes? (:echo aborted) "Changes aborted"))))
+
+  (test "C-x C-q leaves at once when nothing changed, and asks when something did"
+    (let (dir (fixture)
+          left (press (editing dir) [:ctrl-x :ctrl-q])
+          asked (press (rename-row (editing dir) "a.txt" "q.txt") [:ctrl-x :ctrl-q])
+          kept-back (press asked ["n"])
+          applied (press asked ["y"]))
+      (assert= (editor/layers/buffer-type-for (cur left)) :dired)
+      (is (includes? (:echo asked) "Save changes?"))
+      (assert= (editor/layers/buffer-type-for (cur kept-back)) :dired)
+      (assert= (file/slurp (path/join dir "q.txt")) "hello")
+      (assert= (editor/layers/buffer-type-for (cur applied)) :dired)))
+
+  (test "Dired's own keys work again afterwards"
+    (let (dir (fixture)
+          back (press (editing dir) [:ctrl-c :ctrl-k])
+          marked (press (at-entry back "a.txt") ["m"]))
+      (assert= (ed-dired-state marked :dired-marks) (list "a.txt")))))

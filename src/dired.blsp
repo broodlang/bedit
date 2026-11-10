@@ -313,7 +313,16 @@ A directory a file handler claims — another machine's (`/ssh:…`) — is list
   "Show `dir`'s listing in dired from `entries` (`{:name :stat}` each, the stat in `file/stat`'s
 shape) a file handler brought — another machine's directory, listed over ssh — ordered as a
 local one is ([[dired-order-entries]]), its marks kept, point on (1-based) `line`. The entries
-that are directories are kept on the buffer (`:dired-dirs`): RET cannot ask the disk."
+that are directories are kept on the buffer (`:dired-dirs`): RET cannot ask the disk. A listing
+that lands while its names are being edited (wdired) is dropped, as Emacs refuses a revert there:
+the edits are not thrown away under the reader."
+  (if (let (index (ed-buffer-index-by-name m dir))
+        (and (int? index) (editspans/editing? (ed-buf-at m index))))
+    m
+    (ed-dired-show-landed m dir entries line)))
+
+(defn- ed-dired-show-landed (m dir entries line)
+  ;; [[ed-dired-show-entries]] once the listing may be shown
   (let (ordered (dired-order-entries entries (ed-dired-switches m dir))
         shown (ed-dired-render m dir ordered line))
     (ed-set-buf shown
@@ -496,12 +505,29 @@ seven whitespace fields; 0 when `line` isn't a row (so point isn't pulled off th
     (second (ed-dired-fields line ed-dired-fields-col (string/length line) 7 '()))
     0))
 
-(defn- ed-dired-move-to-filename (buffer)
+(defn ed-dired-move-to-filename (buffer)
   "Move point onto the current line's filename (the cursor sits on the name, not the
 leading mark column) — a no-op on the header line."
   (let (line (buffer-current-line buffer)
         line-start (text/line->char (buffer-rope buffer) line))
     (goto-char buffer (+ line-start (ed-dired-filename-col (wrap/line-text buffer line))))))
+
+(defn dired-entry-rows (buffer)
+  "The NAME of each real entry (not `.` / `..`) a listing `buffer` shows, as a span:
+`{:name :line :start :end :text}` — `:line` its 0-based buffer line, `[start end)` the name at
+the row's end (where it is, whatever spaces it holds), `:text` the name. What wdired makes
+editable. A row whose text does not end in its name (not this listing's) is left out."
+  (let (rope (buffer-rope buffer)
+        names (or (:dired-names buffer) []))
+    (seq/keep (range 0 (count names))
+      (fn (index)
+        (let (name (nth names index)
+              line (+ ed-dired-header-lines index))
+          (when (and (ed-dired-entry? name) (< line (text/line-count rope)))
+            (let (text (wrap/rope-line-text rope line)
+                  end (+ (text/line->char rope line) (string/length text)))
+              (when (and (ed-dired-row-line? text) (string/ends-with? text (str " " name)))
+                {:name name :line line :start (- end (string/length name)) :end end :text name}))))))))
 
 (defn- ed-dired-snap (m)
   "Apply `ed-dired-move-to-filename` to the current buffer (after a line move)."
@@ -835,24 +861,25 @@ item`), what is kept of each item done says what its act answered (where a move 
   ;; what a report says was acted on: the one entry by name, else how many
   (if (= (count done) 1) (str (first done)) (str (count done) " entries")))
 
-(defn- ed-dired-report (m verb report)
+(defn- ed-dired-report (m verb report &optional (tail ""))
   "`m` saying how `report` ([[dired-run-each]], over entry names) went: `verb` and what, or
-the first failure and how many failed."
+the first failure and how many failed — then `tail`, what else the operation did."
   (let (done (:done report)
         failed (:failed report))
     (message m
-      (if (empty? failed)
-        (str verb " " (dired-entries-phrase done))
-        (let ([item reason] (first failed))
-          (str verb
-            ": "
-            (count failed)
-            " of "
-            (+ (count done) (count failed))
-            " failed — "
-            item
-            ": "
-            reason))))))
+      (str (if (empty? failed)
+             (str verb " " (dired-entries-phrase done))
+             (let ([item reason] (first failed))
+               (str verb
+                 ": "
+                 (count failed)
+                 " of "
+                 (+ (count done) (count failed))
+                 " failed — "
+                 item
+                 ": "
+                 reason)))
+        tail))))
 
 (defn- ed-dired-refresh (m dir)
   "`m` with `dir`'s listing read again when it is the buffer shown (point kept on its line);
@@ -880,6 +907,10 @@ finished with; one that failed stays marked to try again."
 ;; the first over the same files.
 
 (def- dired-job-slot (offloop/ed-ready-slot :dired)) ; the model field a running operation waits in
+
+(defn ed-dired-busy? (m)
+  "Whether a dired operation (R, C, D, x, wdired's renames) is still running off the loop."
+  (not (nil? (get m dired-job-slot))))
 
 (defn- ed-dired-unless-busy (m start)
   "`(start)` — an operation's first step — unless a dired operation is still running, which
@@ -987,12 +1018,14 @@ directory there is never replaced. Off the loop."
       (:into? move) (error (str (:target move) " is not a directory"))
       else (assoc move :exists (= kind :file)))))
 
-(defn- ed-dired-transfer-choose (m dir kind moves prior-failed)
+(defn- ed-dired-transfer-choose (m dir kind moves prior-failed &optional (run nil))
   "Rename or copy `moves` (each `:exists` when its target is there), asking first about each
 target that exists — `y`, `n`, `!` for it and every one after, `q` to stop asking (Emacs's
 dired-do-copy); a target said yes to is REPLACED (`:replace`) — and refusing one onto itself or
-into itself. `prior-failed` are moves already refused ([[ed-dired-transfer-run]])."
-  (let (word (:word (dired-transfer-words kind))
+into itself. `prior-failed` are moves already refused ([[ed-dired-transfer-run]]). `run` (that
+function's shape) does what was chosen; [[ed-dired-transfer-run]] by default."
+  (let (go (or run ed-dired-transfer-run)
+        word (:word (dired-transfer-words kind))
         usable (seq/reject moves (fn (move) (dired-inside? (:source move) (:target move))))
         clashes (seq/filter usable :exists)
         fresh (seq/reject usable :exists))
@@ -1007,7 +1040,7 @@ into itself. `prior-failed` are moves already refused ([[ed-dired-transfer-run]]
         (ed-dired-report m
           (:done (dired-transfer-words kind))
           {:done [] :failed (dired-failed-names prior-failed)})
-      (empty? clashes) (ed-dired-transfer-run m dir kind fresh prior-failed)
+      (empty? clashes) (go m dir kind fresh prior-failed)
       else
         (ed-map-y-or-n (dissoc m :dired-accepted)
           clashes
@@ -1020,7 +1053,7 @@ into itself. `prior-failed` are moves already refused ([[ed-dired-transfer-run]]
                   cleared (dissoc answered :dired-accepted))
               (if (empty? chosen)
                 (message cleared (str word " canceled"))
-                (ed-dired-transfer-run cleared dir kind chosen prior-failed))))))))
+                (go cleared dir kind chosen prior-failed))))))))
 
 (defn- ed-dired-transfer-ask (m dir kind moves)
   "Rename or copy `moves`, asking first about each target that exists
@@ -1087,6 +1120,190 @@ typed as another machine's path in a local listing goes there."
                       {:name name
                        :source (path/join dir name)
                        :target (ed-dired-target dir name typed)}))))))))))
+
+;; ---- renaming entries to names given (wdired's C-c C-c) ------------------------------
+;; Each entry to a new name of its own, all at once — a swap (a → b, b → a) or a cycle too, as
+;; Emacs's wdired does it: an entry whose name another one takes steps aside to a temporary
+;; name first. A name with a `/` moves the entry, the directories it names made where missing
+;; (Emacs's `wdired-create-parent-directories`, on by default); a target already there that no
+;; other rename takes away is asked about (y / n / ! / q, as R), a directory there is never
+;; replaced. Off the loop as R is; through the file handler for another machine's listing.
+
+(defn- dired-same-path? (a b) (= (path/normalize a) (path/normalize b)))
+
+(defn- dired-rename-target (dir new)
+  ;; where the entry renamed `new` in `dir` goes: an absolute name as it is, else read in `dir`
+  (cond
+    (dired-handler dir) (dired-join dir new)
+    (string/starts-with? new "/") (path/normalize new)
+    else (path/normalize (path/join dir new))))
+
+(defn- dired-resolve-rename (vacated move)
+  ;; `move` with `:exists` when an entry is at its target that no other rename takes away
+  ;; (`vacated`: the sources, normalized); raises for a directory there, never replaced. Off the
+  ;; loop when the disk is another machine's
+  (if (contains? vacated (path/normalize (:target move)))
+    (assoc move :exists false)
+    (let (kind (dired-path-kind (:target move)))
+      (if (= kind :dir)
+        (error (str (:target move) " is a directory, not replaced"))
+        (assoc move :exists (= kind :file))))))
+
+(check-allow :non-tail-recursion
+  (defn- dired-make-parents (path)
+    ;; the directories `path` is in, made where missing: on this machine at once (`file/mkdir`
+    ;; is mkdir -p), on another level by level through its handler
+    (let (parent (dired-parent path))
+      (cond
+        (= parent path) nil
+        (nil? (ed-path-handler parent)) (when (not (file/dir? parent)) (file/mkdir parent))
+        (nil? (dired-path-kind parent))
+          (do (dired-make-parents parent) (dired-handler-op parent :make-directory parent))
+        else nil))))
+
+(defn- dired-move-path (from to replace?)
+  ;; `from` renamed `to`, the directories `to` is in made first: through the file handler
+  ;; claiming either (another machine's), else on this machine's disk
+  (do
+    (dired-make-parents to)
+    (if (or (ed-path-handler from) (ed-path-handler to))
+      (dired-handler-op (if (nil? (ed-path-handler from)) to from)
+        :rename-file from to false replace?)
+      (file/move from to))))
+
+(defn- dired-step-aside (targets move)
+  ;; `move` from a temporary name beside it when another rename takes its name (a swap, a
+  ;; cycle) — the entry already moved there; raises when it cannot be
+  (if (contains? targets (path/normalize (:source move)))
+    (let (temp (dired-join (dired-parent (:source move))
+                 (str ".wdired-" (rand/token 4) "-" (:name move))))
+      (do (dired-move-path (:source move) temp false) (assoc move :from temp)))
+    move))
+
+(defn- dired-put-back (move)
+  ;; a rename that stepped aside and then failed moved back to its own name: "" when it is back
+  ;; or never left, else where it was left
+  (if (nil? (:from move))
+    ""
+    (try
+      (do (dired-move-path (:from move) (:source move) false) "")
+      (catch _e (str " (left at " (:from move) ")")))))
+
+(defn- dired-rename-one (move)
+  ;; `move` made: from its temporary name when it stepped aside; a target that is there after
+  ;; all (the rename taking it away failed) is not replaced unless said yes to
+  (let (from (or (:from move) (:source move))
+        target (:target move))
+    (try
+      (do
+        (when (and (not (:replace move)) (not (nil? (dired-path-kind target))))
+          (error (str target " is there")))
+        (dired-move-path from target (= true (:replace move)))
+        nil)
+      (catch e (error (str (error-message e) (dired-put-back move)))))))
+
+(defn- dired-rename-all (moves)
+  "Make every rename of `moves` (`{:name :source :target :replace}`): first each entry whose name
+another takes steps aside, then each goes to its target. `{:done moves :failed [[move reason]]}`,
+a failure never stopping the rest. Over paths alone, so it runs off the loop."
+  (let (targets (into #{} (map moves (fn (move) (path/normalize (:target move)))))
+        staged (dired-run-each moves
+                 (fn (move) (dired-step-aside targets move))
+                 (fn (_move staged) staged))
+        renamed (dired-run-each (:done staged) dired-rename-one))
+    {:done (:done renamed) :failed (into (vec (:failed staged)) (:failed renamed))}))
+
+(defn- ed-dired-carry-marks (m dir done)
+  ;; `m` with each renamed entry's mark or flag on its new name when it stayed in `dir` (Emacs's
+  ;; wdired leaves it on the line), dropped when the entry moved out
+  (let (renamed (into {}
+                  (map done
+                    (fn (move)
+                      [(:name move)
+                        (when (dired-same-path? (dired-parent (:target move)) dir)
+                          (path/basename (:target move)))])))
+        carry (fn (names)
+                (seq/keep (or names '())
+                  (fn (name) (if (contains? renamed name) (get renamed name) name)))))
+    (ed-update-named m
+      dir
+      (fn (buffer)
+        (assoc buffer
+          :dired-marks (carry (:dired-marks buffer))
+          :dired-flags (carry (:dired-flags buffer)))))))
+
+(defn- ed-dired-rename-all-run (tail)
+  ;; the `run` [[ed-dired-transfer-choose]] hands the chosen renames to: made off the loop, then
+  ;; the buffers visiting them following, the marks carried, the listing read again, said
+  (fn (m dir _kind moves prior-failed)
+    (ed-dired-launch m
+      (str "renaming " (dired-entries-phrase (map moves :name)))
+      (fn () (dired-rename-all moves))
+      (fn (mm report)
+        (let (done (:done report)
+              followed (fold done
+                         mm
+                         (fn (acc move) (ed-file-moved acc (:source move) (:target move)))))
+          (ed-dired-report (ed-dired-refresh (ed-dired-carry-marks followed dir done) dir)
+            "Renamed"
+            {:done (map done :name)
+             :failed (dired-failed-names (into (vec prior-failed) (:failed report)))}
+            tail))))))
+
+;; check-allow: the question's continuation (`lifecycle/ed-map-y-or-n`) and the off-loop fold are
+;; unknown to the checker; every path answers a model
+(sig ed-dired-rename-entries (model string any &optional string -> model))
+(check-allow :trusted
+  (defn ed-dired-rename-entries (m dir renames &optional (tail ""))
+    "Rename entries of the listing of `dir` each to a new name of its own — `renames` is
+`[[name new-name] …]` — all at once, as wdired's C-c C-c: a swap or a cycle works (an entry
+whose name another takes steps aside to a temporary name first); a name with a `/` (or an
+absolute one) moves the entry there, making the directories it names; a target already there
+that no other rename takes away is asked about (y / n / ! / q), a directory there never
+replaced; two entries given one name, or one moved into itself, are refused. Each rename stands
+alone: one that fails is said, the rest are made. A buffer visiting a renamed file follows it,
+a mark stays on its entry, the listing is read again; `tail` is said after the report. Another
+machine's listing (a file handler's) asks its disk and renames through the handler, off the loop."
+    (let (moves (map renames
+                  (fn ([name new])
+                    {:name name :source (dired-join dir name) :target (dired-rename-target dir new)}))
+          real (seq/reject moves (fn (move) (dired-same-path? (:source move) (:target move))))
+          taken (seq/frequencies (map real (fn (move) (path/normalize (:target move)))))
+          refusal (fn (move)
+                    (cond
+                      (> (get taken (path/normalize (:target move))) 1)
+                        (str "two entries would be named " (:target move))
+                      (dired-inside? (:source move) (:target move))
+                        (str (:target move) " is inside " (:name move))
+                      else nil))
+          refused (into []
+                    (seq/keep real (fn (move) (let (why (refusal move)) (when why [move why])))))
+          usable (seq/filter real (fn (move) (nil? (refusal move))))
+          vacated (into #{} (map usable (fn (move) (path/normalize (:source move)))))
+          resolve (fn ()
+                    (dired-run-each usable
+                      (fn (move) (dired-resolve-rename vacated move))
+                      (fn (_move resolved) resolved)))
+          choose (fn (mm report)
+                   (let (failed (into refused (:failed report)))
+                     (if (empty? (:done report))
+                       (ed-dired-report mm
+                         "Renamed"
+                         {:done [] :failed (dired-failed-names failed)}
+                         tail)
+                       (ed-dired-transfer-choose mm
+                         dir
+                         :rename (:done report)
+                         failed
+                         (ed-dired-rename-all-run tail))))))
+      (cond
+        ;; every new name read as the old one (`./a` for `a`)
+        (empty? real) (message m (str "No renames" tail))
+        (empty? usable) (choose m {:done [] :failed []})
+        (or (dired-handler dir)
+          (any? usable (fn (move) (not (nil? (ed-path-handler (:target move)))))))
+          (ed-dired-launch m "looking at the targets" resolve choose)
+        else (choose m (resolve))))))
 
 (defcommand cmd-dired-rename
   (m key)
@@ -1304,7 +1521,10 @@ confirm (D, Emacs `dired-do-delete`): to the trash, or for good when
     ;; d flags for deletion, x deletes the flagged (Emacs); D deletes marked-or-current now
     (keymap-bind ["d"] 'dired/cmd-dired-flag)
     (keymap-bind ["x"] 'dired/cmd-dired-do-flagged-delete)
-    (keymap-bind ["D"] 'dired/cmd-dired-delete)))
+    (keymap-bind ["D"] 'dired/cmd-dired-delete)
+    ;; C-x C-q makes the names editable (Emacs's dired-toggle-read-only → wdired-mode); the
+    ;; global read-only toggle would leave these keys in force, so `m` would still mark
+    (keymap-bind [:ctrl-x :ctrl-q] 'wdired/cmd-wdired-change-to-wdired-mode)))
 
 (def dired-mode-layer
   {:name 'dired

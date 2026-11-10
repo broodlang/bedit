@@ -1139,6 +1139,21 @@ src/filename.blsp           a typed path read the Emacs way (`substitute-in-file
                             and `pool/ed-path-list-prompt` (recent files, projects, git init/clone)
                             — hand their consumer the ABSOLUTE path (`filename/expand`)
 src/completion.blsp         shared fuzzy ranking + vertical-menu card (complete + plume)
+src/dired.blsp              Dired (C-x d, C-x C-j): an `ls -l` listing, its state ON the buffer
+                            (`:dired-dir`, `:dired-names` — a line's entry by index — marks, flags),
+                            single keys to open, sort, mark, flag, R / C / D / x (off the loop, one
+                            at a time; another machine's directory through its file handler's ops).
+                            `ed-dired-rename-entries`: entries renamed to names given, all at once —
+                            swaps and cycles through temporary names, `/` moves (parents made),
+                            an existing target asked about — what wdired applies
+src/wdired.blsp             wdired-mode: C-x C-q in Dired makes the file NAMES editable over
+                            `editspans` (the columns, header, `.` / `..` read-only; no Dired keymap,
+                            so `m` types an m). C-c C-c / C-x C-s rename through dired's
+                            `ed-dired-rename-entries`, an erased name flags its entry `D`; C-c C-k /
+                            C-c ESC put the names back; C-x C-q leaves, asking when changed; C-n / C-p
+                            / C-a keep to the name column, RET refused. No symlink-target or
+                            permission editing (the listing shows neither; brood has no readlink /
+                            symlink / chmod)
 src/fileops.blsp            what dired's deletes need past brood's `file/`: a path removed for good and
                             what that takes counted. Copy, move and the TRASH are brood's
                             (`file/copy-tree`, `file/move`, `file/trash`; a test binds
@@ -1261,11 +1276,20 @@ src/xrefgrep.blsp           M-. and M-? with no language server for the file (no
 src/projectdiag.blsp        C-x p !: every warning and error in the project — open buffers' findings and
                             what the language servers published for files not open — errors first;
                             RET visits, `a` asks the server for the fixes there (code actions)
-src/searchedit.blsp         editable search results (wgrep): C-c C-p in *Project Search* opens each
-                            row's text (the `file:line:` stays read-only — `narrow-to`), C-c C-c
+src/editspans.blsp          the EDITABLE-SPANS mechanism under wgrep, occur-edit and wdired: a
+                            generated read-only buffer narrowed to chosen spans (`narrow-to`, so no
+                            edit path reaches the rest), the spans as they were kept on it
+                            (`:span-edit`, with the type to go back to), switched to an edit type
+                            whose layers name NO command keymap — every letter types. `changes`,
+                            `restore` (C-c C-k), `finish`, `replace-lines` (a row written over a
+                            source line that still reads what it did, else skipped)
+src/searchedit.blsp         editable search results over `editspans`: wgrep — C-c C-p in *Project
+                            Search* opens each row's text (the `file:line:` stays read-only), C-c C-c
                             writes the changed rows to their files' buffers (a line changed since
                             is skipped), C-c C-k puts them back; C-x p % is a project replace over
-                            them (query-replace passes over what it may not edit)
+                            them (query-replace passes over what it may not edit) — and Emacs's
+                            occur-edit-mode: `e` in *Occur* opens its rows the same way, C-c C-c /
+                            C-x C-s write them to the buffer searched (Emacs writes as you type)
 src/isearch.blsp            incremental search (C-s / C-r), a modal mini-loop: regexp
                             (C-M-s / C-M-r, M-r) and word (M-s w) search, M-c case toggle; the `3/17`
                             match count (a timer of its own, a slice of the rope per turn, never on

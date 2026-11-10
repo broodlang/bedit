@@ -1,0 +1,206 @@
+(defmodule wdired
+  "Wdired — a Dired listing edited as text (Emacs's wdired-mode). `C-x C-q` in Dired (or M-x
+wdired-change-to-wdired-mode) makes the file NAMES editable and nothing else: the mark cell,
+the permissions, sizes and dates, the header and `.` / `..` stay read-only (`editspans`), and
+no Dired key is in force, so `m` types an m. Rename by editing a name; type a `/` to move an
+entry into a directory (made when missing); erase a name to flag the entry for deletion (`D`,
+as Emacs: `x` then deletes it). `C-c C-c` or `C-x C-s` applies every change at once — swaps and
+cycles too — through dired's renames (`dired/ed-dired-rename-entries`: an existing target is
+asked about, a buffer visiting a renamed file follows it, another machine's listing renames
+through its file handler); `C-c C-k` or `C-c ESC` puts every name back; `C-x C-q` applies when
+anything changed, asking first. Either way the buffer is Dired again, read again, its marks
+kept. Symlink targets and permissions are not editable: the listing shows neither a link's
+target nor a way to change a mode."
+  (:use editor/buffer) ; the rope, regions, point
+  (:use interactive) ; defcommand
+  (:use model) ; ed-current-buf / ed-apply / message / ed-ding / ed-read-char
+  (:use editor/keymap :only [keymap-bind]) ; the mode's keys
+  (:use modes :only []) ; register-type runs at load, after modes declares its kinds
+  (:use dired
+    :only [ed-show-dired
+      ed-dired-move-to-filename dired-entry-rows ed-dired-busy? ed-dired-rename-entries])) ; the listing and its renames
+
+(defn- editing? (buffer) (and (editspans/editing? buffer) (not (nil? (:dired-dir buffer)))))
+
+(defn- in-dired? (buffer)
+  ;; a Dired listing that has landed (another machine's is listed off the loop)
+  (and (= (editor/layers/buffer-type-for buffer) :dired) (not (nil? (:dired-names buffer)))))
+
+;; ---- point in the name column -------------------------------------------------------
+
+(defn- name-region (buffer)
+  "The editable name on point's line as `[from to]`, or nil on the header, `.` and `..`."
+  (let (rope (buffer-rope buffer)
+        line (buffer-current-line buffer)
+        start (text/line->char rope line)
+        end (+ start (string/length (wrap/rope-line-text rope line))))
+    (seq/find (or (editable-regions buffer) [])
+      (fn ([from to]) (and (>= from start) (<= to end))))))
+
+(defn- into-name (buffer)
+  ;; point moved onto its line's name when it is left of it (wdired-next-line keeps the column
+  ;; otherwise); a line with no name puts it where Dired would
+  (let (region (name-region buffer))
+    (cond
+      (nil? region) (ed-dired-move-to-filename buffer)
+      (< (buffer-point buffer) (first region)) (goto-char buffer (first region))
+      else buffer)))
+
+(defcommand cmd-wdired-next-line
+  (m key)
+  "Move to the next line, point kept in the name column (C-n, Emacs's wdired-next-line)."
+  (ed-apply (motion/cmd-next-line m key) into-name))
+
+(defcommand cmd-wdired-previous-line
+  (m key)
+  "Move to the previous line, point kept in the name column (C-p, wdired-previous-line)."
+  (ed-apply (motion/cmd-previous-line m key) into-name))
+
+(defcommand cmd-wdired-beginning-of-line
+  (m key)
+  "Move to the start of the name on this line, or of the line where there is none (C-a)."
+  (ed-apply m
+    (fn (buffer)
+      (let (region (name-region buffer))
+        (if (nil? region)
+          (goto-char buffer (text/line->char (buffer-rope buffer) (buffer-current-line buffer)))
+          (goto-char buffer (first region)))))))
+
+(defcommand cmd-wdired-no-newline
+  (m key)
+  "Refuse a line break (RET, C-o): a file name cannot hold one."
+  (ed-ding (message m "a file name cannot hold a line break")))
+
+;; ---- C-x C-q in Dired: the names become editable -----------------------------------------
+
+(defcommand cmd-wdired-change-to-wdired-mode
+  (m key)
+  "Make this Dired listing's file names editable (C-x C-q, Emacs's wdired-change-to-wdired-mode):
+edit a name to rename the entry, add a directory to move it, erase it to flag it for deletion.
+C-c C-c applies the changes, C-c C-k puts the names back."
+  (let (buffer (ed-current-buf m)
+        rows (into [] (dired-entry-rows buffer)))
+    (cond
+      (editing? buffer) (message m "already editing the names — C-c C-c applies, C-c C-k aborts")
+      (not (in-dired? buffer)) (message m "not a Dired listing")
+      (empty? rows) (ed-ding (message m "no entries to rename here"))
+      else
+        (message (ed-set-buf m (into-name (editspans/begin buffer rows :wdired)))
+          "Editing the names — C-c C-c applies, C-c C-k aborts"))))
+
+;; ---- leaving: back to Dired --------------------------------------------------------------
+
+(defn- back-to-dired (m buffer)
+  ;; `buffer` (the one being edited) put back as the listing: its names as they began, read-only
+  ;; in Dired, point on its line's name
+  (ed-set-buf m (into-name (editspans/finish (editspans/restore buffer)))))
+
+(defn- flag-all (m names)
+  ;; `m` with `names` flagged for deletion on the current listing, each `*` mark replaced (one
+  ;; mark cell a row, as Dired's d)
+  (let (buffer (ed-current-buf m)
+        flagged (into #{} names))
+    (ed-set-buf m
+      (assoc buffer
+        :dired-marks
+          (seq/reject (or (:dired-marks buffer) '()) (fn (name) (contains? flagged name)))
+        :dired-flags (seq/distinct (append (or (:dired-flags buffer) '()) names))))))
+
+(defn- flagged-note (count-flagged)
+  ;; what flagging says, after the renames' report
+  (if (= count-flagged 0)
+    ""
+    (str "; " (ed-count-noun count-flagged "file") " flagged for deletion — x deletes")))
+
+(defn- relisted (m)
+  ;; the current listing read again, point kept on its line
+  (ed-show-dired m (:dired-dir (ed-current-buf m)) (inc (buffer-current-line (ed-current-buf m)))))
+
+(defcommand cmd-wdired-finish-edit
+  (m key)
+  "Apply the edited names (C-c C-c, C-x C-s — Emacs's wdired-finish-edit): each changed name
+renames its entry, all at once (a swap works), a name with a directory moves the entry there, an
+erased name flags the entry for deletion (`x` then deletes it). A target already there is asked
+about. Back to Dired, read again."
+  (let (buffer (ed-current-buf m)
+        changes (editspans/changes buffer)
+        erased (into []
+                 (map (seq/filter changes (fn ([_row now]) (= now ""))) (fn ([row _]) (:name row))))
+        renames (into []
+                  (map (seq/reject changes (fn ([_row now]) (= now "")))
+                    (fn ([row now]) [(:name row) now]))))
+    (cond
+      (not (editing? buffer)) (message m "not editing the names — C-x C-q starts")
+      (any? renames (fn ([_name now]) (includes? now "\n")))
+        (ed-ding (message m "a file name cannot hold a line break — C-c C-k puts the names back"))
+      (and (not (empty? renames)) (ed-dired-busy? m))
+        (message m "a Dired operation is still running (C-g stops it) — C-c C-c again after")
+      (empty? changes) (message (back-to-dired m buffer) "(No changes to be performed)")
+      else
+        (let (back (flag-all (back-to-dired m buffer) erased)
+              tail (flagged-note (count erased)))
+          (cond
+            (empty? renames)
+              (message (relisted back) (string/substring tail 2 (string/length tail)))
+            (empty? erased) (ed-dired-rename-entries back (:dired-dir buffer) renames)
+            else (ed-dired-rename-entries (relisted back) (:dired-dir buffer) renames tail))))))
+
+(defcommand cmd-wdired-abort-changes
+  (m key)
+  "Put every name back as it was and return to Dired (C-c C-k, C-c ESC — wdired-abort-changes)."
+  (let (buffer (ed-current-buf m))
+    (if (not (editing? buffer))
+      (message m "not editing the names")
+      (message (back-to-dired m buffer) "Changes aborted"))))
+
+(defcommand cmd-wdired-exit
+  (m key)
+  "Return to Dired (C-x C-q again — wdired-exit): at once when nothing changed, else asking
+whether to apply the changes (y) or put the names back (n)."
+  (let (buffer (ed-current-buf m))
+    (cond
+      (not (editing? buffer)) (message m "not editing the names")
+      (not (editspans/changed? buffer))
+        (message (back-to-dired m buffer) "(No changes need to be saved)")
+      else
+        (ed-read-char m
+          "Buffer changed. Save changes? (y or n)"
+          (fn (answered answer)
+            (cond
+              (ed-yes-key? answer) (cmd-wdired-finish-edit answered nil)
+              (= answer "n") (cmd-wdired-abort-changes answered nil)
+              else (message answered "still editing the names")))))))
+
+;; ---- the mode ----------------------------------------------------------------------
+;; Text-mode's typing under these keys and the listing's colours — and no Dired keymap, which
+;; is the point: every letter types.
+
+(def wdired-keymap
+  (-> {}
+    (keymap-bind [:ctrl-c :ctrl-c] 'wdired/cmd-wdired-finish-edit)
+    (keymap-bind [:ctrl-x :ctrl-s] 'wdired/cmd-wdired-finish-edit)
+    (keymap-bind [:ctrl-x :ctrl-q] 'wdired/cmd-wdired-exit)
+    (keymap-bind [:ctrl-c :ctrl-k] 'wdired/cmd-wdired-abort-changes)
+    (keymap-bind [:ctrl-c :escape] 'wdired/cmd-wdired-abort-changes)
+    (keymap-bind [:ctrl-n] 'wdired/cmd-wdired-next-line)
+    (keymap-bind [:down] 'wdired/cmd-wdired-next-line)
+    (keymap-bind [:ctrl-p] 'wdired/cmd-wdired-previous-line)
+    (keymap-bind [:up] 'wdired/cmd-wdired-previous-line)
+    (keymap-bind [:ctrl-a] 'wdired/cmd-wdired-beginning-of-line)
+    (keymap-bind [:home] 'wdired/cmd-wdired-beginning-of-line)
+    (keymap-bind [:enter] 'wdired/cmd-wdired-no-newline)
+    (keymap-bind [:ctrl-o] 'wdired/cmd-wdired-no-newline)))
+
+(defn wdired-modeline (m buf)
+  "wdired-mode's `:modeline` segment: what the keys are, Emacs's `Editable` lighter."
+  "Editable — C-c C-c applies, C-c C-k aborts")
+
+(def wdired-mode-layer
+  {:name 'wdired
+   :doc "A Dired listing's names as text: edit to rename, C-c C-c applies, C-c C-k aborts."
+   :keymap wdired/wdired-keymap
+   :modeline 'wdired/wdired-modeline
+   :commands (modes/layer-commands wdired/wdired-keymap)
+   :fontify 'dired/dired-fontify})
+
+(modes/register-type :wdired (list 'wdired/wdired-mode-layer 'modes/text-mode-layer))

@@ -56,8 +56,10 @@ app id, the entry, the icon) hook up.
 Emacs-style movement and editing, a kill ring, multiple buffers and a
 `*Messages*` echo area, a real minibuffer with Vertico-style completion,
 completion-at-point, tiled window splits with mouse support, incremental search
-and query-replace, `M-x`, registers, bookmarks, keyboard macros, occur, dired,
-project-aware find-file, a per-project shell, `M-x compile` with next-error,
+and query-replace, `M-x`, registers, bookmarks, keyboard macros, occur (`e`
+edits the matches in place), dired (`C-x C-q` is wdired: the file names edited
+as text, `C-c C-c` renames — swaps, moves into directories, an erased name
+flagged for deletion), project-aware find-file, a per-project shell, `M-x compile` with next-error,
 and `C-x C-e` eval-in-buffer (run off the loop so a looping form can't freeze
 the editor). brood-mode adds live syntax highlighting, bracket matching, eldoc,
 sexp-aware indentation, paredit-style structural editing, and advisory

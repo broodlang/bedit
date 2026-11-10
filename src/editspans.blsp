@@ -1,0 +1,94 @@
+(defmodule editspans
+  "A generated, read-only buffer whose chosen SPANS become editable for a while — the mechanism
+under Emacs's wgrep (`searchedit`, *Project Search*), occur-edit-mode (`searchedit`, *Occur*)
+and wdired (`wdired`, a Dired listing). The buffer is narrowed to the spans (`editor/buffer`'s
+`narrow-to`), so no edit path — a key, a yank, a query-replace, an undo — can touch the text
+around them; the spans move with the edits, an erased one stays as an empty place to type. The
+spans as they were (the ROWS) ride on the buffer under `:span-edit` with the buffer type to go
+back to, and the buffer takes an edit type of the caller's — whose layers name no command
+keymap, so every letter is typing. What a changed span MEANS (a line of a file, a file's new
+name) is the caller's."
+  (:use editor/buffer)) ; narrowing, the rope, replace-region
+
+(defn begin (buffer rows edit-type)
+  "`buffer` with each of `rows` (`{:start :end :text}` and whatever else the caller keeps: the
+span `[start end)` reading `text`, top to bottom) made editable and nothing else, the rows kept
+on it, and its type `edit-type` — its layers seeded again. [[finish]] goes back to the type it
+had."
+  (let (ordered (into [] (seq/sort-by rows :start)))
+    (-> buffer
+      (narrow-to (map ordered (fn (row) [(:start row) (:end row)])))
+      (assoc :span-edit {:rows ordered :back (editor/layers/buffer-type-for buffer)})
+      (editor/layers/set-buffer-type edit-type)
+      (editor/layers/init-buffer-layers))))
+
+(defn editing? (buffer)
+  "Whether `buffer`'s spans are open for editing ([[begin]])."
+  (not (nil? (:span-edit buffer))))
+
+(defn rows (buffer)
+  "The rows `buffer`'s editing began with, top to bottom — `[]` when it is not editing."
+  (or (map/get-in buffer [:span-edit :rows]) []))
+
+(defn texts (buffer)
+  "What each row's span reads NOW, in row order: the editable regions moved with the edits, one
+a row."
+  (let (rope (buffer-rope buffer))
+    (map (editable-regions buffer) (fn ([from to]) (text/slice rope from to)))))
+
+(defn changes (buffer)
+  "`[row now]` for every row whose span no longer reads what it did, in row order."
+  (seq/keep (seq/zip (rows buffer) (texts buffer))
+    (fn ([row now]) (when (not (= now (:text row))) [row now]))))
+
+(defn changed? (buffer)
+  "Whether any row's span was changed."
+  (not (empty? (changes buffer))))
+
+(defn restore (buffer)
+  "`buffer` with every span put back to the text its row began with — the edits' undo, as one
+more edit (bottom up, so the regions above stay where they are)."
+  (let (regions (editable-regions buffer)
+        all (rows buffer))
+    (fold (reverse (range 0 (count all)))
+      buffer
+      (fn (restored index)
+        (let ([from to] (nth regions index)
+              text (:text (nth all index)))
+          (if (= (text/slice (buffer-rope restored) from to) text)
+            restored
+            (replace-region restored from to text)))))))
+
+(defn finish (buffer)
+  "`buffer` read-only again in the type it had before [[begin]], its text as it now reads (a
+caller wanting the rows back calls [[restore]] first)."
+  (let (back (map/get-in buffer [:span-edit :back]))
+    (-> buffer
+      (dissoc :span-edit)
+      (set-read-only true)
+      (editor/layers/set-buffer-type back)
+      (editor/layers/init-buffer-layers))))
+
+(defn replace-lines (buffer changes)
+  "`[buffer written skipped]`: each of `changes` (`[row new-text]`, the row naming a line of
+`buffer` — 0-based `:source-line` — and what it read, `:text`) written over that line when the
+line still reads it, else counted as skipped, never overwritten. All of them are ONE undo step.
+What wgrep and occur-edit do with an edited row.
+
+    (let ([b w s] (editspans/replace-lines (editor/buffer/make-buffer \"a\\nb\\n\") [[{:source-line 1 :text \"b\"} \"B\"] [{:source-line 0 :text \"x\"} \"X\"]])) [(editor/buffer/buffer-text b) w s])   ;=> [\"a\\nB\\n\" 1 1]"
+  (fold changes
+    [buffer 0 0]
+    (fn (outcome change)
+      (let ([target written skipped] outcome
+            [row new-text] change
+            rope (buffer-rope target)
+            line (:source-line row))
+        (if (and (< line (text/line-count rope)) (= (wrap/rope-line-text rope line) (:text row)))
+          (let (start (text/line->char rope line))
+            [(replace-region (if (> written 0) (amalgamate-undo target) target)
+               start
+               (+ start (string/length (:text row)))
+               new-text)
+              (inc written)
+              skipped])
+          [target written (inc skipped)])))))

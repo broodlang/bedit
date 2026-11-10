@@ -1,23 +1,24 @@
 (defmodule searchedit
-  "Editable search results (Emacs's wgrep): `C-c C-p` in *Project Search* makes the text of
-every `file:line:text` row editable — the `file:line:` stays read-only (`editor/buffer`'s
-`narrow-to`, so no edit path can touch it) — and `C-c C-c` writes each changed row back to
-its line in its file, `C-c C-k` puts the rows back. The files are edited in their buffers, left
-modified for C-x s, as wgrep leaves them; a line that changed on its own since the search is
-skipped and said, never overwritten. A project-wide replace is a search, `C-c C-p`, `M-%` over
-the rows (query-replace keeps to what may be edited) and `C-c C-c`;
-`M-x project-query-replace-regexp` is those steps in one."
-  (:use editor/buffer) ; the rope, narrowing, replace-region
+  "Editable search results: Emacs's wgrep over *Project Search* and occur-edit-mode over *Occur*.
+`C-c C-p` in *Project Search* (or `e` in *Occur*) makes the text of every row editable — the
+`file:line:` / `N:` before it stays read-only (`editspans`, so no edit path can touch it) — and
+`C-c C-c` writes each changed row back to its line, `C-c C-k` puts the rows back. The files
+(the buffer an *Occur* searched) are edited in their buffers, left modified for C-x s, as wgrep
+leaves them; a line that changed on its own since the search is skipped and said, never
+overwritten. A project-wide replace is a search, `C-c C-p`, `M-%` over the rows (query-replace
+keeps to what may be edited) and `C-c C-c`; `M-x project-query-replace-regexp` is those steps
+in one."
+  (:use editor/buffer) ; the rope, buffer-name / buffer-point
   (:use interactive) ; defcommand
   (:use model) ; ed-current-buf / ed-apply / message / ed-ding
-  (:use editor/keymap :only [keymap-bind]) ; the edit mode's keys
+  (:use editor/keymap :only [keymap-bind]) ; the edit modes' keys
   (:use modes :only []) ; register-type runs at load, after modes declares its kinds
   (:use pool :only [ed-find-file ed-return-to ed-project-root])) ; the files edited, and back; the project
 
 ;; ---- the rows ------------------------------------------------------------------
 
 (defn- row-of (rope line root)
-  ;; `{:line :file :file-line :start :end :text}` for a `file:line:text` row at buffer line
+  ;; `{:line :file :source-line :start :end :text}` for a `file:line:text` row at buffer line
   ;; `line` — `:start`/`:end` the span of its text — or nil for any other line
   (let (start (text/line->char rope line)
         text (wrap/rope-line-text rope line)
@@ -27,7 +28,7 @@ the rows (query-replace keeps to what may be edited) and `C-c C-c`;
             prefix (string/length (:text found)))
         {:line line
          :file (path/join root (:text file-group))
-         :file-line (dec (reflect/read-string (:text line-group)))
+         :source-line (dec (reflect/read-string (:text line-group)))
          :start (+ start prefix)
          :end (+ start (string/length text))
          :text (string/substring text prefix (string/length text))}))))
@@ -39,82 +40,53 @@ line, the search, the command) come first and match no row."
         root (or (:dir buffer) "."))
     (seq/keep (range 0 (text/line-count rope)) (fn (line) (row-of rope line root)))))
 
-(defn- editing? (buffer) (not (nil? (:search-edit buffer))))
+(defn- editing? (buffer) (editspans/editing? buffer))
 
-;; ---- C-c C-p: the rows become editable ------------------------------------------
+(defn- begin-editing (m rows edit-type note)
+  ;; the current results buffer with `rows` open for editing as `edit-type`, `note` said — or
+  ;; why not
+  (let (buffer (ed-current-buf m))
+    (cond
+      (editing? buffer) (message m "already editing — C-c C-c writes, C-c C-k puts back")
+      (empty? rows) (ed-ding (message m "no result rows to edit"))
+      else (message (ed-set-buf m (editspans/begin buffer rows edit-type)) note))))
+
+(defn- row-with-break? (changes)
+  ;; whether a changed row now holds a line break, which no line can
+  (any? (map changes second) (fn (text) (includes? text "\n"))))
+
+(defn- finish-editing (m buffer-name)
+  ;; the results buffer read-only again, its rows as they now read
+  (ed-update-named m buffer-name editspans/finish))
+
+(defcommand cmd-search-edit-abort
+  (m key)
+  "Put every row back as the search found it and stop editing (C-c C-k)."
+  (let (buffer (ed-current-buf m))
+    (if (not (editing? buffer))
+      (message m "not editing the results")
+      (message (ed-set-buf m (editspans/finish (editspans/restore buffer))) "Edits put back"))))
+
+;; ---- C-c C-p in *Project Search*: the rows become editable ---------------------------
 
 (defcommand cmd-search-edit
   (m key)
   "Make *Project Search*'s rows editable (C-c C-p, wgrep's key): the text after each
 `file:line:` may be changed, nothing else. C-c C-c writes the changes to the files, C-c C-k
 puts the rows back."
-  (let (buffer (ed-current-buf m)
-        rows (into [] (search-rows buffer)))
-    (cond
-      (editing? buffer) (message m "already editing — C-c C-c writes, C-c C-k puts back")
-      (empty? rows) (ed-ding (message m "no result rows to edit"))
-      else
-        (message (ed-set-buf m
-                   (-> buffer
-                     (narrow-to (map rows (fn (row) [(:start row) (:end row)])))
-                     (assoc :search-edit rows)
-                     (editor/layers/set-buffer-type :project-search-edit)
-                     (editor/layers/init-buffer-layers)))
-          "Editing the results — C-c C-c writes them to the files, C-c C-k puts them back"))))
-
-;; ---- C-c C-c: the changes go to the files -----------------------------------------
-
-(defn- edited-rows (buffer)
-  "`[row new-text]` for every row whose text was changed, read from the editable regions, which
-moved with the edits — one region a row, in row order."
-  (let (rope (buffer-rope buffer)
-        regions (editable-regions buffer))
-    (seq/keep (range 0 (count (:search-edit buffer)))
-      (fn (index)
-        (let (row (nth (:search-edit buffer) index)
-              [from to] (nth regions index)
-              now (text/slice rope from to))
-          (when (not (= now (:text row))) [row now]))))))
-
-(defn- apply-row (outcome [row new-text])
-  ;; `[buffer written skipped]`: the row's line in its file `buffer` replaced by `new-text` when
-  ;; it still reads what the search found, else counted as skipped. A file's rows are ONE undo
-  ;; step: each replacement after the first amalgamates into it
-  (let ([buffer written skipped] outcome
-        rope (buffer-rope buffer)
-        line (:file-line row))
-    (if (and (< line (text/line-count rope)) (= (wrap/rope-line-text rope line) (:text row)))
-      (let (start (text/line->char rope line))
-        [(replace-region (if (> written 0) (amalgamate-undo buffer) buffer)
-           start
-           (+ start (string/length (:text row)))
-           new-text)
-          (inc written)
-          skipped])
-      [buffer written (inc skipped)])))
+  (begin-editing m
+    (into [] (search-rows (ed-current-buf m)))
+    :project-search-edit "Editing the results — C-c C-c writes them to the files, C-c C-k puts them back"))
 
 (defn- write-file-rows (outcome [path changes])
   ;; `[model written skipped]` with `changes` (`[row new-text]`s of one file) applied to its
   ;; buffer, opened (or switched to) for it
   (let ([m written skipped] outcome
         opened (ed-find-file m path)
-        [edited file-written file-skipped] (fold changes [(ed-current-buf opened) 0 0] apply-row))
+        [edited file-written file-skipped] (editspans/replace-lines (ed-current-buf opened) changes))
     [(if (> file-written 0) (ed-edit opened (fn (_) edited)) opened)
       (+ written file-written)
       (+ skipped file-skipped)]))
-
-(defn- finish-editing (m buffer-name)
-  ;; *Project Search* read-only again, its rows as they now read
-  (let (index (ed-buffer-index-by-name m buffer-name))
-    (if (nil? index)
-      m
-      (ed-set-buf-at m
-        index
-        (-> (ed-buf-at m index)
-          (dissoc :search-edit)
-          (set-read-only true)
-          (editor/layers/set-buffer-type :project-search)
-          (editor/layers/init-buffer-layers))))))
 
 (defcommand cmd-search-edit-commit
   (m key)
@@ -122,11 +94,11 @@ moved with the edits — one region a row, in row order."
 file's buffer, left modified for C-x s. A line that no longer reads what the search found
 (changed since) is skipped, and said."
   (let (buffer (ed-current-buf m)
-        changes (edited-rows buffer)
-        rows-text (seq/find (map changes second) (fn (text) (includes? text "\n"))))
+        changes (editspans/changes buffer))
     (cond
       (not (editing? buffer)) (message m "not editing the results — C-c C-p starts")
-      rows-text (ed-ding (message m "a row may not hold a line break — C-c C-k puts the rows back"))
+      (row-with-break? changes)
+        (ed-ding (message m "a row may not hold a line break — C-c C-k puts the rows back"))
       else
         (let (by-file (seq/group-by changes (fn ([row _]) (:file row)))
               [written-model written skipped] (fold (%map-pairs by-file) [m 0 0] write-file-rows)
@@ -143,27 +115,81 @@ file's buffer, left modified for C-x s. A line that no longer reads what the sea
                 "")
               (if (> written 0) " — C-x s saves" "")))))))
 
-;; ---- C-c C-k: the rows put back ---------------------------------------------------
+;; ---- e in *Occur*: occur-edit-mode ---------------------------------------------------
+;; An *Occur* row is `N: text`, its source `{:buffer :line}` in `:line-links` (0-based row line →
+;; the searched buffer's NAME and 1-based line). Emacs's occur-edit-mode writes each change to
+;; the source as it is typed; here, as wgrep, C-c C-c writes them all and C-c C-k puts them back.
 
-(defcommand cmd-search-edit-abort
+(defn- occur-row (rope line link)
+  ;; the *Occur* row at buffer `line`, showing `link`'s source line, or nil
+  (let (start (text/line->char rope line)
+        text (wrap/rope-line-text rope line)
+        found (regex/find "^[0-9]+: " text))
+    (when found
+      (let (prefix (string/length (:text found)))
+        {:line line
+         :source (:buffer link)
+         :source-line (dec (:line link))
+         :start (+ start prefix)
+         :end (+ start (string/length text))
+         :text (string/substring text prefix (string/length text))}))))
+
+(defn- occur-rows (buffer)
+  "Every *Occur* row of `buffer` with the source line it shows, top to bottom."
+  (let (rope (buffer-rope buffer)
+        links (or (:line-links buffer) {}))
+    (seq/keep (sort (keys links))
+      (fn (line) (when (< line (text/line-count rope)) (occur-row rope line (get links line)))))))
+
+(defcommand cmd-occur-edit
   (m key)
-  "Put every row back as the search found it and stop editing (C-c C-k)."
-  (let (buffer (ed-current-buf m))
-    (if (not (editing? buffer))
-      (message m "not editing the results")
-      (let (regions (editable-regions buffer)
-            rows (:search-edit buffer)
-            restored (fold (reverse (range 0 (count rows)))
-                       buffer
-                       (fn (b index)
-                         (let ([from to] (nth regions index))
-                           (replace-region b from to (:text (nth rows index)))))))
-        (message (finish-editing (ed-set-buf m restored) (buffer-name buffer)) "Edits put back")))))
+  "Make *Occur*'s rows editable (e, Emacs's occur-edit-mode): the text after each `N:` may be
+changed, nothing else. C-c C-c writes the changes to the lines of the buffer searched, C-c C-k
+puts the rows back."
+  (begin-editing m
+    (into [] (occur-rows (ed-current-buf m)))
+    :occur-edit "Editing the matches — C-c C-c writes them to the buffer, C-c C-k puts them back"))
 
-;; ---- the mode ------------------------------------------------------------------
+(defn- write-source-rows (outcome [name changes])
+  ;; `[model written skipped]` with `changes` written to the lines of the buffer named `name`;
+  ;; a buffer since killed, or read-only, takes none of them
+  (let ([m written skipped] outcome
+        index (ed-buffer-index-by-name m name))
+    (if (or (nil? index) (read-only? (ed-buf-at m index)))
+      [m written (+ skipped (count changes))]
+      (let ([edited source-written source-skipped] (editspans/replace-lines (ed-buf-at m index)
+                                                     changes))
+        [(if (> source-written 0) (ed-set-buf-at m index edited) m)
+          (+ written source-written)
+          (+ skipped source-skipped)]))))
+
+(defcommand cmd-occur-edit-commit
+  (m key)
+  "Write the edited *Occur* rows to the buffer searched (C-c C-c): each changed row replaces its
+line, left modified for C-x s. A line that no longer reads what occur found is skipped, and
+said; so is a buffer since killed or read-only."
+  (let (buffer (ed-current-buf m)
+        changes (editspans/changes buffer))
+    (cond
+      (not (editing? buffer)) (message m "not editing the matches — e starts")
+      (row-with-break? changes)
+        (ed-ding (message m "a row may not hold a line break — C-c C-k puts the rows back"))
+      else
+        (let (by-source (seq/group-by changes (fn ([row _]) (:source row)))
+              [written-model written skipped] (fold (%map-pairs by-source)
+                                                [m 0 0]
+                                                write-source-rows))
+          (message (finish-editing written-model (buffer-name buffer))
+            (str (ed-count-noun written "line")
+              " changed"
+              (if (> skipped 0) (str "; " (ed-count-noun skipped "line") " skipped") "")
+              (if (> written 0) " — C-x s saves" "")))))))
+
+;; ---- the modes -----------------------------------------------------------------
+;; Typing is text-mode's and the colours the results buffer's: no layer below names a command
+;; keymap, so `n`, `q` or `g` are letters while the rows are open.
 
 (def search-edit-layer
-  ;; the keys while the rows are editable; typing is text-mode's, the colours project-search's
   {:name 'search-edit
    :keymap (-> {}
              (keymap-bind [:ctrl-c :ctrl-c] 'searchedit/cmd-search-edit-commit)
@@ -171,6 +197,16 @@ file's buffer, left modified for C-x s. A line that no longer reads what the sea
 
 (modes/register-type :project-search-edit
   (list 'searchedit/search-edit-layer 'project-search/project-search-layer 'modes/text-mode-layer))
+
+(def occur-edit-layer
+  ;; C-c C-c leaves occur-edit-mode in Emacs; C-x C-s too, as in wdired
+  {:name 'occur-edit
+   :keymap (-> {}
+             (keymap-bind [:ctrl-c :ctrl-c] 'searchedit/cmd-occur-edit-commit)
+             (keymap-bind [:ctrl-x :ctrl-s] 'searchedit/cmd-occur-edit-commit)
+             (keymap-bind [:ctrl-c :ctrl-k] 'searchedit/cmd-search-edit-abort))})
+
+(modes/register-type :occur-edit (list 'searchedit/occur-edit-layer 'modes/text-mode-layer))
 
 ;; ---- M-x project-query-replace-regexp: the steps in one --------------------------------
 
