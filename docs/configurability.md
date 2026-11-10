@@ -181,6 +181,29 @@ package) can mark *their own* command repeatable or a kill command. Still separa
 `*prefix-consuming*`, `*command-inverse*`, `input/*view-resume-keys*`,
 `input/ed--shift-deactivators`.
 
+### A mode's editability — the `:writable` facet (built)
+
+How a buffer becomes writable is its MODE's answer, not a flag flipped under whatever keys
+the mode binds: C-x C-q in Dired once made the listing writable with Dired's keymap still in
+force, so `m` marked a file instead of typing an m. C-x C-q (`editing/cmd-toggle-read-only`,
+M-x toggle-read-only) asks the buffer's layers for `:writable` (`modes/writable-policy`):
+
+| value | C-x C-q | who |
+|---|---|---|
+| `:toggle` | flips the flag; the mode's keys stay commands (Emacs's special-mode) | special-mode and the reports over it, the git / mur views, the menus, the rebase plan |
+| `{:enter command}` | runs the mode's EDIT VARIANT | Dired → wdired, *Occur* → occur-edit, *Project Search* → wgrep's edit |
+| `{:commit c :abort a}` | leaves the variant — at once if unchanged, else asks: y applies, n puts back | wdired, occur-edit, the search edit (`editspans/edit-layer`) |
+| `{:never why}` | refuses, saying `why` | the hex, image and document views |
+
+No layer declaring it means `:toggle`, which is right for text and code. **A new mode whose
+keymap binds a printable key to a command must declare `:writable`** on that layer (or one
+above it) — `tests/writable_test.blsp` walks every registered type and fails otherwise, then
+presses C-x C-q in a buffer of each type to check it does what was declared. An edit variant
+is a layer built with `editspans/edit-layer layer commit abort`: its C-c C-c / C-x C-s /
+C-c C-k / C-c ESC and its `:writable` come from that one call, and its stack may bind no
+letter (the test checks that too). The per-type decisions, with the Emacs behaviour each
+follows, are the table in `src/modes.blsp`.
+
 ## Prime-directive split (what's Brood vs. what's the editor)
 
 **Part 1 — Brood / `std`.**

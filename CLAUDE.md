@@ -699,7 +699,10 @@ src/typing.blsp             self-insert, newline, the delete keys, delete-select
 src/killing.blsp            the kills and yanks (coalescing, M-y, C-u N C-y), zap, rectangles, the
                             middle click's PRIMARY yank
 src/editing.blsp            open-line, transposes (negative arguments drag backward), duplicate /
-                            join, case, read-only toggle, undo / redo
+                            join, case, undo / redo, and C-x C-q (`cmd-toggle-read-only`), which
+                            asks the MODE (`modes/writable-policy`): the flag, the mode's edit
+                            variant (entered or left), or a refusal — never the flag under a mode
+                            whose letters are commands; a guest enters no variant it may not run
 src/region.blsp             the mark commands, narrowing, `ed-active-region`, rectangle-mark-mode (C-x SPC:
                             `:rectangle-mark` on the buffer, painted as a block, C-w / M-w / C-y act
                             on it through `killing`; dropped by a post-step once the mark goes)
@@ -878,6 +881,11 @@ src/modes.blsp              modes as layers — the INFRASTRUCTURE: text-mode, t
                             mode goes with it: editor/layers cannot remove a file rule, so each
                             type gets ONE std rule reading its pattern from the claimed
                             `:modes/file-patterns` when it runs
+                            And EDITABILITY: a mode's `:writable` facet (`writable-policy`, the
+                            decision table per type) — `:toggle`, `{:enter cmd}` (an edit
+                            variant), `{:commit :abort}` (the variant), `{:never why}`; a layer
+                            binding a printable key to a command must declare it
+                            (tests/writable_test.blsp walks every type and presses C-x C-q in each)
 src/brood-mode.blsp         brood-mode: the `.blsp` keymap (paredit, electric pairs) and
                             its services — eldoc, doc-at, completion against the live
                             image, the CST indenter, the checker as `:diagnostics`
@@ -1150,7 +1158,8 @@ src/wdired.blsp             wdired-mode: C-x C-q in Dired makes the file NAMES e
                             `editspans` (the columns, header, `.` / `..` read-only; no Dired keymap,
                             so `m` types an m). C-c C-c / C-x C-s rename through dired's
                             `ed-dired-rename-entries`, an erased name flags its entry `D`; C-c C-k /
-                            C-c ESC put the names back; C-x C-q leaves, asking when changed; C-n / C-p
+                            C-c ESC put the names back; C-x C-q leaves, asking when changed (`editspans/leave`,
+                            dired's `:writable {:enter …}` entering it — dired binds no C-x C-q); C-n / C-p
                             / C-a keep to the name column, RET refused. No symlink-target or
                             permission editing (the listing shows neither; brood has no readlink /
                             symlink / chmod)
@@ -1282,7 +1291,10 @@ src/editspans.blsp          the EDITABLE-SPANS mechanism under wgrep, occur-edit
                             (`:span-edit`, with the type to go back to), switched to an edit type
                             whose layers name NO command keymap — every letter types. `changes`,
                             `restore` (C-c C-k), `finish`, `replace-lines` (a row written over a
-                            source line that still reads what it did, else skipped)
+                            source line that still reads what it did, else skipped). Every
+                            variant's layer is `edit-layer` (C-c C-c / C-x C-s apply, C-c C-k / C-c
+                            ESC put back, its `:writable`), and C-x C-q in one is `leave`: back at
+                            once, or asking y / n when changed
 src/searchedit.blsp         editable search results over `editspans`: wgrep — C-c C-p in *Project
                             Search* opens each row's text (the `file:line:` stays read-only), C-c C-c
                             writes the changed rows to their files' buffers (a line changed since

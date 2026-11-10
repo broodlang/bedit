@@ -1,0 +1,258 @@
+;; tests/writable_test.blsp — how a buffer becomes writable is its MODE's (`modes/writable-policy`,
+;; the `:writable` facet). C-x C-q once flipped the flag on a Dired listing and left Dired's keys
+;; in force, so `m` marked a file instead of typing an m. These tests walk EVERY registered buffer
+;; type, so a new mode cannot bring that back: a layer that binds a printable key to a command
+;; must say how C-x C-q treats it, an edit variant must leave every letter typing, and C-x C-q
+;; must do what each type declared.
+
+(defmodule writable-test
+  (:use test)
+  (:use model)
+  (:use input)
+  (:use editor/buffer)
+  (:use dired :only [ed-show-dired])
+  (:use main :only [])) ; the released image: every mode loaded, every type registered
+
+(purge-stale-temp "bedit-writable-")
+
+(defn- layer-value (ref)
+  (cond
+    (map? ref) ref
+    (and (symbol? ref) (bound? ref)) (reflect/eval ref)
+    else nil))
+
+(defn- type-stack (type)
+  "`type`'s layers as maps, highest precedence first."
+  (map (editor/layers/layers-for-type type) layer-value))
+
+(defn- inserts? (binding)
+  ;; a key bound to a command that types (an electric bracket) still types
+  (and (symbol? binding) (interactive/command-trait? binding :typing)))
+
+(defn- printable-commands (layer)
+  "`[key binding]` for each printable one-character key `layer`'s keymap binds to something
+other than typing: a command or a prefix map."
+  (into []
+    (seq/filter (or (:keymap (or layer {})) {})
+      (fn ([key binding]) (and (string? key) (= (string/length key) 1) (not (inserts? binding)))))))
+
+(defn- first-index (stack pred)
+  (letrec (go (fn (layers index)
+                (cond
+                  (empty? layers) nil
+                  (pred (first layers)) index
+                  else (go (rest layers) (inc index)))))
+    (go stack 0)))
+
+(defn- types () (sort (keys editor/layers/*type-layers*)))
+
+(defn- policy-of (type)
+  (or (seq/find (map (type-stack type) (fn (layer) (get (or layer {}) :writable))) identity)
+    :toggle))
+
+(defn- variant? (policy) (and (map? policy) (not (nil? (:commit policy)))))
+
+(defn- types-with (pred) (seq/filter (types) (fn (type) (pred (policy-of type)))))
+
+(defn- undeclared ()
+  "`[type keys]` for each type a layer of which binds printable keys to commands while no layer
+at or above it declares `:writable`."
+  (seq/keep (types)
+    (fn (type)
+      (let (stack (type-stack type)
+            lettered (first-index stack (fn (layer) (not (empty? (printable-commands layer)))))
+            declared (first-index stack (fn (layer) (contains? (or layer {}) :writable))))
+        (when (and (not (nil? lettered)) (or (nil? declared) (> declared lettered)))
+          [type (sort (map (printable-commands (nth stack lettered)) first))])))))
+
+(defn- unbound-layers ()
+  "`[type ref]` for each layer ref no loaded module defines — a stack these tests cannot read."
+  (seq/keep (mapcat (types)
+              (fn (type) (map (editor/layers/layers-for-type type) (fn (ref) [type ref]))))
+    (fn ([type ref]) (when (nil? (layer-value ref)) [type ref]))))
+
+(defn- holds (label value)
+  ;; `value` truthy, `label` naming the case in the failure
+  (assert= [label (not (or (nil? value) (= value false)))] [label true]))
+
+(defn- press (m keys) (fold keys m (fn (acc key) (ed-update acc key 80 24))))
+(defn- cur (m) (ed-current-buf m))
+(defn- typed-model (type text) (ed-init (editor/layers/set-buffer-type (make-buffer text) type)))
+(defn- type-of (m) (editor/layers/buffer-type-for (cur m)))
+
+(describe "every type says how C-x C-q treats it"
+  (test "the walk reads every type's whole stack"
+    (is (> (count (types)) 80))
+    (assert= (vec (unbound-layers)) []))
+
+  (test "a layer that binds a printable key to a command declares :writable at or above it"
+    ;; A type listed here can be flipped writable under keys that do not type. Declare
+    ;; `:writable` on the layer that binds them (`modes/writable-policy` has the choices):
+    ;; :toggle (Emacs special-mode: the flag, the keys stay commands), {:enter command} (an
+    ;; edit variant) or {:never why}.
+    (assert= (vec (undeclared)) []))
+
+  (test "the guard sees what it guards: Dired's letters, and special-mode's q under a report"
+    (is (includes? (map (printable-commands dired/dired-mode-layer) first) "m"))
+    (is (includes? (map (printable-commands modes/special-mode-layer) first) "q"))
+    ;; an electric bracket types, so brood-mode needs no declaration
+    (assert= (printable-commands brood-mode/brood-mode-layer) []))
+
+  (test "every policy is one the toggle knows"
+    (each (types)
+      (fn (type)
+        (let (policy (policy-of type))
+          (holds [type policy]
+            (or (= policy :toggle)
+              (and (map? policy) (or (:enter policy) (:commit policy) (:never policy)))))))))
+
+  (test "the edit variants are Dired's, *Occur*'s and *Project Search*'s"
+    (assert= (vec (types-with (fn (policy) (and (map? policy) (:enter policy)))))
+      [:dired :occur :project-search])
+    (assert= (vec (types-with variant?)) [:occur-edit :project-search-edit :wdired])))
+
+(describe "an edit variant leaves every letter typing"
+  (test "no layer of a variant's stack binds a printable key to a command"
+    (each (types-with variant?)
+      (fn (type)
+        (assert= [type (vec (mapcat (type-stack type) printable-commands))] [type []]))))
+
+  (test "every variant applies and puts back with the same keys, which its facet names"
+    (each (types-with variant?)
+      (fn (type)
+        (let (policy (policy-of type)
+              keymap (:keymap (first (type-stack type))))
+          (assert= (map/get-in keymap [:ctrl-c :ctrl-c]) (:commit policy))
+          (assert= (map/get-in keymap [:ctrl-x :ctrl-s]) (:commit policy))
+          (assert= (map/get-in keymap [:ctrl-c :ctrl-k]) (:abort policy))
+          ;; C-x C-q is the global toggle's, which reads the facet
+          (is (nil? (map/get-in keymap [:ctrl-x :ctrl-q]))))))))
+
+;; ---- C-x C-q, pressed in a buffer of every type -----------------------------------------
+
+(describe "C-x C-q in a :toggle type flips the flag and says so"
+  (test "every :toggle type"
+    (each (types-with (fn (policy) (= policy :toggle)))
+      (fn (type)
+        (let (m (typed-model type "one\ntwo\n")
+              before (read-only? (cur m))
+              once (press m [:ctrl-x :ctrl-q])
+              twice (press once [:ctrl-x :ctrl-q]))
+          (assert= [type (read-only? (cur once))] [type (not before)])
+          (assert= [type (:echo once)] [type (if before "writable" "read-only")])
+          (assert= [type (read-only? (cur twice))] [type before])))))
+
+  (test "a report's keys stay commands once it is writable, as Emacs's special-mode keeps them"
+    (let (m (press (typed-model :help "text\n") [:ctrl-x :ctrl-q]))
+      (refute (read-only? (cur m)))
+      (assert= (modes/writable-policy (cur m)) :toggle)))
+
+  (test "the rebase plan is read-only, as Magit's, and its verbs still rewrite it"
+    ;; it was writable with letters bound: no `p` could ever be typed into it
+    (let (m (typed-model :git-rebase "pick aaa one\n")
+          fixed (press m ["f"]))
+      (is (read-only? (cur m)))
+      (assert= (buffer-text (cur fixed)) "fixup aaa one\n")
+      (is (read-only? (cur fixed)))
+      ;; made writable, a verb keeps it so
+      (refute (read-only? (cur (press m [:ctrl-x :ctrl-q "d"])))))))
+
+(describe "C-x C-q in a :never type refuses, saying why"
+  (test "every :never type"
+    (assert= (vec (types-with (fn (policy) (and (map? policy) (:never policy)))))
+      [:docview :hexl :image])
+    (each (types-with (fn (policy) (and (map? policy) (:never policy))))
+      (fn (type)
+        (let (m (typed-model type "00000000: 6869\n")
+              pressed (press m [:ctrl-x :ctrl-q]))
+          (assert= [type (read-only? (cur pressed))] [type (read-only? (cur m))])
+          (holds type (includes? (:echo pressed) "stays read-only"))
+          (holds type (includes? (:echo pressed) (:never (policy-of type)))))))))
+
+;; Every {:enter} type needs a fixture here: the guard below fails for one that has none, so a
+;; new edit variant comes with its behaviour checked.
+(defn- dired-fixture ()
+  (let (dir (temp-dir "bedit-writable-"))
+    (file/mkdir dir)
+    (file/spit (path/join dir "a.txt") "hello")
+    (ed-show-dired (assoc (ed-init (make-buffer "")) :dired-listing-switches "-al") dir 2)))
+
+(defn- occur-fixture ()
+  (press (ed-init (make-buffer "foo one\nbar\nfoo two\n")) (into [:alt-s "o"] ["f" "o" "o" :enter])))
+
+(defn- project-search-fixture ()
+  (let (root (temp-dir "bedit-writable-"))
+    (file/mkdir root)
+    (file/spit (path/join root "a.txt") "foo one\nbar\n")
+    (project-search/ed-project-search (assoc (ed-init (make-buffer "")) :project-root root)
+      root "foo")))
+
+(def- *variant-fixtures*
+  {:dired dired-fixture :occur occur-fixture :project-search project-search-fixture})
+
+(defn- in-first-span (m)
+  ;; point at the start of the first editable span (a buffer with none, not editing, stays put:
+  ;; the checks after it say so)
+  (ed-apply m
+    (fn (buffer)
+      (let (regions (editable-regions buffer))
+        (if (empty? regions) buffer (goto-char buffer (first (first regions))))))))
+
+(defn- base-letter (type)
+  ;; a printable key the base type binds to a command, preferring one that is not a prefix
+  (let (keys (sort (map (mapcat (type-stack type) printable-commands) first)))
+    (or (seq/find keys (fn (key) (not (= key "q")))) (first keys))))
+
+(describe "C-x C-q in a type with an edit variant enters it, and every letter types"
+  (test "every {:enter} type has a fixture here"
+    (assert= (vec (seq/reject (types-with (fn (policy) (and (map? policy) (:enter policy))))
+                    (fn (type) (contains? *variant-fixtures* type))))
+      []))
+
+  (test "C-x C-q enters the variant; a key the base binds is INSERTED; C-x C-q n leaves"
+    (each (sort (keys *variant-fixtures*))
+      (fn (type)
+        (let (shown ((get *variant-fixtures* type))
+              letter (base-letter type)
+              entered (press shown [:ctrl-x :ctrl-q])
+              at (in-first-span entered)
+              length (buffer-length (cur at))
+              typed (press at [letter])
+              asked (press typed [:ctrl-x :ctrl-q])
+              left (press asked ["n"]))
+          (assert= [type (type-of shown)] [type type])
+          (holds type (variant? (modes/writable-policy (cur entered))))
+          ;; the letter is in the text, one character longer, at point
+          (assert= [type letter (buffer-length (cur typed))] [type letter (inc length)])
+          (assert= [type
+                     (text/slice (buffer-rope (cur typed))
+                       (dec (buffer-point (cur typed)))
+                       (buffer-point (cur typed)))]
+            [type letter])
+          ;; changed, so C-x C-q asks before it leaves
+          (holds type (includes? (:echo asked) "Save changes?"))
+          (assert= [type (type-of left)] [type type])
+          (assert= [type (buffer-text (cur left))] [type (buffer-text (cur shown))])))))
+
+  (test "C-x C-q with nothing changed leaves at once"
+    (each (sort (keys *variant-fixtures*))
+      (fn (type)
+        (let (left (press ((get *variant-fixtures* type)) [:ctrl-x :ctrl-q :ctrl-x :ctrl-q]))
+          (assert= [type (type-of left)] [type type])
+          (holds type (read-only? (cur left)))
+          (assert= [type (:echo left)] [type "(No changes need to be saved)"])))))
+
+  (test "C-c C-k leaves every variant too"
+    (each (sort (keys *variant-fixtures*))
+      (fn (type)
+        (let (shown ((get *variant-fixtures* type))
+              left (press (press (in-first-span (press shown [:ctrl-x :ctrl-q])) ["z"])
+                     [:ctrl-c :ctrl-k]))
+          (assert= [type (type-of left)] [type type])
+          (assert= [type (buffer-text (cur left))] [type (buffer-text (cur shown))]))))))
+
+(describe "a guest's C-x C-q"
+  (test "does not reach an edit variant a guest may not run"
+    (let (guest (press (assoc (dired-fixture) :guest-session true) [:ctrl-x :ctrl-q]))
+      (assert= (type-of guest) :dired)
+      (is (includes? (:echo guest) "guest")))))
