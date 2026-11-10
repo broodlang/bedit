@@ -261,7 +261,7 @@ src/sshremote.blsp          the transport under `/ssh:`: the system `ssh` (`*pro
                             STREAMED through an OS pipe, never held here — staged where it is
                             (`stage-pack-script`, size + SHA-256), a receiver left where it goes
                             (`receiver-script`), one local `sh` running `ssh FROM cat | ssh TO sh
-                            RECEIVER` (`stream-line`, `stream-side`) — any size; a root-hop side
+                            RECEIVER` (`os/pipeline`, brood ADR-696; `stream-side`) — any size; a root-hop side
                             is carried through the editor instead (`pack-script` /
                             `unpack-script`, ≤ `*transfer-max-bytes*`, 200 MB). Unpacked in a
                             staging dir, size + SHA-256 + entry count checked, then renamed; a
