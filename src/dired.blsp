@@ -134,12 +134,19 @@ the files, each group keeping that order (`ls --group-directories-first`)."
       sorted)))
 
 (defn- ed-dired-list (dir switches)
-  "The display-ordered entries of `dir`, each `{:name :stat}` (one `file-stat` per entry):
-`.` then `..`, then every entry in the order `switches` ask for ([[dired-sort-of]]) —
-folders and files mixed, as `ls -al` lists them. Robust to an unreadable `dir` (just
-`.`/`..`)."
+  "The display-ordered entries of `dir`, each `{:name :stat}` (one `file-stat` per entry) and a
+symlink's `:link-target` as it is stored (`file/read-link`): `.` then `..`, then every entry in
+the order `switches` ask for ([[dired-sort-of]]) — folders and files mixed, as `ls -al` lists
+them. Robust to an unreadable `dir` (just `.`/`..`)."
   (let (names (try (file/ls dir) (catch _e '()))
-        entries (map names (fn (name) {:name name :stat (file/stat (path/join dir name))})))
+        entries (map names
+                  (fn (name)
+                    (let (path (path/join dir name)
+                          stat (file/stat path)
+                          target (when (and stat (:symlink? stat)) (file/read-link path)))
+                      (if (string? target)
+                        {:name name :stat stat :link-target target}
+                        {:name name :stat stat})))))
     (dired-order-entries (into [{:name "." :stat (file/stat dir)}
                                  {:name ".." :stat (file/stat (path/dirname dir))}]
                            entries)
@@ -221,10 +228,10 @@ nlink / owner / group / size fields across `entries`."
      :group-w (widths :group "?")
      :size-w (widths :size "0")}))
 
-(defn- ed-dired-row (mark stat name cols)
-  "One `ls -l` row: `<mark><perms> <nlink> <owner> <group> <size> <date> <name>`, each
-field padded to `cols`' widths so the columns line up. `mark` is the mark cell: `*` a
-marked row, `D` one flagged for deletion, a space otherwise."
+(def- link-arrow " -> ") ; between a symlink's name and its target, as `ls -l` shows it
+
+(defn- ed-dired-row-head (mark stat cols)
+  ;; a row up to its name: the mark cell, the permissions and the padded fields
   (str mark
     (perms-string stat)
     " "
@@ -237,8 +244,17 @@ marked row, `D` one flagged for deletion, a space otherwise."
     (string/pad-left (ed-stat-field-str stat :size "0") (:size-w cols))
     " "
     (ed-dired-date (and stat (:mtime stat)))
-    " "
-    name))
+    " "))
+
+(defn- ed-dired-row (mark entry cols)
+  "One `ls -l` row for `entry` (`{:name :stat :link-target}`): `<mark><perms> <nlink> <owner>
+<group> <size> <date> <name>`, each field padded to `cols`' widths so the columns line up, and a
+symlink's ` -> target` after its name. `mark` is the mark cell: `*` a marked row, `D` one flagged
+for deletion, a space otherwise."
+  (let (target (:link-target entry))
+    (str (ed-dired-row-head mark (:stat entry) cols)
+      (:name entry)
+      (if (string? target) (str link-arrow target) ""))))
 
 (defn- ed-dired-header (dir)
   "The header line: the absolute directory path (trailing `:`, `ls`/dired style)."
@@ -257,9 +273,7 @@ sized to the listing), a row marked `*` when its name is in `marks`, `D` when it
                                        (includes? flags (:name entry)) "D"
                                        (includes? marks (:name entry)) "*"
                                        else " ")
-                         (:stat entry)
-                         (:name entry)
-                         cols)))
+                         entry cols)))
         "\n")
       "\n")))
 
@@ -349,6 +363,11 @@ the edits are not thrown away under the reader."
                :dir dir
                :dired-dir dir
                :dired-names names
+               :dired-links
+                 (into {}
+                   (seq/keep entries
+                     (fn (entry)
+                       (when (string? (:link-target entry)) [(:name entry) (:link-target entry)]))))
                :dired-marks marks
                :dired-flags flags)))
     ;; land point ON the filename (not the leading mark column), Emacs dired-style
@@ -512,22 +531,45 @@ leading mark column) — a no-op on the header line."
         line-start (text/line->char (buffer-rope buffer) line))
     (goto-char buffer (+ line-start (ed-dired-filename-col (wrap/line-text buffer line))))))
 
-(defn dired-entry-rows (buffer)
+(defn dired-entry-rows (buffer &optional (options {}))
   "The NAME of each real entry (not `.` / `..`) a listing `buffer` shows, as a span:
-`{:name :line :start :end :text}` — `:line` its 0-based buffer line, `[start end)` the name at
-the row's end (where it is, whatever spaces it holds), `:text` the name. What wdired makes
-editable. A row whose text does not end in its name (not this listing's) is left out."
+`{:kind :name :name :line :start :end :text}` — `:line` its 0-based buffer line, `[start end)`
+the name (where it is, whatever spaces it holds: before a symlink's ` -> target`, else at the
+row's end), `:text` the name. With `options`' `:links?`, a symlink's TARGET is a span too
+(`:kind :target`, after the arrow); with `:perms?`, each row's nine permission characters
+(`:kind :perms`, past the mark and type cells). Every span names its entry (`:name`) and its
+line, in row order. What wdired makes editable. A row whose text does not end as its entry
+does (not this listing's) is left out."
   (let (rope (buffer-rope buffer)
-        names (or (:dired-names buffer) []))
-    (seq/keep (range 0 (count names))
+        names (or (:dired-names buffer) [])
+        links (or (:dired-links buffer) {}))
+    (mapcat (range 0 (count names))
       (fn (index)
         (let (name (nth names index)
-              line (+ ed-dired-header-lines index))
-          (when (and (ed-dired-entry? name) (< line (text/line-count rope)))
+              line (+ ed-dired-header-lines index)
+              target (get links name)
+              tail (if (string? target) (str link-arrow target) ""))
+          (if (and (ed-dired-entry? name) (< line (text/line-count rope)))
             (let (text (wrap/rope-line-text rope line)
-                  end (+ (text/line->char rope line) (string/length text)))
-              (when (and (ed-dired-row-line? text) (string/ends-with? text (str " " name)))
-                {:name name :line line :start (- end (string/length name)) :end end :text name}))))))))
+                  line-start (text/line->char rope line)
+                  end (+ line-start (string/length text))
+                  name-end (- end (string/length tail))
+                  perms-start (+ line-start ed-dired-perms-col 1)
+                  span (fn (kind start stop span-text)
+                         {:kind kind :name name :line line :start start :end stop :text span-text}))
+              (if (and (ed-dired-row-line? text) (string/ends-with? text (str " " name tail)))
+                (append (if (:perms? options)
+                          [(span :perms
+                             perms-start
+                             (+ perms-start 9)
+                             (text/slice rope perms-start (+ perms-start 9)))]
+                          [])
+                  [(span :name (- name-end (string/length name)) name-end name)]
+                  (if (and (:links? options) (string? target))
+                    [(span :target (- end (string/length target)) end target)]
+                    []))
+                []))
+            []))))))
 
 (defn- ed-dired-snap (m)
   "Apply `ed-dired-move-to-filename` to the current buffer (after a line move)."
@@ -1304,6 +1346,50 @@ machine's listing (a file handler's) asks its disk and renames through the handl
           (any? usable (fn (move) (not (nil? (ed-path-handler (:target move)))))))
           (ed-dired-launch m "looking at the targets" resolve choose)
         else (choose m (resolve))))))
+
+;; ---- a link re-pointed, a mode changed (wdired's targets and permissions) -----------------
+;; Emacs's wdired-allow-to-redirect-links and wdired-allow-to-change-permissions: an edited link
+;; target becomes `make-symbolic-link` over the link, edited permissions `set-file-modes`. On
+;; this machine Brood's `file/symlink` (`:replace`, atomic) and `file/chmod`; on another, the
+;; claiming file handler's `:make-symbolic-link` / `:set-file-modes`, off the loop.
+
+(defn- dired-attribute-one (change)
+  ;; `change` (`{:op :redirect | :chmod :path :value}`) made; raises with the reason
+  (let (path (:path change)
+        value (:value change)
+        handled? (not (nil? (ed-path-handler path)))
+        done (case (:op change)
+               :redirect
+                 (if handled?
+                   (dired-handler-op path :make-symbolic-link value path true)
+                   (file/symlink value path {:replace true}))
+               :chmod
+                 (if handled?
+                   (dired-handler-op path :set-file-modes path value)
+                   (file/chmod path value))
+               (error (str "dired: no such change " (:op change)))))
+    (if (failure? done) (error (error-message done)) done)))
+
+;; check-allow: the off-loop fold is unknown to the checker; `then` answers a model
+(check-allow :trusted
+  (defn ed-dired-set-attributes (m dir changes then)
+    "Make each of `changes` to entries of the listing of `dir` — `{:op :redirect :name :value
+target}` re-points the symlink `name` at `target`, `{:op :chmod :name :value mode}` sets its
+mode bits — each standing alone (one that fails never stops the rest), then fold `(then m
+report)`, the report `{:done [change …] :failed [[change reason] …]}`. A change whose `:value`
+is a failure (a permission string that did not read) fails with its reason. On this machine at
+once; a file handler's listing (another machine's) off the loop. No changes: `then` at once."
+    (let (located (map changes (fn (change) (assoc change :path (dired-join dir (:name change)))))
+          work (fn ()
+                 (dired-run-each located
+                   (fn (change)
+                     (if (failure? (:value change))
+                       (error (error-message (:value change)))
+                       (dired-attribute-one change))))))
+      (cond
+        (empty? located) (then m {:done [] :failed []})
+        (dired-handler dir) (ed-dired-launch m "changing the entries" work then)
+        else (then m (work))))))
 
 (defcommand cmd-dired-rename
   (m key)

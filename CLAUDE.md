@@ -253,8 +253,8 @@ src/sshremote.blsp          the transport under `/ssh:`: the system `ssh` (`*pro
                             `os/shell-quote`d): a read through base64 (bytes, a size limit asked
                             first), an atomic write (staged beside the file with its mode, size +
                             SHA-256 checked, renamed), `ls -1pa` for the prompt (kept 10 s, a
-                            table), `stat` rows for dired (`list-entries`, GNU or BSD) and its
-                            mkdir / mv / cp -pR / rm -rf (`make-directory`, `transfer`, `delete-path`,
+                            table), `stat` rows for dired (`list-entries`, GNU or BSD, a link's `readlink` target) and its
+                            mkdir / mv / cp -pR / rm -rf / ln -sfn / chmod (`make-directory`, `transfer`, `delete-path`, `make-symlink`, `set-mode`,
                             `file-kind`: never over a directory, over another entry only when told
                             — a copy staged beside it and renamed over it). Between two machines,
                             or a host and this one (`run-local`), `cross-transfer`: a tar archive
@@ -306,7 +306,8 @@ src/sshedit.blsp            editing a file on ANOTHER MACHINE (Emacs's TRAMP `/s
                             `dired/ed-dired-show-entries`), whose `+` `R` `C` `D` `x` go through the
                             handler's file operations (`:make-directory`, `:rename-file`,
                             `:copy-file` — within a host, between hosts or to and from this machine,
-                            replacing an entry only when asked — `:file-kind`, `:delete-file`,
+                            replacing an entry only when asked — `:file-kind`, `:delete-file`, wdired's
+                            `:make-symbolic-link` / `:set-file-modes`,
                             `:expand-file-name`, `:parent-directory`, Emacs's
                             file-name-handler-alist — dired names no handler). CI's `ssh-real` job
                             drives all of it against a real sshd (tools/ci/ssh-real.sh). Its sidecar
@@ -1148,26 +1149,36 @@ src/filename.blsp           a typed path read the Emacs way (`substitute-in-file
                             — hand their consumer the ABSOLUTE path (`filename/expand`)
 src/completion.blsp         shared fuzzy ranking + vertical-menu card (complete + plume)
 src/dired.blsp              Dired (C-x d, C-x C-j): an `ls -l` listing, its state ON the buffer
-                            (`:dired-dir`, `:dired-names` — a line's entry by index — marks, flags),
+                            (`:dired-dir`, `:dired-names` — a line's entry by index — marks, flags,
+                            `:dired-links`: a symlink's row ends `name -> target`, `file/read-link`),
                             single keys to open, sort, mark, flag, R / C / D / x (off the loop, one
                             at a time; another machine's directory through its file handler's ops).
                             `ed-dired-rename-entries`: entries renamed to names given, all at once —
                             swaps and cycles through temporary names, `/` moves (parents made),
-                            an existing target asked about — what wdired applies
+                            an existing target asked about — and `ed-dired-set-attributes`: links
+                            re-pointed (`file/symlink` `{:replace true}`) and modes set (`file/chmod`,
+                            brood ADR-697; a handler's `:make-symbolic-link` / `:set-file-modes`) —
+                            what wdired applies
 src/wdired.blsp             wdired-mode: C-x C-q in Dired makes the file NAMES editable over
                             `editspans` (the columns, header, `.` / `..` read-only; no Dired keymap,
-                            so `m` types an m). C-c C-c / C-x C-s rename through dired's
-                            `ed-dired-rename-entries`, an erased name flags its entry `D`; C-c C-k /
-                            C-c ESC put the names back; C-x C-q leaves, asking when changed (`editspans/leave`,
+                            so `m` types an m) — and a symlink's TARGET after ` -> `
+                            (`:wdired-allow-to-redirect-links`, on, as Emacs) and the PERMISSIONS
+                            (`:wdired-allow-to-change-permissions`: off; true — each character a
+                            toggle, SPC flips, r w x s t S T - set, through `cmd-wdired-set-bit`, a
+                            `:typing` command, so the writable guard holds; `:advanced` — free text,
+                            read by `fileperm/perms->mode`). C-c C-c / C-x C-s re-point the links and
+                            set the modes first (`dired/ed-dired-set-attributes`), then rename through
+                            dired's `ed-dired-rename-entries`, an erased name flags its entry `D`; each
+                            change stands alone, a failure said. C-c C-k / C-c ESC put everything
+                            back; C-x C-q leaves, asking when changed (`editspans/leave`,
                             dired's `:writable {:enter …}` entering it — dired binds no C-x C-q); C-n / C-p
-                            / C-a keep to the name column, RET refused. No symlink-target or
-                            permission editing (the listing shows neither; brood has no readlink /
-                            symlink / chmod)
+                            / C-a keep to the name column, RET refused
 src/fileops.blsp            what dired's deletes need past brood's `file/`: a path removed for good and
                             what that takes counted. Copy, move and the TRASH are brood's
                             (`file/copy-tree`, `file/move`, `file/trash`; a test binds
                             `file/*trash-home*`, a test run otherwise gets its scratch home's)
-src/fileperm.blsp           the `ls -l` permission string (`rwx`, `perms-string`) — dired + plume marginalia
+src/fileperm.blsp           the `ls -l` permission string (`rwx`, `perms-string`, setuid / setgid /
+                            sticky as `s` / `t`) and back (`perms->mode`, wdired) — dired + plume marginalia
 src/plume.blsp              the minibuffer completion UI — vertical list + marginalia + N/M counter (our Vertico/Marginalia)
 src/debugger.blsp           the editor as the debugger (ADR-174/184): C-c d session, *Spy* trace
                             stream, *Debug* paused-process queue with resume/eval-in-scope,

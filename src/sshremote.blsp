@@ -321,15 +321,18 @@ count and SHA-256 sent with them.
   ;; the resolved directory, then one line per entry — `.` and `..` first — as GNU or BSD
   ;; `stat` gives it, links followed where they lead somewhere: the mode in hex, the link count,
   ;; owner, group, size, mtime (seconds), then `d` / `-` (a directory, followed) and `l` for a
-  ;; link, and the name. A name with a line break in it is left out (it cannot be one line).
+  ;; link, and the name. A name with a line break in it is left out (it cannot be one line). A
+  ;; link's target as stored (`readlink`, GNU and BSD alike) follows on a line of its own after
+  ;; `@ ` — no entry line starts so — unless it holds a line break.
   (str "cd -- \"$p\" 2>/dev/null || { echo \"$p: cannot list\" >&2; exit 4; }\n"
     "pwd\n"
     "if stat -c %f . >/dev/null 2>&1; then flag=-c; form='%f %h %U %G %s %Y'; else flag=-f; form='%Xp %l %Su %Sg %z %m'; fi\n"
     "nl='\n'\n" "entry() {\n" "  case $1 in *\"$nl\"*) return 0 ;; esac\n"
     "  s=$(stat -L $flag \"$form\" -- \"$1\" 2>/dev/null || stat $flag \"$form\" -- \"$1\" 2>/dev/null) || return 0\n"
     "  t=-; [ -d \"$1\" ] && t=d; [ -L \"$1\" ] && t=${t}l\n"
-    "  printf '%s %s %s\\n' \"$s\" \"$t\" \"$1\"\n" "}\n" "entry .; entry ..\n"
-    "for n in .* *; do\n" "  case $n in .|..) continue ;; esac\n"
+    "  printf '%s %s %s\\n' \"$s\" \"$t\" \"$1\"\n"
+    "  if [ -L \"$1\" ]; then l=$(readlink -- \"$1\" 2>/dev/null) && case $l in *\"$nl\"*) ;; *) printf '@ %s\\n' \"$l\" ;; esac; fi\n"
+    "}\n" "entry .; entry ..\n" "for n in .* *; do\n" "  case $n in .|..) continue ;; esac\n"
     "  if [ -e \"$n\" ] || [ -L \"$n\" ]; then entry \"$n\"; fi\n" "done\n"))
 
 (defn entries-script (path)
@@ -362,6 +365,40 @@ it — for good: the other machine has no trash this can reach.
 
     (includes? (sshremote/delete-script \"/srv/old\") \"rm -rf -- \")   ;=> true"
   (script-with [path] delete-body))
+
+(def- symlink-body
+  ;; `$2` the target, stored as given; `$3` 1 when an entry there (never a directory) may be
+  ;; replaced. `ln -sfn` replaces a link to a directory rather than going into it
+  (str "if [ -d \"$p\" ] && [ ! -L \"$p\" ]; then echo \"$p is a directory — not replaced\" >&2; exit 4; fi\n"
+    "if { [ -e \"$p\" ] || [ -L \"$p\" ]; } && [ \"$3\" != 1 ]; then echo \"$p exists — not replaced\" >&2; exit 4; fi\n"
+    "ln -sfn -- \"$2\" \"$p\" || exit 4\n"))
+
+(defn symlink-script (target path &optional (replace? false))
+  "The script that makes the remote `path` a symlink to `target` (stored as given, relative or
+not): over an entry already there only when `replace?`, never over a directory.
+
+    (includes? (sshremote/symlink-script \"a\" \"/srv/l\" true) \"ln -sfn -- \")   ;=> true"
+  (script-with [path target (if replace? "1" "0")] symlink-body))
+
+(def- chmod-body
+  ;; `$2` the mode as octal digits; a link is followed, as chmod does
+  (str "if [ ! -e \"$p\" ]; then echo \"$p: no such file\" >&2; exit 4; fi\n"
+    "chmod -- \"$2\" \"$p\" || exit 4\n"))
+
+(defn octal-mode (mode)
+  "The mode bits `mode` (0..0o7777) as the four octal digits `chmod` reads.
+
+    (sshremote/octal-mode 2541)   ;=> \"4755\""
+  (str (math/quot mode 512)
+    (math/rem (math/quot mode 64) 8)
+    (math/rem (math/quot mode 8) 8)
+    (math/rem mode 8)))
+
+(defn chmod-script (path mode)
+  "The script that sets the remote `path`'s mode bits to `mode` (a link followed).
+
+    (includes? (sshremote/chmod-script \"/srv/a\" 420) \"set -- /srv/a 0644\")   ;=> true"
+  (script-with [path (octal-mode mode)] chmod-body))
 
 (def- place-function
   ;; `place TARGET NAME INTO REPLACE` sets `$to` to where an entry called NAME lands for TARGET:
@@ -683,12 +720,26 @@ directory's ending in `/`, `.` and `..` left out.
 
 (defn parse-entries (stdout)
   "What an [[entries-script]] answered: `{:dir resolved :entries [{:name :stat} …]}`, `.` and
-`..` among them, a line that does not read left out.
+`..` among them, a symlink's with its `:link-target`, a line that does not read left out.
 
-    (:dir (sshremote/parse-entries \"/srv\\n41ed 2 me me 4096 10 d .\\n\"))   ;=> \"/srv\""
+    (:dir (sshremote/parse-entries \"/srv\\n41ed 2 me me 4096 10 d .\\n\"))   ;=> \"/srv\"
+    (:link-target (second (:entries (sshremote/parse-entries \"/srv\\n41ed 2 me me 4096 10 d .\\na1ff 1 me me 3 10 -l l\\n@ ../x\\n\"))))   ;=> \"../x\""
   (let (lines (seq/reject (lines-of stdout) (fn (line) (= line ""))))
     {:dir (first lines)
-     :entries (vec (seq/reject (map (rest lines) parse-entry) nil?))}))
+     :entries (fold (rest lines)
+                []
+                (fn (entries line)
+                  (if (string/starts-with? line "@ ")
+                    ;; only after the link's own line (one that did not read drops its target too)
+                    (if (or (empty? entries)
+                          (not (map/get-in (last entries) [:stat :symlink?]))
+                          (contains? (last entries) :link-target))
+                      entries
+                      (assoc entries
+                        (dec (count entries))
+                          (assoc (last entries)
+                            :link-target (string/substring line 2 (string/length line)))))
+                    (let (entry (parse-entry line)) (if (nil? entry) entries (conj entries entry))))))}))
 
 ;; ---- what failed --------------------------------------------------------------------------
 
@@ -843,6 +894,16 @@ Blocks."
   "Delete the remote `path` on `parts`' host for good, a directory with everything in it: true,
 or a failure saying why. Blocks."
   (let (done (run-op parts (delete-script path))) (if (failure? done) done true)))
+
+(defn make-symlink (parts target path &optional (replace? false))
+  "Make the remote `path` on `parts`' host a symlink to `target` ([[symlink-script]]): true, or a
+failure saying why. Blocks."
+  (let (done (run-op parts (symlink-script target path replace?))) (if (failure? done) done true)))
+
+(defn set-mode (parts path mode)
+  "Set the remote `path`'s mode bits on `parts`' host to `mode` ([[chmod-script]]): true, or a
+failure saying why. Blocks."
+  (let (done (run-op parts (chmod-script path mode))) (if (failure? done) done true)))
 
 (defn transfer (parts op from to into? &optional (replace? false))
   "Move (`op` `:move`) or copy (`:copy`) the remote `from` to `to` on `parts`' host

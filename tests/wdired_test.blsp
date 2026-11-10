@@ -228,3 +228,153 @@
           back (press (editing dir) [:ctrl-c :ctrl-k])
           marked (press (at-entry back "a.txt") ["m"]))
       (assert= (ed-dired-state marked :dired-marks) (list "a.txt")))))
+
+;; ---- link targets and permissions (Emacs's wdired-allow-to-redirect-links and
+;; wdired-allow-to-change-permissions) ----------------------------------------------------
+
+(defn- link-fixture ()
+  ;; `a.txt` ("hello"), `b.txt` ("bee"), `l -> a.txt` and `dangling -> nowhere`
+  (let (dir (temp-dir "bedit-wdired-"))
+    (do
+      (file/mkdir dir)
+      (file/spit (path/join dir "a.txt") "hello")
+      (file/spit (path/join dir "b.txt") "bee")
+      (file/symlink "a.txt" (path/join dir "l"))
+      (file/symlink "nowhere" (path/join dir "dangling"))
+      dir)))
+
+(defn- with-settings (settings)
+  ;; an empty model with init.blsp's `settings`
+  (merge (ed-init (make-buffer "")) settings))
+
+(defn- span-of (m name kind)
+  ;; where the `kind` span of entry `name` is now, `[from to]`
+  (let (buffer (cur m)
+        found (seq/find (seq/zip (editspans/rows buffer) (editable-regions buffer))
+                (fn ([row _]) (and (= (:name row) name) (= (:kind row) kind)))))
+    (if found (second found) (error (str "no " kind " span for " name)))))
+
+(defn- span-text (m name kind)
+  (let ([from to] (span-of m name kind)) (text/slice (buffer-rope (cur m)) from to)))
+
+(defn- to-span (m name kind)
+  ;; point at the start of entry `name`'s `kind` span
+  (let ([from _] (span-of m name kind)) (ed-apply m (fn (buffer) (goto-char buffer from)))))
+
+(defn- replace-span (m name kind new)
+  ;; the `kind` span of entry `name` replaced by `new`, typed
+  (let ([from to] (span-of m name kind))
+    (type-str (press (to-span m name kind) (into [] (map (range from to) (fn (_) :ctrl-d)))) new)))
+
+(defn- mode-of (dir name) (math/rem (:mode (file/stat (path/join dir name))) 4096))
+
+(describe "wdired: a symlink's target"
+  (test "is editable after its arrow, and an edit re-points the link"
+    (let (dir (link-fixture)
+          m (editing dir)
+          done (finish (replace-span m "l" :target "b.txt")))
+      (assert= (span-text m "l" :target) "a.txt")
+      (assert= (first (span-of m "l" :target)) (+ (second (span-of m "l" :name)) 4))
+      (assert= (file/read-link (path/join dir "l")) "b.txt")
+      (assert= (file/slurp (path/join dir "l")) "bee")
+      (assert= (editor/layers/buffer-type-for (cur done)) :dired)
+      (is (includes? (buffer-text (cur done)) " l -> b.txt\n"))
+      (is (includes? (:echo done) "1 link redirected"))))
+
+  (test "a rename and a redirect of one link in one commit"
+    (let (dir (link-fixture)
+          edited (replace-span (replace-span (editing dir) "l" :target "b.txt") "l" :name "link")
+          done (finish edited))
+      (refute (file/exists? (path/join dir "l")))
+      (assert= (file/read-link (path/join dir "link")) "b.txt")
+      (is (includes? (:echo done) "Renamed l"))
+      (is (includes? (:echo done) "1 link redirected"))))
+
+  (test "a dangling link shows its target and can be pointed somewhere real"
+    (let (dir (link-fixture)
+          m (editing dir)
+          done (finish (replace-span m "dangling" :target "a.txt")))
+      (is (includes? (buffer-text (cur m)) " dangling -> nowhere\n"))
+      (assert= (file/slurp (path/join dir "dangling")) "hello")
+      (is (includes? (:echo done) "1 link redirected"))))
+
+  (test "an erased target is refused, and the rest still applies"
+    (let (dir (link-fixture)
+          edited (replace-span (replace-span (editing dir) "l" :target "") "a.txt" :name "c.txt")
+          done (finish edited))
+      (assert= (file/read-link (path/join dir "l")) "a.txt")
+      (is (file/exists? (path/join dir "c.txt")))
+      (is (includes? (:echo done) "1 change failed — l: a link needs a target"))))
+
+  (test "with :wdired-allow-to-redirect-links false the target stays read-only"
+    (let (dir (link-fixture)
+          m (editing dir (with-settings {:wdired-allow-to-redirect-links false})))
+      (refute (any? (editspans/rows (cur m)) (fn (row) (= (:kind row) :target))))
+      (assert= (count (editable-regions (cur m))) 4))))
+
+(describe "wdired: the permissions"
+  (test "are read-only by default, as Emacs"
+    (let (m (editing (link-fixture)))
+      (refute (any? (editspans/rows (cur m)) (fn (row) (= (:kind row) :perms))))
+      (is (position-read-only? (cur m) (+ (text/line->char (buffer-rope (cur m)) 3) 2)))))
+
+  (test "as toggles: SPC flips a character, a letter sets it, C-c C-c sets the mode"
+    (let (dir (link-fixture)
+          _ (file/chmod (path/join dir "a.txt") 420)
+          m (to-span (editing dir (with-settings {:wdired-allow-to-change-permissions true}))
+              "a.txt" :perms)
+          ;; rw-r--r--: SPC flips the r off, the w is stepped over, x sets the x, SPC flips the
+          ;; group's r off
+          edited (press m [" " :right "x" " "])
+          done (finish edited))
+      (assert= (span-text m "a.txt" :perms) "rw-r--r--")
+      (assert= (span-text edited "a.txt" :perms) "-wx---r--")
+      (assert= (mode-of dir "a.txt") 196)
+      (is (includes? (:echo done) "1 mode changed"))
+      (is (includes? (buffer-text (cur done)) " --wx---r-- "))))
+
+  (test "as toggles: a letter that cannot stand there is refused, the text kept"
+    (let (m (to-span (editing (link-fixture)
+                       (with-settings {:wdired-allow-to-change-permissions true}))
+              "a.txt" :perms)
+          refused (press m ["x"]))
+      (assert= (buffer-text (cur refused)) (buffer-text (cur m)))
+      (is (:command-failed refused))))
+
+  (test "as toggles: s and T set the special bits, as ls shows them"
+    (let (dir (link-fixture)
+          _ (file/chmod (path/join dir "b.txt") 493)
+          m (to-span (editing dir (with-settings {:wdired-allow-to-change-permissions true}))
+              "b.txt" :perms)
+          edited (press m [:right :right "s" :right :right :right :right :right "T"]))
+      (assert= (span-text edited "b.txt" :perms) "rwsr-xr-T")
+      (finish edited)
+      (assert= (mode-of dir "b.txt") (+ 2048 512 492))))
+
+  (test "the name is still typed into, the toggles' letters too"
+    (let (dir (link-fixture)
+          m (editing dir (with-settings {:wdired-allow-to-change-permissions true})))
+      (finish (type-str (to-span m "a.txt" :name) "rwx- "))
+      (assert= (file/slurp (path/join dir "rwx- a.txt")) "hello")))
+
+  (test ":advanced: the permissions are free text"
+    (let (dir (link-fixture)
+          m (editing dir (with-settings {:wdired-allow-to-change-permissions :advanced}))
+          done (finish (replace-span m "a.txt" :perms "rwx------")))
+      (assert= (mode-of dir "a.txt") 448)
+      (is (includes? (:echo done) "1 mode changed"))))
+
+  (test "a mode that cannot be set is said, and the other changes are made"
+    (let (dir (link-fixture)
+          b-mode (mode-of dir "b.txt")
+          m (editing dir (with-settings {:wdired-allow-to-change-permissions :advanced}))
+          edited (replace-span (replace-span (replace-span m "a.txt" :perms "rwx------")
+                                 "b.txt" :perms "rwq------")
+                   "l" :target "b.txt")
+          ;; a.txt gone from under the listing: its chmod fails
+          _ (file/rm (path/join dir "a.txt"))
+          done (finish edited))
+      (assert= (file/read-link (path/join dir "l")) "b.txt")
+      (is (includes? (:echo done) "1 link redirected"))
+      (is (includes? (:echo done) "2 changes failed — a.txt: "))
+      (assert= (mode-of dir "b.txt") b-mode))))
