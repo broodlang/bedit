@@ -626,6 +626,12 @@ src/spell.blsp              spell checking (Emacs jinx, `:spell-check`): the vis
                             `enchant-2 -a` (else aspell); M-$ correct, C-M-$ the dictionary. The
                             word being typed (point at its end) is not underlined until point
                             leaves it, as flyspell judges a word
+src/thingatpt.blsp          what a line names at a column (Emacs thingatpt, the part it reads): the token,
+                            a URL in it, a file it names that exists (`file-at`) — pure; embark's
+                            target and C-x C-f's M-n (`pool/ed-file-defaults`) read the same thing
+src/sibling.blsp            M-x find-sibling-file (Emacs 29): a source's header, a module's test and
+                            back, by rules as data (`*default-rules*`, init.blsp's `:find-sibling-rules`
+                            first); one sibling opened, several asked between
 src/cape.blsp               completion sources beside the mode's (Emacs cape): file paths, and words
                             from other open buffers, ranked after this buffer's
 src/savehist.blsp           minibuffer answers kept per prompt across sessions (Emacs savehist,
