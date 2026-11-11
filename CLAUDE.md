@@ -574,7 +574,8 @@ src/codecrumbs.blsp         the header line's crumbs for code: the definitions a
 src/headerline.blsp         the HEADER LINE above each pane (Emacs breadcrumb-mode, on with `:header-line`):
                             the file by its project and path, then the mode's `:breadcrumbs` at point
                             (an Org heading's path); the layout takes the pane's top row for it
-                            (`panes/ed-header-layout`), so nothing below knows it is there
+                            (`panes/ed-header-layout`), so nothing below knows it is there; a mode whose
+                            first line already says where it is declares `:header-line false` (dired)
 src/pulse.blsp              a flash on the line after a JUMP (Emacs pulsar, `:pulse`): a post-step row tells a
                             key command's jump (another window or buffer, 5+ lines) from typing and
                             the mouse by `:command-count`, a timer fades the band the view lays over it
