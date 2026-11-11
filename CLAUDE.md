@@ -937,11 +937,21 @@ src/tsbrackets.blsp         show-paren over a tree-sitter parse: a bracket is a 
                             `:bracket-match-tree`. A pair in the middle of its parent (an HCL
                             block's braces) is found among the parent's children, anonymous
                             tokens included (`node-children` all?), with no length cap
-src/org.blsp                Org text: `org-spans` (the colouring), heading levels, where a
-                            subtree ends, the TODO cycle. Pure; org-mode is the mode over it
+src/org.blsp                Org text: `org-spans` (the colouring), and the OUTLINE as facts over
+                            lines read one at a time: a heading's parts (level, keyword,
+                            priority, title), where a subtree or a list item ends, siblings and
+                            parents, the TODO and priority steps, an ordered list renumbered,
+                            what a `[2/3]` cookie counts. Pure; org-mode is the mode over it
                             (moved from brood's std by ADR-417)
-src/org-mode.blsp           org-mode: the mode over `org` — folding (TAB, S-TAB), TODO cycling,
-                            heading motion, promote / demote, breadcrumbs
+src/org-mode.blsp           org-mode: the mode over `org` — folding (TAB, S-TAB) and Org's
+                            STRUCTURE EDITING: M-RET (a heading or item where point is, splitting
+                            at point, before it from its start), C-RET (after the subtree),
+                            M-S-RET / C-S-RET (TODO, a checkbox item); M-arrows promote / demote
+                            / move a heading or item, M-S- with what is under it (folds carried);
+                            S-arrows the keyword and priority (shift-select off a heading);
+                            C-c C-c a checkbox and every `[2/3]` cookie above it; C-c C-t,
+                            C-c C-n / p / f / b / u; breadcrumbs. Each change is one rewrite of
+                            a run of lines (`org-rewrite`), so one undo step
 src/mail.blsp               mail: mbox-mode (C-c C-n / C-c C-p between messages, on rope
                             searches that cost the distance, not the offset), eml-mode, and
                             C-c C-v — the message at point DECODED in *Message* (Gnus's

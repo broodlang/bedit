@@ -26,7 +26,13 @@ over text:
   - `(subtree-end lines index)` — the last line of the subtree under the heading at
     `index`: the line before the next heading at its level or above, else the last line.
   - `(cycle-todo line)` — the heading line with its TODO keyword stepped
-    none → TODO → DONE → none (Org's `C-c C-t`)."
+    none → TODO → DONE → none (Org's `C-c C-t`); `step-todo` and `step-priority` either way.
+  - a heading's parts (`heading-parts`, `heading-line`), a plain-list item's (`list-item`,
+    `item-prefix`, `set-checkbox`), where an item ends and its siblings are
+    (`item-end-by`, `item-sibling-by`, `item-parent-by`, `heading-sibling-by`,
+    `heading-above-by`), an ordered list renumbered (`renumbered-by`, `list-start-by`) and what a `[2/3]`
+    cookie counts (`checkboxes-under-by`, `with-statistics`) — the facts org-mode's structure
+    keys edit by."
   (:use editor/face))
 
 ;; ---- the outline ---------------------------------------------------------------
@@ -100,26 +106,359 @@ a heading.
 
 (defn cycle-todo (line)
   "`line`, a heading, with its keyword stepped none → TODO → DONE → none (Org's `C-c C-t`);
-any other line unchanged.
+any other line unchanged. [[step-todo]] forward.
 
     (org/cycle-todo \"* Write it\")        ;=> \"* TODO Write it\"
     (org/cycle-todo \"* TODO Write it\")   ;=> \"* DONE Write it\"
     (org/cycle-todo \"* DONE Write it\")   ;=> \"* Write it\""
-  (let (stars (heading-level line))
-    (if (nil? stars)
-      line
-      (let (prefix (string/substring line 0 (inc stars))
-            word (keyword-after-stars line stars)
-            title (if (nil? word)
-                    (string/substring line (inc stars) (string/length line))
-                    (string/triml (string/substring line
-                                    (+ stars 1 (string/length word))
-                                    (string/length line)))))
-        (cond
-          (nil? word) (str prefix "TODO " title)
-          (includes? todo-keywords word) (str prefix "DONE " title)
-          else (str prefix title))))))
+  (step-todo line 1))
 (sig cycle-todo (string -> string))
+
+;; ---- a heading's parts ---------------------------------------------------------------
+
+(defn heading-parts (line)
+  "The parts of the heading `line`: `{:level :keyword :priority :title}` — its stars, its TODO
+/ DONE word, its priority cookie's letter (`[#A]` is `\"A\"`) and the rest — the keyword and
+the priority nil when it has none; nil when `line` is not a heading.
+
+    (org/heading-parts \"** TODO [#A] Write it\")   ;=> {:level 2 :keyword \"TODO\" :priority \"A\" :title \"Write it\"}
+    (org/heading-parts \"* Notes\")                 ;=> {:level 1 :keyword nil :priority nil :title \"Notes\"}"
+  (let (level (heading-level line))
+    (when level
+      (let (keyword (keyword-after-stars line level)
+            after (string/triml (string/substring line
+                                  (+ level 1 (if keyword (string/length keyword) 0))
+                                  (string/length line)))
+            cookie (regex/find "^\\[#([A-Z])\\](?: |$)" after))
+        {:level level
+         :keyword keyword
+         :priority (when cookie (:text (first (:groups cookie))))
+         :title (if cookie
+                  (string/triml (string/substring after (:end cookie) (string/length after)))
+                  after)}))))
+(sig heading-parts (string -> (or nil map)))
+
+(defn heading-line (parts)
+  "The heading line `parts` spell ([[heading-parts]]'s shape): the stars, then the keyword, the
+priority cookie and the title, each that is there.
+
+    (org/heading-line {:level 2 :keyword \"DONE\" :priority nil :title \"Write it\"})   ;=> \"** DONE Write it\""
+  (str (string/repeat "*" (:level parts))
+    " "
+    (string/join (seq/filter [(:keyword parts)
+                               (when (:priority parts) (str "[#" (:priority parts) "]"))
+                               (:title parts)]
+                   (fn (piece) (and piece (not (= piece "")))))
+      " ")))
+(sig heading-line (map -> string))
+
+(defn step-todo (line step)
+  "`line`, a heading, with its keyword stepped `step` (1 or -1) round none → TODO → DONE (Org's
+S-<right> / S-<left>): another not-done word (NEXT, WAITING) stands where TODO does and
+another done word (CANCELLED) where DONE does. Any other line unchanged.
+
+    (org/step-todo \"* Write it\" -1)        ;=> \"* DONE Write it\"
+    (org/step-todo \"* TODO Write it\" -1)   ;=> \"* Write it\""
+  (let (parts (heading-parts line))
+    (if (nil? parts)
+      line
+      (let (keyword (:keyword parts)
+            position (cond
+                       (nil? keyword) 0
+                       (includes? todo-keywords keyword) 1
+                       else 2))
+        (heading-line (assoc parts
+                        :keyword (nth [nil "TODO" "DONE"] (math/mod (+ position step) 3))))))))
+(sig step-todo (string int -> string))
+
+(defn step-priority (line step)
+  "`line`, a heading, with its priority raised (`step` 1, Org's S-<up>) or lowered (-1,
+S-<down>) through A, B and C: none rises to A and falls to C, and rising past A or falling
+past C takes the cookie off, as Org's does. Any other line unchanged.
+
+    (org/step-priority \"* TODO Write it\" 1)        ;=> \"* TODO [#A] Write it\"
+    (org/step-priority \"* TODO [#A] Write it\" -1)  ;=> \"* TODO [#B] Write it\"
+    (org/step-priority \"* [#A] Write it\" 1)        ;=> \"* Write it\""
+  (let (parts (heading-parts line))
+    (if (nil? parts)
+      line
+      (let (letters ["A" "B" "C"]
+            index (get {"A" 0 "B" 1 "C" 2} (:priority parts))
+            next (cond
+                   (nil? index) (if (> step 0) 0 2)
+                   else (- index step)))
+        (heading-line (assoc parts :priority (when (and (>= next 0) (< next 3)) (nth letters next))))))))
+(sig step-priority (string int -> string))
+
+;; ---- plain lists ---------------------------------------------------------------------
+
+(defn- lead (line) (- (string/length line) (string/length (string/triml line))))
+
+;; a plain-list item as [[list-item]] reads it
+(deftype item
+  (record :indent int :bullet string :checkbox (or nil string) :box (or nil int) :text int))
+
+(defn- item-match (line)
+  ;; the regex match of the plain-list item `line` opens — groups: its indentation, its bullet,
+  ;; its checkbox's mark — or nil; a `*` at the margin is a heading, never a bullet
+  (let (found (regex/find "^([ \\t]*)([-+*]|[0-9]+[.)])(?: +|$)(?:\\[([ xX-])\\](?: +|$))?" line))
+    (when (and found
+            (not (and (= (:text (second (:groups found))) "*")
+                   (= (:text (first (:groups found))) ""))))
+      found)))
+
+(defn list-item (line)
+  "The plain-list item `line` opens: `{:indent :bullet :checkbox :text}` — its indentation, its
+bullet (`-`, `+`, `1.`, `1)`, or `*` when indented, since a `*` at the margin is a heading),
+its checkbox's mark (`\" \"`, `\"X\"` or `\"-\"`, nil without one) and the column its text starts
+at — or nil when `line` is not an item.
+
+    (org/list-item \"  - [ ] milk\")   ;=> {:indent 2 :bullet \"-\" :checkbox \" \" :text 8}
+    (org/list-item \"* Heading\")      ;=> nil"
+  (let (found (item-match line))
+    (when found
+      (let ([indent bullet box] (:groups found))
+        {:indent (string/length (:text indent))
+         :bullet (:text bullet)
+         :checkbox (when box (string/upper (:text box)))
+         :text (:end found)}))))
+(sig list-item (string -> (or nil map)))
+
+(defn- ordered? (bullet) (regex/match? "^[0-9]" bullet))
+
+(sig bullet-number (string -> int))
+(defn- bullet-number (bullet)
+  ;; an ordered bullet's number (`12.` is 12)
+  (let (number (string/->number (string/substring bullet 0 (dec (string/length bullet)))))
+    (if (int? number) number 1)))
+
+(defn- numbered (bullet number)
+  ;; an ordered bullet with its number replaced, its `.` or `)` kept
+  (str number (string/substring bullet (dec (string/length bullet)) (string/length bullet))))
+
+(defn item-prefix (item &optional (checkbox nil) (before nil))
+  "What opens a new item after `item` in its list (or, with `before`, in its place, before it):
+its indentation, its bullet (an ordered one numbered for that place) and an empty checkbox
+when it has one or `checkbox` asks.
+
+    (org/item-prefix (org/list-item \"  3. [X] eggs\"))   ;=> \"  4. [ ] \"
+    (org/item-prefix (org/list-item \"- milk\") true)     ;=> \"- [ ] \""
+  (let (bullet (:bullet item))
+    (str (string/repeat " " (:indent item))
+      (if (ordered? bullet) (numbered bullet (+ (bullet-number bullet) (if before 0 1))) bullet)
+      " "
+      (if (or checkbox (:checkbox item)) "[ ] " ""))))
+(sig item-prefix (map &optional any any -> string))
+
+(defn set-checkbox (line mark)
+  "The item `line` with its checkbox showing `mark` (`\" \"`, `\"X\"`, `\"-\"`); unchanged when
+it has no checkbox.
+
+    (org/set-checkbox \"- [ ] milk\" \"X\")   ;=> \"- [X] milk\""
+  (let (item (list-item line))
+    (if (or (nil? item) (nil? (:checkbox item)))
+      line
+      (let (box (nth (:groups (item-match line)) 2))
+        (str (string/substring line 0 (:start box))
+          mark
+          (string/substring line (:end box) (string/length line)))))))
+(sig set-checkbox (string string -> string))
+
+(defn item-end-by (line-at line-count index)
+  "The last line of the item at `index` (lines read one at a time, as [[subtree-end-by]]):
+its own line and every line under it indented deeper — its text and its sub-items — a blank
+line among them only when the item goes on after it. `index` itself when it is not an item.
+
+    (org/item-end-by (fn (i) (nth [\"- a\" \"  - b\" \"\" \"- c\"] i)) 4 0)   ;=> 1"
+  (let (item (when (< index line-count) (list-item (line-at index))))
+    (if (nil? item)
+      index
+      (letrec (walk (fn (i last)
+                      (if (>= i line-count)
+                        last
+                        (let (text (line-at i))
+                          (cond
+                            (string/blank? text) (walk (inc i) last)
+                            (and (> (lead text) (:indent item)) (nil? (heading-level text)))
+                              (walk (inc i) i)
+                            else last)))))
+        (walk (inc index) index)))))
+(sig item-end-by (any int int -> int))
+
+(defn- next-content (line-at line-count index)
+  ;; the first line after `index` that is not blank, or nil
+  (let (next (inc index))
+    (cond
+      (>= next line-count) nil
+      (string/blank? (line-at next)) (next-content line-at line-count next)
+      else next)))
+
+(defn item-sibling-by (line-at line-count index step)
+  "The item beside the one at `index` in its list — the next (`step` 1) or the previous (-1) at
+its indentation with nothing shallower between — or nil.
+
+    (org/item-sibling-by (fn (i) (nth [\"- a\" \"  - b\" \"- c\"] i)) 3 2 -1)   ;=> 0"
+  (let (item (list-item (line-at index))
+        same (fn (i)
+               (let (other (list-item (line-at i))) (and other (= (:indent other) (:indent item))))))
+    (if (> step 0)
+      (let (next (next-content line-at line-count (item-end-by line-at line-count index)))
+        (when (and next (same next)) next))
+      (letrec (up (fn (i)
+                    (when (>= i 0)
+                      (let (text (line-at i))
+                        (cond
+                          (string/blank? text) (up (dec i))
+                          (heading-level text) nil
+                          (same i) i
+                          (> (lead text) (:indent item)) (up (dec i))
+                          else nil)))))
+        (up (dec index))))))
+(sig item-sibling-by (any int int int -> (or nil int)))
+
+(defn item-parent-by (line-at index)
+  "The item the one at `index` is a sub-item of — the nearest above it indented less, with
+nothing between ending the list — or nil for a top-level item or a line that is not one.
+
+    (org/item-parent-by (fn (i) (nth [\"- a\" \"  text\" \"  - b\"] i)) 2)   ;=> 0"
+  (let (item (list-item (line-at index)))
+    (when item
+      (letrec (up (fn (i)
+                    (when (>= i 0)
+                      (let (text (line-at i)
+                            other (list-item text))
+                        (cond
+                          (string/blank? text) (up (dec i))
+                          (heading-level text) nil
+                          (and other (< (:indent other) (:indent item))) i
+                          (and (nil? other) (< (lead text) (:indent item))) nil
+                          else (up (dec i)))))))
+        (up (dec index))))))
+(sig item-parent-by (any int -> (or nil int)))
+
+(defn heading-sibling-by (line-at line-count index step)
+  "The heading beside the one at `index` under the same parent — the next (`step` 1) or the
+previous (-1) at its level — or nil.
+
+    (org/heading-sibling-by (fn (i) (nth [\"* a\" \"** b\" \"* c\"] i)) 3 0 1)   ;=> 2"
+  (let (level (heading-level (line-at index)))
+    (cond
+      (nil? level) nil
+      (> step 0)
+        (let (next (inc (subtree-end-by line-at line-count index)))
+          (when (and (< next line-count) (= (heading-level (line-at next)) level)) next))
+      else
+        (letrec (up (fn (i)
+                      (when (>= i 0)
+                        (let (other (heading-level (line-at i)))
+                          (cond
+                            (nil? other) (up (dec i))
+                            (> other level) (up (dec i))
+                            (= other level) i
+                            else nil)))))
+          (up (dec index))))))
+(sig heading-sibling-by (any int int int -> (or nil int)))
+
+(defn heading-above-by (line-at index)
+  "The heading at or above line `index` — the one whose entry it is in — or nil before the
+first.
+
+    (org/heading-above-by (fn (i) (nth [\"* a\" \"text\" \"more\"] i)) 2)   ;=> 0"
+  (cond
+    (< index 0) nil
+    (heading-level (line-at index)) index
+    else (heading-above-by line-at (dec index))))
+(sig heading-above-by (any int -> (or nil int)))
+
+(defn- renumber-line (text number)
+  ;; the ordered item `text` with `number` in its bullet, or nil when it already has it
+  (let (at (lead text)
+        bullet (:bullet (list-item text))
+        want (numbered bullet number))
+    (when (not (= want bullet))
+      (str (string/substring text 0 at)
+        want
+        (string/substring text (+ at (string/length bullet)) (string/length text))))))
+
+(defn- first-item-by (line-at line-count index)
+  ;; the first item of the list the item at `index` is in
+  (let (previous (item-sibling-by line-at line-count index -1))
+    (if (nil? previous) index (first-item-by line-at line-count previous))))
+
+(defn list-start-by (line-at line-count index)
+  "The number the ordered list the item at `index` is in starts at, or nil for an unordered
+list or a line that is not an item — what [[renumbered-by]] counts from once items moved.
+
+    (org/list-start-by (fn (i) (nth [\"3. a\" \"4. b\"] i)) 2 1)   ;=> 3"
+  (let (item (list-item (line-at index)))
+    (when (and item (ordered? (:bullet item)))
+      (bullet-number (:bullet (list-item (line-at (first-item-by line-at line-count index))))))))
+(sig list-start-by (any int int -> (or nil int)))
+
+(defn renumbered-by (line-at line-count index &optional (start nil))
+  "`[line text]` for each item of the ordered list the item at `index` is in whose number is not
+its place, counting from `start`, else the list's first item's number — Org's renumbering
+after an insert or a move. Empty for an unordered list or a line that is not an item.
+
+    (org/renumbered-by (fn (i) (nth [\"1. a\" \"1. b\" \"3. c\"] i)) 3 0)     ;=> [[1 \"2. b\"]]
+    (org/renumbered-by (fn (i) (nth [\"2. b\" \"1. a\"] i)) 2 0 1)          ;=> [[0 \"1. b\"] [1 \"2. a\"]]"
+  (let (item (list-item (line-at index)))
+    (if (or (nil? item) (not (ordered? (:bullet item))))
+      []
+      (letrec (walk (fn (i number changes)
+                      (if (nil? i)
+                        changes
+                        (let (renumbered (renumber-line (line-at i) number))
+                          (walk (item-sibling-by line-at line-count i 1)
+                            (inc number)
+                            (if renumbered (conj changes [i renumbered]) changes))))))
+        (let (first (first-item-by line-at line-count index))
+          (walk first (or start (bullet-number (:bullet (list-item (line-at first))))) []))))))
+(sig renumbered-by (any int int &optional any -> vector))
+
+;; ---- checkbox statistics -------------------------------------------------------------
+
+(defn checkboxes-under-by (line-at line-count index)
+  "`[done total]` over the checkboxes one level under the line at `index`: a heading's are the
+items of its entry's lists at their shallowest, an item's its sub-items at theirs — what a
+`[2/3]` cookie on that line counts, as Org's hierarchical statistics do.
+
+    (org/checkboxes-under-by (fn (i) (nth [\"* a [/]\" \"- [X] b\" \"  - [ ] c\" \"- [ ] d\"] i)) 4 0)   ;=> [1 2]"
+  (let (own (list-item (line-at index))
+        last (if own
+               (item-end-by line-at line-count index)
+               (dec (or (seq/find (range (inc index) line-count)
+                          (fn (i) (heading-level (line-at i))))
+                      line-count)))
+        items (seq/keep (range (inc index) (inc last)) (fn (i) (list-item (line-at i))))
+        depth (when (not (empty? items)) (apply math/min (map items :indent)))
+        boxes (seq/filter items (fn (item) (and (= (:indent item) depth) (:checkbox item)))))
+    [(count (seq/filter boxes (fn (item) (= (:checkbox item) "X")))) (count boxes)]))
+(sig checkboxes-under-by (any int int -> vector))
+
+(defn- replace-first (text pattern by)
+  ;; `text` with the first match of `pattern` replaced by `by`, or unchanged
+  (let (found (regex/find pattern text))
+    (if found
+      (str (string/substring text 0 (:start found))
+        by
+        (string/substring text (:end found) (string/length text)))
+      text)))
+
+(defn with-statistics (line done total)
+  "`line` with its statistics cookies saying `done` of `total` — `[2/3]` or `[66%]`; unchanged
+when it has none.
+
+    (org/with-statistics \"* Shop [/]\" 2 3)          ;=> \"* Shop [2/3]\"
+    (org/with-statistics \"- groceries [0%]\" 1 2)   ;=> \"- groceries [50%]\""
+  (-> line
+    (replace-first "\\[[0-9]*/[0-9]*\\]" (str "[" done "/" total "]"))
+    (replace-first "\\[[0-9]*%\\]" (str "[" (if (= total 0) 0 (math/quot (* 100 done) total)) "%]"))))
+(sig with-statistics (string int int -> string))
+
+(defn statistics? (line)
+  "Whether `line` carries a statistics cookie, `[n/m]` or `[n%]`."
+  (regex/match? "\\[[0-9]*(/[0-9]*|%)\\]" line))
 
 ;; ---- faces -----------------------------------------------------------------------
 
@@ -199,8 +538,6 @@ any other line unchanged.
 
 ;; ---- one line ----------------------------------------------------------------------
 
-(defn- lead (line) (- (string/length line) (string/length (string/triml line))))
-
 (sig heading-spans (string int int map list -> list))
 (defn- heading-spans (line base stars palette acc)
   ;; stars and title in the level's face, the keyword, priority and tags in their own
@@ -235,22 +572,23 @@ any other line unchanged.
       with-title)))
 
 (defn- list-spans (line base palette acc)
-  ;; a list item: its bullet, a checkbox after it, and the item's inline markup — or nil
-  ;; when the line is not one
-  (let (bullet (regex/find "^\\s*([-+]|\\d+[.)])\\s" line))
-    (when bullet
-      (let (group (first (get bullet :groups))
-            with-bullet (cons [(+ base (get group :start))
-                                (+ base (get group :end))
+  ;; a list item ([[list-item]]): its bullet, a checkbox after it, and the item's inline markup
+  ;; — or nil when the line is not one
+  (let (found (item-match line))
+    (when found
+      (let ([_ bullet box] (:groups found)
+            with-bullet (cons [(+ base (:start bullet))
+                                (+ base (:end bullet))
                                 (get palette :bullet)]
                           acc)
-            after (get bullet :end)
-            box (regex/find "^\\[[ X-]\\]" (string/substring line after (string/length line)))
+            ;; the box's brackets round its mark
             with-box (if box
-                       (cons [(+ base after) (+ base after (get box :end)) (get palette :checkbox)]
+                       (cons [(+ base (dec (:start box)))
+                               (+ base (inc (:end box)))
+                               (get palette :checkbox)]
                          with-bullet)
                        with-bullet))
-        (inline-spans line base (if box (+ after (get box :end)) after) palette with-box)))))
+        (inline-spans line base (:end found) palette with-box)))))
 
 (defn- line-spans (line base block? palette acc)
   "`[spans-newest-first block?']` for one line of Org at offset `base`, `block?` saying

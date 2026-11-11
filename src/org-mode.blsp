@@ -1,8 +1,11 @@
 (defmodule org-mode
-  "org-mode: outlines, TODOs and folding. The text is `org`'s: the colouring
-and the outline facts (a heading's level, where its subtree ends, the TODO cycle). Folding
-is the editor's (`folds`); this mode supplies what a fold covers (`:fold-extent`)
-and the keys. Prose wraps, as in markdown: an Org paragraph is one long line."
+  "org-mode: outlines, TODOs, plain lists and folding. The text is `org`'s: the colouring and
+the outline facts (a heading's parts and level, where a subtree or an item ends, siblings,
+the TODO cycle, priorities, checkbox statistics). Folding is the editor's (`folds`); this
+mode supplies what a fold covers (`:fold-extent`) and the keys — Org's structure editing:
+M-RET / C-RET and their TODO forms, M-arrows to promote, demote and move subtrees and items,
+S-arrows for the keyword and the priority, C-c C-c for checkboxes and `[2/3]` cookies. Prose
+wraps, as in markdown: an Org paragraph is one long line."
   (:use modes :only [register-language-mode layer-commands])
   (:use interactive :only [defcommand]))
 
@@ -14,23 +17,86 @@ and the keys. Prose wraps, as in markdown: an Org paragraph is one long line."
     (when (and (< line line-count) (org/heading-level (line-at line)))
       (org/subtree-end-by line-at line-count line))))
 
-(defn- org-current-line (buffer) (wrap/line-text buffer (editor/buffer/buffer-current-line buffer)))
+;; ---- reading and rewriting lines ------------------------------------------------------
+;; Every structure command reads the outline facts off `org` over the current buffer's lines
+;; (`org-context`) and makes its change as ONE rewrite of a run of lines (`org-rewrite`) — the
+;; folds among them carried to where the lines went, point placed — so a move, an insert and a
+;; promote are each one undo step and never leave a fold on the wrong heading.
 
-(defn- org-replace-line (m rewrite)
-  ;; the current line replaced by `(rewrite text)`, point keeping its distance from the line's end
+(defn- org-context (m)
+  ;; the current buffer's lines as `org` reads them, and where point is among them. The empty "line" after a file's final newline is not one:
+  ;; a subtree ends at its last text line, so a move or an append keeps the file's newline last
   (let (buffer (model/ed-current-buf m)
-        line (editor/buffer/buffer-current-line buffer)
-        text (wrap/line-text buffer line)
-        start (text/line->char (editor/buffer/buffer-rope buffer) line)
-        from-end (- (string/length text) (editor/buffer/buffer-column buffer))
-        replaced (rewrite text))
-    (first (model/ed-try-edit m
-             (fn (edited)
-               (editor/buffer/goto-char (editor/buffer/replace-region edited
-                                          start
-                                          (+ start (string/length text))
-                                          replaced)
-                 (+ start (math/max 0 (- (string/length replaced) from-end)))))))))
+        rope (editor/buffer/buffer-rope buffer)
+        lines (text/line-count rope))
+    {:buffer buffer
+     :line-at (fn (index) (wrap/rope-line-text rope index))
+     :line-count (if (and (> lines 1) (= (wrap/rope-line-text rope (dec lines)) ""))
+                   (dec lines)
+                   lines)
+     :line (editor/buffer/buffer-current-line buffer)
+     :column (editor/buffer/buffer-column buffer)}))
+
+(sig org-rewrite (map int int any any (tuple int int) -> map))
+(defn- org-rewrite (m from to lines remap point)
+  ;; lines `from`..`to` replaced by `lines` as one edit; a fold among them moved to the line
+  ;; `(remap line)` names (dropped on nil), point to `point`, `[line column]` of the result
+  (first (model/ed-try-edit m
+           (fn (buffer)
+             (let (rope (editor/buffer/buffer-rope buffer)
+                   start (text/line->char rope from)
+                   end (+ (text/line->char rope to) (string/length (wrap/rope-line-text rope to)))
+                   folded (seq/filter (folds/folded-lines buffer)
+                            (fn (line) (and (>= line from) (<= line to))))
+                   edited (editor/buffer/replace-region (fold folded buffer folds/unfold-heading)
+                            start
+                            end
+                            (string/join lines "\n"))
+                   refolded (fold folded
+                              edited
+                              (fn (acc line)
+                                (let (moved (remap line))
+                                  (if (nil? moved) acc (folds/fold-heading acc moved)))))
+                   [point-line point-column] point
+                   result (editor/buffer/buffer-rope refolded))
+               (editor/buffer/goto-char refolded
+                 (+ (text/line->char result point-line)
+                   (math/max 0
+                     (math/min point-column (string/length (wrap/rope-line-text result point-line)))))))))))
+
+(defn- org-lines (context from to)
+  ;; lines `from`..`to` of `context` as a vector
+  (map (range from (inc to)) (:line-at context)))
+
+(defn- org-set-line (m line text)
+  ;; line `line` replaced by `text`, point staying where it is on its line
+  (let (context (org-context m))
+    (if (= ((:line-at context) line) text)
+      m
+      (org-rewrite m
+        line
+        line
+        [text]
+        identity
+        [(:line context)
+          (if (= (:line context) line)
+            (+ (:column context) (- (string/length text) (string/length ((:line-at context) line))))
+            (:column context))]))))
+
+(defn- org-renumber (m line &optional (start nil))
+  ;; the ordered list the item at `line` is in numbered again: from `start`, else from its first
+  ;; item's number
+  (let (context (org-context m))
+    (fold (org/renumbered-by (:line-at context) (:line-count context) line start)
+      m
+      (fn (acc [index text]) (org-set-line acc index text)))))
+
+(defn- org-goto-line (m line)
+  (let (buffer (model/ed-current-buf m))
+    (model/ed-set-buf m
+      (editor/buffer/goto-char buffer (text/line->char (editor/buffer/buffer-rope buffer) line)))))
+
+;; ---- folding ---------------------------------------------------------------------------
 
 (defcommand cmd-org-cycle
   (m key)
@@ -49,12 +115,93 @@ and the keys. Prose wraps, as in markdown: an Org paragraph is one long line."
   (let ([cycled state] (folds/cycle-buffer (model/ed-current-buf m)))
     (model/message (model/ed-set-buf m cycled) (if (= state :overview) "OVERVIEW" "SHOW ALL"))))
 
+;; ---- the keyword, the priority, checkboxes ---------------------------------------------
+
+(defn- org-heading-step (m key step fallback)
+  ;; the heading at point rewritten by `(step line)`; off a heading, the `fallback` command (what
+  ;; the key does in text), or a refusal without one
+  (let (context (org-context m)
+        text ((:line-at context) (:line context)))
+    (cond
+      (org/heading-level text) (org-set-line m (:line context) (step text))
+      (nil? fallback) (model/message m "Not on a heading")
+      else (fallback m key))))
+
 (defcommand cmd-org-todo
   (m key)
   "Step the heading's TODO keyword: none → TODO → DONE → none (C-c C-t, Org's `org-todo`)."
-  (if (nil? (org/heading-level (org-current-line (model/ed-current-buf m))))
-    (model/message m "not on a heading")
-    (org-replace-line m org/cycle-todo)))
+  (org-heading-step m key org/cycle-todo nil))
+
+(defcommand cmd-org-shift-right
+  (m key)
+  "S-<right> in Org: on a heading, the next TODO keyword (none → TODO → DONE); elsewhere,
+shift-select as everywhere."
+  (org-heading-step m key (fn (line) (org/step-todo line 1)) motion/cmd-shift-motion))
+
+(defcommand cmd-org-shift-left
+  (m key)
+  "S-<left> in Org: on a heading, the previous TODO keyword (none → DONE → TODO); elsewhere,
+shift-select as everywhere."
+  (org-heading-step m key (fn (line) (org/step-todo line -1)) motion/cmd-shift-motion))
+
+(defcommand cmd-org-shift-up
+  (m key)
+  "S-<up> in Org: on a heading, a higher priority (none → A, C → B → A → none); elsewhere,
+shift-select as everywhere."
+  (org-heading-step m key (fn (line) (org/step-priority line 1)) motion/cmd-shift-motion))
+
+(defcommand cmd-org-shift-down
+  (m key)
+  "S-<down> in Org: on a heading, a lower priority (none → C, A → B → C → none); elsewhere,
+shift-select as everywhere."
+  (org-heading-step m key (fn (line) (org/step-priority line -1)) motion/cmd-shift-motion))
+
+(defn- org-refresh-statistics (m line)
+  ;; line `line`'s `[2/3]` cookie and, on an item, its checkbox, brought in line with the
+  ;; checkboxes under it
+  (let (context (org-context m)
+        text ((:line-at context) line)
+        [done total] (org/checkboxes-under-by (:line-at context) (:line-count context) line)
+        item (org/list-item text)
+        counted (org/with-statistics text done total)
+        marked (if (and item (:checkbox item) (> total 0))
+                 (org/set-checkbox counted
+                   (cond
+                     (= done total) "X"
+                     (= done 0) " "
+                     else "-"))
+                 counted))
+    (org-set-line m line marked)))
+
+(defn- org-update-statistics (m line)
+  ;; every cookie and parent checkbox that counts line `line`, innermost first: its parent
+  ;; items in turn, then the heading whose entry they are in
+  (let (context (org-context m)
+        parent (org/item-parent-by (:line-at context) line))
+    (if parent
+      (org-update-statistics (org-refresh-statistics m parent) parent)
+      (let (heading (org/heading-above-by (:line-at context) line))
+        (if (and heading (not (= heading line))) (org-refresh-statistics m heading) m)))))
+
+(defcommand cmd-org-ctrl-c-ctrl-c
+  (m key)
+  "C-c C-c in Org: on a checkbox item, tick it or clear it; on a line with a `[2/3]` or `[66%]`
+cookie, count again. Either way every cookie and parent checkbox above it follows (Org's
+`org-ctrl-c-ctrl-c`)."
+  (let (context (org-context m)
+        line (:line context)
+        text ((:line-at context) line)
+        item (org/list-item text))
+    (cond
+      (and item (:checkbox item))
+        (org-update-statistics (org-set-line m
+                                 line
+                                 (org/set-checkbox text (if (= (:checkbox item) "X") " " "X")))
+          line)
+      (org/statistics? text) (org-update-statistics (org-refresh-statistics m line) line)
+      else (model/message m "Nothing to do here: no checkbox or statistics cookie on this line"))))
+
+;; ---- moving around the outline ---------------------------------------------------------
 
 (defn- org-heading-from (rope line-count line step)
   ;; the nearest heading line from `line` in direction `step`, or nil — reading the lines it
@@ -72,10 +219,7 @@ and the keys. Prose wraps, as in markdown: an Org paragraph is one long line."
                  (text/line-count rope)
                  (editor/buffer/buffer-current-line buffer)
                  step))
-    (if (nil? target)
-      (model/message m none)
-      (model/ed-set-buf m
-        (editor/buffer/goto-char buffer (text/line->char rope target))))))
+    (if (nil? target) (model/message m none) (org-goto-line m target))))
 
 (defcommand cmd-org-next-heading
   (m key)
@@ -87,36 +231,303 @@ and the keys. Prose wraps, as in markdown: an Org paragraph is one long line."
   "Move to the previous heading, at any level (C-c C-p)."
   (org-heading-move m -1 "No previous heading"))
 
-(defn- org-change-level (m delta)
-  (let (text (org-current-line (model/ed-current-buf m))
-        level (org/heading-level text))
+(defn- org-sibling-move (m step none)
+  (let (context (org-context m)
+        heading (org/heading-above-by (:line-at context) (:line context))
+        target (when heading
+                 (org/heading-sibling-by (:line-at context) (:line-count context) heading step)))
+    (if (nil? target) (model/message m none) (org-goto-line m target))))
+
+(defcommand cmd-org-forward-heading-same-level
+  (m key)
+  "Move to the next heading at this one's level under the same parent (C-c C-f)."
+  (org-sibling-move m 1 "No following sibling heading"))
+
+(defcommand cmd-org-backward-heading-same-level
+  (m key)
+  "Move to the previous heading at this one's level under the same parent (C-c C-b)."
+  (org-sibling-move m -1 "No previous sibling heading"))
+
+(defcommand cmd-org-up-heading
+  (m key)
+  "Move to the heading this entry is a subheading of (C-c C-u, Emacs's `outline-up-heading`)."
+  (let (context (org-context m)
+        line-at (:line-at context)
+        heading (org/heading-above-by line-at (:line context))
+        level (when heading (org/heading-level (line-at heading)))
+        parent (when level
+                 (seq/find (range (dec heading) -1 -1)
+                   (fn (index)
+                     (let (other (org/heading-level (line-at index))) (and other (< other level)))))))
+    (if (nil? parent)
+      (model/message m "Already at top level of the outline")
+      (org-goto-line m parent))))
+
+;; ---- new headings and items ------------------------------------------------------------
+
+(defn- org-split-at (text column keep?)
+  ;; `text` cut at `column`: `[left right]`, the left trimmed at its end unless that stops it
+  ;; being what `keep?` (when given) says it is (`* ` trimmed is no heading), the right at its start
+  (let (cut (math/min column (string/length text))
+        left (string/substring text 0 cut)
+        trimmed (string/trimr left))
+    [(if (or (nil? keep?) (keep? trimmed)) trimmed left)
+      (string/triml (string/substring text cut (string/length text)))]))
+
+(sig org-heading-prefix (int any -> string))
+(defn- org-heading-prefix (level todo?) (str (string/repeat "*" level) " " (if todo? "TODO " "")))
+
+(defn- org-insert-after (m line text)
+  ;; `text` on a new line after line `line`, point at its end
+  (let (context (org-context m))
+    (org-rewrite m
+      line
+      line
+      [((:line-at context) line) text]
+      identity
+      [(inc line) (string/length text)])))
+
+(defn- org-insert-item (m context item todo?)
+  ;; M-RET on an item: a new one before it at its start, else the text after point moved into a
+  ;; new item after it (past its sub-items), the list renumbered
+  (let (line-at (:line-at context)
+        line (:line context)
+        text (line-at line))
+    (if (<= (:column context) (:indent item))
+      (let (prefix (org/item-prefix item todo? true))
+        (org-renumber (org-rewrite m line line [prefix text] identity [line (string/length prefix)])
+          line))
+      (let (end (org/item-end-by line-at (:line-count context) line)
+            prefix (org/item-prefix item todo?)
+            [left right] (org-split-at text (math/max (:column context) (:text item)) org/list-item))
+        (org-renumber (org-rewrite m
+                        line
+                        end
+                        (append [left] (org-lines context (inc line) end) [(str prefix right)])
+                        identity
+                        [(inc end) (string/length prefix)])
+          (inc end))))))
+
+(defn- org-insert-heading (m todo? after-subtree?)
+  ;; M-RET / C-RET and their TODO forms — the cases are Org's `org-insert-heading`'s
+  (let (context (org-context m)
+        line-at (:line-at context)
+        line (:line context)
+        column (:column context)
+        text (line-at line)
+        parts (org/heading-parts text)
+        item (when (not after-subtree?) (org/list-item text))
+        entry (org/heading-above-by line-at line)
+        level (or (when entry (org/heading-level (line-at entry))) 1)
+        prefix (org-heading-prefix level todo?))
     (cond
-      (nil? level) (model/message m "not on a heading")
-      (and (< delta 0) (= level 1)) (model/message m "cannot promote a top-level heading")
+      ;; after the subtree: C-RET, or a folded heading, whose new sibling goes past what it hides
+      (or after-subtree? (and parts (folds/folded? (:buffer context) line)))
+        (org-insert-after m
+          (if entry (org/subtree-end-by line-at (:line-count context) entry) line)
+          prefix)
+      ;; at the start of a heading: a sibling before it
+      (and parts (= column 0))
+        (org-rewrite m
+          line
+          line
+          [prefix text]
+          (fn (index) (inc index))
+          [line (string/length prefix)])
+      ;; in a heading: split it, the title after point the new heading's
+      parts
+        (let ([left right] (org-split-at text
+                             (math/max column
+                               (- (string/length text) (string/length (:title parts))))
+                             org/heading-level))
+          (org-rewrite m
+            line
+            line
+            [left (str prefix right)]
+            identity
+            [(inc line) (string/length prefix)]))
+      item (org-insert-item m context item todo?)
+      ;; at the start of text: the line becomes a heading
+      (= column 0)
+        (org-rewrite m line line [(str prefix text)] identity [line (string/length prefix)])
+      ;; in text: split it, the rest a heading
       else
-        (org-replace-line m
-          (fn (line) (if (< delta 0) (string/substring line 1 (string/length line)) (str "*" line)))))))
-
-(defcommand cmd-org-promote
-  (m key)
-  "One star fewer on this heading (M-<left>, Org's `org-do-promote`)."
-  (org-change-level m -1))
-
-(defcommand cmd-org-demote
-  (m key)
-  "One star more on this heading (M-<right>, Org's `org-do-demote`)."
-  (org-change-level m 1))
+        (let ([left right] (org-split-at text column nil))
+          (org-rewrite m
+            line
+            line
+            [left (str prefix right)]
+            identity
+            [(inc line) (string/length prefix)])))))
 
 (defcommand cmd-org-meta-return
   (m key)
-  "A new heading at this one's level on the line below (M-RET); off a heading, a newline."
-  (let (level (org/heading-level (org-current-line (model/ed-current-buf m))))
-    (if (nil? level)
-      (typing/cmd-newline m key)
-      (let (at-end (model/ed-set-buf m (editor/buffer/end-of-line (model/ed-current-buf m))))
-        (first (model/ed-try-edit at-end
-                 (fn (edited)
-                   (editor/buffer/insert edited (str "\n" (string/repeat "*" level) " ")))))))))
+  "M-RET in Org (`org-meta-return`): on a heading, a new one at its level — before it from the
+heading's start, else after it with the title after point; on a list item, a new item the
+same way (numbered, a checkbox if this one has one); in text, a heading at the entry's level,
+the line itself when point is at its start. A folded heading's new sibling goes after what
+it hides."
+  (org-insert-heading m false false))
+
+(defcommand cmd-org-insert-heading-respect-content
+  (m key)
+  "C-RET in Org: a new heading at this entry's level AFTER its whole subtree, wherever point
+is in it (Org's `org-insert-heading-respect-content`)."
+  (org-insert-heading m false true))
+
+(defcommand cmd-org-insert-todo-heading
+  (m key)
+  "M-S-RET in Org: M-RET's new heading with TODO on it, or on a list item a new item with an
+empty checkbox (Org's `org-insert-todo-heading`)."
+  (org-insert-heading m true false))
+
+(defcommand cmd-org-insert-todo-heading-respect-content
+  (m key)
+  "C-S-RET in Org: C-RET's new heading with TODO on it (Org's
+`org-insert-todo-heading-respect-content`)."
+  (org-insert-heading m true true))
+
+;; ---- promote, demote, move -------------------------------------------------------------
+
+(defn- org-shift-lines (m from to shift column-delta)
+  ;; lines `from`..`to` each rewritten by `(shift line)`, point's column moved by `column-delta`
+  (let (context (org-context m))
+    (org-rewrite m
+      from
+      to
+      (map (org-lines context from to) shift)
+      identity
+      [(:line context) (+ (:column context) column-delta)])))
+
+(defn- org-restar (delta)
+  ;; a heading line with one star more (`delta` 1) or fewer (-1); any other line as it was
+  (fn (text)
+    (cond
+      (nil? (org/heading-level text)) text
+      (> delta 0) (str "*" text)
+      else (string/substring text 1 (string/length text)))))
+
+(defn- org-reindent (delta)
+  ;; a line indented two more columns (`delta` 1) or up to two fewer (-1)
+  (fn (text)
+    (if (> delta 0)
+      (if (string/blank? text) text (str "  " text))
+      (string/substring text
+        (math/min 2 (- (string/length text) (string/length (string/triml text))))
+        (string/length text)))))
+
+(defn- org-structure-shift (m key delta subtree? fallback)
+  ;; M-<left> / M-<right> (`subtree?` false) and M-S-<left> / M-S-<right> (true)
+  (let (context (org-context m)
+        line-at (:line-at context)
+        line (:line context)
+        text (line-at line)
+        level (org/heading-level text)
+        item (org/list-item text))
+    (cond
+      (and level (< delta 0) (= level 1)) (model/message m "Cannot promote to level 0")
+      level
+        (org-shift-lines m
+          line
+          (if subtree? (org/subtree-end-by line-at (:line-count context) line) line)
+          (org-restar delta)
+          delta)
+      (and item (< delta 0) (= (:indent item) 0)) (model/message m "Cannot outdent beyond margin")
+      item
+        (org-renumber (org-shift-lines m
+                        line
+                        (if subtree? (org/item-end-by line-at (:line-count context) line) line)
+                        (org-reindent delta)
+                        (* 2 delta))
+          line)
+      (nil? fallback) (model/message m "Not on a heading or a list item")
+      else (fallback m key))))
+
+(defcommand cmd-org-metaleft
+  (m key)
+  "M-<left> in Org: promote the heading (one star fewer) or outdent the list item; in text,
+back a word (Org's `org-metaleft`)."
+  (org-structure-shift m key -1 false motion/cmd-backward-word))
+
+(defcommand cmd-org-metaright
+  (m key)
+  "M-<right> in Org: demote the heading (one star more) or indent the list item; in text,
+forward a word (Org's `org-metaright`)."
+  (org-structure-shift m key 1 false motion/cmd-forward-word))
+
+(defcommand cmd-org-promote-subtree
+  (m key)
+  "M-S-<left> in Org: promote the heading and every heading under it, or outdent the list item
+with its sub-items (Org's `org-shiftmetaleft`)."
+  (org-structure-shift m key -1 true nil))
+
+(defcommand cmd-org-demote-subtree
+  (m key)
+  "M-S-<right> in Org: demote the heading and every heading under it, or indent the list item
+with its sub-items (Org's `org-shiftmetaright`)."
+  (org-structure-shift m key 1 true nil))
+
+(sig swapped-line (int int int int -> int))
+(defn- swapped-line (line upper lower last)
+  ;; where line `line` goes when the blocks `upper`..`lower - 1` and `lower`..`last` change places
+  (if (< line lower) (+ line (inc (- last lower))) (- line (- lower upper))))
+
+(defn- org-swap (m upper lower last)
+  ;; the block `upper`..`lower - 1` and the block `lower`..`last` change places, point moving
+  ;; with its block and every fold with its heading
+  (let (context (org-context m)
+        moved (fn (line) (swapped-line line upper lower last)))
+    (org-rewrite m
+      upper
+      last
+      (append (org-lines context lower last) (org-lines context upper (dec lower)))
+      moved
+      [(swapped-line (:line context) upper lower last) (:column context)])))
+
+(defn- org-move (m step)
+  ;; M-<up> (`step` -1) / M-<down> (1): the subtree, the item, or the line past its neighbour
+  (let (context (org-context m)
+        line-at (:line-at context)
+        line-count (:line-count context)
+        line (:line context)
+        text (line-at line))
+    (cond
+      (org/heading-level text)
+        (let (sibling (org/heading-sibling-by line-at line-count line step))
+          (cond
+            (nil? sibling) (model/message m "Cannot move past superior level or buffer limit")
+            (< step 0) (org-swap m sibling line (org/subtree-end-by line-at line-count line))
+            else (org-swap m line sibling (org/subtree-end-by line-at line-count sibling))))
+      (org/list-item text)
+        (let (sibling (org/item-sibling-by line-at line-count line step)
+              ;; the list keeps the number it started at, whichever item now comes first
+              start (org/list-start-by line-at line-count line))
+          (cond
+            (nil? sibling) (model/message m "Cannot move this item further")
+            (< step 0)
+              (org-renumber (org-swap m sibling line (org/item-end-by line-at line-count line))
+                sibling start)
+            else
+              (org-renumber (org-swap m line sibling (org/item-end-by line-at line-count sibling))
+                line start)))
+      (< step 0)
+        (if (= line 0) (model/message m "Beginning of buffer") (org-swap m (dec line) line line))
+      else
+        (if (>= (inc line) line-count)
+          (model/message m "End of buffer")
+          (org-swap m line (inc line) (inc line))))))
+
+(defcommand cmd-org-move-up
+  (m key)
+  "M-<up> in Org: the subtree past the heading above it at its level, the list item past the
+item above it (sub-items with each), or the line past the line above (Org's `org-metaup`)."
+  (org-move m -1))
+
+(defcommand cmd-org-move-down
+  (m key)
+  "M-<down> in Org: the subtree past the heading below it at its level, the list item past the
+item below it (sub-items with each), or the line past the line below (Org's `org-metadown`)."
+  (org-move m 1))
 
 (defn org-on-move (m)
   "org-mode's `:on-move`: point that lands inside a fold some way other than C-n / C-p
@@ -130,12 +541,32 @@ and the keys. Prose wraps, as in markdown: an Org paragraph is one long line."
     (editor/keymap/keymap-bind [:tab] 'org-mode/cmd-org-cycle)
     (editor/keymap/keymap-bind [:back-tab] 'org-mode/cmd-org-cycle-buffer)
     (editor/keymap/keymap-bind [:ctrl-c :ctrl-t] 'org-mode/cmd-org-todo)
+    (editor/keymap/keymap-bind [:ctrl-c :ctrl-c] 'org-mode/cmd-org-ctrl-c-ctrl-c)
     (editor/keymap/keymap-bind [:ctrl-c :ctrl-n] 'org-mode/cmd-org-next-heading)
     (editor/keymap/keymap-bind [:ctrl-c :ctrl-p] 'org-mode/cmd-org-previous-heading)
-    (editor/keymap/keymap-bind [:alt-left] 'org-mode/cmd-org-promote)
-    (editor/keymap/keymap-bind [:alt-right] 'org-mode/cmd-org-demote)
-    (editor/keymap/keymap-bind [:alt-enter] 'org-mode/cmd-org-meta-return)))
-
+    (editor/keymap/keymap-bind [:ctrl-c :ctrl-f] 'org-mode/cmd-org-forward-heading-same-level)
+    (editor/keymap/keymap-bind [:ctrl-c :ctrl-b] 'org-mode/cmd-org-backward-heading-same-level)
+    (editor/keymap/keymap-bind [:ctrl-c :ctrl-u] 'org-mode/cmd-org-up-heading)
+    ;; new headings and items: M-RET where point is, C-RET after the subtree, Shift for TODO
+    (editor/keymap/keymap-bind [:alt-enter] 'org-mode/cmd-org-meta-return)
+    (editor/keymap/keymap-bind [:ctrl-enter] 'org-mode/cmd-org-insert-heading-respect-content)
+    (editor/keymap/keymap-bind [:alt-shift-enter] 'org-mode/cmd-org-insert-todo-heading)
+    (editor/keymap/keymap-bind [:ctrl-shift-enter]
+      'org-mode/cmd-org-insert-todo-heading-respect-content)
+    ;; structure: M-arrows the heading or item, M-S-arrows with what is under it
+    (editor/keymap/keymap-bind [:alt-left] 'org-mode/cmd-org-metaleft)
+    (editor/keymap/keymap-bind [:alt-right] 'org-mode/cmd-org-metaright)
+    (editor/keymap/keymap-bind [:alt-shift-left] 'org-mode/cmd-org-promote-subtree)
+    (editor/keymap/keymap-bind [:alt-shift-right] 'org-mode/cmd-org-demote-subtree)
+    (editor/keymap/keymap-bind [:alt-up] 'org-mode/cmd-org-move-up)
+    (editor/keymap/keymap-bind [:alt-down] 'org-mode/cmd-org-move-down)
+    (editor/keymap/keymap-bind [:alt-shift-up] 'org-mode/cmd-org-move-up)
+    (editor/keymap/keymap-bind [:alt-shift-down] 'org-mode/cmd-org-move-down)
+    ;; on a heading S-arrows step the keyword and the priority; elsewhere they shift-select
+    (editor/keymap/keymap-bind [:shift-right] 'org-mode/cmd-org-shift-right)
+    (editor/keymap/keymap-bind [:shift-left] 'org-mode/cmd-org-shift-left)
+    (editor/keymap/keymap-bind [:shift-up] 'org-mode/cmd-org-shift-up)
+    (editor/keymap/keymap-bind [:shift-down] 'org-mode/cmd-org-shift-down)))
 ;; the header line's crumbs for an Org buffer (`headerline/crumbs`): the headings point is
 ;; under. Memoised on the rope and the line, because the header asks every frame and the walk
 ;; up to a top-level heading is as long as the subtree.
