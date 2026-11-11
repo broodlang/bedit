@@ -156,6 +156,12 @@ point is short of its limit."
       else nil)))
 
 (sig qr-goto (model (or nil int) -> model))
+(defn- qr-lazy-spec (qr)
+  "The replace as the lazy highlight describes a search (`isearch/lazy-ranges`): its pattern as a
+regexp, its case rule, and over a region only the matches the replace will reach."
+  (merge {:pattern (if (:regexp? qr) (:from qr) (regex/escape (:from qr))) :fold? (qr-fold? qr)}
+    (if (:limit qr) {:within [(:region-start qr) (:limit qr)]} {})))
+
 (defn- qr-goto (m position)
   "Highlight the next match at or after `position` (a transient overlay, point at its start, the
 other matches in the window lit), or finish if there is none — or no `position` at all, past an
@@ -167,11 +173,7 @@ empty match at the buffer's end ([[qr-next]])."
       (qr-finish m)
       (assoc (ed-set-buf m (goto-char buf (:start found)))
         :overlays [{:start (:start found) :end (:end found) :face face-isearch}]
-        :isearch-lazy
-          (merge {:pattern (if (:regexp? qr) (:from qr) (regex/escape (:from qr)))
-                  :fold? (qr-fold? qr)}
-            ;; over a region, only the matches the replace will reach are lit
-            (if (:limit qr) {:within [(:region-start qr) (:limit qr)]} {}))
+        :isearch-lazy (qr-lazy-spec qr)
         :echo (qr-prompt qr)
         ;; the question stands until answered: a `message` meanwhile shows beside it
         :query-replace
@@ -391,6 +393,12 @@ or Enter/Esc/C-g/Delete. Any other key finishes the replace and is dispatched no
   (or (and (string? input) (includes? *qr-keys* input))
     (includes? [:enter :escape :ctrl-g :delete] input)))
 
+(defn- qr-new-state (from to options)
+  "A replace of `from` → `to` not yet at a match, as [[qr-start]]'s `options` describe it (over a
+region: its start, and the limit no match may pass)."
+  (merge {:from from :to to :regexp? (= true (:regexp? options)) :match nil :count 0}
+    (if-let (region (:region options)) {:region-start (first region) :limit (second region)} {})))
+
 (defn qr-start (m from to &optional (options {}))
   "Begin query-replace of `from` → `to` from point; jump to the first match. `options`:
 `:regexp?` makes `from` a regexp and lets `to` refer to its groups (C-M-%); `:region [low
@@ -400,17 +408,16 @@ match may end past `high` — which moves as replacements change the text's leng
 ([[qr-limit]])."
   (let (region (:region options)
         buf (ed-current-buf m)
-        state {:from from :to to :regexp? (= true (:regexp? options)) :match nil :count 0})
+        state (qr-new-state from to options))
     (cond
       (= from "") (message m "(nothing to replace)")
       (and (:regexp? options) (regex/incomplete? from))
         (message m (str "Invalid regexp: " from " [incomplete input]"))
       (nil? region) (qr-goto (assoc m :query-replace state) (buffer-point buf))
       else
-        (let ([low high] region)
-          (qr-goto (assoc (ed-set-buf m (clear-mark (goto-char buf low)))
-                     :query-replace (assoc state :region-start low :limit high))
-            low)))))
+        (qr-goto (assoc (ed-set-buf m (clear-mark (goto-char buf (first region))))
+                   :query-replace state)
+          (first region)))))
 
 (defn qr-handle (m input)
   "Fold one query-replace answer key: y/space replace+advance, n/Delete skip, `,` replace and
@@ -468,3 +475,62 @@ go on and ! replaces the rest from there."
   (overlay-exit (_ m) (qr-finish m)))
 
 (register-overlay :query-replace 40 (query-replace-overlay))
+
+;; ---- the preview while the replacement is typed ------------------------------------------
+;; Emacs 32's `query-replace-show-preview`: while `Query replace X with: ` is answered, every
+;; match on screen shows what it will become. The match keeps the lazy highlight it has in the
+;; y/n loop, and its replacement follows it as INLINE virtual text (`inlinetext`, an owner of
+;; its own), so the text never changes until a key says so. Built on the replace's own search
+;; and replacement ([[qr-find-any]], [[qr-replacement]]): the preview is what `y` would do.
+
+(def *preview-owner* :query-replace-preview)
+(def *preview-max* 400) ; the most matches one preview shows: a screen holds far fewer
+
+(defn preview-annotations (qr buf low high)
+  "The inline annotations previewing replace `qr` over the matches starting between `low` and
+`high`: each match's replacement, after it, in `face-qr-preview`."
+  (letrec (walk (fn (position acc)
+                  (let (found (when (and (<= position high) (< (count acc) *preview-max*))
+                                (qr-find qr buf position)))
+                    (if (or (nil? found) (> (:start found) high))
+                      acc
+                      (walk (if (= (:end found) (:start found)) (inc (:end found)) (:end found))
+                        (conj acc
+                          {:at (:end found) :text (qr-replacement qr found) :face face-qr-preview}))))))
+    (walk low [])))
+
+(defn- preview-window (m buf)
+  "`[low high]`: the chars of the selected pane's lines on screen."
+  (let (rope (buffer-rope buf)
+        top (ed-current-top m)
+        rows (let (view-rows (:view-rows m)) (if (int? view-rows) view-rows 50))
+        last-line (math/min (dec (text/line-count rope)) (+ top rows)))
+    [(text/line->char rope (math/min top last-line))
+      (if (< (inc last-line) (text/line-count rope))
+        (text/line->char rope (inc last-line))
+        (text/length rope))]))
+
+(defn preview (m from to options)
+  "`m` showing what replacing `from` with `to` (as typed so far, [[qr-start]]'s `options`) does
+to every match on screen: lit as the y/n loop lights them, each followed by its replacement.
+Nothing to show — a regexp still being typed — clears it."
+  (let (buf (ed-current-buf m)
+        cleared (inlinetext/clear buf *preview-owner*))
+    (if (or (= from "") (and (:regexp? options) (regex/incomplete? from)))
+      (preview-off m)
+      (let (qr (qr-new-state from to options)
+            [low high] (preview-window m buf)
+            start (if (:region-start qr) (math/max low (:region-start qr)) low))
+        (assoc (ed-set-buf m
+                 (inlinetext/set-annotations cleared
+                   *preview-owner*
+                   (preview-annotations qr cleared start high)))
+          :query-replace-preview true
+          :isearch-lazy (qr-lazy-spec qr))))))
+
+(defn preview-off (m)
+  "`m` with the replacement preview gone: its annotations and the highlight it lit."
+  (if (:query-replace-preview m)
+    (dissoc (ed-set-buf m (inlinetext/clear (ed-current-buf m) *preview-owner*))
+      :query-replace-preview :isearch-lazy)
+    m))

@@ -1356,7 +1356,11 @@ src/query-replace.blsp      query-replace (M-%, C-M-%), a modal mini-loop on ise
                             C-M-% stay inside it (`Query replace in region:`): its end moves with
                             each replacement, and a regexp is searched with it as the bound (brood ADR-554). M-x replace-string /
                             replace-regexp are `!` at the first match (`replace-all`): the same
-                            search, `\&` / `\1` and case rule, one undo group
+                            search, `\&` / `\1` and case rule, one undo group. While the
+                            replacement is TYPED every match on screen shows what it becomes
+                            (`preview`, Emacs 32's query-replace-show-preview): lit, its replacement
+                            after it as inline virtual text (`inlinetext`, owner `*preview-owner*`),
+                            following each key through the minibuffer's `:on-edit` hook
 src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
 src/eval-commands.blsp      the C-x C-e family as commands (eval-last-sexp / -region / -buffer):
                             off the loop as a std/task, C-g cancels; loaded with the image (main)
