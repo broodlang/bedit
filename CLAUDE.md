@@ -196,6 +196,11 @@ src/scroll.blsp             keeping point on screen: the scroll-margin clamp, ho
                             the mode's `:long-lines` facet, the setting's `:default`
 src/autosave.blsp           `#file#` auto-save sidecars written (owner-only, on the idle beat, order
                             110, and a timer of their own). Only a MODIFIED buffer is ever written
+src/backup.blsp             backup files (Emacs make-backup-files, `:make-backup-files`, on): the first
+                            save over a file in a session copies it as it was to state/backups/,
+                            owner-only, named by its whole path (`sidecar/path-file-name`, a private
+                            sidecar's naming) — in the save's own task
+                            (`file-save/ed-save-launch`); local files only
 src/sidecar.blsp            where a sidecar lives and the note a visit shows when one is newer than
                             its file. A file edited as root (sudoedit) keeps its sidecar PRIVATE —
                             `state/auto-save/#%2Fsudo::%2Fetc%2Fhosts#`,
@@ -804,6 +809,9 @@ src/filecoding.blsp         C-x RET f (the next save's coding) and C-x RET r (re
                             another coding or the hex view): how a file reads is a guess, and this
                             overrules it either way. A file edited as root reads through sudo
                             (`sudoedit/ed-sudo-revert`, M-x revert-buffer too)
+                            A file MIXING line endings (read as LF, its CRs kept) is said on visit
+                            (a visit step) and M-x convert-line-endings makes it all LF or CRLF,
+                            one undoable edit
 src/imageview.blsp          an image (PNG, JPEG, GIF, WebP, BMP) opens as a picture: ONE brood `[:image …]`
                             op (brood ADR-686) over the pane's text area — a window paints it at full
                             pixel resolution, a terminal in half-block cells; never enlarged, top-left
@@ -1156,8 +1164,16 @@ src/filename.blsp           a typed path read the Emacs way (`substitute-in-file
                             part painted dim — file-name-shadow), `$VAR`s expand, a name from the
                             disk goes on the line escaped (`$$`), a relative name is read under the
                             prompt's directory. Both path prompts — `pool/ed-path-prompt` (the disk)
-                            and `pool/ed-path-list-prompt` (recent files, projects, git init/clone)
-                            — hand their consumer the ABSOLUTE path (`filename/expand`)
+                            and `pool/ed-path-list-prompt` (recent files, projects, recover)
+                            — hand their consumer the ABSOLUTE path (`filename/expand`). EVERY prompt
+                            for a file or folder is one of these two, never a bare line. A prompt for
+                            a path that need not exist — C-x C-w, rename-visited-file, dired + R C,
+                            git init / clone, a saved attachment or image — is `ed-path-prompt`'s
+                            `{:new-name true}`: Enter takes the line as typed, never the first entry
+                            listed under it, a blank one is said; a directory answered takes the
+                            name (`pool/ed-into-dir`) and a file already there is asked about
+                            (`pool/ed-confirm-overwrite`). A prompt opens in a directory spelled
+                            as one (`filename/as-dir`, `pool/ed-default-dir-input`)
 src/completion.blsp         shared fuzzy ranking + vertical-menu card (complete + plume)
 src/dired.blsp              Dired (C-x d, C-x C-j): an `ls -l` listing, its state ON the buffer
                             (`:dired-dir`, `:dired-names` — a line's entry by index — marks, flags,
