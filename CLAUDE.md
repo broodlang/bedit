@@ -1766,7 +1766,8 @@ tests/path_prompt_guard_test  no bare minibuffer line asks for a file, a directo
 tests/layout_doc_test       every src/ module has an entry in this Layout
 tools/affected-tests.sh     the test files a change reaches — its own, every test naming a changed module
                             (`:use` or qualified), the registry pins — and `--run` runs each by itself:
-                            the sweep before a push
+                            the sweep before a push, and the changed modules' docstring examples
+                            (`nest test --doc`, a nest from brood 9755cbc78 on)
 tests/window_paint_test     what the window PAINTS, read from pixels: the real view for a model
                             painted by brood's window painter into memory (`gui/render-frame`,
                             brood ADR-609) at a real size with bedit's font, inset and background —
