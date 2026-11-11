@@ -617,7 +617,7 @@ up — opening dired on the chosen directory."
   (assoc m
     :minibuffer
       (ed-path-prompt "Dired: "
-        (str (ed-default-dir m) "/")
+        (ed-default-dir-input m)
         (if (:recent-files m) (recent-files) [])
         (fn (mm typed)
           (if (string/blank? typed)
@@ -838,15 +838,21 @@ Emacs `dired-flag-file-deletion`). `x` deletes every flagged entry after a confi
       (inc (buffer-current-line (ed-current-buf m))))))
 
 (defn- ed-dired-prompt (m prompt initial run)
-  "A minibuffer prompt for a dired file op: `run` is `(model dir text) -> model`,
-called with the model, the current `:dired-dir`, and the entered text (a no-op-with-
-message on blank input)."
+  "A path prompt for a dired file op, the one find-file and C-x C-w use (`ed-path-prompt`,
+a NEW name: Enter takes the line as typed): prefilled with `initial`, the listing's own spelling
+of a path in it, so Tab completes, C-w walks up a directory, `~` and `//` read as everywhere
+else, and another machine's listing completes over ssh. `run` is `(model dir path) -> model`,
+called with the model, the current `:dired-dir` and the ABSOLUTE path meant. The line left as
+it was offered does nothing and says so; a blank one the prompt itself refuses."
   (let (dir (ed-dired-state m :dired-dir))
     (assoc m
       :minibuffer
-        {:edit (ed-mb-edit prompt initial)
-         :on-complete (fn (mm typed)
-                        (if (string/blank? typed) (message mm "(no name)") (run mm dir typed)))})))
+        (ed-path-prompt prompt
+          initial
+          []
+          (fn (mm path)
+            (if (dired-same-path? path initial) (message mm "(nothing changed)") (run mm dir path)))
+          {:new-name true}))))
 
 (defn- ed-dired-op (mm dir verb op)
   "Run file-op thunk `op`, then re-render dired for `dir`; on failure show
@@ -859,18 +865,18 @@ message on blank input)."
   (m key)
   "Create a new subdirectory (+). In a directory a file handler brings (another machine's) it
 is made through the handler, off the loop."
-  (ed-dired-prompt m
-    "Create directory: "
-    ""
-    (fn (mm dir typed)
-      (if (dired-handler dir)
-        (ed-dired-launch mm
-          (str "making " typed)
-          (fn ()
-            (dired-run-each [typed]
-              (fn (name) (dired-handler-op dir :make-directory (dired-join dir name)))))
-          (fn (landed report) (ed-dired-report (ed-dired-refresh landed dir) "Made" report)))
-        (ed-dired-op mm dir "mkdir" (fn () (file/mkdir (path/join dir typed))))))))
+  (let (dir (ed-dired-state m :dired-dir))
+    (ed-dired-prompt m
+      "Create directory: "
+      (filename/as-dir dir)
+      (fn (mm listed path)
+        (if (dired-handler listed)
+          (ed-dired-launch mm
+            (str "making " path)
+            (fn ()
+              (dired-run-each [path] (fn (target) (dired-handler-op listed :make-directory target))))
+            (fn (landed report) (ed-dired-report (ed-dired-refresh landed listed) "Made" report)))
+          (ed-dired-op mm listed "mkdir" (fn () (file/mkdir path))))))))
 
 ;; ---- running an operation: R, C, D and x over the marked entries -------------------
 ;; Emacs's dired acts on the MARKED entries when any are marked, else on the one at point.
@@ -968,12 +974,6 @@ another dired operation runs. A headless model (a test) runs it inline."
   (ed-dired-unless-busy m (fn () (offloop/ed-open-when-ready m label work finish :dired))))
 
 ;; ---- R and C: rename / move and copy -------------------------------------------------
-
-(defn- ed-dired-target (dir name typed)
-  "Where R or C of `name` in `dir` to `typed` goes: `typed` under `dir`, or INTO it when it names
-a directory (Emacs's dired), keeping the name."
-  (let (target (path/join dir typed))
-    (if (file/dir? target) (path/join target name) target)))
 
 (defn- dired-transfer-words (kind)
   ;; how R (`:rename`) and C (`:copy`) are said
@@ -1117,51 +1117,47 @@ is asked here."
 (defn- ed-dired-transfer (m kind)
   "R or C (`kind`): the marked entries — or the one at point — renamed or copied to where the
 prompt says. One entry goes to the name typed, or into it when it is a directory; several go
-into the directory typed. A listing another machine brought (`/ssh:…`) starts the prompt at the
-entry's whole path, as Emacs does: edited, it stays on that host; another `/ssh:` path is
+into the directory typed. The prompt is find-file's (`ed-path-prompt`), opened at the entry's whole
+path (several: at the listing), so Tab completes and C-w walks up; in another machine's listing
+(`/ssh:…`) the line edited stays on that host; another `/ssh:` path is
 another host; a path of this machine's (the line cleared, `/tmp/x` typed) is here. A target
 typed as another machine's path in a local listing goes there."
   (let (names (ed-dired-chosen m)
         words (dired-transfer-words kind)
         many? (> (count names) 1)
-        listed (ed-dired-state m :dired-dir)
-        remote-listing? (not (nil? (dired-handler listed))))
+        listed (ed-dired-state m :dired-dir))
     (if (empty? names)
       (message m (str "not on a " (if (= kind :rename) "renamable" "copyable") " entry"))
       (ed-dired-prompt m
         (if many?
           (str (:prompt words) " " (count names) " marked into: ")
           (str (:prompt words) " " (first names) " to: "))
-        (cond
-          (not remote-listing?) (if many? "" (first names))
-          many? (if (string/ends-with? listed "/") listed (str listed "/"))
-          else (dired-join listed (first names)))
-        (fn (mm dir typed)
-          (let (expanded (filename/expand typed dir))
-            (cond
-              ;; from or to another machine: the target is asked about off the loop
-              (or (not (nil? (dired-handler dir))) (not (nil? (ed-path-handler expanded))))
-                (ed-dired-transfer-ask mm
-                  dir
-                  kind
-                  (map names
-                    (fn (name)
-                      {:name name
-                       :source (dired-join dir name)
-                       :target expanded
-                       :into? many?
-                       :handled true})))
-              (and many? (not (file/dir? (path/join dir typed))))
-                (message mm (str (:word words) ": " typed " is not a directory"))
-              else
-                (ed-dired-transfer-ask mm
-                  dir
-                  kind
-                  (map names
-                    (fn (name)
-                      {:name name
-                       :source (path/join dir name)
-                       :target (ed-dired-target dir name typed)}))))))))))
+        (if many? (filename/as-dir listed) (dired-join listed (first names)))
+        (fn (mm dir expanded)
+          (cond
+            ;; from or to another machine: the target is asked about off the loop
+            (or (not (nil? (dired-handler dir))) (not (nil? (ed-path-handler expanded))))
+              (ed-dired-transfer-ask mm
+                dir
+                kind
+                (map names
+                  (fn (name)
+                    {:name name
+                     :source (dired-join dir name)
+                     :target expanded
+                     :into? many?
+                     :handled true})))
+            (and many? (not (file/dir? expanded)))
+              (message mm (str (:word words) ": " (path/abbreviate expanded) " is not a directory"))
+            else
+              (ed-dired-transfer-ask mm
+                dir
+                kind
+                (map names
+                  (fn (name)
+                    {:name name
+                     :source (path/join dir name)
+                     :target (ed-into-dir expanded name)})))))))))
 
 ;; ---- renaming entries to names given (wdired's C-c C-c) ------------------------------
 ;; Each entry to a new name of its own, all at once — a swap (a → b, b → a) or a cycle too, as
