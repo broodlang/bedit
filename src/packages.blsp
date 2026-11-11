@@ -67,6 +67,23 @@ applied, and the install says why — one bad package never blocks the editor."
   "Put package `name`'s src/ on `*load-path*` so `(require-one 'name)` finds it (idempotent)."
   (reflect/add-load-path (path/join (package-dir name) "src")))
 
+(defn dependency-names (name)
+  "The package names installed package `name`'s manifest lists under `:dependencies`, as
+strings: `[[agentkit :version \"0.1.0\"]]` names `agentkit`."
+  (let (dependencies (manifest-value name :dependencies))
+    (if (or (vector? dependencies) (list? dependencies))
+      (vec (seq/keep dependencies
+             (fn (entry)
+               (let (head (if (or (vector? entry) (list? entry)) (first entry) entry))
+                 (when (or (symbol? head) (string? head)) (str head))))))
+      [])))
+
+(defn installed-dependencies (name)
+  "The libraries package `name` depends on that are installed beside it, which go on the load
+path before it loads. A library is a package in the package dir that need not `:enhances`
+bedit: it is there for the plugins that use it."
+  (vec (seq/filter (dependency-names name) installed?)))
+
 (defn- reload-sources (name)
   "Load every source file of package `name` again — what an UPDATE of a plugin this image has
 already loaded needs, since `require-one` of a loaded module is a no-op and would keep running
@@ -84,6 +101,19 @@ nothing: its entry run again would register its rows a second time, outside the 
 claim, and the claims would lose them — or nil: a package never applied, or one whose entry
 failed, contributed nothing that is still registered."
   (registry/lookup :packages/contributions name))
+
+(defn before-retire (m name)
+  "`m` after package `name`'s own clean-up, run before it is retired (removed, or updated):
+its contribution's `:on-retire`, a `(model) -> model` symbol — Emacs's `FEATURE-unload-function`.
+What no registry can take back is the package's to stop there: processes it started, files it
+keeps open. A hook that raises is logged, and the retiring goes on."
+  (let (hook (:on-retire (loaded-contribution name)))
+    (if (and (symbol? hook) (bound? hook))
+      (try
+        (let (after ((reflect/eval hook) m)) (if (map? after) after m))
+        (catch e
+          (do (log/warn (str "packages: " name "'s :on-retire raised: " (error-message e))) m)))
+      m)))
 
 ;; ---- a package's module names ------------------------------------------------------
 ;; A package's module that shares its short name with one of bedit's — `org` — or with a std
@@ -195,7 +225,10 @@ A package whose module has the name of one of bedit's or a std module is not loa
       (apply-plugin-files! name reload?))))
 
 (defn- apply-plugin-files! (name reload?)
-  ;; [[apply-plugin!]] for a package whose modules are its own
+  ;; [[apply-plugin!]] for a package whose modules are its own; the libraries it uses go on
+  ;; the load path first, so its modules find theirs
+  (doseq (library (installed-dependencies name))
+    (add-to-load-path! library))
   (add-to-load-path! name)
   (let (settings-before (registry/entries config/*settings*)
         before (values-before)
@@ -231,9 +264,10 @@ buffers of a mode it took away seeded again in the new version's mode, else fund
 ([[ed-settle-package-buffers]]). `applied` is [[apply-plugin!]]'s answer: an update that
 fails to load leaves none of the old version behind either — the package reads as broken,
 with the reason."
-  (let (retired (retire-package name)
+  (let (cleaned (before-retire m name)
+        retired (retire-package name)
         applied (apply-plugin! name true))
-    [(ed-settle-package-buffers m name (:types retired)) applied]))
+    [(ed-settle-package-buffers cleaned name (:types retired)) applied]))
 
 ;; ---- what became of each installed package -----------------------------------------
 ;; Emacs's package.el marks a package it will not activate (`incompat`, `disabled`) and says so;
@@ -295,9 +329,11 @@ package (another editor's, or for another bedit version — a bedit upgrade can 
 not put on the load path at all: its `src/` would otherwise shadow modules for code that never
 asked for it. It is not dropped in silence either: each installed package's fate is recorded
 ([[package-status]]) for the *Packages* buffer and [[load-problems]]."
-  (let (compatible (compatible-in (user-package-dir)))
+  (let (compatible (compatible-in (user-package-dir))
+        libraries (into #{} (mapcat compatible installed-dependencies)))
     (doseq (name (installed-packages))
-      (when (not (includes? compatible name))
+      ;; a library a loaded plugin uses is not a plugin: nothing to say about it
+      (when (not (or (includes? compatible name) (contains? libraries name)))
         (note-status name :incompatible (incompatible-reason name))))
     (vec (seq/keep compatible (fn (name) (when (= true (apply-plugin! name)) name))))))
 
@@ -334,13 +370,78 @@ a package."
           (check-allow :discarded-catch
             (try (file/rmdir (path/join packages-dir entry)) (catch _ nil))))))))
 
-(defn- staged-refusal (staging name)
-  ;; why the package `name` just extracted into `staging` is not moved into place, or nil
-  (if (not (includes? (compatible-in staging) name))
-    (str name " does not enhance bedit " (about/bedit-version))
-    (when-let (clash (collision-reason (modules-in (source-files-under (path/join staging
-                                                                         name "src")))))
-      (str name ": " clash))))
+(defn- staged-refusal (staging name &optional (library? false))
+  ;; why the package `name` just extracted into `staging` is not moved into place, or nil: a
+  ;; plugin must enhance this bedit; a LIBRARY (a plugin's dependency) need only be a package
+  (cond
+    (and library? (not (file/exists? (path/join staging name "project.blsp"))))
+      (str name " is not a package")
+    (and (not library?) (not (includes? (compatible-in staging) name)))
+      (str name " does not enhance bedit " (about/bedit-version))
+    else
+      (when-let (clash (collision-reason (modules-in (source-files-under (path/join staging
+                                                                           name "src")))))
+        (str name ": " clash))))
+
+(defn hive-dependencies (dir name)
+  "The libraries package `name` (its copy in `dir`) depends on that the hive publishes —
+`[{:name :version}]`, the `:dependencies` entries that name no `:path`, `:git` or
+`:tarball` — what installing it installs beside it."
+  (let (entries (manifest-value-in (path/join dir name) :dependencies))
+    (if (or (vector? entries) (list? entries))
+      (vec (seq/keep entries
+             (fn (entry)
+               (when (and (or (vector? entry) (list? entry))
+                       (or (symbol? (first entry)) (string? (first entry)))
+                       (not (any? entry (fn (part) (includes? [:path :git :tarball] part)))))
+                 (let (options (rest entry)
+                       at (index-of options :version))
+                   {:name (str (first entry))
+                    :version (if (>= at 0) (nth options (inc at)) nil)})))))
+      [])))
+
+(defn- install-dependencies (registry name id &optional (dir nil))
+  "Install the hive libraries package `name` depends on — its copy in `dir`, by default the
+installed one (a staged update under review names its own) — that are not installed yet,
+each staged and moved into place as a plugin is ([[staged-install]], as a library). Answers
+`[{:name :version :wanted} | {:name :error}]`: what each became. The hive installs a library's
+newest release, so `:wanted` is the version the plugin named when that is another."
+  (vec (map (seq/reject (hive-dependencies (or dir (user-package-dir)) name)
+              (fn (dependency) (installed? (:name dependency))))
+         (fn (dependency)
+           (let (result (staged-install registry (:name dependency) id true))
+             (if (failure? result)
+               {:name (:name dependency) :error (error-message result)}
+               {:name (:name dependency)
+                :version (:version result)
+                :wanted (if (and (:version dependency)
+                              (not (= (:version dependency) (:version result))))
+                          (:version dependency)
+                          nil)}))))))
+
+(defn dependencies-note (dependencies)
+  "What an install says about the libraries it installed beside the plugin, or \"\".
+
+    (packages/dependencies-note [{:name \"agentkit\" :version \"0.1.0\"}])   ;=> \" (with agentkit 0.1.0)\"
+    (packages/dependencies-note [])   ;=> \"\""
+  (if (empty? (or dependencies []))
+    ""
+    (str " (with "
+      (string/join (map dependencies
+                     (fn (dependency)
+                       (cond
+                         (:error dependency)
+                           (str (:name dependency) " — not installed: " (:error dependency))
+                         (:wanted dependency)
+                           (str (:name dependency)
+                             " "
+                             (:version dependency)
+                             ", not the "
+                             (:wanted dependency)
+                             " it named")
+                         else (str (:name dependency) " " (:version dependency)))))
+        ", ")
+      ")")))
 
 (defn- staging-id (id name)
   ;; the staging directory's id for package `name` in job `id`: an update of EVERY package
@@ -351,7 +452,7 @@ a package."
   ;; the job a staging id belongs to, whose own stagings a clean-up keeps
   (if (vector? id) (first id) id))
 
-(defn- stage-package (registry name id)
+(defn- stage-package (registry name id &optional (library? false))
   "Install `name` through `registry`'s `:install` into a fresh staging directory and check it:
 `{:staging :result}` when it arrived AND enhances this bedit — the staging directory, the
 package in it under its name, and the install's result map — or a failure carrying the
@@ -369,7 +470,7 @@ package of an update of every package ([[staging-id]])."
     (let (result (try ((:install registry) name staging) (catch e (failure (error-message e)))))
       (if (failure? result)
         (do (file/rmdir staging) result)
-        (let (refusal (staged-refusal staging name))
+        (let (refusal (staged-refusal staging name library?))
           (if refusal
             (do (file/rmdir staging) (failure refusal " — not installed"))
             {:staging staging :result result}))))))
@@ -387,11 +488,11 @@ final one. Local file moves, so an applied review runs it on the loop."
     (file/rmdir staging)
     (assoc (:result staged) :path (package-dir name))))
 
-(defn- staged-install (registry name id)
+(defn- staged-install (registry name id &optional (library? false))
   "Install `name` through `registry`'s `:install`: staged ([[stage-package]]) and moved into
 place only when it arrived AND enhances this bedit ([[commit-staged]]). Answers the install's
 result map, or a failure carrying the reason — the installed copy, if there was one, untouched."
-  (let (staged (stage-package registry name id))
+  (let (staged (stage-package registry name id library?))
     (if (failure? staged) staged (commit-staged name staged))))
 
 (defn- fetch-list (registry)
@@ -404,10 +505,14 @@ result map, or a failure carrying the reason — the installed copy, if there wa
       else {:kind :list :available []})))
 
 (defn- install-job (registry name id)
+  ;; the plugin, then the hive libraries it depends on that are not installed yet
   (let (result (staged-install registry name id))
     (if (failure? result)
       {:kind :install :name name :error (error-message result)}
-      {:kind :install :name name :result result})))
+      {:kind :install
+       :name name
+       :result result
+       :dependencies (install-dependencies registry name id)})))
 
 (defn- review-job (registry name id)
   "An update to REVIEW: the new version staged ([[stage-package]]) and what it changes against
@@ -421,7 +526,10 @@ the installed copy read ([[package-review/review-of]]) — both here, in the tas
         {:kind :update
          :name name
          :staged staged
-         :review (package-review/review-of name (path/join (:staging staged) name) new-version)}))))
+         :review (package-review/review-of name (path/join (:staging staged) name) new-version)
+         ;; the libraries the new version needs are installed now, beside it: new ones only,
+         ;; so nothing installed changes until the update is applied
+         :dependencies (install-dependencies registry name id (:staging staged))}))))
 
 (defn- update-job (registry name id review?)
   ;; newer on the hive: install it — or, `review?`, stage it to be looked at first; current:
@@ -442,7 +550,10 @@ the installed copy read ([[package-review/review-of]]) — both here, in the tas
         (let (result (staged-install registry name id))
           (if (failure? result)
             {:kind :update :name name :error (error-message result)}
-            {:kind :update :name name :result result})))))
+            {:kind :update
+             :name name
+             :result result
+             :dependencies (install-dependencies registry name id)})))))
 
 (defn- update-all-job (registry id review?)
   "Update EVERY installed package (`M-x package-update-all`): each one's update as [[update-job]]
@@ -568,9 +679,10 @@ did not load — why not."
       (:current outcome) [m (str name " is already up to date")]
       else
         (let ([applied-model applied] (if update? (update-plugin! m name) [m (apply-plugin! name)])
-              note (if update?
-                     (str "updated " name " → " (:version (:result outcome)))
-                     (installed-note name (:result outcome))))
+              note (str (if update?
+                          (str "updated " name " → " (:version (:result outcome)))
+                          (installed-note name (:result outcome)))
+                     (dependencies-note (:dependencies outcome))))
           [applied-model
             (if (failure? applied)
               (str note " — but it was not applied: " (error-message applied))
@@ -658,10 +770,11 @@ anything is retired or deleted."
   (let (dir (removable-dir name))
     (if (nil? dir)
       [m false]
-      (let (retired (retire-package name))
+      (let (cleaned (before-retire m name)
+            retired (retire-package name))
         (registry/remove! :packages/status name)
         (file/rmdir dir)
-        [(ed-settle-package-buffers m name (:types retired)) true]))))
+        [(ed-settle-package-buffers cleaned name (:types retired)) true]))))
 
 ;; ---- reviewing an update before it is applied (Emacs bug #74604) -----------------
 ;; With `:package-review-updates` (the default) an update stages the new version off the loop

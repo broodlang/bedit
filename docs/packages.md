@@ -398,6 +398,16 @@ cannot say which package's code is running in such a process; Brood tracks it as
 (`../brood/docs/known-issues.md`). Register hooks as symbols (`'pkg/hook`), as every bedit
 registry asks, and this does not arise.
 
+## A plugin's library dependencies (built, partly)
+
+A plugin with code may use a library that is not bedit's: bedit-agent uses `agentkit`, which
+any Brood program driving a coding agent can use and which knows nothing of bedit. The plugin
+names it under `:dependencies`; a library INSTALLED BESIDE it in the package dir goes on the
+load path before the plugin loads (`packages/installed-dependencies`). A library needs no
+`:enhances`, and startup does not report it as a package it failed to load. Not built yet:
+installing a plugin does not fetch its dependencies from the hive, so the library is installed
+by hand beside it.
+
 ## A staged path
 
 1. **Stage 1 — the marker and a live install (no language change).** `:enhances` end to end
