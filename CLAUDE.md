@@ -346,6 +346,9 @@ src/lifeline.blsp           the editor loop under a SUPERVISOR (`main` runs `sup
 src/diagcheck.blsp          the advisory diagnostics CHECK, off the loop on the idle beat — in
                             the sandbox child for a brood buffer (its own session client), an
                             in-image task otherwise; folds into the model's diagnostics cache
+src/diagnostics.blsp        C-c ! *Diagnostics*: every warning and error in the buffer, one row per
+                            finding (`line:col` and the message) in a pane beside it, RET or a click
+                            visiting it; the command toggles
 src/eldoc.blsp              the idle beat's point-driven hints: the eldoc line (off the loop),
                             when an LSP signature hint is due, the inline completion preview
 src/treewarm.blsp           a large tree-sitter buffer's parse warmed off the loop, so the first
@@ -376,8 +379,9 @@ src/display-rules.blsp      `:display-buffer` rules as data: `*display-actions*`
 src/config.blsp             ~/.config/bedit/init.blsp — the declarative user config (data, not eval'd).
                             Every key is ONE `settings/define` (std `settings`, brood ADR-428):
                             its default, type and doc give the check, the fallback
-                            (`config/setting`) and the generated default file. A package
-                            declares its own under `:bedit/settings`. `:undo-limit` /
+                            (`config/setting`) and the generated default file. A FEATURE's
+                            switch is declared beside the feature, in its own module, under `config/*settings*`
+                            (glyphless, sibling, backup); a package declares its own under `:bedit/settings`. `:undo-limit` /
                             `:undo-strong-limit` are std/editor/buffer's undo cap (brood
                             ADR-550), `def`'d image-wide so buffer processes trim by them too
 src/userkeys.blsp           init.blsp's `:keys` (global-set-key) and `:mode-keys` (define-key in a
@@ -423,6 +427,9 @@ src/themes.blsp             the theme registry (M-x theme-select): a live picker
                             Mocha Calm` is the restrained-syntax option (Tonsky's Alabaster rules:
                             definitions coloured, calls plain, punctuation dimmed — the
                             `:syntax/definition` and `:syntax/punctuation` faces, brood ADR-614)
+src/appearance.blsp         the window's type setup (family, size, line height) and named presets
+                            over it (M-x preset-select / preset-save / preset-delete); a zoom is per
+                            PANE (C-x C-= / C-x C-- / C-x C-0, Ctrl+wheel), never the window's font
 src/ownership.blsp          WHO registered each registry row: every `register-*` (model's idle jobs,
                             task replies, event / down / timer handlers, exit queries, post-steps,
                             layout keepers, slot keepers, visit steps; statusbar chips; M-x commands; keymap profiles;
@@ -751,6 +758,9 @@ src/lifecycle.blsp          the file and session commands: write and revert a fi
                             quit with its questions (`ed-map-y-or-n`, what is still running)
 src/project-commands.blsp   C-x p f over a file list cached per root, refreshed off the loop; C-x p p
                             picks a project and what to do in it; C-x p k closes one
+src/project-search.blsp     C-x p g: the fastest searcher on PATH (ripgrep, git grep, grep) over the
+                            project root, its rows in *Project Search*, each a link to its file and
+                            line (C-c C-p edits them, searchedit)
 src/electric.blsp           electric pairs (Emacs electric-pair-mode) as POLICY: the pairs are the
                             MODE's — a layer's `:electric-pairs` (a `deflanguage`'s `:pairs`: `'`
                             where it opens a string, a backtick in Markdown / JS / Go / shell,
@@ -814,6 +824,10 @@ src/charset.blsp            the encodings a file may be in besides UTF-8 (Emacs'
                             character it has no form for, leaving the file (`file-content`, which a
                             root file's save shares). `tool-view` is the text as a program's captured
                             output shows the file, which is what the diff gutter compares with
+src/charset-tables.blsp     the single-byte codings as DATA, one row per coding, generated from
+                            iconv by tools/gen-charset-tables.sh: what bytes 128-255 mean, the names
+                            people call it, the letters a text in it is mostly made of
+                            (`charset/detect` reads that)
 src/filecoding.blsp         C-x RET f (the next save's coding) and C-x RET r (read the file again as
                             another coding or the hex view): how a file reads is a guess, and this
                             overrules it either way. A file edited as root reads through sudo
@@ -872,6 +886,9 @@ src/menu.blsp               the right-click context menu's model ops (open / mov
                             close); an item names its command by SYMBOL, resolved when it
                             runs, so a redefined command reaches the menu too
 src/keymaps.blsp            keybinding profiles (emacs / modal vim) as model-scope layers
+src/vim.blsp                the Vim grammar over the modal profile: `[count] operator [count]
+                            motion|text-object`, `.` repeat, the normal-mode commands and the mode
+                            transitions (Esc, I, A, o, O, v)
 src/interactive.blsp        the `defcommand` macro + the M-x command registry, command traits, and REPEAT MAPS
                             (`declare-repeat-map`, Emacs repeat-map: after C-x C-M-+ the keys + / - / 0 repeat)
 src/transient.blsp          TRANSIENT MENUS (magit's `P`): the editor half of
@@ -1134,6 +1151,10 @@ src/lsp-servers.blsp        the servers as the model holds them: where each star
                             buffer (`ed-lsp-ask-server-at`, `ed-lsp-push-text-at`), and which of a
                             server's buffers are on screen (`ed-lsp-shown`, what a refresh re-asks). lsp-commands is the
                             commands and the folds of their answers
+src/lsp-commands.blsp       the editor's side of a language server: definition and back, references,
+                            imenu, hover, signature help, code actions, rename, format, and the
+                            folds of the server's replies, notices, diagnostics and edits; the
+                            `LspRequest` fold impls
 src/lsp-requests.blsp       the LSP request-kind records + `LspRequest` ability — the shape/fold vocabulary
                             shared by lsp (connection side) and lsp-commands (model side); eager-loaded so
                             lsp-commands can register fold impls while lsp stays deferred
@@ -1692,6 +1713,12 @@ src/beam.blsp               the BEAM, from the editor. C-c b p processes · C-c 
                             `:erpc` for every eval and observation) — node typed not
                             discovered, cookie asked for not assumed, and the mode line
                             names the node the whole time, because the risk is forgetting
+src/process-list.blsp       M-x list-processes: the runtime's live processes in a read-only,
+                            killable *Process List* (mailbox depth, reductions per second) to find a
+                            runaway evaluation; the rate is shared with the BEAM view
+src/attach.blsp             which runtime is my code running in: a session pointed at a process
+                            bedit did not start (the Elixir agent at a BEAM node, the Brood sandbox
+                            at a peer), named on the mode line the whole time
 src/web.blsp                live HTTP mirror of the selected buffer (C-x w)
 src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclient model over node links.
                             A TCP session hands out GUEST cookies (brood ADR-415; one per
@@ -1719,11 +1746,27 @@ src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclien
                             a snapshot, `ed-served-retain-step`). A shared session saves from its
                             collab registry and restarts with every document it had open linked
                             again (`ed-collab-reopen`)
+src/guest.blsp              a guest's session (brood ADR-415): editing what it was given, nothing
+                            more — the allowlist (`ed-guest-allows?`, the `:guest` command trait)
+                            that tests/guest_allowed.txt pins
 src/collab.blsp             shared-buffer collaboration: presence carets, delta merges, follow/mirror
 src/collabview.blsp         collab presence as the panes paint it: other participants' selections
                             (a highlight source) and carets with their name tags (a `:with-text`
                             pane layer)
+src/collab-commands.blsp    the shared-session commands: M-x share-session, follow or mirror a
+                            participant, stop sharing, what the session is doing; the mechanism
+                            (presence, the file registry, follow) is `collab`'s
 tests/*_test.blsp           pure model/view tests, one suite per area (no window needed)
+tests/support/testkit.blsp  what the tests share: `m-of`, `cur`, `press` (keys through the real dispatch at
+                            80×24), `type-str`, `after`, and `said` (the message shown, beside a standing
+                            prompt or on the echo line) — `(:use testkit :only [...])`; tests/support is
+                            on project.blsp's `:source-paths`, and no src/ module names it
+tests/path_prompt_guard_test  no bare minibuffer line asks for a file, a directory or a path: every one
+                            is `pool/ed-path-prompt` (an exception says why in `*not-a-path*`)
+tests/layout_doc_test       every src/ module has an entry in this Layout
+tools/affected-tests.sh     the test files a change reaches — its own, every test naming a changed module
+                            (`:use` or qualified), the registry pins — and `--run` runs each by itself:
+                            the sweep before a push
 tests/window_paint_test     what the window PAINTS, read from pixels: the real view for a model
                             painted by brood's window painter into memory (`gui/render-frame`,
                             brood ADR-609) at a real size with bedit's font, inset and background —
@@ -1801,12 +1844,17 @@ nest test --cover        # function-level coverage: what the suite never calls
 nest test --repeat-until-failure 5 --seed 0   # shake out a flaky/order-dependent test
 nest check               # advisory type/lint check
 make drive               # live pty drivers: the real editor, driven (tools/README.md)
+tools/affected-tests.sh --run   # every test file the change reaches, one at a time (the pre-push sweep)
 ```
 
 **Verify the GUI only via the installed `nest`** (or a `cargo build --features
 brood/gui` in ../brood). A plain `cargo run -p nest -- test` rebuilds
 `target/debug/nest` *without* the GUI feature and clobbers the installed binary's
 counterpart — it won't reflect the windowed build.
+
+**CI builds brood's `last-green`, not `main`** — the newest brood commit whose own CI passed
+every job (brood's ci.yml advances the branch). A bedit change that needs a new brood name is
+pushed after brood's run for that commit is green, or bedit's CI reports it unbound.
 
 **The tree is `nest format`-clean, and CI enforces it** (`nest format --check`). Run
 `nest format --changed` before committing — the whole tree was reformatted once, on
