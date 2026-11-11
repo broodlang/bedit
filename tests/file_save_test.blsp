@@ -10,6 +10,7 @@
   (:use pool) ; ed-visit-file / *read-off-loop* / ed-apply-read
   (:use file-save) ; ed-save-buf-at / *write-off-loop* / *write-file* / ed-apply-save
   (:use lifecycle :only []) ; cmd-save / cmd-quit
+  (:use backup :only []) ; backup-path
   (:use main :only []) ; the released image: every row loaded
   (:use editor/buffer))
 
@@ -261,3 +262,62 @@ a key at a time ranks the candidates of every directory on the way, a second of 
                      (fn (buffer) (goto-char buffer 4)))))
       (refute (:read-proc opened))
       (assert= (buffer-point (ed-current-buf opened)) 4))))
+
+;; C-x C-w replaced a file already there without a word, and Enter took the first entry the
+;; prompt listed: `notes` typed beside `notes-old.md` wrote over notes-old.md. Emacs's
+;; write-file reads the line as typed and asks "File exists; overwrite?".
+(describe "C-x C-w never replaces a file unasked"
+  (test "the prompt is a new name's: Enter takes the line, not the first entry listed"
+    (let ([m _] (visited "old\n")
+          asked (lifecycle/cmd-write-file m nil))
+      (assert= (minibuffer/mb-sel (:minibuffer asked)) -1)))
+  (test "an existing file is asked about; n leaves it, y writes over it"
+    (let ([m path] (visited "old\n")
+          target (path/join (path/dirname path) "other.txt")
+          _ (file/spit target "keep\n")
+          asked (binding (*write-off-loop* true) (write-to (type-key m "x") target)))
+      (is (includes? (:echo asked) "exists; overwrite?"))
+      (refute (:save-proc asked))
+      (let (declined (type-key asked "n"))
+        (assert= (file/slurp target) "keep\n")
+        (assert= (buffer-file (ed-current-buf declined)) path))
+      (let (landed (landed-save (binding (*write-off-loop* true) (type-key asked "y"))))
+        (assert= (file/slurp target) "xold\n")
+        (assert= (buffer-file (ed-current-buf landed)) target))))
+  (test "the buffer's own file is written without a question"
+    (let ([m path] (visited "old\n")
+          landed (landed-save (binding (*write-off-loop* true) (write-to (type-key m "x") path))))
+      (assert= (file/slurp path) "xold\n")
+      (refute (buffer-modified? (ed-current-buf landed)))))
+  (test "a directory takes the file under its name"
+    (let ([m path] (visited "old\n")
+          dir (path/join (path/dirname path) "into")
+          _ (file/mkdir dir)
+          landed (landed-save (binding (*write-off-loop* true) (write-to m dir))))
+      (assert= (file/slurp (path/join dir "notes.txt")) "old\n")
+      (assert= (buffer-file (ed-current-buf landed)) (path/join dir "notes.txt")))))
+
+;; A save that replaced the wrong text could not be undone without version control: the sidecar
+;; keeps what was typed, nothing kept what was on disk. Emacs's make-backup-files.
+(describe "the first save over a file backs it up"
+  (test "the file as it was is copied to state/backups, owner-only, once a session"
+    (let ([m path] (visited "old\n")
+          on (assoc m :make-backup-files true)
+          backup (backup/backup-path path)
+          first-save (landed-save (binding (*write-off-loop* true)
+                                    (lifecycle/cmd-save (type-key on "x") nil))))
+      (assert= (file/slurp backup) "old\n")
+      (assert= (file/slurp path) "xold\n")
+      (assert= (math/mod (:mode (file/stat backup)) 512) 384)
+      ;; the second save keeps the first backup: it is the file as the session found it
+      (landed-save (binding (*write-off-loop* true)
+                     (lifecycle/cmd-save (type-key first-save "y") nil)))
+      (assert= (file/slurp backup) "old\n")
+      (assert= (file/slurp path) "xyold\n")))
+  (test "off, nothing is backed up"
+    (let ([m path] (visited "old\n"))
+      (landed-save (binding (*write-off-loop* true) (lifecycle/cmd-save (type-key m "x") nil)))
+      (refute (file/exists? (backup/backup-path path)))))
+  (test "a backup's name is the whole path, so two notes.txt never share one"
+    (assert= (backup/backup-name "/a/notes.txt") "%2Fa%2Fnotes.txt~")
+    (refute (= (backup/backup-name "/a/notes.txt") (backup/backup-name "/b/notes.txt")))))
