@@ -612,7 +612,10 @@ src/glyphless.blsp          the invisible format characters SHOWN (Emacs glyphle
                             from `:glyphless-chars`); this module gives the escape its face, and a
                             bidi control (Trojan Source) a hazard face. The minibuffer shows them too.
                             A no-break space (U+00A0, U+202F) is underlined in the escape colour
-                            (Emacs nobreak-char-display, `:nobreak-char-display`, on by default)
+                            (Emacs nobreak-char-display, `:nobreak-char-display`, on by default).
+                            A WORD that mixes scripts the way a homoglyph does (a Cyrillic `а` in
+                            `pаypal`, brood's `string/mixed-script?`, ADR-710) has its odd letters out
+                            in the hazard face (`:mixed-script-warning`, on by default)
 src/rainbow.blsp             a tree-sitter buffer's brackets coloured by depth (Emacs rainbow-delimiters,
                             `:rainbow-delimiters`): delimiter tokens of the held parse, the window's top
                             depth from the tree; the Lisp modes colour theirs in their own lexer
