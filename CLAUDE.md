@@ -413,6 +413,12 @@ src/slowlog.blsp            the SLOW-TURN LOG: every turn of the loop the watchd
                             few hundred keys, quitting records the rest, and M-x slow-turns heads
                             with p50 / p99 / p99.9 over every session (M-x latency: this one).
                             Measuring is for CI or the other machine: tests feed made-up histograms
+src/turnprofile.blsp        WHERE A SLOW TURN'S TIME WENT: each turn's update and view fill a table of the
+                            loop's own — the update's stages (fold, post-steps, spans, tail) and every
+                            hook `model/ed-call-hook` / `ed-call-deferred` ran (post-steps, timers, chips,
+                            highlight sources, pane layers), by name with time and calls; a phase past
+                            the watchdog's 50 ms keeps its costliest parts, which the slow-turn log takes
+                            with the report (`slowlog`: *Messages* and M-x slow-turns say where it went)
 src/theme.blsp              every colour the editor paints (Catppuccin Mocha), referenced by role;
                             the TEXT-EMPHASIS TIERS chrome names (`*fg-code*` · `*fg-chrome*` ·
                             `*fg-chrome-dim*` · `*fg-tertiary*` · `*fg-decor*`, APCA Lc 75 / 60 / 45 /

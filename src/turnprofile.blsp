@@ -1,0 +1,86 @@
+;; WHERE A SLOW TURN'S TIME WENT. The watchdog (brood ADR-490) says which input a slow turn of
+;; the loop was folding, or that the view was slow, and how long it took — not where the time
+;; went. A turn's update and its view each fill a table of this loop's own (`begin!`): the
+;; update's stages (`stage!`) and every hook it called (`note!` — post-steps, timers, chips,
+;; highlight sources, pane layers: whatever `model/ed-call-hook` and `model/ed-call-deferred`
+;; run), each by name with its time and calls. A phase that took longer than the watchdog's line
+;; leaves its breakdown behind (`finish!`), and the slow-turn log takes it with the report
+;; (`slowlog/ed-ev-ui-slow`): `update 64 ms: post-steps 51 · bedit-agent/chip/tick 44 ×3`.
+;;
+;; A table, not the model: hooks run deep inside model functions that answer other things
+;; (a chip's segment, a highlight source's ranges), and the time is spent there. Each loop —
+;; a second frame has its own — keys its table by its pid. Costs two clock reads and two table
+;; increments a hook call.
+
+(defmodule turnprofile
+  "Where a slow turn of the editor loop spent its time: the update's stages and every hook it
+called, kept for the slow-turn log.")
+
+;; The watchdog's line (brood's `editor/ui/*slow-ms*`): a phase slower than this keeps its
+;; breakdown.
+(def *slow-ns* (* 50 1000000))
+
+;; How many of a phase's costliest parts a slow report keeps.
+(def *kept-parts* 12)
+
+(defn- table-of (pid)
+  ;; the table `pid`'s loop is filling now, or nil before its first turn
+  (registry/lookup :turnprofile/current pid))
+
+(defn begin! ()
+  "Start this loop's next phase (an update or a view) with an empty table."
+  (let (old (table-of (self)))
+    (when old (table/drop old))
+    (registry/put :turnprofile/current (self) (table/new))))
+
+(defn note! (name ns)
+  "Add `ns` nanoseconds and one call to `name` in this loop's phase, when one is being kept."
+  (let (counts (table-of (self)))
+    (when counts
+      (table/incr counts name ns)
+      (table/incr counts [:calls name] 1))))
+
+(defn timed (name thunk)
+  "`(thunk)`, its time noted under `name`."
+  (let (started (os/now-ns)
+        result (thunk))
+    (note! name (- (os/now-ns) started))
+    result))
+
+(defn stage! (name ns)
+  "Note one of the update's own stages (`fold`, `post-steps`): told apart from a hook's name."
+  (note! (str "stage " name) ns))
+
+(defn- parts (counts)
+  ;; `[[name ms calls] …]`, costliest first, at most `*kept-parts*`
+  (let (all (table/snapshot counts)
+        named (seq/filter (vec all) (fn ([key _]) (not (vector? key)))))
+    (vec (take (map (seq/sort-by named (fn ([_ ns]) (- ns)))
+                 (fn ([name ns])
+                   [(->string name)
+                     (/ (math/round (/ ns 100000)) 10)
+                     (or (get all [:calls name]) 1)]))
+           *kept-parts*))))
+
+(defn finish! (phase ns)
+  "End this loop's `phase` (`\"update\"`, `\"view\"`) after `ns` nanoseconds: past the watchdog's
+line its breakdown is kept for the slow-turn report ([[take-breakdown]])."
+  (let (counts (table-of (self)))
+    (when (and counts (> ns *slow-ns*))
+      (registry/put :turnprofile/slow [(self) phase] (parts counts)))))
+
+(defn take-breakdown (phase)
+  "The breakdown this loop's last slow `phase` left (`[[name ms calls] …]`), taken — nil when
+none is waiting."
+  (let (key [(self) phase]
+        kept (registry/lookup :turnprofile/slow key))
+    (when kept (registry/remove :turnprofile/slow key))
+    kept))
+
+(defn parts-line (parts)
+  "A breakdown as one line: `stage post-steps 51 ms · bedit-agent/chip/tick 44 ms ×3`.
+
+    (turnprofile/parts-line [[\"stage fold\" 3.2 1] [\"git/tick\" 40 3]])   ;=> \"stage fold 3.2 ms · git/tick 40 ms ×3\""
+  (string/join (map parts
+                 (fn ([name ms calls]) (str name " " ms " ms" (if (> calls 1) (str " ×" calls) ""))))
+    " · "))
