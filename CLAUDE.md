@@ -1308,6 +1308,9 @@ src/ansicolor.blsp          a program's ANSI colours on the buffer its output st
                             frame opened later too) keep them on the text — nothing carries them here.
                             A lone `\r` rewrites its output line (`carriage` / `insert-output`,
                             Emacs's comint-carriage-motion): a progress counter shows one count
+                            — written as PROGRAM OUTPUT (brood's `replace-program-output`,
+                            ADR-712): into every undo snapshot, recording nothing, so undo in a
+                            shell takes back only your typing; the output cap's head cut too
 src/wrap.blsp              where a line falls on screen rows: the pure break rule (a line →
                             `[from to]` row segments, wrapped at the pane width where Unicode lets a line break —
                             UAX #14, brood's `string/break-opportunities`: CJK between characters)
