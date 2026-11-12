@@ -1092,7 +1092,7 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   every key and never forgets) · `defmemo` from the `memo` module (`(:use memo)`, then
   `(defmemo rows-of 8 (rope width) …)`: a `defn` that remembers its last N calls compared
   by `=` — bounded, and immediate for the same big value such as a rope) ·
-  `registry` for tables your modules fill as they load (`(registry/put! :app/hooks :save
+  `registry` for tables your modules fill as they load (`(registry/put :app/hooks :save
   'app/on-save)`, read with `registry/entries` / `registry/lookup` / `registry/ranked` — by an
   entry's `:rank`): atomic across processes and carried by the image, which a `defonce` + `def`
   table is not. Store hooks as symbols and call them with `(reflect/call-if-bound sym
@@ -1112,8 +1112,8 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
 - **string**: the string surface lives in the `string` module (ADR-230), so these are
   **`string/`-qualified** unless listed as bare below: `string/length`
   `string/substring` `string/char-at` (returns a 1-char *string* — Brood has no char
-  type) `string/split` `string/join` `string/replace` `string/trim` `string/triml`
-  `string/trimr` `string/blank?` `string/upper` `string/lower`
+  type) `string/split` `string/join` `string/replace` `string/trim` `string/trim-left`
+  `string/trim-right` `string/blank?` `string/upper` `string/lower`
   `string/starts-with?` `string/ends-with?` `string/->list` `string/list->`
   `string/->bytes` `string/bytes->`.
   **Bare (core, not in the module):** `str` `pr-str` `index-of` `includes?`

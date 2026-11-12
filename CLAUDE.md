@@ -477,7 +477,7 @@ src/packages.blsp           bedit's package manager (M-x package-list): install 
                             every std registry entry its loads wrote DIRECTLY (brood's
                             `registry/written-by` over its modules and, for a file with no
                             `defmodule`, the file's path — editor/layers' tables, faces, a
-                            `registry/put!` of its own) taken back, a map entry it replaced given
+                            `registry/put` of its own) taken back, a map entry it replaced given
                             to the layer below it through a per-entry STACK (two packages writing
                             one entry come off in either order), conditional on the entry still
                             being the package's (brood ADR-582); any row
@@ -1773,7 +1773,7 @@ tests/layout_doc_test       every src/ module has an entry in this Layout
 tools/affected-tests.sh     the test files a change reaches — its own, every test naming a changed module
                             (`:use` or qualified), the registry pins — and `--run` runs each by itself:
                             the sweep before a push, and the changed modules' docstring examples
-                            (`nest test --doc`, a nest from brood 9755cbc78 on)
+                            (`nest doctest FILE.blsp`)
 tests/window_paint_test     what the window PAINTS, read from pixels: the real view for a model
                             painted by brood's window painter into memory (`gui/render-frame`,
                             brood ADR-609) at a real size with bedit's font, inset and background —

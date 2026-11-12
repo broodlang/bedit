@@ -90,14 +90,14 @@ for test_file in $selected; do
         printf '%s\n' "$output" | grep -E 'test failed|assert:|actual:|expect:|error' | head -12 | sed 's/^/     /'
     fi
 done
-# the docstring examples of the changed src/ modules (`nest test --doc`, brood 9755cbc78): an
-# example a module's own test file never runs; skipped, and said, on an older nest
+# the docstring examples of the changed src/ modules (`nest doctest FILE.blsp`, brood ADR-716): an
+# example a module's own test file never runs; skipped, and said, on a nest without it
 doc_files=$(printf '%s\n' "$changed" | grep -E '^src/.*\.blsp$' | while read -r path; do [ -f "$path" ] && echo "$path"; done)
 if [ -n "$doc_files" ]; then
     # shellcheck disable=SC2086
-    doc_output=$(BROOD_GUI_HEADLESS=1 nest test --doc $doc_files 2>&1)
-    if printf '%s\n' "$doc_output" | grep -q '^Usage: nest test'; then
-        echo "skip doc examples (this nest has no test --doc)"
+    doc_output=$(BROOD_GUI_HEADLESS=1 nest doctest $doc_files 2>&1)
+    if printf '%s\n' "$doc_output" | grep -q '^Usage: nest doctest'; then
+        echo "skip doc examples (this nest's doctest takes no source files)"
     elif printf '%s\n' "$doc_output" | grep -qE ' 0 failing example'; then
         echo "ok   doc examples of $(echo $doc_files | wc -w) src file(s)"
     else

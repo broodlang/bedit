@@ -372,7 +372,7 @@ before the package loaded:
   the command or hook that ran (`with-symbol-claimant`). Every row a package claimed goes; a
   core row it replaced comes back.
 - **std registries it wrote directly** (`editor/layers`' tables, faces, abilities, a
-  `registry/put!` of its own) are found with Brood's `registry/written-by` (ADR-582): the
+  `registry/put` of its own) are found with Brood's `registry/written-by` (ADR-582): the
   kernel credits each write a load made to its module, or to the FILE for a file with no
   `defmodule`, so the package's writers are its module symbols and its files' absolute paths
   (`package-ledger/package-writers`). A list member is taken back (`registry/retract`). A map entry

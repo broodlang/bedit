@@ -121,7 +121,7 @@ Option-as-Meta and Windows's AltGr (brood ADR-541).
 | paths: home, temp, absolute, `~` (brood ADR-592) | ✅ | ✅ — `C:/…` and `//server/share/` roots, a root its own parent; the home is `%USERPROFILE%` when no `HOME` (run with `HOME` unset) |
 | absolute-path checks (find-file, results jumps, git file prompts, completion, marginalia) | ✅ | ✅ `path/absolute?`, so `C:/x` is not read as relative |
 | the walk up to a project root | ✅ | ✅ ends at `C:/` |
-| LSP file URIs | ✅ | ✅ `file:///C:/x`, a server's `file:///c%3A/x` read back (brood `path/to-file-uri` / `from-file-uri`) — unit-tested; no language server is run in CI |
+| LSP file URIs | ✅ | ✅ `file:///C:/x`, a server's `file:///c%3A/x` read back (brood `path/->file-uri` / `file-uri->`) — unit-tested; no language server is run in CI |
 | compile / results locations | ✅ | ✅ a drive path (`C:\src\a.c:12:5:`) is one file |
 | CRLF and BOM kept through find-file / save | ✅ | ✅ |
 | names with spaces and non-ASCII | ✅ | ✅ |
