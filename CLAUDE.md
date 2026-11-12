@@ -116,7 +116,8 @@ src/model.blsp              the ui-run model: buffer pool, panes, *Messages*,
                             event handlers, feature timers, process deaths
                             (`register-down-handler`), what is still running when
                             C-x C-c asks (`register-exit-query`: a compile, a test run,
-                            the app, a terminal, a push), what follows a KILL
+                            the app, a terminal, a push), what C-x k asks before a kill
+                            (`register-kill-query`: an agent mid-turn), what follows a KILL
                             (`register-slot-keeper`, `{:order :slots :drop}`, run in order
                             by `ed-drop-slot`: everything kept by pool index goes through
                             one `shift-slots` — collab before hosted before the caches) and
