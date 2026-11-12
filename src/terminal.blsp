@@ -144,14 +144,33 @@ palette ahead of it, and start a fresh eviction list."
       (terminal/term-screen-event (:buffer state)
         lines
         (assoc (vt/screen (:vt state) palette) :password (term-password state))))
-    (assoc state :evicted [])))
+    (assoc state :evicted [] :rendered-at (os/now))))
+
+;; A terminal no window shows still reads everything its program writes — the emulator keeps
+;; the screen and the history — but sends the editor a screen at most every
+;; `*term-hidden-render-ms*`: every frame sent costs the editor's loop an update and a paint, and
+;; a program animating off screen (a spinner, a timer) took the loop from the keys typed
+;; elsewhere. It is told when it is shown again (`[:term-shown true]`) and sends one at once.
+(def *term-hidden-render-ms* 1000)
+
+(defn- term-quiet-ms (state)
+  ;; how long the drain waits for more output before it renders: the coalescing pause while
+  ;; shown; while hidden, until a second has passed since the last render
+  (let (left (- (+ (or (:rendered-at state) 0) *term-hidden-render-ms*) (os/now)))
+    (if (and (= false (:shown state)) (> left *term-coalesce-ms*)) left *term-coalesce-ms*)))
+
+(defn- term-shown (state shown?)
+  ;; the editor said whether a window shows this terminal: shown again, the screen goes at once
+  (let (told (assoc state :shown shown?)) (if shown? (term-render told) told)))
 
 (defn- term-drain (state)
   "After a chunk: keep folding chunks that are already queued (a program writes a frame
-as several), then render once the pipe goes quiet."
+as several), then render once the pipe goes quiet — and while no window shows the terminal,
+no sooner than a second after the last render ([[term-quiet-ms]])."
   (receive
     ([:proc _p data] (term-drain (term-feed state data)))
-    (after *term-coalesce-ms* (term-render state))))
+    ([:term-shown shown?] (let (told (term-shown state shown?)) (if shown? told (term-drain told))))
+    (after (math/round (term-quiet-ms state)) (term-render state))))
 
 (defn- term-loop (state)
   (receive
@@ -163,6 +182,7 @@ as several), then render once the pipe goes quiet."
                        (term-write state (or (vt/key->bytes key (:vt state)) ""))
                        (term-loop state)))
     ([:term-paste text] (do (term-write state (vt/paste->bytes text (:vt state))) (term-loop state)))
+    ([:term-shown shown?] (term-loop (term-shown state shown?)))
     ;; line mode: the whole line, as typed, ended the way RET ends it
     ([:term-line text] (do (term-write state (str text "\r")) (term-loop state)))
     ([:term-mouse action button row col mods] (do
@@ -968,4 +988,29 @@ the width it believes it has), so every terminal whose panes changed size is tol
   (if (ed-terminals? m) (term-repalette m) m))
 
 (register-resize-step :terminals 'terminal/term-resized)
+
+(defn term-sync-shown (m)
+  "Tell each terminal's emulator when a window starts or stops showing it (`[:term-shown …]`),
+noted on the buffer as `:term-shown` so it is said once per change: an emulator no window shows
+sends a screen at most every second, and every screen costs the loop an update and a paint.
+After every event, as a buffer is switched or a window closed; nothing without a terminal."
+  (let (tree (:layout m))
+    (if (or (nil? tree) (not (ed-terminals? m)))
+      m
+      (let (shown (into #{}
+                    (map (editor/pane/pane-leaf-paths tree)
+                      (fn (path) (:buffer (editor/pane/pane-payload-at tree path))))))
+        (fold (range (count (:buffers m)))
+          m
+          (fn (acc index)
+            (let (buffer (ed-buf-at acc index)
+                  pid (when (term-buffer? buffer) (live-program buffer))
+                  now? (contains? shown index))
+              (if (or (nil? pid) (= now? (not (= false (:term-shown buffer)))))
+                acc
+                (do
+                  (send pid [:term-shown now?])
+                  (ed-set-buf-at acc index (assoc buffer :term-shown now?)))))))))))
+
+(register-post-step :terminal-shown {:order 85 :run 'terminal/term-sync-shown})
 (register-palette-step :terminals 'terminal/term-recoloured)

@@ -1536,7 +1536,7 @@ src/terminal.blsp           a TERMINAL buffer (C-x p t, C-x p r, C-u M-x term; a
                             buffer's tail. CHAR mode (a full-screen program: claude,
                             htop, vim): every key goes to it (`term-overlay`); C-x and M-x
                             stay the editor's (`*term-editor-keys*`), C-y pastes, C-x c is the C-c map, C-x C-x /
-                            C-x C-y send the literal. LINE mode (the project REPL: iex -S
+                            C-x C-y send the literal. A terminal no window shows sends a screen at most once a second (`term-sync-shown`), one at once when shown again. LINE mode (the project REPL: iex -S
                             mix, nest repl): the input after the program's prompt is
                             bedit's, with comint's history and boundary keys, RET sends
                             it — C-c C-j / C-c C-k switch. A PASSWORD the program asks for
