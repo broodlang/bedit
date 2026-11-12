@@ -78,6 +78,17 @@ strings: `[[agentkit :version \"0.1.0\"]]` names `agentkit`."
                  (when (or (symbol? head) (string? head)) (str head))))))
       [])))
 
+(defn library? (name)
+  "Whether installed package `name` is a LIBRARY: there for the plugins that use it, not
+declaring that it enhances bedit — what an update installs without asking that it does."
+  (let (enhances (manifest-value name :enhances))
+    (not (and (map? enhances) (contains? enhances (symbol *bedit-name*))))))
+
+(defn dependents (name)
+  "The installed packages that depend on package `name`, sorted."
+  (vec (sort (seq/filter (installed-packages)
+               (fn (other) (includes? (dependency-names other) name))))))
+
 (defn installed-dependencies (name)
   "The libraries package `name` depends on that are installed beside it, which go on the load
 path before it loads. A library is a package in the package dir that need not `:enhances`
@@ -495,14 +506,29 @@ result map, or a failure carrying the reason — the installed copy, if there wa
   (let (staged (stage-package registry name id library?))
     (if (failure? staged) staged (commit-staged name staged))))
 
+(defn- hive-versions (registry names)
+  ;; the hive's latest version of each of `names` — `{name version}`, nil for one it does not
+  ;; publish or could not say about
+  (into {}
+    (map names
+      (fn (name)
+        (let (latest (check-allow :discarded-catch
+                       (try ((:latest-version registry) name) (catch _ nil))))
+          [name (if (string? latest) latest nil)])))))
+
 (defn- fetch-list (registry)
-  ;; the hive's bedit packages, or the reason it could not say
+  ;; the hive's bedit packages, or the reason it could not say — and, for each installed
+  ;; package not among them (a library a plugin uses, or a local one), whether the hive has it:
+  ;; the enhancers list names only plugins
   (let (listed (try ((:enhancers registry) *bedit-name*) (catch e (failure (error-message e)))))
-    (cond
-      (failure? listed) {:kind :list :error (error-message listed)}
-      (or (list? listed) (vector? listed)) {:kind :list :available (vec listed)}
-      ;; nil: a registry answer with no `:packages` — nothing published yet
-      else {:kind :list :available []})))
+    (if (failure? listed)
+      {:kind :list :error (error-message listed)}
+      (let (available (if (or (list? listed) (vector? listed)) (vec listed) [])
+            names (map available :name))
+        {:kind :list
+         :available available
+         :others (hive-versions registry
+                   (seq/reject (installed-packages) (fn (name) (includes? names name))))}))))
 
 (defn- install-job (registry name id)
   ;; the plugin, then the hive libraries it depends on that are not installed yet
@@ -518,7 +544,7 @@ result map, or a failure carrying the reason — the installed copy, if there wa
   "An update to REVIEW: the new version staged ([[stage-package]]) and what it changes against
 the installed copy read ([[package-review/review-of]]) — both here, in the task — as
 `{:kind :update :name :staged :review}`, nothing moved into place."
-  (let (staged (stage-package registry name id))
+  (let (staged (stage-package registry name id (library? name)))
     (if (failure? staged)
       {:kind :update :name name :error (error-message staged)}
       (let (new-version (or (:version (:result staged))
@@ -547,7 +573,7 @@ the installed copy read ([[package-review/review-of]]) — both here, in the tas
         {:kind :update :name name :current true}
       review? (review-job registry name id)
       else
-        (let (result (staged-install registry name id))
+        (let (result (staged-install registry name id (library? name)))
           (if (failure? result)
             {:kind :update :name name :error (error-message result)}
             {:kind :update
@@ -722,6 +748,7 @@ died or timed out, said as such."
                 note))
             (refill-package-prompt (refresh-packages (assoc released
                                                        :package-list (:available outcome)
+                                                       :package-others (or (:others outcome) {})
                                                        :package-status nil))))
         ;; an update to review: staged, shown, applied only when asked
         (:staged outcome) (settle-package-prompt (refresh-packages (show-review released outcome)))
@@ -1041,11 +1068,28 @@ package it will not activate."
       (assoc row :status (:status status) :description (str "(" (:reason status) ")"))
       row)))
 
-(defn package-rows (available)
+(defn- other-description (name on-hive?)
+  ;; an installed package the hive's plugin list does not name: a library says who uses it,
+  ;; one the hive lacks says so; then its own description
+  (let (users (dependents name)
+        own (or (manifest-value name :description) "")
+        lead (cond
+               (not (empty? users)) (str "library for " (string/join users ", "))
+               (library? name) "library"
+               else nil)
+        where (if on-hive? nil "not on the hive"))
+    (string/join (seq/keep [(when (or lead where)
+                              (str "(" (string/join (seq/keep [lead where] identity) ", ") ")"))
+                             (when (not (string/blank? own)) own)]
+                   identity)
+      " ")))
+
+(defn package-rows (available &optional (others {}))
   "The merged package list for the browser: every hive bedit package in `available` (the
 registry's `{:name :latest_version :description}` maps, as last fetched) annotated with its
-install status as the DISK has it now, plus any installed package not among them (a local/dev
-one, or every installed one before the list has arrived). Each row is
+install status as the DISK has it now, plus any installed package not among them — a library a
+plugin uses, a local one, or every installed one before the list has arrived — its latest
+version from `others` (`{name version}`, what the list fetch asked the hive). Each row is
 `{:name :installed :latest :status :description}`; an installed package this image could not
 load is `:broken` or `:incompatible`, its description the reason ([[package-status]])."
   (let (available-names (map available :name)
@@ -1062,13 +1106,18 @@ load is `:broken` or `:incompatible`, its description the reason ([[package-stat
         orphans (seq/keep (installed-packages)
                   (fn (name)
                     (when (not (includes? available-names name))
-                      {:name name
-                       :installed (installed-version name)
-                       :latest nil
-                       :description "(installed — not on the registry)"
-                       :status :installed}))))
+                      (let (installed (installed-version name)
+                            latest (get others name))
+                        {:name name
+                         :installed installed
+                         :latest latest
+                         ;; one the hive was never asked about is not said to be missing there
+                         :description (other-description name
+                                        (or (not (contains? others name)) (string? latest)))
+                         :status (row-status installed latest)})))))
     (map (append from-hive orphans) with-load-status)))
 
+(sig pad (any int -> string))
 (defn- pad (s width)
   (let (text (str (or s "-")))
     (if (>= (count text) width) text (str text (string/repeat " " (- width (count text)))))))
@@ -1081,24 +1130,29 @@ load is `:broken` or `:incompatible`, its description the reason ([[package-stat
     :incompatible "incompatible"
     "available"))
 
-(defn- render-package-row (row)
+;; The columns before the description: a heading and what a row shows in it. Each is as wide
+;; as its widest cell, two spaces apart.
+(def- *package-columns*
+  [["Status" (fn (row) (status-label (:status row)))]
+    ["Package" :name]
+    ["Installed" (fn (row) (or (:installed row) "-"))]
+    ["Latest" (fn (row) (or (:latest row) "-"))]])
+
+(defn- column-widths (rows)
+  (map *package-columns*
+    (fn ([heading cell])
+      (reduce (map rows (fn (row) (count (str (cell row)))))
+        (count heading)
+        (fn (widest width) (if (> width widest) width widest))))))
+
+(defn- render-line (cells widths last-cell)
   (str "  "
-    (pad (status-label (:status row)) 13)
-    (pad (:name row) 30)
-    (pad (:installed row) 11)
-    (pad (:latest row) 10)
-    (:description row)))
+    (string/join (map (seq/zip cells widths) (fn ([text width]) (pad text width))) "  ")
+    "  "
+    last-cell))
 
 (def *packages-title*
   "  bedit packages — RET describe · i install · d remove · u update · U update all · g refresh · q quit")
-
-(def *packages-columns*
-  (str "  "
-    (pad "Status" 13)
-    (pad "Package" 30)
-    (pad "Installed" 11)
-    (pad "Latest" 10)
-    "Description"))
 
 (def *packages-header-lines* 3)
 ;; The title, the STATUS line (what is running, how the last job ended — blank when there is
@@ -1107,10 +1161,16 @@ load is `:broken` or `:incompatible`, its description the reason ([[package-stat
 (defn render-packages (rows &optional (status nil))
   "The *Packages* buffer text, and the line→row vector aligned to it (nil for header lines).
 `status` is the second line: what is running, or how the last job ended (one line)."
-  (let (header-lines [*packages-title*
+  (let (widths (column-widths rows)
+        header-lines [*packages-title*
                        (if (nil? status) "" (str "  " (one-line status)))
-                       *packages-columns*]
-        body (map rows render-package-row)
+                       (string/trimr (render-line (map *package-columns* first)
+                                       widths "Description"))]
+        body (map rows
+               (fn (row)
+                 (string/trimr (render-line (map *package-columns* (fn ([_ cell]) (str (cell row))))
+                                 widths
+                                 (one-line (or (:description row) ""))))))
         ;; rows aligned to buffer lines: one nil per header line, then one row per body line
         line-rows (append (map header-lines (fn (_) nil)) rows))
     {:text (string/join (append header-lines body) "\n")
@@ -1124,7 +1184,8 @@ load is `:broken` or `:incompatible`, its description the reason ([[package-stat
 
 (defn- browser-text (m)
   ;; the rendering of what the model knows: the last fetched list against the disk now
-  (render-packages (package-rows (or (:package-list m) [])) (:package-status m)))
+  (render-packages (package-rows (or (:package-list m) []) (or (:package-others m) {}))
+    (:package-status m)))
 
 (defn refresh-packages (m)
   "Redraw *Packages* in place from what the model knows — the last fetched list, the disk as
@@ -1355,6 +1416,8 @@ C-c C-c applying it — and reload it live. Outside the browser, prompts."
    :writable :toggle
    :doc "Installed and available bedit packages — i installs, u updates, d removes."
    :keymap packages/packages-keymap
+   ;; a table: a long description is cut at the window's edge, never wrapped under the columns
+   :long-lines :truncate
    ;; C-n/C-p and the arrows are rebound here to the ORDINARY line motions, and RET to C-h P's
    ;; describe-package; claiming those would hide them from M-x in every other buffer, so
    ;; they stay global
