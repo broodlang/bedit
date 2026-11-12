@@ -27,11 +27,18 @@ called, kept for the slow-turn log.")
   ;; the table `pid`'s loop is filling now, or nil before its first turn
   (registry/lookup :turnprofile/current pid))
 
+(defn- cpu-us ()
+  ;; the CPU time this process has used, in microseconds (what the watchdog's trace reads)
+  (or (:cpu-us (%process-info (self))) 0))
+
 (defn begin! ()
-  "Start this loop's next phase (an update or a view) with an empty table."
-  (let (old (table-of (self)))
+  "Start this loop's next phase (an update or a view) with an empty table, noting the CPU time
+the loop has used so far: a slow phase says how much of its time the loop RAN ([[finish!]])."
+  (let (old (table-of (self))
+        counts (table/new))
     (when old (table/drop old))
-    (registry/put :turnprofile/current (self) (table/new))))
+    (table/put counts [:cpu-start] (cpu-us))
+    (registry/put :turnprofile/current (self) counts)))
 
 (defn note! (name ns)
   "Add `ns` nanoseconds and one call to `name` in this loop's phase, when one is being kept."
@@ -65,9 +72,42 @@ called, kept for the slow-turn log.")
 (defn finish! (phase ns)
   "End this loop's `phase` (`\"update\"`, `\"view\"`) after `ns` nanoseconds: past the watchdog's
 line its breakdown is kept for the slow-turn report ([[take-breakdown]])."
+  ;; first, how much of the phase the loop spent RUNNING, and how much it did not run at all —
+  ;; waiting for a scheduler thread, or blocked: cheap code that took long is the second
   (let (counts (table-of (self)))
-    (when (and counts (> ns *slow-ns*))
-      (registry/put :turnprofile/slow [(self) phase] (parts counts)))))
+    (when counts
+      (let (ran-ns (* 1000 (- (cpu-us) (or (table/get counts [:cpu-start]) (cpu-us))))
+            waited-ns (math/max 0 (- ns ran-ns))
+            ms (fn (n) (/ (math/round (/ n 100000)) 10.0)))
+        (remember! phase ns ran-ns)
+        (when (> ns *slow-ns*)
+          (registry/put :turnprofile/slow
+            [(self) phase]
+            (vec (append [["loop ran" (ms ran-ns) 1] ["loop did not run" (ms waited-ns) 1]]
+                   (parts counts)))))))))
+
+;; ---- every recent turn, slow or not -------------------------------------------------------
+;; A key that takes 40 ms is never a slow turn, so the report above never sees it. The last
+;; `*recent-turns*` phases are kept as `[phase ns ran-ns]`, for M-x latency to set beside the
+;; window's key→paint: what the turns cost, and how much of it the loop ran.
+
+(def *recent-turns* 64)
+
+(defn- recent-table ()
+  ;; this loop's ring of recent phases, made the first time it is asked for
+  (or (registry/lookup :turnprofile/recent (self))
+    (let (made (table/new)) (registry/put :turnprofile/recent (self) made) made)))
+
+(defn- remember! (phase ns ran-ns)
+  (let (ring (recent-table)
+        kept (or (table/get ring :turns) []))
+    (table/put ring
+      :turns (conj (if (>= (count kept) *recent-turns*) (vec (rest kept)) kept) [phase ns ran-ns]))))
+
+(defn recent-turns ()
+  "This loop's last phases, oldest first, as `[phase ns ran-ns]`: an update or a view, how long
+it took and how much of that the loop ran."
+  (or (table/get (recent-table) :turns) []))
 
 (defn take-breakdown (phase)
   "The breakdown this loop's last slow `phase` left (`[[name ms calls] …]`), taken — nil when
