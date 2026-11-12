@@ -136,7 +136,7 @@ Option-as-Meta and Windows's AltGr (brood ADR-541).
 | a grammar that crashes is quarantined (brood ADR-660) | ✅ brood's `grammar_vet_test` | ✅ `windows-proofs.blsp`: by its vetting child (an access violation) and by the runtime it crashed (the unhandled-exception filter) |
 | auto-save sidecars: location, recovery | ✅ | ✅ |
 | auto-save sidecars: owner-only | ✅ mode 0600 | ✅ a one-entry DACL (brood `file/spit-private`, KI-365 fixed; `recover_test` reads the sidecar's ACL back with `icacls`) |
-| terminal buffers (C-x p t, M-x claude) | ✅ `sh -c` under a pty | ✅ `cmd.exe` under ConPTY (brood KI-369 fixed, ADR-597); a password read is found by the prompt's text, since ConPTY has no echo mode to ask |
+| terminal buffers (C-x p t, C-u M-x term) | ✅ `sh -c` under a pty | ✅ `cmd.exe` under ConPTY (brood KI-369 fixed, ADR-597); a password read is found by the prompt's text, since ConPTY has no echo mode to ask |
 | a real window: opens on the desktop, paints (captured, not blank), typed keys reach the loop, C-x C-s writes the file | ✅ `real-window.sh` | ✅ `real-window.sh` (Linux too: Xvfb and headless Weston) |
 | the OS keyboard reaching that window | ✅ required each run (System Events, once the window is frontmost) | ✅ required each run (SendKeys, once the window is in the foreground); Linux: required, xdotool (XTEST) under Xvfb |
 | font discovery, file watching (auto-revert) | not run — headless | not run — headless |
