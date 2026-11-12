@@ -532,6 +532,9 @@ src/help.blsp               the C-h map: C-h b / m / w / a / l / k, C-h f (a fun
 src/panes.blsp              pane-layout geometry: the body rect, a pane's cell, the gutter's width, and
                             the row table every row↔line question reads (`ed-pane-rows`), from
                             the pane's start row
+                            — and how panes are laid out (`ed-layout-opts`): a TERMINAL stacks split
+                            panes with no row between them (std's `{:row-seam 0}`), the upper
+                            pane's mode line the separator and the handle a drag resizes by
 src/spancache.blsp          what a pane is coloured with, kept across frames: fontified a window at a
                             time, a band from a held tree or a line cache, a long line clipped to
                             what is shown; the gutter's cells likewise; `ed-refresh-spans` once per
