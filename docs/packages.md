@@ -366,7 +366,7 @@ put the open buffers right. Like Emacs's `unload-feature`, it leaves the editor 
 before the package loaded:
 
 - **bedit's registry rows** — idle jobs, task replies, event / down / timer handlers, exit
-  queries, post-steps, mode line chips, M-x commands, keymap profiles, modes, file types,
+  queries, post-steps, mode line chips, M-x commands, key bindings, keymap profiles, modes, file types,
   interpreters, themes, chrome faces, settings — are CLAIMED for the file that registered them
   (`src/ownership.blsp`): at load by `reflect/current-file`, at run time by the namespace of
   the command or hook that ran (`with-symbol-claimant`). Every row a package claimed goes; a
@@ -398,16 +398,42 @@ cannot say which package's code is running in such a process; Brood tracks it as
 (`../brood/docs/known-issues.md`). Register hooks as symbols (`'pkg/hook`), as every bedit
 registry asks, and this does not arise.
 
-## A plugin's library dependencies (built, partly)
+## A plugin's `bedit-plugin` map (built)
+
+A plugin's entry, `(defn bedit-plugin () {...})` in its main module, answers what bedit asks
+for BY NAME; everything else it adds is registered as its modules load, through the same
+calls core makes. The keys:
+
+| key | what bedit does with it |
+|---|---|
+| `:themes` | each registered (`M-x theme-select`), claimed for the package |
+| `:keys` | global bindings, written as init.blsp's `:keys` (`{"C-c a" claude}`): compiled when the package loads (`userkeys/register-package-keys`) into `:packages/keys`, claimed for the package |
+| `:mode-keys` | one mode's bindings, as init.blsp's `:mode-keys` (`{markdown {"C-c C-c" …}}`) |
+| `:on-retire` | a `(model) -> model` symbol run before the package is removed or updated: stop what it started |
+
+A package's keys sit UNDER the user's: dispatch lays init.blsp's `:keys` and M-x
+global-set-key over them (`userkeys/ed-user-scope`), so `"C-c a" nil` in init.blsp takes a
+package's key away. C-h k and where-is report them as they run. A key that does not read, or
+a command that is not one, is logged naming the package. Retiring the package takes its keys
+back with the rest of its rows.
+
+## A plugin's library dependencies (built)
 
 A plugin with code may use a library that is not bedit's: bedit-agent uses `agentkit`, which
 any Brood program driving a coding agent can use and which knows nothing of bedit. The plugin
-names it under `:dependencies`; a library INSTALLED BESIDE it in the package dir goes on the
-load path before the plugin loads (`packages/installed-dependencies`). A library needs no
-`:enhances`, and startup does not report it as a package it failed to load. Not built yet:
-installing a plugin does not fetch its dependencies from the hive, so the library is installed
-by hand beside it.
+names it under `:dependencies` (`[[agentkit :version "0.1.0"]]`):
 
+- **Install:** installing the plugin installs each hive dependency not yet installed beside
+  it in the package dir (`packages/hive-dependencies`), said with the install. A `:path` or
+  `:git` dependency is not fetched.
+- **Load:** a library installed beside the plugin goes on the load path before the plugin
+  loads (`packages/installed-dependencies`). It needs no `:enhances`, and startup does not
+  report it as a package it failed to load.
+- **List and update:** *Packages* lists it as `library for bedit-agent` with the hive's
+  latest version, and updates it as it updates a plugin.
+- **Remove:** a library another installed package depends on is refused, naming who uses it
+  (`packages/removal-refusal`). Removing a plugin removes the libraries only it used, said
+  (`packages/orphaned-by`).
 ## A staged path
 
 1. **Stage 1 — the marker and a live install (no language change).** `:enhances` end to end

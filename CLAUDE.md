@@ -395,7 +395,10 @@ src/userkeys.blsp           init.blsp's `:keys` (global-set-key) and `:mode-keys
                             loads later; the global ones into the profile's base layer.
                             M-x global-set-key / local-set-key (help's, over C-h k's key read)
                             bind live into the same `:user-keys`, kept as `:session-keys`
-                            across a reload unless init.blsp binds that key (`ed-merge-session-keys`)
+                            across a reload unless init.blsp binds that key (`ed-merge-session-keys`).
+                            A PLUGIN binds keys the same way (its `bedit-plugin` map's `:keys` /
+                            `:mode-keys`, `register-package-keys`): claimed for the package in
+                            `:packages/keys`, laid UNDER the user's, taken back when it is retired
 src/about.blsp              M-x version · --version · C-h C-a *About bedit* — bedit's version,
                             the brood under it and the build date, all from project-release/build-info
                             (named to dodge std's `version`, whose `version/newer?` packages uses)
@@ -489,7 +492,9 @@ src/packages.blsp           bedit's package manager (M-x package-list): install 
                             the new version's mode, the core one it replaced, else fundamental,
                             said in *Messages* (`ed-settle-package-buffers`, Emacs's
                             `unload-feature`) — then it reloads the sources in load order (brood's
-                            `reflect/source-load-order`); a remove retires the same way. Both are
+                            `reflect/source-load-order`); a remove retires the same way, refuses
+                            a library another package uses (`removal-refusal`) and takes the
+                            libraries only it used along (`orphaned-by`). Both are
                             model-level (`update-plugin!` / `remove!` take and answer the model),
                             so every caller puts the buffers right; docs/packages.md has the one
                             limit (KI-356). What
@@ -1513,7 +1518,7 @@ src/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e): a l
                             appeared moves into the read without a trace
                             (`passwd/take-since-prompt`); type-ahead from before it stays
                             as the next input
-src/terminal.blsp           a TERMINAL buffer (C-x p t, C-x p r, M-x claude, C-u M-x term):
+src/terminal.blsp           a TERMINAL buffer (C-x p t, C-x p r, C-u M-x term; a package's `term-run`):
                             a program under a pty, its screen emulated by std/vt
                             (brood ADR-384) in the buffer's worker and painted into the
                             buffer's tail. CHAR mode (a full-screen program: claude,

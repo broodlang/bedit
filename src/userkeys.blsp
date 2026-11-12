@@ -44,9 +44,14 @@ with Emacs's `-mode` suffix and a keyword's colon dropped — `markdown`, `markd
   "`command` spelled as the keymaps spell a command, `module/cmd-name`: the M-x registry keeps
 it under its package root too (`bedit/commands/cmd-find-file`), and help that asks the
 keymap which key runs `commands/cmd-find-file` compares symbols — so a user binding spelled
-the registry's way would run, and never be named."
-  (let (parts (string/split (->string command) "/"))
-    (if (> (count parts) 2) (symbol (string/join (seq/take-last parts 2) "/")) command)))
+the registry's way would run, and never be named. Only when the short spelling names the SAME
+global: a package's command (`bedit-agent/bedit-agent/commands/cmd-claude`) keeps its root, or
+it would read as bedit's own `commands` module."
+  (let (parts (string/split (->string command) "/")
+        short (when (> (count parts) 2) (symbol (string/join (seq/take-last parts 2) "/"))))
+    (if (and short (bound? short) (bound? command) (= (reflect/eval short) (reflect/eval command)))
+      short
+      command)))
 
 (defn- user-command (value known-globals)
   "`[command problem]` for a binding's VALUE: the command symbol to bind (nil to unbind), or
@@ -65,16 +70,17 @@ as written when it is defined, else as the command of that M-x name."
           (not (nil? known)) [(keymap-spelling known) nil]
           else [nil (str "no command named " text " (M-x lists them)")])))))
 
-(defn- user-bindings (keys where known-globals)
+(defn- user-bindings (keys where known-globals origin)
   "`[bindings warnings]` for one `{key-description command}` map: each binding a
 `[sequence command]`, shortest sequence first (so `C-c` then `C-c f` reads as a prefix
 rebound and then filled), and a warning per key that does not read or command that is not
-one. `where` names the map in a warning (`:keys`, `:mode-keys markdown`)."
+one. `where` names the map in a warning (`:keys`, `:mode-keys markdown`), `origin` whose map it
+is (`init.blsp`, `package bedit-agent`)."
   (let (parsed (map (or keys {})
                  (fn ([description value])
                    (let (sequence (key-parse description)
                          [command problem] (user-command value known-globals)
-                         label (str "init.blsp: " where " " (pr-str description) " — "))
+                         label (str origin ": " where " " (pr-str description) " — "))
                      (cond
                        (failure? sequence) [nil (str label (error-message sequence))]
                        problem [nil (str label problem)]
@@ -111,27 +117,29 @@ registrations, that is at startup; from source, when the module first loads."
               layer-ref-name)
       (keymaps/profile-layer-names))))
 
-(defn ed-user-keys (keys mode-keys)
+(defn ed-user-keys (keys mode-keys &optional (origin "init.blsp"))
   "The init file's `:keys` and `:mode-keys` compiled: `{:global bindings :modes {mode-name
 bindings} :warnings [...]}`, each `bindings` a vector of `[key-sequence command]`. What
 `config/apply-to-model` puts on the model as `:user-keys` and [[ed-user-scope]] amends the
 layers with. A mode no registered layer is named is warned about but still bound: its
-module may not have loaded yet."
+module may not have loaded yet. `origin` names whose bindings they are in a warning: a
+package's `:keys` compile here too ([[register-package-keys]])."
   (let (known-globals (reflect/global-names)
-        [global global-warnings] (user-bindings keys ":keys" known-globals)
+        [global global-warnings] (user-bindings keys ":keys" known-globals origin)
         known-modes (if (empty? mode-keys) #{} (ed-user-mode-names))
         modes (map (or mode-keys {})
                 (fn ([mode bindings])
                   (let (name (ed-user-mode-name mode)
                         [compiled warnings] (user-bindings bindings
                                               (str ":mode-keys " name)
-                                              known-globals))
+                                              known-globals
+                                              origin))
                     [name
                       [compiled
                         (if (contains? known-modes name)
                           warnings
-                          (into [(str "init.blsp: :mode-keys "
-                                   name " — no mode by that name is loaded"
+                          (into [(str origin
+                                   ": :mode-keys " name " — no mode by that name is loaded"
                                    " (not loaded yet? its keys apply once it is; the mode line names"
                                    " a buffer's mode)")]
                             warnings))]]))))
@@ -143,6 +151,47 @@ module may not have loaded yet."
   "Every problem with the init file's bindings, as readable lines: a key that does not read
 (std's `key-parse` says which word), a command that is not one. Empty when they all bind."
   (:warnings (ed-user-keys keys mode-keys)))
+
+;; ---- a package's bindings ------------------------------------------------------
+;; A plugin's `bedit-plugin` map may bind keys the way init.blsp does — `:keys {"C-c a"
+;; claude}`, `:mode-keys {markdown {...}}` — compiled when it loads into `:packages/keys`, a
+;; row CLAIMED for the package (`ownership`), so retiring it takes its keys back with the rest.
+;; They sit UNDER the user's: init.blsp and M-x global-set-key bind over a package's key.
+
+(def- *package-keys* :packages/keys)
+
+(defn register-package-keys (name keys mode-keys)
+  "Compile package `name`'s `:keys` / `:mode-keys` ([[ed-user-keys]]) and register them, claimed
+for whichever file is loading (the package's, under `packages/apply-plugin!`). Answers the
+warnings — a key that does not read, a command that is not one — each naming the package."
+  (let (compiled (ed-user-keys keys mode-keys (str "package " name)))
+    (when (not (and (empty? (:global compiled)) (empty? (:modes compiled))))
+      (ownership/claim! *package-keys* name (dissoc compiled :warnings)))
+    (:warnings compiled)))
+
+(defn ed-package-keys ()
+  "Every loaded package's compiled bindings merged as `{:global :modes}`, packages in name
+order (a later name's binding of the same key wins)."
+  (let (entries (or (registry/entries *package-keys*) {}))
+    (fold (sort (keys entries))
+      {:global [] :modes {}}
+      (fn (acc name)
+        (let (keys-of (get entries name))
+          {:global (into (:global acc) (or (:global keys-of) []))
+           :modes (fold (or (:modes keys-of) {})
+                    (:modes acc)
+                    (fn (modes [mode bindings])
+                      (assoc modes mode (into (or (get modes mode) []) bindings))))})))))
+
+(defn- under (user packages)
+  ;; `user`'s bindings laid over `packages`': each scope's package bindings first, so
+  ;; `keymap-bind` binds the user's after them and the user's win
+  (let (user (or user {}))
+    {:global (into (:global packages) (or (:global user) []))
+     :modes (fold (or (:modes user) {})
+              (:modes packages)
+              (fn (modes [mode bindings])
+                (assoc modes mode (into (or (get modes mode) []) bindings))))}))
 
 ;; ---- bindings made live, for the session (M-x global-set-key / local-set-key) --------
 ;; A key bound with M-x global-set-key or local-set-key is a binding like init.blsp's, in the
@@ -250,9 +299,10 @@ the last (the scope's base) by `base-bindings` too."
 (defn ed-user-scope (buffer m)
   "The scope contexts dispatch resolves a key through — `buffer`'s mode layers, then the
 model's profile layers — with the init file's bindings (`:user-keys`, [[ed-user-keys]])
-amended into them: each mode's into the layer of that name wherever it sits, the global ones
-into the model's base layer. Just `(list buffer m)` when the init file binds nothing."
-  (let (user (:user-keys m))
+amended into them over the loaded packages' ([[ed-package-keys]]): each mode's into the layer
+of that name wherever it sits, the global ones into the model's base layer. Just `(list buffer
+m)` when neither binds anything."
+  (let (user (under (:user-keys m) (ed-package-keys)))
     (if (not (user-bound? user))
       (list buffer m)
       (list {:layers (user-layers (:layers buffer) user [])}
