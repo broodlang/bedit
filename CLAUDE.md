@@ -1862,9 +1862,19 @@ nest test --failed       # just what failed last run — the edit/rerun loop
 nest test --cover        # function-level coverage: what the suite never calls
 nest test --repeat-until-failure 5 --seed 0   # shake out a flaky/order-dependent test
 nest check               # advisory type/lint check
+nest eval --test '(config-paths/config-dir)'   # ask the code a question, as a test sees it (below)
+nest eval --test --in linkview '(ed-hovered-text-link {} {} {})'   # inside a module: its private names
 make drive               # live pty drivers: the real editor, driven (tools/README.md)
 tools/affected-tests.sh --run   # every test file the change reaches, one at a time (the pre-push sweep)
 ```
+
+**Ask the code with `nest eval`, never a probe file.** To learn what a function answers or what
+shape a value has, `nest eval 'EXPR'` evaluates it with the project loaded and prints the value.
+`--in MODULE` evaluates inside a module, its private names and imports bare. `--test` runs it
+as a test sees the world: `test/running?`, and a scratch home, so nothing touches
+`~/.config/bedit`. `-` reads several forms from stdin (`nest eval - <<'EOF' … EOF`). Never
+write a throwaway `tests/zz_probe_test.blsp`: other sessions' `nest test` and `nest check`
+read the tree while you work, and trip on a file that appears and vanishes.
 
 **Verify the GUI only via the installed `nest`** (or a `cargo build --features
 brood/gui` in ../brood). A plain `cargo run -p nest -- test` rebuilds
