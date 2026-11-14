@@ -115,20 +115,31 @@ corrupt history file must never stop a shell opening (the shared reader guarante
 Best-effort via the shared writer — a failure is swallowed, never breaking the editor."
   (persist-write! (bshell-history-path) (bshell-history-trim history)))
 
-;; ---- ANSI colour (pipes carry colour escapes) -----------------------------------
-;; The worker keeps one decoder per stream of the command it runs (`ansicolor/decode`, over
-;; std's streaming `ansi/feed`), so an escape split across two reads never shows; the
-;; colours travel with the text and land on it as its text property (`ansicolor/faces`), as
-;; Emacs's shell-mode colours a command's output.
+;; ---- ANSI colour, and whether the command reads a password ---------------------------
+;; The worker keeps a decoder for the command's output (`ansicolor/decode`, over std's
+;; streaming `ansi/feed`), so an escape split across two reads never shows; the colours
+;; travel with the text and land on it as its text property (`ansicolor/faces`), as Emacs's
+;; shell-mode colours a command's output. A pty is one channel: stderr arrives with stdout.
 
-(defn- bshell-forward (state stream data)
-  "Decode the chunk `data` of `stream` (`:out` or `:err`) with that stream's decoder in
-`state`, send its text and colours to the editor, and return `state` with the decoder
-advanced."
-  (let ([decoder text spans] (ansicolor/decode (get state stream) data))
+(defn- bshell-reading-password (proc)
+  "Whether command `proc` is reading a password right now — its terminal's echo off in line
+mode (`os/pty-password?`, brood ADR-570) — or nil when that cannot be known (no command, a
+closed one). Asked once per chunk of output: a prompt arriving is output."
+  (when proc
+    (check-allow :discarded-catch (try (os/pty-password? proc) (catch _ nil)))))
+
+(defn- bshell-forward (state data)
+  "Decode the chunk `data` of the command's output with the decoder in `state`, send its
+text and colours to the editor with whether the command now reads a password, and return
+`state` with the decoder advanced."
+  (let ([decoder text spans] (ansicolor/decode (:decoder state) data))
     (when (not (= text ""))
-      (send (:reply state) (bshell/bshell-output-event (:buffer state) text spans)))
-    (assoc state stream decoder)))
+      (send (:reply state)
+        (bshell/bshell-output-event (:buffer state)
+          text
+          spans
+          (bshell-reading-password (:proc state)))))
+    (assoc state :decoder decoder)))
 
 ;; ---- the shell process (one per buffer; mirrors lsp's connection process) ----
 ;; State: {:buffer <name> :root <dir> :proc <handle|nil> :reply <loop>}. Owns the child `proc` so its
@@ -159,7 +170,7 @@ a REPL — and off the editor loop), then push the formatted result + a success 
   ;; `eval-source` never throws: captured output then `=> value`, or `error: …`
   (let (buffer (:buffer state)
         out (eval-source line))
-    (send (:reply state) (bshell/bshell-output-event buffer (str out "\n") []))
+    (send (:reply state) (bshell/bshell-output-event buffer (str out "\n") [] nil))
     (send (:reply state) (bshell/bshell-done-event buffer 0))
     (bshell-loop state)))
 
@@ -192,14 +203,10 @@ a pty and a real emulator."
                                          :cols *bshell-columns*
                                          :rows 24
                                          :env *bshell-environment*}))
-                            (bshell-loop (assoc state
-                                           :proc child
-                                           :out (ansicolor/decoder)
-                                           :err (ansicolor/decoder))))))
+                            (bshell-loop (assoc state :proc child :decoder (ansicolor/decoder))))))
     ;; `cd DIR` at the prompt (`cmd-bshell-send`): the next command runs there
     ([:bshell-cd dir] (bshell-loop (assoc state :root dir)))
-    ([:proc _p data] (bshell-loop (bshell-forward state :out data)))
-    ([:proc-err _p data] (bshell-loop (bshell-forward state :err data)))
+    ([:proc _p data] (bshell-loop (bshell-forward state data)))
     ([:proc-closed _p code] (do
                               (send (:reply state) (bshell/bshell-done-event (:buffer state) code))
                               (bshell-loop (assoc state :proc nil))))
@@ -233,8 +240,7 @@ there — `:editor` only for one started before any loop runs."
                          :root root
                          :proc nil
                          :reply reply
-                         :out (ansicolor/decoder)
-                         :err (ansicolor/decoder)}))))
+                         :decoder (ansicolor/decoder)}))))
 
 (defn bshell-interrupt (pid)
   "Interrupt whatever command shell process `pid` is running (Ctrl-C to its process group);
@@ -355,7 +361,9 @@ starting at the new end (`:input-start`, on the buffer)."
 ;; Each folds through its named `ed-ev-*` fn (`model/defuievent`), so redefining one
 ;; hot-swaps the live editor (the impl's global call resolves late, like a keymap binding).
 
-(defuievent bshell-output-event (buffer text spans) ed-ev-bshell-output) ; a chunk of shell/eval output, ANSI-decoded, and its colours
+;; a chunk of shell/eval output, ANSI-decoded, its colours, and whether the command now reads a
+;; password (`os/pty-password?`; nil when that cannot be known)
+(defuievent bshell-output-event (buffer text spans secret) ed-ev-bshell-output)
 (defuievent bshell-done-event (buffer code) ed-ev-bshell-done) ; the command's exit (nil = killed)
 
 (defn ed-ev-bshell-output (m event textrows cols rows)
@@ -368,13 +376,16 @@ leaves the running command at a password prompt reads the password (`bshell-watc
                                         (bshell-output-event-text event)
                                         (bshell-output-event-spans event))
                              textrows)
-      name)))
+      name
+      (bshell-output-event-secret event))))
 
 ;; ---- a password the running command asks for ------------------------------------------------
-;; A command runs on PIPES (no terminal), so nothing can say it turned echo off; what it
-;; printed last is the only signal — matched as comint matches it (`passwd/password-prompt?`:
-;; `[sudo] password for me:` from `sudo -S`, `Password:`, `Enter passphrase …`). On a match
-;; the answer is read masked and written to the command's stdin, never into the buffer or the
+;; Two signals, as in a terminal buffer. The reliable one is the command's terminal: a program
+;; reading a secret turns echo off in line mode (`os/pty-password?`, asked by the worker with
+;; each chunk). The fallback is what it printed last, matched as comint matches it
+;; (`passwd/password-prompt?`: `[sudo] password for me:`, `Password:`, `Enter passphrase …`)
+;; — for a program that prints its prompt before it turns echo off. On either the answer is
+;; read masked and written to the command's terminal, never into the buffer or the
 ;; history. `:bshell-secret` marks a command waiting for one; it is re-decided per chunk of
 ;; output, so the prompt it answered cannot ask again until the command prints anew.
 
@@ -444,9 +455,10 @@ appeared; type-ahead from before it stays in the input region."
   "A shell's `:send-invisible` service: read a line masked for the command it is running."
   (bshell-read-secret m (buffer-name (ed-current-buf m))))
 
-(defn- bshell-watch-password (m name)
+(defn- bshell-watch-password (m name &optional (reading-password nil))
   "After output reached shell `name`: note whether its running command now waits at a password
-prompt, and when it has just started to — and you are looking at it, with no other prompt
+prompt — its terminal says so (`reading-password`, `os/pty-password?`) or its last line reads as
+one — and when it has just started to, and you are looking at it with no other prompt
 open — read the password (`bshell-read-secret`). Elsewhere the first key typed there, or
 RET, asks (`passwd/secret-overlay`). Where the input ended when the prompt appeared is
 marked (`passwd/mark-prompt`): what was typed before it stays as the next input."
@@ -456,7 +468,7 @@ marked (`passwd/mark-prompt`): what was typed before it stays as the next input.
       (let (shell (ed-buf-at m index))
         (if (not (:input-running shell))
           m
-          (let (secret? (passwd/password-prompt? (last-line shell))
+          (let (secret? (or (= reading-password true) (passwd/password-prompt? (last-line shell)))
                 asked? (and secret? (not (:bshell-secret shell)))
                 flagged (assoc shell :bshell-secret secret?)
                 noted (ed-set-buf-at m index (if asked? (passwd/mark-prompt flagged) flagged)))
@@ -718,6 +730,42 @@ or why not, on a line of its own."
           (bshell-prompt target)))
       (bshell-emit-prompt (bshell-append m name (str "\n" why)) name (bshell-prompt dir)))))
 
+;; ---- clear: the buffer back to a fresh prompt -------------------------------------
+;; A command's terminal is `dumb` (no screen to clear: `clear` itself exits 1 there), and what
+;; a reader typing `clear` means is this buffer — so it is the shell's own, as in eshell, and
+;; C-c M-o is comint's `comint-clear-buffer`. The history stays.
+
+(defn bshell-clear-line? (line)
+  "Whether `line` is just `clear`.
+
+    (bshell/bshell-clear-line? \"clear\")   ;=> true
+    (bshell/bshell-clear-line? \"clear && make\")   ;=> false"
+  (= (string/trim line) "clear"))
+
+(defn- bshell-clear (m name)
+  "Shell `name` emptied to a fresh prompt, its input region starting after it — what was typed
+at the prompt goes with the rest."
+  (let (prompt (bshell-prompt-for m name))
+    (bshell-set-buffer-field (bshell-write m
+                               name
+                               (fn (buffer)
+                                 (end-of-buffer (replace-region buffer
+                                                  0
+                                                  (buffer-length buffer)
+                                                  prompt))))
+      name
+      :input-start (count prompt))))
+
+(defcommand cmd-bshell-clear
+  (m key)
+  "Empty the shell to a fresh prompt (C-c M-o, Emacs's `comint-clear-buffer`; or type `clear`).
+Says so while a command runs: its output still has somewhere to go."
+  (let (shell (ed-current-buf m))
+    (cond
+      (not (bshell-buffer? shell)) m
+      (:input-running shell) (message m "a command is running — C-c C-c first")
+      else (bshell-clear m (buffer-name shell)))))
+
 (defcommand cmd-bshell-send
   (m key)
   "RET in a bshell buffer: run the current input (everything from the prompt to the buffer's
@@ -740,6 +788,9 @@ holding what was typed since the prompt appeared, moved out of the buffer."
             ;; `cd DIR` is the shell's own: each command is a fresh `sh -c`, where a cd
             ;; would be lost with it
             (bshell-cd-argument line) (bshell-cd (bshell-remember m line) name line)
+            ;; `clear` is the shell's own too: the terminal a command gets is `dumb`, with no
+            ;; screen to clear, and what a reader means is this buffer
+            (bshell-clear-line? line) (bshell-clear (bshell-remember m line) name)
             ;; an unclosed Brood form → newline at point, keep editing (don't submit)
             (not (bshell-complete-input? line)) (ed-set-buf m (insert shell "\n"))
             else
@@ -792,7 +843,9 @@ compilers), and its exit is reported as usual. Says so when nothing is running."
              ;; C-r searches command history (a filterable minibuffer list)
              (keymap-bind [:ctrl-r] 'comint/cmd-comint-history-search)
              ;; C-c C-c interrupts the running command (comint-interrupt-subjob)
-             (keymap-bind [:ctrl-c :ctrl-c] 'bshell/cmd-bshell-interrupt))
+             (keymap-bind [:ctrl-c :ctrl-c] 'bshell/cmd-bshell-interrupt)
+             ;; C-c M-o empties the buffer to a fresh prompt (comint-clear-buffer); `clear` too
+             (keymap-bind [:ctrl-c :alt-o] 'bshell/cmd-bshell-clear))
    ;; Brood services scoped to the input form: syntax colours, bracket matching, eldoc hints
    :fontify 'bshell/bshell-fontify
    :bracket-match 'bshell/bshell-bracket-match

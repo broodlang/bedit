@@ -74,19 +74,19 @@
 (describe "ed-ev-bshell-output"
   (test "appends the chunk verbatim (no forced newline)"
     (let (m (bshell/ed-ev-bshell-output (bshell-model)
-              (bshell/bshell-output-event bshell-name "hi" [])
+              (bshell/bshell-output-event bshell-name "hi" [] nil)
               24
               80
               24))
       (is (string/ends-with? (bshell-text m) "tmp $ hi"))))
   (test "consecutive chunks concatenate without a line break between them"
     (let (m1 (bshell/ed-ev-bshell-output (bshell-model)
-               (bshell/bshell-output-event bshell-name "ab" [])
+               (bshell/bshell-output-event bshell-name "ab" [] nil)
                24
                80
                24)
           m2 (bshell/ed-ev-bshell-output m1
-               (bshell/bshell-output-event bshell-name "cd" [])
+               (bshell/bshell-output-event bshell-name "cd" [] nil)
                24
                80
                24))
@@ -100,8 +100,8 @@ decode step (`bshell-forward`, its decoder in the worker state, the events sent 
 folded as the loop folds them."
   (do
     (fold chunks
-      {:buffer bshell-name :reply (self) :out (ansicolor/decoder) :err (ansicolor/decoder)}
-      (fn (state chunk) (bshell/bshell-forward state :out chunk)))
+      {:buffer bshell-name :reply (self) :decoder (ansicolor/decoder)}
+      (fn (state chunk) (bshell/bshell-forward state chunk)))
     (letrec (drain (fn (model)
                      (receive
                        (event (drain (bshell/ed-ev-bshell-output model event 24 80 24)))
@@ -119,21 +119,7 @@ folded as the loop folds them."
           spans (ansicolor/colour-spans (ed-buf-at m (ed-buffer-index-by-name! m bshell-name))))
       (assert= (into [] (map spans (fn (s) [(first s) (second s)]))) [[start (+ start 3)]])
       (is (:bold (nth (first spans) 2)))
-      (assert= (:fg (nth (first spans) 2)) 4)))
-  (test "stdout and stderr keep separate decoders"
-    (let (state (bshell/bshell-forward {:buffer bshell-name
-                                        :reply (self)
-                                        :out (ansicolor/decoder)
-                                        :err (ansicolor/decoder)}
-                  :out "\e[3")
-          state2 (bshell/bshell-forward state :err "plain\n")
-          _ (bshell/bshell-forward state2 :out "1mred\n")
-          m (letrec (drain (fn (model)
-                             (receive
-                               (event (drain (bshell/ed-ev-bshell-output model event 24 80 24)))
-                               (after 0 model))))
-              (drain (bshell-model))))
-      (is (string/ends-with? (bshell-text m) "tmp $ plain\nred\n")))))
+      (assert= (:fg (nth (first spans) 2)) 4))))
 
 (describe "bshell: input typed ahead while a command runs"
   ;; the output lands at the process mark (comint's), before what was typed ahead — so no
@@ -222,7 +208,14 @@ folded as the loop folds them."
     (let (m (bshell-stream-into (sent-and-running "sudo -S x")
               [(string/join (seq/repeat 3000 "z") "") "\n[sudo] password for me: "]))
       (assert= (bshell/last-line (bshell-buf m)) "[sudo] password for me: ")
-      (is (:bshell-secret (bshell-buf m))))))
+      (is (:bshell-secret (bshell-buf m)))))
+  (test "a command whose terminal reads a password is asked, whatever its prompt says"
+    (let (running (sent-and-running "vault login")
+          event (fn (secret) (bshell/bshell-output-event bshell-name "Token (hidden): " [] secret))
+          told (bshell/ed-ev-bshell-output running (event true) 24 80 24)
+          guessed (bshell/ed-ev-bshell-output running (event nil) 24 80 24))
+      (is (:bshell-secret (bshell-buf told)))
+      (refute (:bshell-secret (bshell-buf guessed))))))
 
 (describe "bshell: only a pane at the process mark follows the output"
   :isolated (test "a reader up in the running command's own output stays where they are"
@@ -297,6 +290,26 @@ folded as the loop folds them."
       (assert= (take (map spans (fn (span) [(first span) (second span)])) 2) (list [0 7] [15 22])))))
 
 ;; ---- cd: the shell's own -------------------------------------------------------
+
+(describe "bshell: clear empties the buffer to a fresh prompt"
+  (test "only a line that is just clear is the shell's"
+    (is (bshell-clear-line? " clear "))
+    (refute (bshell-clear-line? "clear && make"))
+    (refute (bshell-clear-line? "clearly")))
+  (test "RET on clear leaves only a prompt, the input after it; the command is remembered"
+    (let (m (bshell-stream-into (sent-and-running "ls") ["one\ntwo\n"])
+          done (bshell/ed-ev-bshell-done m (bshell/bshell-done-event bshell-name 0) 24 80 24)
+          cleared (send-line (type-into done "clear") nil)
+          prompt (bshell/bshell-prompt "/tmp"))
+      (assert= (bshell-text cleared) prompt)
+      (assert= (bshell-istart cleared) (count prompt))
+      (assert= (bshell-point cleared) (count prompt))
+      (assert= (last (:input-history (bshell-buf cleared))) "clear")))
+  (test "C-c M-o clears too, but not under a running command"
+    (let (running (sent-and-running "sleep 9")
+          prompt (bshell/bshell-prompt "/tmp"))
+      (assert= (:echo (cmd-bshell-clear running nil)) "a command is running — C-c C-c first")
+      (assert= (bshell-text (cmd-bshell-clear (bshell-model) nil)) prompt))))
 
 (describe "bshell: cd changes where the next command runs"
   (test "a line that is only a cd is the shell's; one with more runs in sh -c"
@@ -577,7 +590,7 @@ folded as the loop folds them."
           m1 (ed-update m0 "s" 80 24)
           m2 (send-line m1 :enter)
           m3 (bshell/ed-ev-bshell-output m2
-               (bshell/bshell-output-event bshell-name "a.txt\n" [])
+               (bshell/bshell-output-event bshell-name "a.txt\n" [] nil)
                24
                80
                24)
@@ -588,7 +601,7 @@ folded as the loop folds them."
     (let (m0 (ed-update (bshell-model) "x" 80 24)
           m1 (at-point m0 0) ; up in the output (the prompt line's start)
           m2 (bshell/ed-ev-bshell-output m1
-               (bshell/bshell-output-event bshell-name "more\n" [])
+               (bshell/bshell-output-event bshell-name "more\n" [] nil)
                24
                80
                24))
