@@ -11,11 +11,12 @@ shells are independent and a buffer carries everything it needs. The input regio
 `comint`'s, shared with a terminal buffer in line mode (terminal.blsp).
 
 Type a line, press RET. A line starting with `(` is **evaluated as Brood** (a REPL — value
-printed `=> …`, defs persisting across the session); anything else runs via `proc-spawn`'d
+printed `=> …`, defs persisting across the session); anything else runs via a pty-spawned
 `sh -c` **in the project root** (`:cwd`, ADR-104). Output streams back, then a fresh prompt
 (non-zero exit → `[exit N]`; success silent, bash-style). ↑/↓ recall history, Tab completes
 (filenames / Brood globals), and `:fontify`/`:bracket-match`/`:eldoc` colour + light up the
-input form. Commands run on pipes (no PTY, so no raw mode); their ANSI colours become faces.
+input form. Commands run under a pty (so `sudo` can ask for a password, `TERM=dumb` and no
+pager); their output is text, not a screen, and their ANSI colours become faces.
 
 Structure mirrors `lsp.blsp`: a dedicated **shell process** (`bshell-loop`, per buffer)
 owns the child `proc` (and runs Brood eval in its own image, off the editor loop). It
@@ -166,19 +167,31 @@ a REPL — and off the editor loop), then push the formatted result + a success 
 ;; `spawn`ed process, where a free global re-resolves on the receiver and only the
 ;; qualified name (`bshell/bshell-output-event`) is bound.
 
+;; A command runs under a pty, as Emacs's shell-mode runs its process: a program that asks
+;; for a terminal gets one — `sudo` will not read a password from anything else ("a terminal
+;; is required to authenticate"), and `ls`, `git` and test runners colour for one. The
+;; terminal says what it is: `TERM=dumb`, so nothing draws a full-screen view into the
+;; buffer, and no pager, so `git log` writes its output here rather than waiting in `less`.
+(def *bshell-columns* 160) ; the width a command is told its terminal has
+(def *bshell-environment* {"TERM" "dumb" "PAGER" "cat" "GIT_PAGER" "cat"})
+
 (defn- bshell-loop (state)
   "The shell process's receive loop: `[:bshell-run line]` evaluates `line` as Brood when it
-starts with `(`, else spawns `sh -c line` in `:root`; the child's stdout/stderr forward to
-the editor as a `bshell-output-event` (ANSI-decoded: a pipe's output is append-only text
-that happens to be coloured, so its escapes become faces — each stream with its own
-decoder, fresh per command — rather than an emulated screen); its exit as a
+starts with `(`, else spawns `sh -c line` in `:root` under a pty; the child's output
+forwards to the editor as a `bshell-output-event` (ANSI-decoded: its output is append-only
+text that happens to be coloured, so its escapes become faces — a decoder fresh per
+command — rather than an emulated screen); its exit as a
 `bshell-done-event`; `:shutdown` kills any live child and stops. A LONG-LIVED program —
 the project REPL — is not hosted here: that is a terminal buffer (terminal.blsp), under
 a pty and a real emulator."
   (receive
     ([:bshell-run line] (if (bshell-brood-form? line)
                           (bshell-eval-and-reply state line)
-                          (let (child (os/shell-spawn line {:cwd (:root state)}))
+                          (let (child (os/shell-spawn-pty line
+                                        {:cwd (:root state)
+                                         :cols *bshell-columns*
+                                         :rows 24
+                                         :env *bshell-environment*}))
                             (bshell-loop (assoc state
                                            :proc child
                                            :out (ansicolor/decoder)
@@ -623,12 +636,11 @@ line (the REPL), else **filenames** under that shell's directory. `nil` in any o
 
 ;; ---- the commands -----------------------------------------------------------
 
-(defn- bshell-start (m root)
-  "Open this project's shell: a fresh `*bshell: <root>*` buffer (mode `:bshell`, so RET runs
-the command) with its prompt, its shell process rooted at `root`, and all its state recorded
-**on the buffer** — so each project's shell is independent."
-  (let (name (bshell-buffer-name root)
-        prompt (bshell-prompt root)
+(defn- bshell-start (m root name)
+  "Open a shell named `name` in `root`: a fresh buffer (mode `:bshell`, so RET runs the
+command) with its prompt, its shell process rooted at `root`, and all its state recorded
+**on the buffer** — so each shell is independent."
+  (let (prompt (bshell-prompt root)
         raw (end-of-buffer (insert (make-buffer "" name) prompt))
         typed (editor/layers/set-buffer-type raw :bshell)
         pid (bshell-connect name root)
@@ -646,15 +658,19 @@ the command) with its prompt, its shell process rooted at `root`, and all its st
   (m key)
   "Open a shell for the current project (C-x p e): its own `*bshell: <project>*` buffer
 running commands / Brood forms in the project root. Re-running switches to *this* project's
-shell (each project has its own — like Emacs `project-eshell`). Reports when not in a project."
+shell (each project has its own — like Emacs `project-eshell`); with a prefix argument
+(`C-u C-x p e`) it opens another one beside it, `*bshell: <project>*<2>`. Reports when not in
+a project."
   (let (root (ed-project-root m))
     (if (nil? root)
       (message m "not in a project (no project.blsp found)")
       (let (name (bshell-buffer-name root)
             index (ed-buffer-index-by-name m name))
-        (if (nil? index)
-          (bshell-start m root)
-          (ed-select m index))))))
+        (cond
+          (not (nil? (current-prefix-arg m))) (bshell-start m root (ed-fresh-buffer-name m name))
+          (nil? index) (bshell-start m root name)
+          else (ed-select m index))))))
+(register-prefix-consuming 'bshell/cmd-project-bshell)
 
 ;; ---- cd: the directory the next command runs in ------------------------------
 ;; Every command is its own `sh -c`, so a `cd` run there changes the directory of a shell
