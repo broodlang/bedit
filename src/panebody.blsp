@@ -365,64 +365,153 @@ deep copy, so a lookup compares each key element by element."
                       spans
                       top
                       (ed-rows-last-line rope top textrows rows))))
-      (map (seq/zip table (ed-row-start-cols rope table))
-        (fn ([row known-col])
-          (let (line (nth row 0)
-                from (nth row 1)
-                to (nth row 2)
-                inlay (nth row 3 nil)
-                clip (nth row 4 nil)
-                display (wrap/row-display row))
-            (if (nil? inlay)
-              (let ([vis from-col base] (ed-row-slice rope
-                                          line
-                                          from
-                                          (if clip (first clip) to)
-                                          w
-                                          known-col)
-                    ;; a wrapped row its line goes on past ends in the continuation mark,
-                    ;; painted just past the text (`ed-with-ellipsis`: the scrollbar column)
-                    ellipsis (cond
-                               clip (second clip)
-                               (and (not (nil? rows))
-                                 (not (nil? to))
-                                 (< (+ (text/line->char rope line) to)
-                                   (textpos/ed-line-end rope line)))
-                                 wrap/continuation-mark
-                               else nil)
-                    line-spans (get by-line line)
-                    ;; the row's prefix and inline text, the latter as indices into `vis`
-                    painted (ed-paint-display display
-                              (- base (text/line->char rope line))
-                              (count vis))
-                    ;; the spans CLIPPED to the text the row shows: a docstring's one span
-                    ;; runs over many lines and lengthens with every character typed in it,
-                    ;; and every row it covers paints the same however long it is
-                    content [vis
-                              from-col
-                              w
-                              (ed-rebase-ranges (spanpaint/ed-ranges-on-line line-spans
-                                                  base
-                                                  (+ base (count vis)))
-                                base)
-                              ellipsis
-                              painted])
-                [line
-                  vis
-                  from-col
-                  base
-                  line-spans
-                  content
-                  (text/line->char rope line)
-                  (textpos/ed-line-end rope line)
-                  ;; the row's whole memo deps for the usual frame — no highlight range
-                  ;; and no override on the line — plain, then tiled: built once with the
-                  ;; facts, so such a row hands its memo the SAME vector every frame
-                  [content '() '() true]
-                  [content '() '() false]
-                  ellipsis
-                  painted])
-              inlay)))))))
+      (let (carry (when (nil? rows) (ed-row-facts-carry rope hscroll w cell-layout)))
+        (map (seq/zip table (ed-row-start-cols rope table))
+          (fn ([row known-col])
+            (let (line (nth row 0)
+                  inlay (nth row 3 nil)
+                  carried (when (and carry (nil? inlay)) (carry line)))
+              (cond
+                (not (nil? inlay)) inlay
+                carried (ed-row-fact-moved carried line (get by-line line))
+                else (ed-row-fact rope by-line w row known-col)))))))))
+
+(defn- ed-row-fact (rope by-line w row known-col)
+  ;; one text row's facts (`ed-row-facts-at`'s), read from the text
+  (let (line (nth row 0)
+        from (nth row 1)
+        to (nth row 2)
+        clip (nth row 4 nil)
+        display (wrap/row-display row)
+        [vis from-col base] (ed-row-slice rope line from (if clip (first clip) to) w known-col)
+        ;; a wrapped row its line goes on past ends in the continuation mark,
+        ;; painted just past the text (`ed-with-ellipsis`: the scrollbar column)
+        ellipsis (cond
+                   clip (second clip)
+                   (and (not (nil? to))
+                     (< (+ (text/line->char rope line) to) (textpos/ed-line-end rope line)))
+                     wrap/continuation-mark
+                   else nil)
+        line-spans (get by-line line)
+        ;; the row's prefix and inline text, the latter as indices into `vis`
+        painted (ed-paint-display display (- base (text/line->char rope line)) (count vis)))
+    (ed-row-fact-of line
+      vis
+      from-col
+      base
+      line-spans
+      ;; the spans CLIPPED to the text the row shows: a docstring's one span runs over many
+      ;; lines and lengthens with every character typed in it, and every row it covers
+      ;; paints the same however long it is
+      [vis from-col w (ed-row-content-spans line-spans base vis) ellipsis painted]
+      (text/line->char rope line)
+      (textpos/ed-line-end rope line))))
+
+(defn- ed-row-content-spans (line-spans base vis)
+  ;; the line's spans over the text a row shows, relative to its first character
+  (ed-rebase-ranges (spanpaint/ed-ranges-on-line line-spans base (+ base (count vis))) base))
+
+(defn- ed-row-fact-of (line vis from-col base line-spans content bol eol)
+  ;; the fact vector, with the row's whole memo deps for the usual frame — no highlight
+  ;; range and no override on the line — plain, then tiled: built once with the facts, so
+  ;; such a row hands its memo the SAME vector every frame
+  [line
+    vis
+    from-col
+    base
+    line-spans
+    content
+    bol
+    eol
+    [content '() '() true]
+    [content '() '() false]
+    (nth content 4)
+    (nth content 5)])
+
+(defn- ed-row-fact-moved (carried line line-spans)
+  "A row's facts carried from the frame before: `carried` is `[fact delta]`, the fact of the
+same text there and how far an edit moved it. The offsets move by `delta`; the text, its
+column and what it paints are the fact's own. Its content — and with it the memo deps — stays
+the SAME cell while the line's spans over it are unchanged, so the row's memo hits at once."
+  (let ([fact delta] carried
+        base (+ (nth fact 3) delta)
+        vis (nth fact 1)
+        content (nth fact 5)
+        ;; the line's spans moved with its text — what an edit elsewhere leaves — keep the
+        ;; content as it is, without clipping and rebasing them again (most of a row's cost)
+        same-spans? (or (ed-spans-moved? (nth fact 4) line-spans delta)
+                      (= (ed-row-content-spans line-spans base vis) (nth content 3)))
+        spans (if same-spans? (nth content 3) (ed-row-content-spans line-spans base vis))
+        moved (ed-row-fact-of line
+                vis
+                (nth fact 2)
+                base
+                line-spans
+                (if same-spans? content (assoc content 3 spans))
+                (+ (nth fact 6) delta)
+                (+ (nth fact 7) delta)))
+    (if same-spans? (assoc moved 8 (nth fact 8) 9 (nth fact 9)) moved)))
+
+(defn- ed-spans-moved? (old new delta)
+  "Whether the `[start end face]` spans `new` are `old`, each moved `delta` characters —
+compared in one walk, nothing built."
+  (cond
+    (and (empty? old) (empty? new)) true
+    (or (empty? old) (empty? new)) false
+    else
+      (let (a (first old)
+            b (first new))
+        (and (vector? a)
+          (int? (nth a 0))
+          (int? (nth a 1))
+          (vector? b)
+          (= (nth b 0) (+ (nth a 0) delta))
+          (= (nth b 1) (+ (nth a 1) delta))
+          (= (nth b 2) (nth a 2))
+          (ed-spans-moved? (rest old) (rest new) delta)))))
+
+(defn- ed-row-facts-carry (rope hscroll w cell-layout)
+  "For an unwrapped pane's rows on a frame `ed-row-facts-at` missed — an edit, a scroll — a
+fn from a line to `[fact delta]`: the fact the newest remembered unwrapped call with the same
+columns, width and layout has for the same text, and how far the edit between moved it; nil
+for a line the edit touched or that call did not show. Nil when there is no such call.
+
+Typing changes the rope, so the whole-pane memo misses on every key; without this every row
+was read again from the text (0.75 ms at 213x49), where one line changed. Lines before the
+edit keep their offsets, lines after it move by its length (`text/changed-range`)."
+  (let (name (symbol (str (reflect/fn-module ed-row-facts-at) "/ed-row-facts-at"))
+        entry (seq/find (memo/entries name)
+                (fn (entry)
+                  (let (key (first entry))
+                    (and (nil? (nth key 5))
+                      (= (nth key 4) hscroll)
+                      (= (nth key 6) w)
+                      (= (nth key 7) cell-layout))))))
+    (when entry
+      (let (key (first entry)
+            old-rope (nth key 0)
+            old-top (nth key 2)
+            facts (vec (second entry))
+            change (text/changed-range old-rope rope)
+            ;; `[first-changed last-changed shift-lines shift-chars]` of the edit, in the new text
+            edit (when change
+                   (let ([start old-end new-end] change
+                         new-last (text/char->line rope new-end))
+                     [(text/char->line rope start)
+                       new-last
+                       (- new-last (text/char->line old-rope old-end))
+                       (- new-end old-end)])))
+        (fn (line)
+          (let (moved (cond
+                        (nil? edit) [line 0]
+                        (< line (nth edit 0)) [line 0]
+                        (> line (nth edit 1)) [(- line (nth edit 2)) (nth edit 3)]
+                        else nil))
+            (when moved
+              (let (index (- (first moved) old-top)
+                    fact (when (and (>= index 0) (< index (count facts))) (nth facts index)))
+                (when (and (vector? fact) (= (first fact) (first moved)))
+                  [fact (second moved)])))))))))
 
 (defn- ed-rebase-ranges (ranges base)
   "`[start end face]` `ranges` with both ends made relative to offset `base` — `()` for
