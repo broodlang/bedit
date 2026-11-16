@@ -105,19 +105,71 @@
       (assert= (carry-spans [[4 5 :v]] seen now) [[7 8 :v]])
       (assert= (carry-spans [[4 5 :v]] seen seen) [[4 5 :v]])
       ;; a buffer the log cannot reach: nil, for the caller to drop them
-      (is (nil? (carry-spans [[4 5 :v]] seen gone))))))
+      (is (nil? (carry-spans [[4 5 :v]] seen gone)))))
+  (test "a window is carried alone, and agrees with carrying everything"
+    (let (spans [[0 3 :a] [10 13 :b] [20 23 :c] [30 33 :d]]
+          splices [[0 0 "xy"] [25 26 ""] [12 12 "q"]])
+      (assert= (spans-window spans splices 11 17) [[13 16 :b]])
+      (assert= (spans-window spans splices 0 40)
+        (fold splices spans shift-spans))
+      ;; an empty window, and one before every edit
+      (assert= (spans-window spans splices 40 40) [])
+      (assert= (spans-window spans [[30 30 "z"]] 0 5) [[0 3 :a]])))
+  (test "the window a frame paints is read through the edits since the spans were stamped"
+    (let (buf (assoc (make-buffer "fn main() {}")
+                :semantic-spans [[3 7 :syntax/definition]]
+                :semantic-rope (buffer-rope (make-buffer "fn other() {}")))
+          stamped (assoc buf :semantic-rope (buffer-rope buf))
+          typed (insert (goto-char stamped 0) "  "))
+      (assert= (semantic-window stamped 0 12) [[3 7 :syntax/definition]])
+      (assert= (semantic-window typed 0 14) [[5 9 :syntax/definition]])
+      ;; a rope the log cannot reach paints nothing
+      (is (nil? (semantic-window buf 0 12))))))
+
+(defn- painted (m)
+  "What a frame paints of the current buffer's semantic spans, over its whole text."
+  (or (semantic-window (ed-current-buf m) 0 (count (buffer-rope (ed-current-buf m)))) []))
+
+(describe "lsp semantic tokens: the post-step between answers"
+  (test "a keystroke leaves the stamp alone; many re-base it; a log that cannot say drops it"
+    (let (m (assoc (ed-init (make-buffer "fn main() {}" "s.rs" "/tmp/semfollow.rs"))
+              :lsp-semantic {"/tmp/semfollow.rs" {:requested :rope}})
+          buf (ed-current-buf m)
+          stamped (ed-set-buf m
+                    (assoc buf
+                      :semantic-spans [[3 7 :syntax/definition]]
+                      :semantic-rope (buffer-rope buf)))
+          once (semantic-follow (ed-set-buf stamped
+                                  (insert (goto-char (ed-current-buf stamped) 0) " ")))
+          ;; typed one key an event, the post-step after each, as the loop runs it
+          many (fold (range 20)
+                 once
+                 (fn (acc _)
+                   (semantic-follow (ed-set-buf acc (insert (goto-char (ed-current-buf acc) 0) " ")))))
+          ;; the text replaced wholesale (a revert): a buffer whose log does not reach the stamp
+          lost (semantic-follow (ed-set-buf stamped
+                                  (assoc (make-buffer "other text" "s.rs" "/tmp/semfollow.rs")
+                                    :semantic-spans [[3 7 :syntax/definition]]
+                                    :semantic-rope (buffer-rope buf)))))
+      (assert= (:semantic-spans (ed-current-buf once)) [[3 7 :syntax/definition]])
+      (assert= (painted once) [[4 8 :syntax/definition]])
+      ;; re-based once the log held more than half what it keeps (16 of 32), read since
+      (assert= (:semantic-spans (ed-current-buf many)) [[20 24 :syntax/definition]])
+      (assert= (painted many) [[24 28 :syntax/definition]])
+      (assert= (painted lost) [])
+      (is (nil? (map/get-in lost [:lsp-semantic "/tmp/semfollow.rs" :requested]))))))
 
 (describe "lsp semantic tokens: painted over the mode's colours"
   (test "the semantic layer wins where it colours, the mode shows elsewhere"
     (let (buf (assoc (make-buffer "foo bar") :semantic-spans [[4 7 :syntax/variable]])
-          spans (spanpaint/ed-buffer-spans buf [[0 3 :syntax/keyword] [4 7 :syntax/special]]))
+          spans (spanpaint/ed-buffer-spans buf [[0 3 :syntax/keyword] [4 7 :syntax/special]] 0 1))
       (assert= (view/ed-face-at spans 1) :syntax/keyword)
       (assert= (view/ed-face-at spans 5) :syntax/variable)
       (assert= (into [] (get (spanpaint/ed-spans-by-line-at (buffer-rope buf) spans 0 0) 0))
         [[0 3 :syntax/keyword] [4 7 :syntax/variable]])))
   (test "a buffer with no semantic spans paints exactly the mode's"
     (let (buf (make-buffer "foo"))
-      (assert= (spanpaint/ed-buffer-spans buf [[0 3 :syntax/keyword]]) [[0 3 :syntax/keyword]]))))
+      (assert= (spanpaint/ed-buffer-spans buf [[0 3 :syntax/keyword]] 0 1) [[0 3 :syntax/keyword]]))))
 
 ;; ---- code lenses: parsing and placement ----------------------------------------------
 (describe "lsp code lens: parsing and placement"
@@ -246,12 +298,12 @@ taken and ignored."
           [kind _] (asked)
           _ (assert= kind (lsp-semantic-tokens))
           landed (deliver asking))
-      (assert= (:semantic-spans (ed-current-buf landed))
+      (assert= (painted landed)
         [[3 7 :syntax/definition] [12 13 :syntax/variable]])
       ;; typed at the start: the post-step carries the spans with the text
       (let (typed (semantic-follow (ed-set-buf landed
                                      (insert (goto-char (ed-current-buf landed) 0) "  "))))
-        (assert= (:semantic-spans (ed-current-buf typed))
+        (assert= (painted typed)
           [[5 9 :syntax/definition] [14 15 :syntax/variable]])
         (is (ed-semantic-due? typed))
         ;; the second ask is a delta against the first answer
@@ -261,7 +313,7 @@ taken and ignored."
               _ (assert= (:previous-result-id request) "1")
               updated (deliver again))
           (assert= (map/get-in updated [:lsp-semantic "/tmp/sem.rs" :data]) [0 5 4 0 1 0 12 1 1 0])
-          (assert= (:semantic-spans (ed-current-buf updated))
+          (assert= (painted updated)
             [[5 9 :syntax/definition] [17 18 :syntax/variable]])))))
   (test "inside a loop the spans are worked out by a task, landed when it answers"
     (let (conn (stand-in [{:resultId "1" :data [0 3 4 0 1 0 9 1 1 0]}]))
@@ -277,7 +329,7 @@ taken and ignored."
               handle (:lsp-semantic-proc handed))
           ;; nothing painted yet, and the file is not asked again while its spans are worked out
           (refute (nil? handle))
-          (is (nil? (:semantic-spans (ed-current-buf handed))))
+          (assert= (painted handed) [])
           (refute (ed-semantic-due? (ed-set-buf handed (insert (ed-current-buf handed) "z"))))
           ;; typed while the task ran: the spans land where the text went
           (let (typed (semantic-follow (ed-set-buf handed
@@ -288,7 +340,7 @@ taken and ignored."
                                                          80
                                                          24))
                                             (is (nil? (:lsp-semantic-job landed)))
-                                            (assert= (:semantic-spans (ed-current-buf landed))
+                                            (assert= (painted landed)
                                               [[5 9 :syntax/definition] [14 15 :syntax/variable]])
                                             (assert= (map/get-in landed
                                                        [:lsp-semantic "/tmp/semtask.rs" :result-id])
@@ -516,7 +568,7 @@ the raw server answer `raw` as if it had just landed."
       ;; against the last answer, which the server keeps: it sends what changed
       (assert= kind (lsp-semantic-tokens-delta))
       (assert= (:previous-result-id request) "1")
-      (assert= (:semantic-spans (ed-current-buf (deliver refreshed))) [[3 7 :syntax/function]])))
+      (assert= (painted (deliver refreshed)) [[3 7 :syntax/function]])))
   (test "a server's `content modified` asks again, for what the idle beat asks by itself"
     (let (state {:proc :fake
                  :buf ""

@@ -10,17 +10,19 @@ Three halves, as every LSP feature here:
   (`apply-delta`), a token's type and modifiers turned into one of the editor's `:syntax/*`
   faces through the server's legend (`token-face`), the array turned in one pass into
   `[start end face]` char spans of the text it was computed against (`token-spans`), and
-  those spans carried through what the buffer's edits did since (`shift-spans`), so an answer
-  that lands after a keystroke, and every keystroke until the next answer, paints where the text
-  went rather than where it was.
+  those spans carried through what the buffer's edits did since (`shift-spans`, for a window
+  alone `spans-window`), so an answer that lands after a keystroke, and every keystroke until the
+  next answer, paints where the text went rather than where it was.
 - **the wire**: two request kinds (`lsp-semantic-tokens`, `lsp-semantic-tokens-delta`) under
   the `LspRequest` ability, shaped and folded like every other lookup.
 - **the model**: the idle beat asks when the current buffer's text moved since the last ask
   (`ed-semantic-due?`), the answer is turned into spans by a task off the loop and
-  `ed-semantic-land` stamps them on the pool buffer (`:semantic-spans`, which
-  `spanpaint/ed-buffer-spans` lays over the mode's spans), and a post-step carries them through
-  the splice log after each event (`semantic-follow`). Per file under `:lsp-semantic`:
-  `{path {:seen buffer :spans [...] :data [...] :result-id :conn :requested rope}}`.
+  `ed-semantic-land` stamps them on the pool buffer with the rope they are about
+  (`:semantic-spans`, `:semantic-rope`). A frame asks for the lines it shows
+  (`semantic-window`, the span overlay `spanpaint/ed-buffer-spans` lays over the mode's spans),
+  carried through the edits since; the post-step only re-bases them now and then
+  (`semantic-follow`). Per file under `:lsp-semantic`:
+  `{path {:data [...] :result-id :conn :delta? :asked token :requested rope}}`.
 
 On while the server offers it (`semanticTokensProvider`) unless init.blsp's
 `:lsp-semantic-tokens` says false; M-x lsp-semantic-tokens-mode toggles it."
@@ -264,6 +266,31 @@ between them (`buffer-splices-since`) — or nil when the buffer's log cannot sa
     (let (splices (buffer-splices-since seen current))
       (when (not (nil? splices)) (fold splices spans shift-spans)))))
 
+(defn- first-starting-at (spans at)
+  ;; the index of the first span starting at or after `at` (spans ascending), by bisection
+  (letrec (search (fn (low high)
+                    (if (>= low high)
+                      low
+                      (let (middle (math/floor (/ (+ low high) 2)))
+                        (if (>= (first (nth spans middle)) at)
+                          (search low middle)
+                          (search (inc middle) high))))))
+    (search 0 (count spans))))
+
+(defn spans-window (spans splices from to)
+  "`spans` (ascending, computed against the text before `splices`) carried through `splices`
+for the stretch `[from, to)` of the text after them alone: the spans reaching into what that
+stretch was before the edits ([[textpos/ed-splices-back]]), each edit applied to them
+([[shift-spans]]). What a frame asks of a file's spans between answers, so a keystroke costs it
+the spans it shows rather than every token of the file.
+
+    (lsp-semantic/spans-window [[0 3 :a] [10 13 :b] [20 23 :c]] [[0 0 \"xy\"]] 11 16)   ;=> [[12 15 :b]]"
+  (let (spans (as-vector spans)
+        [lo hi] (textpos/ed-splices-back splices from to)
+        start (first-touched spans lo)
+        end (math/max start (first-starting-at spans hi)))
+    (fold splices (seq/subvec spans start end) shift-spans)))
+
 ;; ---- the wire: two request kinds ----------------------------------------------------
 
 (defrecord lsp-semantic-tokens ()) ; textDocument/semanticTokens/full
@@ -389,11 +416,25 @@ refresh asks for each buffer of its on screen. Nothing for a buffer no live serv
 whose stand-in servers are the test process itself."
   (if (or (ed-headless?) (not (ed-semantic-due? m))) m (ed-semantic-request m)))
 
-(defn- ed-semantic-stamp (m index path store)
-  "`m` with `store` filed for `path` and its spans stamped on pool buffer `index` — `:seen`
-becomes the stamped buffer, so the next carry starts from it."
-  (let (stamped (assoc (ed-buf-at m index) :semantic-spans (:spans store)))
-    (map/assoc-in (ed-set-buf-at m index stamped) [:lsp-semantic path] (assoc store :seen stamped))))
+(defn- ed-semantic-stamp (m index spans)
+  ;; `spans` stamped on pool buffer `index` with the text they are about, its rope now: what
+  ;; [[semantic-window]] carries them from
+  (let (buffer (ed-buf-at m index))
+    (ed-set-buf-at m index (assoc buffer :semantic-spans spans :semantic-rope (buffer-rope buffer)))))
+
+(defn semantic-window (buffer from to)
+  "The span overlay (`model/register-span-overlay`): `buffer`'s semantic spans over chars
+`[from, to)`, carried from the text they were stamped against through the edits since
+([[spans-window]]) — only what a frame shows, never the file's every token. Nil when it has
+none, or when the buffer's log cannot say what changed (the post-step drops those)."
+  (let (spans (:semantic-spans buffer)
+        rope (:semantic-rope buffer))
+    (cond
+      (or (nil? spans) (empty? spans)) nil
+      (or (nil? rope) (= rope (buffer-rope buffer))) spans
+      else
+        (let (splices (buffer-splices-since (assoc buffer :rope rope) buffer))
+          (when (not (nil? splices)) (spans-window spans splices from to))))))
 
 (defn ed-semantic-fold (pending m payload)
   "A semantic-tokens answer landing: the array rebuilt (a delta applied to the last one, when
@@ -460,40 +501,51 @@ worked out; `spans` nil (the task failed) makes the file due again."
       (not (vector? spans)) (map/assoc-in cleared [:lsp-semantic path :requested] nil)
       else
         (let (carried (carry-spans spans (:seen job) (ed-buf-at cleared index)))
-          (ed-semantic-stamp cleared
-            index
-            path
+          (map/assoc-in (ed-semantic-stamp cleared index (or carried []))
+            [:lsp-semantic path]
             (merge store
               (:answer job)
-              {:spans (or carried [])
-               ;; spans the log could not carry are wrong: asked again on the next beat
-               :requested (when carried (:requested store))}))))))
+              ;; spans the log could not carry are wrong: asked again on the next beat
+              {:requested (when carried (:requested store))}))))))
+
+(def- *rebase-after*
+  ;; edits a buffer's spans are read through ([[semantic-window]]) before the post-step carries
+  ;; them whole once and restamps them: half what the buffer's splice log keeps, so the log still
+  ;; reaches the stamp when it does, and no frame reads through a long log
+  (math/quot editor/buffer/*splice-log-max* 2))
 
 (defn semantic-follow (m)
-  "The post-step: every file's spans carried through what this event did to its buffer
-([[carry-spans]]), restamped on it; a file whose buffer is gone forgotten. O(files) rope
-compares when nothing was typed."
+  "The post-step. Between answers a file's spans stay on its buffer against the text they were
+stamped for and a frame carries what it shows ([[semantic-window]]), so a keystroke costs this
+nothing but a look at the buffer's log: spans whose edits the log cannot say are dropped and the
+file asked again; spans read through more than `*rebase-after*` edits are carried whole once and
+restamped. A file whose buffer is gone is forgotten."
   (let (stores (or (:lsp-semantic m) {}))
     (if (empty? stores)
       m
       (fold (%map-pairs stores)
         m
         (fn (acc pair)
-          (let ([path store] pair
-                index (ed-buffer-index-by-file acc path)
-                seen (:seen store))
-            (cond
-              (nil? index) (assoc acc :lsp-semantic (dissoc (:lsp-semantic acc) path))
-              (nil? seen) acc
-              (= (buffer-rope seen) (buffer-rope (ed-buf-at acc index))) acc
-              else
-                (let (carried (carry-spans (:spans store) seen (ed-buf-at acc index)))
-                  (ed-semantic-stamp acc
-                    index
-                    path
-                    (if (nil? carried)
-                      (assoc store :spans [] :requested nil)
-                      (assoc store :spans carried)))))))))))
+          (let ([path _store] pair
+                index (ed-buffer-index-by-file acc path))
+            (if (nil? index)
+              (assoc acc :lsp-semantic (dissoc (:lsp-semantic acc) path))
+              (ed-semantic-rebase acc index path))))))))
+
+(defn- ed-semantic-rebase (m index path)
+  ;; pool buffer `index`'s stamp kept while the log reaches it and few edits lie since; carried
+  ;; whole and restamped past `*rebase-after*`; dropped, `path` asked again, when the log cannot say
+  (let (buffer (ed-buf-at m index)
+        rope (:semantic-rope buffer))
+    (if (or (nil? rope) (= rope (buffer-rope buffer)))
+      m
+      (let (splices (buffer-splices-since (assoc buffer :rope rope) buffer))
+        (cond
+          (nil? splices)
+            (map/assoc-in (ed-semantic-stamp m index []) [:lsp-semantic path :requested] nil)
+          (> (count splices) *rebase-after*)
+            (ed-semantic-stamp m index (fold splices (:semantic-spans buffer) shift-spans))
+          else m)))))
 
 (defn- ed-semantic-clear (m)
   ;; every buffer's spans taken off and the files forgotten
@@ -502,7 +554,7 @@ compares when nothing was typed."
            (fn (acc index)
              (let (buffer (ed-buf-at acc index))
                (if (contains? buffer :semantic-spans)
-                 (ed-set-buf-at acc index (dissoc buffer :semantic-spans))
+                 (ed-set-buf-at acc index (dissoc buffer :semantic-spans :semantic-rope))
                  acc))))
     :lsp-semantic {}))
 
@@ -554,5 +606,7 @@ every answer a whole one)."
    :stale? 'lsp-semantic/ed-semantic-due?})
 ;; after the snippet's carry (35), before anything that reads the colours
 (register-post-step :lsp-semantic {:order 45 :run 'lsp-semantic/semantic-follow})
+;; the spans a frame paints over the mode's, carried for what it shows
+(register-span-overlay :lsp-semantic {:rank 10 :spans 'lsp-semantic/semantic-window})
 ;; an answer turned into spans off the loop; a failed task makes its file due again
 (register-task-reply :lsp-semantic-proc 'lsp-semantic/ed-semantic-land nil nil)
