@@ -1092,7 +1092,7 @@ src/lsp-requests.blsp       the LSP request-kind records + `LspRequest` ability 
                             shared by lsp (connection side) and lsp-commands (model side); eager-loaded so
                             lsp-commands can register fold impls while lsp stays deferred
 src/lsp-semantic.blsp       LSP SEMANTIC TOKENS (`semanticTokens/full`, `/full/delta`): the integer
-                            array decoded against the server's legend, a delta applied, each token
+                            array (a delta applied) turned into spans by a TASK off the loop, each token
                             type + modifiers a `:syntax/*` face (`:syntax/variable` is its own; a
                             definition `:syntax/definition`; strings / comments / numbers left to
                             the mode), stamped on the pool buffer as `:semantic-spans`, which

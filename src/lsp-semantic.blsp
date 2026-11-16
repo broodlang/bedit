@@ -6,17 +6,18 @@ layer OVER the mode's own colouring (tree-sitter or a lexer), never instead of i
 
 Three halves, as every LSP feature here:
 
-- **pure**: the server's relative-encoded integer array decoded (`decode-tokens`), a delta
-  applied to the last array (`apply-delta`), a token's type and modifiers turned into one of
-  the editor's `:syntax/*` faces through the server's legend (`token-face`), the tokens turned
-  into `[start end face]` char spans of the text they were computed against (`token-spans`), and
+- **pure**: a delta applied to the server's last relative-encoded integer array
+  (`apply-delta`), a token's type and modifiers turned into one of the editor's `:syntax/*`
+  faces through the server's legend (`token-face`), the array turned in one pass into
+  `[start end face]` char spans of the text it was computed against (`token-spans`), and
   those spans carried through what the buffer's edits did since (`shift-spans`), so an answer
   that lands after a keystroke, and every keystroke until the next answer, paints where the text
   went rather than where it was.
 - **the wire**: two request kinds (`lsp-semantic-tokens`, `lsp-semantic-tokens-delta`) under
   the `LspRequest` ability, shaped and folded like every other lookup.
 - **the model**: the idle beat asks when the current buffer's text moved since the last ask
-  (`ed-semantic-due?`), the fold stamps the spans on the pool buffer (`:semantic-spans`, which
+  (`ed-semantic-due?`), the answer is turned into spans by a task off the loop and
+  `ed-semantic-land` stamps them on the pool buffer (`:semantic-spans`, which
   `spanpaint/ed-buffer-spans` lays over the mode's spans), and a post-step carries them through
   the splice log after each event (`semantic-follow`). Per file under `:lsp-semantic`:
   `{path {:seen buffer :spans [...] :data [...] :result-id :conn :requested rope}}`.
@@ -27,7 +28,8 @@ On while the server offers it (`semanticTokensProvider`) unless init.blsp's
   (:use editor/buffer) ; buffer-rope / buffer-file / buffer-splices-since
   (:use interactive) ; defcommand — M-x lsp-semantic-tokens-mode
   (:use lsp-requests) ; the LspRequest ability the two request kinds implement
-  (:use lsp-servers)) ; ed-lsp-ask-server — one request path for every lookup
+  (:use lsp-servers) ; ed-lsp-ask-server — one request path for every lookup
+  (:use task)) ; task — an answer turned into spans off the loop
 
 ;; ---- the faces --------------------------------------------------------------------
 ;; The token types this client asks for (the protocol's standard set) and the modifiers. A
@@ -117,36 +119,19 @@ readonly variable `:syntax/constant`. `deprecated` changes nothing: a span has o
 ;; previous token's when on the same line, else absolute — UTF-16 units), length, type index,
 ;; modifier bits.
 
-(defn decode-tokens (data)
-  "The tokens of a semantic-tokens `data` array as `[line units length type bits]`, absolute
-0-based line and UTF-16 start column, in order. A trailing partial group is dropped.
-
-    (lsp-semantic/decode-tokens [0 4 3 1 0 1 2 5 0 2 0 6 1 2 0])   ;=> [[0 4 3 1 0] [1 2 5 0 2] [1 8 1 2 0]]"
-  (let (data (if (vector? data) data (if (list? data) (into [] data) [])))
-    (letrec (step (fn (index line start acc)
-                    (if (> (+ index 5) (count data))
-                      acc
-                      (let (delta-line (nth data index)
-                            delta-start (nth data (+ index 1))
-                            next-line (+ line delta-line)
-                            next-start (if (= delta-line 0) (+ start delta-start) delta-start))
-                        (step (+ index 5)
-                          next-line
-                          next-start
-                          (conj acc
-                            [next-line
-                              next-start
-                              (nth data (+ index 2))
-                              (nth data (+ index 3))
-                              (nth data (+ index 4))]))))))
-      (step 0 0 0 []))))
+(defn- as-vector (data)
+  ;; a server's array as a vector, whatever JSON decoding handed over; nothing for a non-array
+  (cond
+    (vector? data) data
+    (list? data) (into [] data)
+    else []))
 
 (defn apply-delta (data edits)
   "The array a `/full/delta` answer's `edits` (`{:start :deleteCount :data}`, against `data`)
 make of the previous array `data`.
 
     (lsp-semantic/apply-delta [1 2 3 4 5] [{:start 1 :deleteCount 2 :data [9]}])   ;=> [1 9 4 5]"
-  (let (data (if (vector? data) data (if (list? data) (into [] data) []))
+  (let (data (as-vector data)
         size (count data)
         sorted (seq/sort-by (or edits []) (fn (edit) (or (:start edit) 0)))
         [built at] (fold sorted
@@ -165,51 +150,70 @@ make of the previous array `data`.
 
 ;; ---- pure: tokens -> char spans ----------------------------------------------------
 
-(defn- astral? (text)
-  ;; whether `text` holds a character beyond the BMP — two UTF-16 units, so units are not chars
-  (any? (string/->codepoints text) (fn (code) (> code 65535))))
+(defn- line-of (rope line)
+  ;; `[line start text bmp?]` for 0-based `line` of `rope`, its newline cut off: what a token
+  ;; on it is measured against, read once however many tokens the line has
+  (let (whole (text/line rope line)
+        text (if (string/ends-with? whole "\n")
+               (string/substring whole 0 (dec (count whole)))
+               whole))
+    [line (text/line->char rope line) text (lsp-protocol/lsp-bmp? text)]))
 
-(defn- units->index (text units astral)
-  "The char index in line `text` (its newline excluded) at UTF-16 column `units`."
-  (let (whole (count text) size (if (string/ends-with? text "\n") (dec whole) whole))
-    (if (not astral)
-      (math/min size (math/max 0 units))
-      (letrec (walk (fn (codes index used)
-                      (if (or (empty? codes) (>= used units) (>= index size))
-                        index
-                        (walk (rest codes)
-                          (inc index)
-                          (+ used (if (> (or (first codes) 0) 65535) 2 1))))))
-        (walk (string/->codepoints text) 0 0)))))
+(defn- column-of (info units)
+  ;; the char column on the line `info` ([[line-of]]) at UTF-16 column `units`
+  (let ([_ _ text bmp] info)
+    (if bmp
+      (math/min (count text) (math/max 0 units))
+      (lsp-protocol/lsp-utf16->index text units))))
 
-(defn token-spans (tokens legend rope)
-  "`[start end face]` char spans of `rope` for decoded `tokens` ([[decode-tokens]]) read through
-the server's `legend` (`{:tokenTypes :tokenModifiers}`) — ascending, a token with no face
-([[token-face]]) or past the text left out. Each line is read once, however many tokens it has.
+(defn token-spans (data legend rope)
+  "`[start end face]` char spans of `rope` for a semantic-tokens `data` array (five integers a
+token, relative-encoded), read through the server's `legend` (`{:tokenTypes :tokenModifiers}`)
+— ascending; a token with no face ([[token-face]]), past the text, or in a trailing partial
+group left out. One pass over the array: a line is read once however many tokens it has, a
+type and modifier pair is turned into its face once, and an all-ASCII line's UTF-16 columns
+are its char columns.
 
-    (lsp-semantic/token-spans [[0 4 3 0 0]] {:tokenTypes [\"function\"]} (text/string-> \"let foo = 1\"))   ;=> [[4 7 :syntax/function]]"
-  (let (types (or (:tokenTypes legend) [])
+    (lsp-semantic/token-spans [0 4 3 0 0] {:tokenTypes [\"function\"]} (text/string-> \"let foo = 1\"))   ;=> [[4 7 :syntax/function]]"
+  (let (data (as-vector data)
+        size (count data)
+        types (or (:tokenTypes legend) [])
         names (or (:tokenModifiers legend) [])
         lines (text/line-count rope))
-    (second (fold tokens
-              [nil []]
-              (fn (carried token)
-                (let ([cached spans] carried
-                      [line units length type bits] token
-                      face (token-face (nth types type nil) (modifier-names bits names)))
-                  (if (or (nil? face) (not (int? line)) (>= line lines) (< line 0))
-                    carried
-                    (let (info (if (and cached (= (first cached) line))
-                                 cached
-                                 (let (text (text/line rope line))
-                                   [line (text/line->char rope line) text (astral? text)]))
-                          [_ line-start text astral] info
-                          from (units->index text units astral)
-                          to (units->index text (+ units length) astral))
-                      [info
-                        (if (> to from)
-                          (conj spans [(+ line-start from) (+ line-start to) face])
-                          spans)]))))))))
+    (letrec (step (fn (index line start cached faces spans)
+                    (if (> (+ index 5) size)
+                      (into [] (reverse spans))
+                      (let (delta-line (nth data index)
+                            line (+ line delta-line)
+                            start (if (= delta-line 0)
+                                    (+ start (nth data (+ index 1)))
+                                    (nth data (+ index 1)))
+                            type (nth data (+ index 3))
+                            bits (nth data (+ index 4))
+                            ;; one int names the pair: a face is worked out once a pair
+                            kind (+ (* bits 65536) type)
+                            known (get faces kind :unknown)
+                            face (if (= known :unknown)
+                                   (token-face (nth types type nil) (modifier-names bits names))
+                                   known)
+                            faces (if (= known :unknown) (assoc faces kind face) faces))
+                        (if (or (nil? face) (not (int? line)) (>= line lines) (< line 0))
+                          (step (+ index 5) line start cached faces spans)
+                          (let (info (if (and cached (= (first cached) line))
+                                       cached
+                                       (line-of rope line))
+                                line-start (second info)
+                                from (column-of info start)
+                                to (column-of info (+ start (nth data (+ index 2)))))
+                            (step (+ index 5)
+                              line
+                              start
+                              info
+                              faces
+                              (if (> to from)
+                                (cons [(+ line-start from) (+ line-start to) face] spans)
+                                spans))))))))
+      (step 0 0 0 nil {} (list)))))
 
 ;; ---- pure: carrying spans through edits --------------------------------------------
 
@@ -320,18 +324,23 @@ between them (`buffer-splices-since`) — or nil when the buffer's log cannot sa
   ;; `semanticTokensProvider.full` is `true` or `{:delta bool}`
   (let (full (:full provider)) (and (map? full) (= true (:delta full)))))
 
+(defn- ed-semantic-busy? (m file)
+  ;; an ask out for `file`, or its answer still being turned into spans off the loop: one at a
+  ;; time, as two in flight are two deltas against one answer, and the server, which keeps
+  ;; only its newest, answers the second whole
+  (or (ed-lsp-in-flight? m (map/get-in m [:lsp-semantic file :asked]))
+    (= file (:path (:lsp-semantic-job m)))))
+
 (defn ed-semantic-due? (m)
   "True when the current buffer's tokens are due an ask: wanted, a live server offering them,
-and the text moved since the last ask. The idle job's `:stale?`, so false whenever the ask
-would not happen."
+the text moved since the last ask, and no ask or answer for it under way. The idle job's
+`:stale?`, so false whenever the ask would not happen."
   (let (buffer (ed-current-buf m)
         file (buffer-file buffer))
     (and (semantic-on? m)
       (string? file)
       (not (= (buffer-rope buffer) (map/get-in m [:lsp-semantic file :requested])))
-      ;; one ask at a time: two in flight are two deltas against one answer, and the server,
-      ;; which keeps only its newest, answers the second whole
-      (not (ed-lsp-in-flight? m (map/get-in m [:lsp-semantic file :asked])))
+      (not (ed-semantic-busy? m file))
       (not (nil? (semantic-entry m file))))))
 
 (defn ed-semantic-request (m)
@@ -388,10 +397,13 @@ becomes the stamped buffer, so the next carry starts from it."
 
 (defn ed-semantic-fold (pending m payload)
   "A semantic-tokens answer landing: the array rebuilt (a delta applied to the last one, when
-it is the answer the delta was asked against), decoded against the legend the request carried,
-turned into spans of the text it was about (`:seen`) and carried to the text now. Dropped for a
-closed file, with the feature off, or for an ask a newer one has replaced; a delta against an
-answer no longer kept forgets the result id, so the next ask is a whole one."
+it is the answer the delta was asked against), then turned into spans of the text it was about
+(`:seen`) OFF the loop — a large file's answer is tens of thousands of tokens — and landed by
+[[ed-semantic-land]] when that is done (inline when there is no loop to answer, a test).
+Dropped for a closed file, with the feature off, or for an ask a newer one has replaced; a
+delta against an answer no longer kept forgets the result id, so the next ask is a whole one.
+An answer that finds another file's spans still being worked out is asked again on the next
+beat."
   (let (path (:path pending)
         store (or (map/get-in m [:lsp-semantic path]) {})
         index (when path (ed-buffer-index-by-file m path)))
@@ -406,25 +418,56 @@ answer no longer kept forgets the result id, so the next ask is a whole one."
                        (when (and (:previous-id pending)
                                (= (:previous-id pending) (:result-id store)))
                          (apply-delta (:data store) (:edits payload)))
-                     else (into [] (or (:data payload) []))))
-          (if (nil? data)
-            (map/assoc-in m [:lsp-semantic path] (dissoc store :result-id :data :requested))
-            (let (seen (:seen pending)
-                  spans (token-spans (decode-tokens data) (:legend pending) (buffer-rope seen))
-                  carried (carry-spans spans seen (ed-buf-at m index)))
-              (ed-semantic-stamp m
-                index
-                path
-                (assoc store
-                  :spans (or carried [])
-                  :data data
-                  ;; whether this array was rebuilt from a delta — what *lsp-log* and a
-                  ;; driver read to tell the two answers apart
-                  :delta? (not (nil? (:edits payload)))
-                  :result-id (:result-id payload)
-                  :conn (:conn pending)
-                  ;; spans the log could not carry are wrong: asked again on the next beat
-                  :requested (when carried (:requested store))))))))))
+                     else (as-vector (:data payload))))
+          (cond
+            (nil? data)
+              (map/assoc-in m [:lsp-semantic path] (dissoc store :result-id :data :requested))
+            (not (nil? (:lsp-semantic-job m))) (map/assoc-in m [:lsp-semantic path :requested] nil)
+            else
+              (let (seen (:seen pending)
+                    rope (buffer-rope seen)
+                    legend (:legend pending)
+                    job {:path path
+                         :seen seen
+                         :token (:token pending)
+                         :answer {:data data
+                                  ;; whether this array was rebuilt from a delta — what
+                                  ;; *lsp-log* and a driver read to tell the two answers apart
+                                  :delta? (not (nil? (:edits payload)))
+                                  :result-id (:result-id payload)
+                                  :conn (:conn pending)}})
+                (if (ed-headless?)
+                  (ed-semantic-land (assoc m :lsp-semantic-job job) (token-spans data legend rope))
+                  ;; the task captures the rope (a rope cannot cross a message, a capture can)
+                  ;; and answers plain spans
+                  (assoc m
+                    :lsp-semantic-job job
+                    :lsp-semantic-proc (task (fn () (token-spans data legend rope)))))))))))
+
+(defn ed-semantic-land (m spans)
+  "The spans of the answer [[ed-semantic-fold]] handed off (`:lsp-semantic-job`) landing:
+carried from the text they were computed against to the text now and stamped on the file's
+buffer, with the answer's array and result id filed for the next delta. Dropped when the file
+closed, the feature was turned off, or a newer ask replaced this one while the spans were being
+worked out; `spans` nil (the task failed) makes the file due again."
+  (let (job (:lsp-semantic-job m)
+        cleared (dissoc m :lsp-semantic-job :lsp-semantic-proc)
+        path (:path job)
+        store (or (map/get-in cleared [:lsp-semantic path]) {})
+        index (when path (ed-buffer-index-by-file cleared path)))
+    (cond
+      (or (nil? index) (not (semantic-on? cleared)) (not (= (:token job) (:asked store)))) cleared
+      (not (vector? spans)) (map/assoc-in cleared [:lsp-semantic path :requested] nil)
+      else
+        (let (carried (carry-spans spans (:seen job) (ed-buf-at cleared index)))
+          (ed-semantic-stamp cleared
+            index
+            path
+            (merge store
+              (:answer job)
+              {:spans (or carried [])
+               ;; spans the log could not carry are wrong: asked again on the next beat
+               :requested (when carried (:requested store))}))))))
 
 (defn semantic-follow (m)
   "The post-step: every file's spans carried through what this event did to its buffer
@@ -498,9 +541,7 @@ every answer a whole one)."
             (cond
               (not (= (:conn entry) connection)) acc
               ;; an ask already out: this file is due again once it lands (`:requested` forgotten)
-              (ed-lsp-in-flight? acc
-                (map/get-in acc [:lsp-semantic (buffer-file (ed-buf-at acc index)) :asked]))
-                acc
+              (ed-semantic-busy? acc (buffer-file (ed-buf-at acc index))) acc
               else (ed-semantic-request-at acc index))))))))
 
 ;; ---- registration -------------------------------------------------------------------
@@ -513,3 +554,5 @@ every answer a whole one)."
    :stale? 'lsp-semantic/ed-semantic-due?})
 ;; after the snippet's carry (35), before anything that reads the colours
 (register-post-step :lsp-semantic {:order 45 :run 'lsp-semantic/semantic-follow})
+;; an answer turned into spans off the loop; a failed task makes its file due again
+(register-task-reply :lsp-semantic-proc 'lsp-semantic/ed-semantic-land nil nil)
