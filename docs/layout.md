@@ -345,9 +345,11 @@ src/theme.blsp              every colour the editor paints (Catppuccin Mocha), r
                             mode line is recessed (the mantle, secondary text; colour only for a
                             state: modified `●`, `Def`, a failing check); the gutter is the base, its
                             current number lavender
-src/systemtheme.blsp        with no `:theme` named, the window follows the desktop's light or dark setting
-                            (brood's `gui/color-scheme`): `:theme-light` / `:theme-dark` at startup, and a
-                            change re-themes live (asked again every 30 s, off the loop)
+src/desktopprefs.blsp       the window follows the desktop (brood's `gui/desktop-preferences`): with no `:theme`
+                            its light or dark setting picks `:theme-light` / `:theme-dark`; with `:text-aa
+                            :desktop` its text rendering is the window's (GNOME: grayscale, sRGB, as GTK 4);
+                            with no `:blink-cursor-blinks` the caret blinks as VTE does. Asked once at
+                            startup and every 30 s, off the loop; a change applies live
 src/themes.blsp             the theme registry (M-x theme-select): a live picker that swaps the
                             whole palette AND the window font — a theme is a plain map, so
                             adding one is data (theme.blsp is the palette; this is the registry).

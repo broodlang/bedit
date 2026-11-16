@@ -96,7 +96,7 @@ Never add module detail here: it is loaded into every session.
 |---|---|
 | startup + loop | `main` `startup` `model` (the registries every feature plugs into) `input` `events` `lifeline` `offloop` |
 | text model | `textpos` `bufferops` `wrap` `inlinetext` `folds` `codefold` `stringstate` `stringlex` `stringwarm` `conventions` `editorconfig` `dirlocals` |
-| view | `view` `panes` `panegeometry` `panebody` `spanpaint` `spancache` `syntaxtree` `linecache` `treewarm` `modeline` `statusbar` `headerline` `echoarea` `hittest` `overlayview` `ui-kit` `theme` `themes` `systemtheme` `appearance` `scrollbar` `scroll` `eolview` `eolnotes` `linkview` `foldview` `gutter` |
+| view | `view` `panes` `panegeometry` `panebody` `spanpaint` `spancache` `syntaxtree` `linecache` `treewarm` `modeline` `statusbar` `headerline` `echoarea` `hittest` `overlayview` `ui-kit` `theme` `themes` `desktopprefs` `appearance` `scrollbar` `scroll` `eolview` `eolnotes` `linkview` `foldview` `gutter` |
 | decorations | `whitespace` `fillindicator` `glyphless` `rainbow` `pulse` `spell` `diffhl` `codecrumbs` `tsbrackets` |
 | commands | `commands` `motion` `structural` `indent` `typing` `killing` `editing` `region` `textops` `comment` `fill` `electric` `kmacro` `registers` `window-commands` `search-commands` `isearch` `query-replace` `avy` `embark` `menu` `mouse` `clipboard` `browse-kill-ring` `yankmedia` |
 | keys + modes | `keymaps` `vim` `userkeys` `interactive` `transient` `transient-core` `whichkey` `keyhelp` `help` `modes` `brood-mode` `lisp-modes` `lang-*` `language-core` `lex-*` `org` `org-mode` `mail` `mail-message` |
