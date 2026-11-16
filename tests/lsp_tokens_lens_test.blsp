@@ -14,13 +14,6 @@
 
 ;; ---- the integer array --------------------------------------------------------------
 (describe "lsp semantic tokens: decoding"
-  (test "relative lines and columns become absolute"
-    (assert= (decode-tokens [0 4 3 1 0 1 2 5 0 2 0 6 1 2 0])
-      [[0 4 3 1 0] [1 2 5 0 2] [1 8 1 2 0]]))
-  (test "a partial trailing group and an empty array decode to what is whole"
-    (assert= (decode-tokens [0 1 2 0 0 3 4]) [[0 1 2 0 0]])
-    (assert= (decode-tokens []) [])
-    (assert= (decode-tokens nil) []))
   (test "a delta's edits splice the previous array, in start order"
     (assert= (apply-delta [1 2 3 4 5] [{:start 1 :deleteCount 2 :data [9]}]) [1 9 4 5])
     (assert= (apply-delta [1 2 3 4 5]
@@ -68,15 +61,32 @@
 (describe "lsp semantic tokens: spans of the text"
   (test "tokens become char spans, a faceless one left out"
     (let (rope (text/string-> "fn main() {\n  let x = \"s\";\n}\n"))
-      (assert= (token-spans (decode-tokens [0 3 4 0 1 1 6 1 1 0 0 4 3 2 0]) legend rope)
+      (assert= (token-spans [0 3 4 0 1 1 6 1 1 0 0 4 3 2 0] legend rope)
         [[3 7 :syntax/definition] [18 19 :syntax/variable]])))
+  (test "relative columns add up on a line and restart on the next"
+    (let (rope (text/string-> "ab cd ef\ngh ij\n"))
+      (assert= (token-spans [0 0 2 1 0 0 3 2 1 0 0 3 2 1 0 1 3 2 1 0] legend rope)
+        [[0 2 :syntax/variable]
+          [3 5 :syntax/variable]
+          [6 8 :syntax/variable]
+          [12 14 :syntax/variable]])))
   (test "a column past an emoji is read in UTF-16 units"
     ;; `😀` is two units: `x` starts at unit 3, char 2
     (let (rope (text/string-> "a😀x"))
-      (assert= (token-spans [[0 3 1 1 0]] legend rope) [[2 3 :syntax/variable]])))
+      (assert= (token-spans [0 3 1 1 0] legend rope) [[2 3 :syntax/variable]])))
+  (test "every token on a line with an emoji lands on its chars, past the line's end cut"
+    ;; units: a=0 😀=1..2 b=3 c=4 😀=5..6 d=7; tokens at a, bc, d, and one at the end (empty)
+    (let (rope (text/string-> "a😀bc😀d"))
+      (assert= (token-spans [0 0 1 1 0 0 3 2 1 0 0 4 1 1 0 0 1 9 1 0] legend rope)
+        [[0 1 :syntax/variable] [2 4 :syntax/variable] [5 6 :syntax/variable]])))
   (test "a token past the text or past its line's end is cut or dropped"
     (let (rope (text/string-> "ab\ncd"))
-      (assert= (token-spans [[0 1 9 1 0] [5 0 1 1 0]] legend rope) [[1 2 :syntax/variable]]))))
+      (assert= (token-spans [0 1 9 1 0 5 0 1 1 0] legend rope) [[1 2 :syntax/variable]])))
+  (test "a partial trailing group, an empty array and no array give what is whole"
+    (let (rope (text/string-> "abc"))
+      (assert= (token-spans [0 0 1 1 0 0 2] legend rope) [[0 1 :syntax/variable]])
+      (assert= (token-spans [] legend rope) [])
+      (assert= (token-spans nil legend rope) []))))
 
 ;; ---- carrying spans through edits --------------------------------------------------
 (describe "lsp semantic tokens: spans follow the text"
@@ -93,26 +103,79 @@
   (test "a deletion takes what it covers and leaves a name's tail"
     (assert= (shift-spans [[0 3 :a] [4 7 :b]] [2 5 ""]) [[2 4 :b]])
     (assert= (shift-spans [[0 3 :a] [4 7 :b]] [0 3 ""]) [[1 4 :b]]))
-  (test "spans are carried from the buffer they were computed on to the buffer now"
+  (test "spans are carried through the edits a buffer's log says were made since"
     (let (seen (make-buffer "let x = 1")
           now (insert (goto-char seen 0) "// ")
           gone (make-buffer "other"))
-      (assert= (carry-spans [[4 5 :v]] seen now) [[7 8 :v]])
-      (assert= (carry-spans [[4 5 :v]] seen seen) [[4 5 :v]])
-      ;; a buffer the log cannot reach: nil, for the caller to drop them
-      (is (nil? (carry-spans [[4 5 :v]] seen gone))))))
+      (assert= (shift-through [[4 5 :v]] (textpos/ed-splices-from now (buffer-rope seen)))
+        [[7 8 :v]])
+      (assert= (textpos/ed-splices-from seen (buffer-rope seen)) [])
+      ;; a buffer the log cannot reach: nil, for the caller to drop the spans
+      (is (nil? (textpos/ed-splices-from gone (buffer-rope seen))))))
+  (test "a window is carried alone, and agrees with carrying everything"
+    (let (spans [[0 3 :a] [10 13 :b] [20 23 :c] [30 33 :d]]
+          splices [[0 0 "xy"] [25 26 ""] [12 12 "q"]])
+      (assert= (spans-window spans splices 11 17) [[13 16 :b]])
+      (assert= (spans-window spans splices 0 40)
+        (fold splices spans shift-spans))
+      ;; an empty window, and one before every edit
+      (assert= (spans-window spans splices 40 40) [])
+      (assert= (spans-window spans [[30 30 "z"]] 0 5) [[0 3 :a]])))
+  (test "the window a frame paints is read through the edits since the spans were stamped"
+    (let (buf (assoc (make-buffer "fn main() {}")
+                :semantic-spans [[3 7 :syntax/definition]]
+                :semantic-rope (buffer-rope (make-buffer "fn other() {}")))
+          stamped (assoc buf :semantic-rope (buffer-rope buf))
+          typed (insert (goto-char stamped 0) "  "))
+      (assert= (semantic-window stamped 0 0) [[3 7 :syntax/definition]])
+      (assert= (semantic-window typed 0 0) [[5 9 :syntax/definition]])
+      ;; a rope the log cannot reach paints nothing
+      (is (nil? (semantic-window buf 0 0))))))
+
+(defn- painted (m)
+  "What a frame paints of the current buffer's semantic spans, over its whole text."
+  (or (semantic-window (ed-current-buf m) 0 (text/line-count (buffer-rope (ed-current-buf m)))) []))
+
+(describe "lsp semantic tokens: the post-step between answers"
+  (test "a keystroke leaves the stamp alone; many re-base it; a log that cannot say drops it"
+    (let (m (assoc (ed-init (make-buffer "fn main() {}" "s.rs" "/tmp/semfollow.rs"))
+              :lsp-semantic {"/tmp/semfollow.rs" {:requested :rope}})
+          buf (ed-current-buf m)
+          stamped (ed-set-buf m
+                    (assoc buf
+                      :semantic-spans [[3 7 :syntax/definition]]
+                      :semantic-rope (buffer-rope buf)))
+          once (semantic-follow (ed-set-buf stamped
+                                  (insert (goto-char (ed-current-buf stamped) 0) " ")))
+          ;; typed one key an event, the post-step after each, as the loop runs it
+          many (fold (range 20)
+                 once
+                 (fn (acc _)
+                   (semantic-follow (ed-set-buf acc (insert (goto-char (ed-current-buf acc) 0) " ")))))
+          ;; the text replaced wholesale (a revert): a buffer whose log does not reach the stamp
+          lost (semantic-follow (ed-set-buf stamped
+                                  (assoc (make-buffer "other text" "s.rs" "/tmp/semfollow.rs")
+                                    :semantic-spans [[3 7 :syntax/definition]]
+                                    :semantic-rope (buffer-rope buf)))))
+      (assert= (:semantic-spans (ed-current-buf once)) [[3 7 :syntax/definition]])
+      (assert= (painted once) [[4 8 :syntax/definition]])
+      ;; re-based each time the log held more than a quarter of what it keeps (8 of 32), read since
+      (assert= (:semantic-spans (ed-current-buf many)) [[21 25 :syntax/definition]])
+      (assert= (painted many) [[24 28 :syntax/definition]])
+      (assert= (painted lost) [])
+      (is (nil? (map/get-in lost [:lsp-semantic "/tmp/semfollow.rs" :requested]))))))
 
 (describe "lsp semantic tokens: painted over the mode's colours"
   (test "the semantic layer wins where it colours, the mode shows elsewhere"
     (let (buf (assoc (make-buffer "foo bar") :semantic-spans [[4 7 :syntax/variable]])
-          spans (spanpaint/ed-buffer-spans buf [[0 3 :syntax/keyword] [4 7 :syntax/special]]))
+          spans (spanpaint/ed-buffer-spans buf [[0 3 :syntax/keyword] [4 7 :syntax/special]] 0 1))
       (assert= (view/ed-face-at spans 1) :syntax/keyword)
       (assert= (view/ed-face-at spans 5) :syntax/variable)
       (assert= (into [] (get (spanpaint/ed-spans-by-line-at (buffer-rope buf) spans 0 0) 0))
         [[0 3 :syntax/keyword] [4 7 :syntax/variable]])))
   (test "a buffer with no semantic spans paints exactly the mode's"
     (let (buf (make-buffer "foo"))
-      (assert= (spanpaint/ed-buffer-spans buf [[0 3 :syntax/keyword]]) [[0 3 :syntax/keyword]]))))
+      (assert= (spanpaint/ed-buffer-spans buf [[0 3 :syntax/keyword]] 0 1) [[0 3 :syntax/keyword]]))))
 
 ;; ---- code lenses: parsing and placement ----------------------------------------------
 (describe "lsp code lens: parsing and placement"
@@ -241,12 +304,12 @@ taken and ignored."
           [kind _] (asked)
           _ (assert= kind (lsp-semantic-tokens))
           landed (deliver asking))
-      (assert= (:semantic-spans (ed-current-buf landed))
+      (assert= (painted landed)
         [[3 7 :syntax/definition] [12 13 :syntax/variable]])
       ;; typed at the start: the post-step carries the spans with the text
       (let (typed (semantic-follow (ed-set-buf landed
                                      (insert (goto-char (ed-current-buf landed) 0) "  "))))
-        (assert= (:semantic-spans (ed-current-buf typed))
+        (assert= (painted typed)
           [[5 9 :syntax/definition] [14 15 :syntax/variable]])
         (is (ed-semantic-due? typed))
         ;; the second ask is a delta against the first answer
@@ -256,8 +319,71 @@ taken and ignored."
               _ (assert= (:previous-result-id request) "1")
               updated (deliver again))
           (assert= (map/get-in updated [:lsp-semantic "/tmp/sem.rs" :data]) [0 5 4 0 1 0 12 1 1 0])
-          (assert= (:semantic-spans (ed-current-buf updated))
+          (assert= (painted updated)
             [[5 9 :syntax/definition] [17 18 :syntax/variable]])))))
+  (test "inside a loop the spans are worked out by a task, landed when it answers"
+    (let (conn (stand-in [{:resultId "1" :data [0 3 4 0 1 0 9 1 1 0]}]))
+      (binding (editor/ui/*loop* (self))
+        (let (caps {:semanticTokensProvider {:legend {:tokenTypes ["function" "variable"]
+                                                      :tokenModifiers ["declaration"]}
+                                             :full true}}
+              m (serving (ed-init (make-buffer "fn main() { x; y }" "s.rs" "/tmp/semtask.rs"))
+                  conn caps)
+              asking (ed-semantic-request m)
+              _ (asked)
+              handed (deliver asking)
+              handle (:lsp-semantic-proc handed))
+          ;; nothing painted yet, and the file is not asked again while its spans are worked out
+          (refute (nil? handle))
+          (assert= (painted handed) [])
+          (refute (ed-semantic-due? (ed-set-buf handed (insert (ed-current-buf handed) "z"))))
+          ;; typed while the task ran: the spans land where the text went
+          (let (typed (semantic-follow (ed-set-buf handed
+                                         (insert (goto-char (ed-current-buf handed) 0) "  "))))
+            (receive
+              ([:task-done ^handle value] (let (landed (input/ed-update typed
+                                                         [:task-done handle value]
+                                                         80
+                                                         24))
+                                            (is (nil? (:lsp-semantic-job landed)))
+                                            (assert= (painted landed)
+                                              [[5 9 :syntax/definition] [14 15 :syntax/variable]])
+                                            (assert= (map/get-in landed
+                                                       [:lsp-semantic "/tmp/semtask.rs" :result-id])
+                                              "1")))
+              (after 5000 (assert= :task-reply :never-landed))))))))
+  (test "a failed or timed-out task makes the file due again"
+    (let (m (assoc (ed-init (make-buffer "x" "s.rs" "/tmp/semfail.rs"))
+              :lsp-semantic {"/tmp/semfail.rs" {:asked :t :requested :rope}}
+              :lsp-semantic-job {:path "/tmp/semfail.rs" :token :t :answer {}})
+          failed (ed-semantic-land m nil))
+      (is (nil? (:lsp-semantic-job failed)))
+      (is (nil? (map/get-in failed [:lsp-semantic "/tmp/semfail.rs" :requested])))))
+  (test "an answer meeting another file's task waits its turn, and starts when that one lands"
+    (binding (editor/ui/*loop* (self))
+      (let (m (assoc (ed-init (make-buffer "fn a() {}" "s.rs" "/tmp/semwait.rs"))
+                :lsp-semantic
+                  {"/tmp/semwait.rs" {:asked :t}
+                   "/tmp/other.rs" {:asked :o}}
+                :lsp-semantic-job {:path "/tmp/other.rs" :token :o :answer {}})
+            answered (ed-semantic-fold {:path "/tmp/semwait.rs"
+                                        :token :t
+                                        :seen (ed-current-buf m)
+                                        :legend {:tokenTypes ["function"]}}
+                       m
+                       {:data [0 3 1 0 0]}))
+        ;; the running job is untouched, the answer queued and the file busy until it is done
+        (assert= (:path (:lsp-semantic-job answered)) "/tmp/other.rs")
+        (assert= (into [] (map (:lsp-semantic-queue answered) :path)) ["/tmp/semwait.rs"])
+        (refute (ed-semantic-due? answered))
+        ;; the other file's spans land (its file is not open: dropped) and the queued one starts
+        (let (next (ed-semantic-land answered [])
+              handle (:lsp-semantic-proc next))
+          (assert= (:path (:lsp-semantic-job next)) "/tmp/semwait.rs")
+          (assert= (:lsp-semantic-queue next) [])
+          (receive
+            ([:task-done ^handle value] (assert= value [[3 4 :syntax/function]]))
+            (after 5000 (assert= :task-reply :never-landed)))))))
   (test "a server that offers none is never asked, and the mode toggles it off"
     (let (m (serving (ed-init (make-buffer "x" "s.rs" "/tmp/sem2.rs")) (self) {}))
       (refute (ed-semantic-due? m))
@@ -467,7 +593,7 @@ the raw server answer `raw` as if it had just landed."
       ;; against the last answer, which the server keeps: it sends what changed
       (assert= kind (lsp-semantic-tokens-delta))
       (assert= (:previous-result-id request) "1")
-      (assert= (:semantic-spans (ed-current-buf (deliver refreshed))) [[3 7 :syntax/function]])))
+      (assert= (painted (deliver refreshed)) [[3 7 :syntax/function]])))
   (test "a server's `content modified` asks again, for what the idle beat asks by itself"
     (let (state {:proc :fake
                  :buf ""

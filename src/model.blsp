@@ -761,8 +761,9 @@ a live loop runs the beat in slices ([[ed-run-idle-slice]])."
 
 (sig ed-run-idle-slice (model int -> model))
 (defn ed-run-idle-slice (m from)
-  "Run the idle beat's jobs from index `from`, in `:order`, until `*idle-slice-ms*` has gone
-— at least one job per slice, so the beat always progresses. Unfinished, the model keeps
+  "Run the idle beat's jobs from index `from`, in `:order`, until `*idle-slice-ms*` has gone or
+the user's input is waiting (`editor/ui/ui-input-pending?`, brood's priority lane) — at least
+one job per slice, so the beat always progresses. Unfinished, the model keeps
 `:idle-resume` (the next job's index) and the `:idle-continue` ticker that picks it up;
 finished, both are gone. Each job still sees the model every earlier one left, across
 slices as within one."
@@ -771,7 +772,11 @@ slices as within one."
     (letrec (step (fn (acc i)
                     (cond
                       (>= i (count jobs)) (ed-drop-timer (dissoc acc :idle-resume) :idle-continue)
-                      (and (> i from) (>= (os/now) deadline))
+                      ;; a slice yields at its deadline, or as soon as a key is waiting
+                      (and (> i from)
+                        (or (>= (os/now) deadline)
+                          ;; through call-if-bound until every build's brood has it (ADR-726)
+                          (reflect/call-if-bound 'editor/ui/ui-input-pending? false)))
                         (ed-set-timer (assoc acc :idle-resume i) :idle-continue {:every 1})
                       else (step (ed-call-deferred acc (:run (nth jobs i)) acc) (inc i)))))
       (step m from))))
@@ -822,13 +827,40 @@ or an async event does neither."
     (vector? input) (any? [:mouse :text :preedit] (fn (tag) (= (first input) tag)))
     else true))
 
+(defn- desktop-blink (m)
+  ;; the desktop's caret blink (`:desktop-prefs`, `desktopprefs`) while init.blsp counts no
+  ;; blinks of its own — the one place the two are weighed — else nil
+  (when (nil? (:blink-cursor-blinks m)) (:cursor-blink (:desktop-prefs m))))
+
+(defn ed-blink-interval (m)
+  "How long the caret shows, and then hides, in one blink: the desktop's phase (half its on-off
+cycle, as VTE blinks) while init.blsp counts no blinks, else [[*blink-ms*]]."
+  (let (interval (:interval-ms (desktop-blink m)))
+    (cond
+      (and (int? interval) (> interval 0)) interval
+      ;; `*blink-ms*` is an int; said so for the checker, which cannot see through a defdyn
+      (int? *blink-ms*) *blink-ms*
+      else 530)))
+
 (sig ed-blink-count (model -> int))
 (defn ed-blink-count (m)
-  "How many times the caret blinks at rest before it stays solid: the model's
-`:blink-cursor-blinks` (the init setting) or [[*blink-cursor-blinks*]]; 0 blinks forever, and
-so does a value that is not a count."
-  (let (limit (or (:blink-cursor-blinks m) *blink-cursor-blinks*))
+  "How many times the caret blinks at rest before it stays solid: init.blsp's
+`:blink-cursor-blinks`; unset, as many as fit in the desktop's timeout (VTE's stop), else
+[[*blink-cursor-blinks*]]. 0 blinks forever, and so does a value that is not a count."
+  (let (desktop (desktop-blink m)
+        timeout (:timeout-ms desktop)
+        limit (cond
+                (not (nil? (:blink-cursor-blinks m))) (:blink-cursor-blinks m)
+                (nil? desktop) *blink-cursor-blinks*
+                (int? timeout) (math/max 1 (math/quot timeout (* 2 (ed-blink-interval m))))
+                else 0))
     (if (and (int? limit) (> limit 0)) limit 0)))
+
+(defn ed-caret-blinks? (m)
+  "Whether the focused caret blinks: as the desktop says while init.blsp counts no blinks (one
+that says nothing blinks, Emacs's default), else always."
+  (let (desktop (desktop-blink m))
+    (or (nil? desktop) (= true (:blink? desktop)))))
 
 ;; ---- motion: what moves on its own, and when it must not ------------------------
 ;; The editor's few animations — the settle ease after a trackpad scroll, the pulse after a
@@ -1433,16 +1465,39 @@ through as they are painted (`spanpaint/ed-span-layers`), so a theme switch reco
 The lowest `:rank` with spans on a buffer is its layer. Called when the source's module loads."
   (ownership/claim! :model/text-faces name (assoc row :name name)))
 
+(defn register-span-overlay (name row)
+  "Add the span overlay `name`, `{:rank :spans}`: faces painted OVER everything else a buffer's
+text has, where it says (a language server's semantic tokens — `lsp-semantic`), the colouring
+under it showing everywhere else. `:spans` is a `(buffer first-line last-line) -> spans` symbol:
+ascending `[from to face]` spans covering at least what reaches into those lines of the
+buffer's text — a frame asks for what it shows, so an overlay kept against an older text carries only
+that much; nil or `[]` for none. The lowest `:rank` with spans on a buffer is painted. Called
+when the overlay's module loads."
+  (ownership/claim! :model/span-overlays name (assoc row :name name)))
+
+(defn- first-ranked-spans (registry answer)
+  ;; the first non-empty spans `(answer row)` gives, rows of `registry` in `:rank` order, with
+  ;; the row they came from: `[spans row]`, or nil when no row has any
+  (reduce (registry/ranked registry)
+    nil
+    (fn (found [_ row])
+      (or found
+        (let (spans (answer row))
+          (when (and spans (not (empty? spans))) [spans row]))))))
+
+(defn ed-span-overlay (buf first-line last-line)
+  "The spans of the first span overlay ([[register-span-overlay]]) with any over lines
+`first-line`..`last-line` of `buf`, or nil when none has."
+  (first (first-ranked-spans :model/span-overlays
+           (fn (row) (reflect/call-if-bound (:spans row) [] buf first-line last-line)))))
+
 (defn ed-text-faces (buf)
   "`[spans palette]` of the first text-face source ([[register-text-faces]]) with spans on
 `buf`, or nil when none has any."
-  (reduce (registry/ranked :model/text-faces)
-    nil
-    (fn (found [_ row])
-      (if found
-        found
-        (let (spans (reflect/call-if-bound (:spans row) [] buf))
-          (when (and spans (not (empty? spans))) [spans (reflect/call-if-bound (:palette row) nil)]))))))
+  (let (found (first-ranked-spans :model/text-faces
+                (fn (row) (reflect/call-if-bound (:spans row) [] buf))))
+    (when found
+      (let ([spans row] found) [spans (reflect/call-if-bound (:palette row) nil)]))))
 
 (defn register-pane-layer (name layer)
   "Add the pane layer `name`, `{:rank :slot :run}` (see the comment above), replacing any

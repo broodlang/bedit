@@ -1,0 +1,96 @@
+(defmodule desktopprefs
+  "Following the desktop's preferences (brood's `gui/desktop-preferences`), as a GTK app on it
+does:
+
+- its light or dark setting picks the theme when init.blsp names no `:theme` (`:theme-light` /
+  `:theme-dark`), as M-x theme-select would;
+- its text rendering is the window's when `:text-aa` is `:desktop` (the default): on GNOME,
+  GTK 4 draws grayscale, slightly hinted text blended in sRGB whatever the older font keys
+  say, so the window does too (`config/window-settings`);
+- its caret blink is the caret's when init.blsp sets no `:blink-cursor-blinks`: VTE's phase
+  (half the desktop's on-off cycle), stopping after the desktop's timeout, or steady when it
+  says not to blink (`model/ed-caret-blinks?`).
+
+Asked once at startup ([[startup-answer]], shared by the steps that run before there is a
+model: the window's first settings, the theme, reduced motion) and again every `*check-ms*`,
+off the loop since asking runs the desktop's settings tool. The model keeps the last answer
+(`:desktop-prefs`, seeded from the startup answer); a different one applies live. A served session's desktop is its
+client's, and a test never asks."
+  (:use model)) ; register-timer-client / register-task-reply
+
+(def *check-ms* 30000) ; how often the desktop is asked again
+
+(defn- ask ()
+  ;; the desktop's preferences as it answers now (`gui/desktop-preferences`), `{}` when it says
+  ;; nothing — and never asked under a test (`config-paths/under-test?`), which keeps every default.
+  ;; Through `call-if-bound` until the brood every build runs on has it (ADR-726): on one that
+  ;; does not, only the colour scheme is asked, as before
+  (cond
+    (config-paths/under-test?) {}
+    (bound? 'gui/desktop-preferences) (or (reflect/call-if-bound 'gui/desktop-preferences {}) {})
+    else {:color-scheme (gui/color-scheme) :reduce-motion? (gui/reduce-motion?)}))
+
+(defn startup-answer ()
+  "The desktop's preferences as startup found them — a map of `:color-scheme` `:reduce-motion?`
+`:text-rendering` `:cursor-blink`, `{}` when it says nothing or under a test — asked the first
+time a launch needs them and shared by every step before the model exists, so a launch asks
+once."
+  (or (registry/lookup :desktopprefs/startup :answer)
+    (let (answer (ask))
+      (registry/put :desktopprefs/startup :answer answer)
+      answer)))
+
+(defn- text-follows? (m)
+  ;; the window's text is the desktop's: init.blsp's `:text-aa` is `:desktop`
+  (= :desktop (config/setting (or (:init-config m) {}) :text-aa)))
+
+(defn following? (m)
+  "Whether `m`'s window follows the desktop at all: a local window (`:gui`) whose theme, text
+or caret blink is the desktop's."
+  (and (:gui m)
+    (or (:theme-follows-system m) (text-follows? m) (nil? (:blink-cursor-blinks m)))))
+
+(defn check-timer (m)
+  "The timer client's question: every `*check-ms*`, while following."
+  (when (following? m) {:every *check-ms*}))
+
+(defn check (m)
+  "The timer's step: ask the desktop, off the loop — unless the last question is still out."
+  (if (:desktop-job m) m (assoc m :desktop-job (task/task (fn () (ask))))))
+
+(defn- scheme-arrived (m scheme previous)
+  ;; the theme re-applied for colour scheme `scheme` when it differs from the `previous` answer's
+  ;; and the theme follows the desktop; a first answer (none before) only noted
+  (if (or (nil? scheme) (nil? previous) (= scheme previous) (not (:theme-follows-system m)))
+    m
+    (let (name (if (= scheme :light) (:theme-light m) (:theme-dark m)))
+      (if name (themes/themes-apply m name) m))))
+
+(defn- text-arrived (m rendering previous)
+  ;; the window's settings applied again against the text rendering `rendering` when it differs
+  ;; from the `previous` answer's and the window's text follows the desktop (init.blsp's own
+  ;; `:text-contrast` and the rest kept, `config/apply-window!`)
+  (when (and (text-follows? m) (not (nil? rendering)) (not (= rendering previous)))
+    (config/apply-window! (or (:init-config m) {}) rendering))
+  m)
+
+(defn preferences-arrived (m preferences)
+  "The desktop's answer `preferences` (`gui/desktop-preferences`; nil when the task failed, `{}`
+when the desktop could not be read): the job's slot freed, then, for an answer that differs
+from the last, the theme, the window's text, the caret's blink and reduced motion
+(`:os-reduce-motion`, read under init.blsp's `:reduce-motion :auto`) follow it and it becomes
+the model's `:desktop-prefs`. A failed read, or the same answer, changes nothing."
+  (let (freed (dissoc m :desktop-job)
+        previous (or (:desktop-prefs freed) {}))
+    (if (or (not (map? preferences)) (empty? preferences) (= preferences previous))
+      freed
+      (assoc (text-arrived (scheme-arrived freed
+                             (:color-scheme preferences)
+                             (:color-scheme previous))
+               (:text-rendering preferences)
+               (:text-rendering previous))
+        :desktop-prefs preferences
+        :os-reduce-motion (:reduce-motion? preferences)))))
+
+(register-timer-client :desktop-prefs 'desktopprefs/check-timer 'desktopprefs/check)
+(register-task-reply :desktop-job 'desktopprefs/preferences-arrived nil nil)
