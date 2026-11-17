@@ -1279,31 +1279,6 @@ src/frames.blsp             frames (C-x 5 2 / o / 0): a second OS window is a PR
                             colours) ride the splice, so every frame shows them; a foreign splice
                             lands on a read-only copy too (std's `buffer-apply-action`), and a
                             redaction (brood ADR-581) redacts every copy, history and all
-src/procstream.blsp         the shared streaming-subprocess worker (testrun's :testrun and
-                            apprun's :apprun ride it): line-buffered stdout -> handler fns,
-                            each line ANSI-decoded (a decoder per stream) with its colour spans
-                            and its carriage returns done (the partial line too, so a counter
-                            that never ends its line keeps one count);
-                            a partial line past `*procstream-line-max*` is delivered as it
-                            stands, so the worker's buffer is bounded (an escape cut there
-                            waits in the decoder)
-src/ansicolor.blsp          a program's ANSI colours on the buffer its output streams into (Emacs
-                            ansi-color), over std's streaming decoder (`ansi/feed`, brood ADR-567):
-                            a decoder per stream, so an escape split across two reads never leaks
-                            (`1mERROR`, issue #24); the SGR attributes laid on the text in the
-                            same edit as its `:ansi` TEXT PROPERTY (`faces`, brood ADR-579) and
-                            resolved through `theme/ansi-palette` as the view paints them, UNDER the
-                            mode's colouring (`view/ed-span-layers`) — so a theme switch recolours
-                            them. *compilation*, the shell buffer, *Run* and M-!'s output colour;
-                            *Tests* keeps the text; the vcs log is `ansi/render`ed. The colours
-                            belong to the characters: the user's edits, undo, the output cap's head
-                            cut and another frame's copy (the splice carries them, the seed of a
-                            frame opened later too) keep them on the text — nothing carries them here.
-                            A lone `\r` rewrites its output line (`carriage` / `insert-output`,
-                            Emacs's comint-carriage-motion): a progress counter shows one count
-                            — written as PROGRAM OUTPUT (brood's `replace-program-output`,
-                            ADR-712): into every undo snapshot, recording nothing, so undo in a
-                            shell takes back only your typing; the output cap's head cut too
 src/wrap.blsp              where a line falls on screen rows: the pure break rule (a line →
                             `[from to]` row segments, wrapped at the pane width where Unicode lets a line break —
                             UAX #14, brood's `string/break-opportunities`: CJK between characters)
@@ -1495,53 +1470,6 @@ src/projects.blsp           project root + file walk (find-file-in-project); a V
 src/formbuf.blsp            FORM BUFFERS: generated text with editable regions (a shell's
                             input, a tutorial's boxes) — the region algebra, `splice`, and the
                             `:veto` / `:clamp` guards. Pure; moved from brood's std by ADR-417
-src/comint.blsp             the INPUT REGION of a line-oriented program's buffer (Emacs's comint):
-                            `:input-start`, the process mark, the boundary guard, the ↑/↓/C-r
-                            history over a buffer's submitted lines, and M-x send-invisible, which
-                            asks the mode (`:send-invisible`). A shell and a line-mode terminal
-                            both stand on it, neither knowing the other
-src/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e): a line
-                            typed at bedit's own prompt runs as `sh -c` (pipes, its ANSI
-                            colours as faces — ansicolor) or, starting with `(`, evaluates
-                            as Brood in the worker; a running command's output lands at the
-                            PROCESS MARK (`comint`), before input typed ahead, which the next
-                            prompt then keeps. A running command whose output
-                            ends at a password prompt (`passwd/password-prompt?`: `sudo -S`,
-                            `Password:`) gets the answer read masked and written to its stdin,
-                            never the buffer, the next command or the history file: one asked
-                            while the shell was not shown waits for the first TYPED key there
-                            (`passwd/secret-overlay`), and input typed after the prompt
-                            appeared moves into the read without a trace
-                            (`passwd/take-since-prompt`); type-ahead from before it stays
-                            as the next input
-src/terminal.blsp           a TERMINAL buffer (C-x p t, C-x p r, C-u M-x term; a package's `term-run`):
-                            a program under a pty, its screen emulated by std/vt
-                            (brood ADR-384) in the buffer's worker and painted into the
-                            buffer's tail. CHAR mode (a full-screen program: claude,
-                            htop, vim): every key goes to it (`term-overlay`); C-x and M-x
-                            stay the editor's (`*term-editor-keys*`), C-y pastes, C-x c is the C-c map, C-x C-x /
-                            C-x C-y send the literal. A terminal no window shows sends a screen at most once a second (`term-sync-shown`), one at once when shown again. LINE mode (the project REPL: iex -S
-                            mix, nest repl): the input after the program's prompt is
-                            bedit's, with comint's history and boundary keys, RET sends
-                            it — C-c C-j / C-c C-k switch. A PASSWORD the program asks for
-                            (the worker asks the pty on each render — echo off in line
-                            mode, `os/pty-password?`, brood ADR-570 — else the prompt's
-                            text) is read masked and sent, never inserted or remembered;
-                            M-x send-invisible reads one by hand. A prompt that arrived while
-                            the terminal was not shown waits for the first TYPED key there,
-                            which opens the read as its first character (input's
-                            `passwd/secret-overlay`), never reaching the buffer or a macro; text
-                            typed after the prompt appeared moves into the read, leaving no
-                            undo step (`passwd/take-since-prompt`; a redraw puts the marker
-                            back), while type-ahead from before it stays. An answered prompt redrawn is not
-                            asked again; one re-asked is, told apart by the rows scrolled off
-                            (`:term-scrolled`) and the pty's echo coming back on. The mouse reaches a program
-                            that asked for it; one that did not gets a middle click as
-                            PRIMARY pasted in (Emacs's term-mouse-paste); the program's
-                            cursor shape and visibility
-                            are painted; history above the screen keeps its colour and
-                            is capped; the mode line chip says which program and mode
-                            (named to dodge std's `term`, as formatter dodges `format`)
 src/section.blsp            SECTION TREES (magit-section) as data: a tree rendered to lines
                             plus parallel rows, walked and folded by index. Pure; moved from
                             brood's std by ADR-417
@@ -1826,4 +1754,96 @@ tools/ci/drive-all.sh       CI's weekly LIVE DRIVERS run (.github/workflows/driv
 assets/                     the desktop identity: the icon (SVG) + the .desktop entry the
                             window's `:app-id` is matched against (`make install` places both)
 project.blsp                the nest manifest (:name "bedit")
+```
+
+## processes — running a program: the streaming worker every runner shares, its output's colours
+
+```
+src/processes.blsp
+    the context's API: a program's output decoded and laid into a buffer with its colours
+    (`output-decoder`, `decode-output`, `insert-output`, …) and the streaming worker's loop
+    (`stream-loop`, `close-quietly`) — what compile, results, shell-command and the test and
+    app runners use
+src/processes/procstream.blsp
+    the shared streaming-subprocess worker (testrun's :testrun and
+    apprun's :apprun ride it): line-buffered stdout -> handler fns,
+    each line ANSI-decoded (a decoder per stream) with its colour spans
+    and its carriage returns done (the partial line too, so a counter
+    that never ends its line keeps one count);
+    a partial line past `*procstream-line-max*` is delivered as it
+    stands, so the worker's buffer is bounded (an escape cut there
+    waits in the decoder)
+src/processes/ansicolor.blsp
+    a program's ANSI colours on the buffer its output streams into (Emacs
+    ansi-color), over std's streaming decoder (`ansi/feed`, brood ADR-567):
+    a decoder per stream, so an escape split across two reads never leaks
+    (`1mERROR`, issue #24); the SGR attributes laid on the text in the
+    same edit as its `:ansi` TEXT PROPERTY (`faces`, brood ADR-579) and
+    resolved through `theme/ansi-palette` as the view paints them, UNDER the
+    mode's colouring (`view/ed-span-layers`) — so a theme switch recolours
+    them. *compilation*, the shell buffer, *Run* and M-!'s output colour;
+    *Tests* keeps the text; the vcs log is `ansi/render`ed. The colours
+    belong to the characters: the user's edits, undo, the output cap's head
+    cut and another frame's copy (the splice carries them, the seed of a
+    frame opened later too) keep them on the text — nothing carries them here.
+    A lone `\r` rewrites its output line (`carriage` / `insert-output`,
+    Emacs's comint-carriage-motion): a progress counter shows one count
+    — written as PROGRAM OUTPUT (brood's `replace-program-output`,
+    ADR-712): into every undo snapshot, recording nothing, so undo in a
+    shell takes back only your typing; the output cap's head cut too
+```
+
+## shells — the program buffers you type into: the input region (comint), the project shell and Brood REPL, the terminal
+
+```
+src/shells/comint.blsp
+    the INPUT REGION of a line-oriented program's buffer (Emacs's comint):
+    `:input-start`, the process mark, the boundary guard, the ↑/↓/C-r
+    history over a buffer's submitted lines, and M-x send-invisible, which
+    asks the mode (`:send-invisible`). A shell and a line-mode terminal
+    both stand on it, neither knowing the other
+src/shells/bshell.blsp
+    per-project shell + Brood REPL buffer (C-x p e): a line
+    typed at bedit's own prompt runs as `sh -c` (pipes, its ANSI
+    colours as faces — ansicolor) or, starting with `(`, evaluates
+    as Brood in the worker; a running command's output lands at the
+    PROCESS MARK (`comint`), before input typed ahead, which the next
+    prompt then keeps. A running command whose output
+    ends at a password prompt (`passwd/password-prompt?`: `sudo -S`,
+    `Password:`) gets the answer read masked and written to its stdin,
+    never the buffer, the next command or the history file: one asked
+    while the shell was not shown waits for the first TYPED key there
+    (`passwd/secret-overlay`), and input typed after the prompt
+    appeared moves into the read without a trace
+    (`passwd/take-since-prompt`); type-ahead from before it stays
+    as the next input
+src/shells/terminal.blsp
+    a TERMINAL buffer (C-x p t, C-x p r, C-u M-x term; a package's `term-run`):
+    a program under a pty, its screen emulated by std/vt
+    (brood ADR-384) in the buffer's worker and painted into the
+    buffer's tail. CHAR mode (a full-screen program: claude,
+    htop, vim): every key goes to it (`term-overlay`); C-x and M-x
+    stay the editor's (`*term-editor-keys*`), C-y pastes, C-x c is the C-c map, C-x C-x /
+    C-x C-y send the literal. A terminal no window shows sends a screen at most once a second (`term-sync-shown`), one at once when shown again. LINE mode (the project REPL: iex -S
+    mix, nest repl): the input after the program's prompt is
+    bedit's, with comint's history and boundary keys, RET sends
+    it — C-c C-j / C-c C-k switch. A PASSWORD the program asks for
+    (the worker asks the pty on each render — echo off in line
+    mode, `os/pty-password?`, brood ADR-570 — else the prompt's
+    text) is read masked and sent, never inserted or remembered;
+    M-x send-invisible reads one by hand. A prompt that arrived while
+    the terminal was not shown waits for the first TYPED key there,
+    which opens the read as its first character (input's
+    `passwd/secret-overlay`), never reaching the buffer or a macro; text
+    typed after the prompt appeared moves into the read, leaving no
+    undo step (`passwd/take-since-prompt`; a redraw puts the marker
+    back), while type-ahead from before it stays. An answered prompt redrawn is not
+    asked again; one re-asked is, told apart by the rows scrolled off
+    (`:term-scrolled`) and the pty's echo coming back on. The mouse reaches a program
+    that asked for it; one that did not gets a middle click as
+    PRIMARY pasted in (Emacs's term-mouse-paste); the program's
+    cursor shape and visibility
+    are painted; history above the screen keeps its colour and
+    is capped; the mode line chip says which program and mode
+    (named to dodge std's `term`, as formatter dodges `format`)
 ```

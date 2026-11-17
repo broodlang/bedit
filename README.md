@@ -135,7 +135,7 @@ src/isearch.blsp            incremental search + query-replace (C-s/C-r/M-%) mod
 src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
 src/compile.blsp            M-x compile: run a build in the project root, C-x ` next-error
 src/projects.blsp           project root + file walk (find-file-in-project)
-src/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e)
+src/shells/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e)
 src/vcs*.blsp               the VCS layer, whichever system (Emacs VC): C-x g, C-x M-g, C-c g, C-x v =/l/b, the mode line
 src/git*.blsp               git porcelain (Magit): the status buffer, diff/log/commit
 src/mur*.blsp               mur porcelain (mur.fly.dev): *mur-status*, save/land/update, the forge
