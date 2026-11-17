@@ -18,9 +18,6 @@ src/main.blsp               entry point — window / daemon startup (--serve/--a
                             pool (`pool/ed-ensure-scratch`), built by `startup-scratch`: init.blsp's
                             `:scratch-message`, keys rendered, a plain buffer; `:startup-buffer
                             :scratch` opens on it rather than the start page (the welcome)
-src/showparen.blsp          show-paren: the bracket pair at point as two one-character overrides (the end at
-                            point underlined, its partner a block, an unmatched one red), through the
-                            mode's `:bracket-match` / `:bracket-match-tree` — an override source
 src/startpage.blsp          the start page bedit opens on with no file: recent files (1-9 open them) and
                             projects, the keys that open everything, where to learn, the version —
                             read-only, each action line a link (`:start-actions` by line, not matched
@@ -473,15 +470,6 @@ src/headerline.blsp         the HEADER LINE above each pane (Emacs breadcrumb-mo
                             (an Org heading's path); the layout takes the pane's top row for it
                             (`panes/ed-header-layout`), so nothing below knows it is there; a mode whose
                             first line already says where it is declares `:header-line false` (dired)
-src/pulse.blsp              a flash on the line after a JUMP (Emacs pulsar, `:pulse`): a post-step row tells a
-                            key command's jump (another window or buffer, 5+ lines) from typing and
-                            the mouse by `:command-count`, a timer fades the band the view lays over it
-                            (280 ms). A held key (an OS repeat, `:key-repeat` from brood's
-                            `gui/key-repeat?`) starts none; under `:reduce-motion` the band is still
-                            and the next command clears it. `:reduce-motion` (`:auto` follows the
-                            desktop, brood's `gui/reduce-motion?`) also snaps the scroll settle, hides
-                            the scrollbar without a fade and stills the spinner
-                            (`model/ed-reduce-motion?`); a key settles a scroll ease at once
 src/winner.blsp             C-c ← / C-c → window-layout undo and redo (Emacs winner-mode, `:winner`): a
                             post-step row keeps the layouts the window SHAPE changed from, carried
                             with their buffers' text (`model/register-layout-keeper`)
@@ -491,36 +479,11 @@ src/tabbar.blsp             TABS (Emacs tab-bar-mode, C-x t …): each tab a win
                             (`panes/ed-tab-bar-rows`, `ed-body-rect`); a kept tab follows a kill (a
                             slot keeper) and its text (a layout keeper); a click is
                             `hittest/ed-tab-bar-click`; lastsession saves the tabs. Per frame
-src/whitespace.blsp         trailing whitespace and tabs as highlight ranges (Emacs whitespace-mode,
-                            `:show-whitespace`, per mode through `display-settings/ed-mode-setting`)
-src/fillindicator.blsp      the fill-column rule (Emacs display-fill-column-indicator-mode,
-                            `:fill-column-indicator` per mode, M-x display-fill-column-indicator-mode
-                            per buffer): `│` at `conventions/fill-column` on each row that leaves
-                            it empty, a `:with-text` pane layer; hscroll moves it, a wrapped row is
-                            measured from its start, a clipped (truncated) row gets none
-src/glyphless.blsp          the invisible format characters SHOWN (Emacs glyphless-char-display):
-                            brood lays a zero width space, a BOM mid-text, a tag character out as
-                            its `<200b>` escape (ADR-556, bound by `conventions/with-cell-layout`
-                            from `:glyphless-chars`); this module gives the escape its face, and a
-                            bidi control (Trojan Source) a hazard face. The minibuffer shows them too.
-                            A no-break space (U+00A0, U+202F) is underlined in the escape colour
-                            (Emacs nobreak-char-display, `:nobreak-char-display`, on by default).
-                            A WORD that mixes scripts the way a homoglyph does (a Cyrillic `а` in
-                            `pаypal`, brood's `string/mixed-script?`, ADR-710) has its odd letters out
-                            in the hazard face (`:mixed-script-warning`, on by default)
-src/rainbow.blsp             a tree-sitter buffer's brackets coloured by depth (Emacs rainbow-delimiters,
-                            `:rainbow-delimiters`): delimiter tokens of the held parse, the window's top
-                            depth from the tree; the Lisp modes colour theirs in their own lexer
 src/avy.blsp                jump to a visible position by label (Emacs avy): C-' char-timer, M-g w / e
                             word starts — targets from each pane's row table, over the read-char overlay
 src/embark.blsp             C-. act on the thing at point or the selected candidate (Emacs embark): the
                             target (region > URL > file > symbol), a transient of actions that NAME
                             existing commands, C-; its default, C-h B every binding as a prompt
-src/spell.blsp              spell checking (Emacs jinx, `:spell-check`): the visible prose, and the
-                            comments and strings of code, checked off the loop by a long-lived
-                            `enchant-2 -a` (else aspell); M-$ correct, C-M-$ the dictionary. The
-                            word being typed (point at its end) is not underlined until point
-                            leaves it, as flyspell judges a word
 src/thingatpt.blsp          what a line names at a column (Emacs thingatpt, the part it reads): the token,
                             a URL in it, a file it names that exists (`file-at`) — pure; embark's
                             target and C-x C-f's M-n (`pool/ed-file-defaults`) read the same thing
@@ -940,7 +903,7 @@ src/conventions.blsp        a buffer's INDENT WIDTH, TAB WIDTH, tabs-or-spaces a
                             and scrolls at the buffer's width — and brood's `*glyphless-display*`
                             (ADR-556) beside it, from init.blsp's `:glyphless-chars`, so a zero
                             width space or a bidi control shows, moves and wraps as its `<200b>`
-                            escape (src/glyphless.blsp gives it a face) — and an indent target is a COLUMN
+                            escape (src/decorations/glyphless.blsp gives it a face) — and an indent target is a COLUMN
                             at it (a Makefile's tab stays a tab); a save trims
                             and adds the final newline when .editorconfig asks (a new file takes
                             its end_of_line, and with charset = utf-8-bom a byte-order mark —
@@ -1247,10 +1210,6 @@ src/compile.blsp            M-x compile: run a build in the project root, C-x ` 
                             needed brood's regex captures to be expressible at all
 src/projects.blsp           project root + file walk (find-file-in-project); a VCS checkout (git,
                             mur — std's `vcs`) is a root and lists its own files
-src/diffhl.blsp             diff-hl change gutter: per-line added/modified/deleted against the
-                            file's base text (std's `vcs/base-text`: git's HEAD, mur's last
-                            save), recomputed off the loop on the idle beat;
-                            C-x v ] / [ walk its changes, whichever VCS drew them
 src/beam.blsp               the BEAM, from the editor. C-c b p processes · C-c b s the SUPERVISION
                             TREE (indented by depth, supervisors marked) · C-c b e ETS
                             (biggest first — where the memory went) · C-c b t trace a named
@@ -1948,4 +1907,60 @@ src/tutor/live.blsp
     playground-core
 src/tutor/lessons.blsp
     the tutorial's CONTENT only — the lessons vector (grow the course here)
+```
+
+## decorations — what is drawn over the text but is not the text: changed lines, the fill column, invisible characters, a jump's flash, rainbow brackets, the bracket pair, misspellings, whitespace
+
+```
+src/decorations.blsp
+    the context module: loads every decoration, each of which registers what it paints
+src/decorations/diffhl.blsp
+    diff-hl change gutter: per-line added/modified/deleted against the
+    file's base text (std's `vcs/base-text`: git's HEAD, mur's last
+    save), recomputed off the loop on the idle beat;
+    C-x v ] / [ walk its changes, whichever VCS drew them
+src/decorations/fillindicator.blsp
+    the fill-column rule (Emacs display-fill-column-indicator-mode,
+    `:fill-column-indicator` per mode, M-x display-fill-column-indicator-mode
+    per buffer): `│` at `conventions/fill-column` on each row that leaves
+    it empty, a `:with-text` pane layer; hscroll moves it, a wrapped row is
+    measured from its start, a clipped (truncated) row gets none
+src/decorations/glyphless.blsp
+    the invisible format characters SHOWN (Emacs glyphless-char-display):
+    brood lays a zero width space, a BOM mid-text, a tag character out as
+    its `<200b>` escape (ADR-556, bound by `conventions/with-cell-layout`
+    from `:glyphless-chars`); this module gives the escape its face, and a
+    bidi control (Trojan Source) a hazard face. The minibuffer shows them too.
+    A no-break space (U+00A0, U+202F) is underlined in the escape colour
+    (Emacs nobreak-char-display, `:nobreak-char-display`, on by default).
+    A WORD that mixes scripts the way a homoglyph does (a Cyrillic `а` in
+    `pаypal`, brood's `string/mixed-script?`, ADR-710) has its odd letters out
+    in the hazard face (`:mixed-script-warning`, on by default)
+src/decorations/pulse.blsp
+    a flash on the line after a JUMP (Emacs pulsar, `:pulse`): a post-step row tells a
+    key command's jump (another window or buffer, 5+ lines) from typing and
+    the mouse by `:command-count`, a timer fades the band the view lays over it
+    (280 ms). A held key (an OS repeat, `:key-repeat` from brood's
+    `gui/key-repeat?`) starts none; under `:reduce-motion` the band is still
+    and the next command clears it. `:reduce-motion` (`:auto` follows the
+    desktop, brood's `gui/reduce-motion?`) also snaps the scroll settle, hides
+    the scrollbar without a fade and stills the spinner
+    (`model/ed-reduce-motion?`); a key settles a scroll ease at once
+src/decorations/rainbow.blsp
+    a tree-sitter buffer's brackets coloured by depth (Emacs rainbow-delimiters,
+    `:rainbow-delimiters`): delimiter tokens of the held parse, the window's top
+    depth from the tree; the Lisp modes colour theirs in their own lexer
+src/decorations/showparen.blsp
+    show-paren: the bracket pair at point as two one-character overrides (the end at
+    point underlined, its partner a block, an unmatched one red), through the
+    mode's `:bracket-match` / `:bracket-match-tree` — an override source
+src/decorations/spell.blsp
+    spell checking (Emacs jinx, `:spell-check`): the visible prose, and the
+    comments and strings of code, checked off the loop by a long-lived
+    `enchant-2 -a` (else aspell); M-$ correct, C-M-$ the dictionary. The
+    word being typed (point at its end) is not underlined until point
+    leaves it, as flyspell judges a word
+src/decorations/whitespace.blsp
+    trailing whitespace and tabs as highlight ranges (Emacs whitespace-mode,
+    `:show-whitespace`, per mode through `display-settings/ed-mode-setting`)
 ```

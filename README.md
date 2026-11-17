@@ -139,7 +139,7 @@ src/shells/bshell.blsp             per-project shell + Brood REPL buffer (C-x p 
 src/vcs*.blsp               the VCS layer, whichever system (Emacs VC): C-x g, C-x M-g, C-c g, C-x v =/l/b, the mode line
 src/git*.blsp               git porcelain (Magit): the status buffer, diff/log/commit
 src/mur*.blsp               mur porcelain (mur.fly.dev): *mur-status*, save/land/update, the forge
-src/diffhl.blsp             diff-hl change gutter vs git HEAD or mur's last save; C-x v ] / [ walk its changes
+src/decorations/diffhl.blsp             diff-hl change gutter vs git HEAD or mur's last save; C-x v ] / [ walk its changes
 src/web.blsp                live HTTP mirror of the selected buffer (C-x w)
 src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclient model
 src/collab.blsp             shared-buffer collaboration: presence carets, delta merges, follow/mirror
