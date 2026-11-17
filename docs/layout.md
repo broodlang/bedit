@@ -462,9 +462,6 @@ src/modeline.blsp           a pane's mode line: its segments (`ed-statusbar-segm
 src/overlayview.blsp        the cards over the panes as ui-kit widgets: the context menu and the
                             transient menu, paint and zones in one pass. The transient card is
                             Magit's: groups side by side in balanced columns (`keycolumns`), each row KEY first
-src/codecrumbs.blsp         the header line's crumbs for code: the definitions around point by name, off the
-                            held parse (each `deflanguage` names a `:breadcrumbs` that calls it); a Lisp's
-                            top-level form
 src/headerline.blsp         the HEADER LINE above each pane (Emacs breadcrumb-mode, on with `:header-line`):
                             the file by its project and path, then the mode's `:breadcrumbs` at point
                             (an Org heading's path); the layout takes the pane's top row for it
@@ -775,48 +772,6 @@ src/modes.blsp              modes as layers — the INFRASTRUCTURE: text-mode, t
                             variant), `{:commit :abort}` (the variant), `{:never why}`; a layer
                             binding a printable key to a command must declare it
                             (tests/writable_test.blsp walks every type and presses C-x C-q in each)
-src/brood-mode.blsp         brood-mode: the `.blsp` keymap (paredit, electric pairs) and
-                            its services — eldoc, doc-at, completion against the live
-                            image, the CST indenter, the checker as `:diagnostics`
-src/lisp-modes.blsp         the other Lisps: `deflisp` (a special-form set + a file
-                            pattern over Brood's own reader) for elisp, Common Lisp,
-                            Clojure, Scheme, Fennel; `lisp-indent-with` (Emacs's rule);
-                            wos kernel source
-src/lang-scripts.blsp       Ruby, Elixir, HEEx, Python
-src/lang-systems.blsp       Rust, Go, go.mod, C, C#
-src/lang-web.blsp           JavaScript, TypeScript, TSX (each extending the last), CSS, HTML
-src/lang-config.blsp        HCL + Terraform, shell, JSON, TOML, YAML, Dockerfile, and the line-lexed
-                            formats. All four are `language-core` specs, one file a family
-src/language-core.blsp      `deflanguage` declares a tree-sitter language from ONE spec
-                            (faces, indent, heredocs, injections, formatter) and generates its
-                            whole service set — show-paren (`tsbrackets`) included — checked against
-                            editor/treesit/language-contract, so an incomplete language
-                            fails at load rather than at the keypress that needed it.
-                            Ruby / Elixir / Python / Rust / JavaScript / TypeScript / TSX /
-                            Go / C / Terraform + HCL (two modes over one `:hcl` grammar,
-                            told apart by `:type`; only Terraform's files take `terraform
-                            fmt`), shell (bash), JSON, TOML, YAML and Dockerfile, each naming
-                            where its grammar lives AND the commit its tables were written
-                            against (`:grammar {:url :revision}`, for M-x grammar-install —
-                            each pin the commit the installed library was rebuilt
-                            byte-identical from), its names registered for `grammarcheck` — a
-                            spec may extend another's (TypeScript is JavaScript's, Terraform
-                            HCL's). A language that had a line lexer first keeps it as its
-                            `:fallback`: a buffer opened while the grammar is missing is typed
-                            as the lexer's stand-in (`model/ed-grammar-fallback`) and becomes
-                            the parsed mode when the grammar arrives (`ed-grammars-arrived`);
-                            JSON stays lexed past a megabyte (`:fallback-above`). A language with
-                            no stand-in (Rust, Go, C) stays its parsed mode without its grammar,
-                            and its services answer without one (`spec-grammar?`): no colours, RET
-                            keeps the line's indentation, nothing folds — never a parse that
-                            raises into the view's `render error`. `:injections`
-                            (brood ADR-489) is the code embedded in a language — a Terraform
-                            heredoc named BASH / JSON / PY, a Dockerfile `RUN` line as shell,
-                            Elixir's `~H` as HEEx (heex-mode) — coloured with the embedded
-                            language's OWN spec's faces, found per frame (`modes/language-faces`), so
-                            a missing language or grammar keeps the host's colours. `deflexer`
-                            is its sibling for the line-lexer languages (a pattern + a `lex-*`
-                            stem): env, JSON5, Makefile / INI / commit
 src/tsbrackets.blsp         show-paren over a tree-sitter parse: a bracket is a delimiter
                             TOKEN, its partner the matching token under the same parent (so a
                             `(` in a string matches nothing), read off the held tree when the
@@ -847,14 +802,6 @@ src/mail.blsp               mail: mbox-mode (C-c C-n / C-c C-p between messages,
 src/mail-message.blsp       Internet mail messages: RFC 5322 headers, the MIME part tree,
                             encoded words, quoted-printable / base64, legacy charsets — what
                             mail.blsp decodes with (std's `mime` until brood ADR-417)
-src/lex-gitignore.blsp       .gitignore-style ignore files and .gitattributes (Emacs git-modes)
-src/lex-*.blsp              the lexical highlighters, each a pure `[start end face]` span fn
-                            for a `:fontify` service: `lex-configs` (JSON / YAML / TOML /
-                            Makefile / INI / commit, as `editor/lexer` tables), `lex-shell`,
-                            `lex-dotenv`, `lex-dockerfile`, `lex-markdown` (spans, a fence
-                            coloured as its info string's language over the whole fence —
-                            `markdown-fence-pass`, kept by body text — and the rendering
-                            mdpreview paints). std's `editor/*` until brood ADR-417
 src/gutter.blsp             the line-number gutter text-mode names as its `:gutter-*`
                             services: the number column, the diff-hl bar, and the margin
                             marks (● ✓ ✗ ⚠) read through one precedence table (`register-gutter-mark`,
@@ -1181,11 +1128,6 @@ src/workings.blsp           the "show me how it actually ran" pane over `aside`:
                             report cache and the rule for what earns a split — the tutorial's
                             *Workings* (`tutor-live/*workings-spec*`) and the two playgrounds' spy
                             panes are its clients
-src/mdpreview.blsp          C-c C-p in a .md buffer: the document rendered beside it
-                            (std's `markdown-render`, faces as data on the buffer), following
-                            the cursor per key, level with the source's scroll (a post-step),
-                            re-rendering on the idle beat off the loop (`:on-idle`), and opening
-                            on its own with init.blsp's `:markdown-preview`
 src/toolchain.blsp          the project TYPE as data: marker file -> which commands compile,
                             test, run and REPL here (mix / nest / cargo / npm / go /
                             terraform / make),
@@ -1971,4 +1913,84 @@ src/collab/commands.blsp
     the shared-session commands: M-x share-session, follow or mirror a
     participant, stop sharing, what the session is doing; the mechanism
     (presence, the file registry, follow) is `collab`'s
+```
+
+## languages — what the editor knows of each kind of file: its mode, colours, indentation and structure
+
+```
+src/languages.blsp
+    the context's API: Brood's indenter, eldoc and completion (for the project shell and the
+    tutor), a buffer's definitions from its parse; the modes themselves register by file type
+src/languages/crumbs.blsp
+    the header line's crumbs for code: the definitions around point by name, off the
+    held parse (each `deflanguage` names a `:breadcrumbs` that calls it); a Lisp's
+    top-level form
+src/languages/brood.blsp
+    brood-mode: the `.blsp` keymap (paredit, electric pairs) and
+    its services — eldoc, doc-at, completion against the live
+    image, the CST indenter, the checker as `:diagnostics`
+src/languages/lisps.blsp
+    the other Lisps: `deflisp` (a special-form set + a file
+    pattern over Brood's own reader) for elisp, Common Lisp,
+    Clojure, Scheme, Fennel; `lisp-indent-with` (Emacs's rule);
+    wos kernel source
+src/languages/scripts.blsp
+    Ruby, Elixir, HEEx, Python
+src/languages/systems.blsp
+    Rust, Go, go.mod, C, C#
+src/languages/web.blsp
+    JavaScript, TypeScript, TSX (each extending the last), CSS, HTML
+src/languages/config.blsp
+    HCL + Terraform, shell, JSON, TOML, YAML, Dockerfile, and the line-lexed
+    formats. All four are `language-core` specs, one file a family
+src/languages/core.blsp
+    `deflanguage` declares a tree-sitter language from ONE spec
+    (faces, indent, heredocs, injections, formatter) and generates its
+    whole service set — show-paren (`tsbrackets`) included — checked against
+    editor/treesit/language-contract, so an incomplete language
+    fails at load rather than at the keypress that needed it.
+    Ruby / Elixir / Python / Rust / JavaScript / TypeScript / TSX /
+    Go / C / Terraform + HCL (two modes over one `:hcl` grammar,
+    told apart by `:type`; only Terraform's files take `terraform
+    fmt`), shell (bash), JSON, TOML, YAML and Dockerfile, each naming
+    where its grammar lives AND the commit its tables were written
+    against (`:grammar {:url :revision}`, for M-x grammar-install —
+    each pin the commit the installed library was rebuilt
+    byte-identical from), its names registered for `grammarcheck` — a
+    spec may extend another's (TypeScript is JavaScript's, Terraform
+    HCL's). A language that had a line lexer first keeps it as its
+    `:fallback`: a buffer opened while the grammar is missing is typed
+    as the lexer's stand-in (`model/ed-grammar-fallback`) and becomes
+    the parsed mode when the grammar arrives (`ed-grammars-arrived`);
+    JSON stays lexed past a megabyte (`:fallback-above`). A language with
+    no stand-in (Rust, Go, C) stays its parsed mode without its grammar,
+    and its services answer without one (`spec-grammar?`): no colours, RET
+    keeps the line's indentation, nothing folds — never a parse that
+    raises into the view's `render error`. `:injections`
+    (brood ADR-489) is the code embedded in a language — a Terraform
+    heredoc named BASH / JSON / PY, a Dockerfile `RUN` line as shell,
+    Elixir's `~H` as HEEx (heex-mode) — coloured with the embedded
+    language's OWN spec's faces, found per frame (`modes/language-faces`), so
+    a missing language or grammar keeps the host's colours. `deflexer`
+    is its sibling for the line-lexer languages (a pattern + a `lex-*`
+    stem): env, JSON5, Makefile / INI / commit
+src/languages/lex-gitignore.blsp
+    .gitignore-style ignore files and .gitattributes (Emacs git-modes)
+src/languages/lex-*.blsp
+    the lexical highlighters, each a pure `[start end face]` span fn
+    for a `:fontify` service: `lex-configs` (JSON / YAML / TOML /
+    Makefile / INI / commit, as `editor/lexer` tables), `lex-shell`,
+    `lex-dotenv`, `lex-dockerfile`, `lex-markdown` (spans, a fence
+    coloured as its info string's language over the whole fence —
+    `markdown-fence-pass`, kept by body text — and the rendering
+    mdpreview paints). std's `editor/*` until brood ADR-417
+src/languages/markdown.blsp
+    Markdown: the lexer (colours as a pure function, and the document RENDERED for
+    the preview) and the `.md` mode (a fence coloured as its language, C-c C-p)
+src/languages/markdown-preview.blsp
+    C-c C-p in a .md buffer: the document rendered beside it
+    (std's `markdown-render`, faces as data on the buffer), following
+    the cursor per key, level with the source's scroll (a post-step),
+    re-rendering on the idle beat off the loop (`:on-idle`), and opening
+    on its own with init.blsp's `:markdown-preview`
 ```
