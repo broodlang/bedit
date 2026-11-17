@@ -938,19 +938,6 @@ src/debugger.blsp           the editor as the debugger (ADR-174/184): C-c d sess
                             stream, *Debug* paused-process queue with resume/eval-in-scope,
                             trace-fn/break-fn by name — the collector process speaks std/debug's
                             wire protocol and forwards UiEvent records to the loop
-src/testrun.blsp            native test runs (C-c t): the commands and the *Tests* mode; a run goes to
-                            a warm session when one is ready, else the cold runner
-src/testrun-cold.blsp       a dedicated nest subprocess streams per-test JSON (std's
-                            test/*report-sink*) into the *Tests* buffer — never in-image (%isolate
-                            would revert the editor's globals + kill its pids). The folds every
-                            runner fills *Tests* with
-src/testrun-warm.blsp       a project with a WARM test session uses it instead (`*warm-backends*`,
-                            one row per language: Elixir's `MIX_ENV=test` node, Brood's
-                            eval-server child) — same rows, same marks, without the runtime
-                            start. A warm run RECOMPILES / RELOADS what changed first, so it
-                            never reports on the code the session booted with, and says so
-                            when it had to. The cold path stays and is never slower: a run
-                            with no warm session uses it AND starts one
 src/session.blsp            ONE event vocabulary for every evalsession the editor keeps
                             (`session-ready` / `session-reply` / `session-down`, each carrying
                             the session's NAME) plus the shared emit and client API. Each
@@ -958,12 +945,6 @@ src/session.blsp            ONE event vocabulary for every evalsession the edito
                             purely so the router could tell whose event it was — a fact the
                             session already knows, and now says. A live-evaluating client's
                             ready/down bookkeeping too (`client-ready` / `client-down`)
-src/brood-test.blsp         C-c t in a Brood project without the project load: an eval-server
-                            child answering `:test` / `:teststop`, streaming per-test
-                            verdicts AND the spy entries a test traces.
-                            Measured here — 1.21s cold (435ms of it loading sixty modules)
-                            against ~200ms warm, and it reloads changed src/ per run
-                            (project/reload-changed), so it is never stale
 src/apprun.blsp             run the project (C-c r): nest run in a subprocess with debug taps —
                             app output + spy/trace traffic into *Run*; live stats on a statusbar chip
 src/hosted.blsp             THE FLIP: every pool buffer backed by its own process (hosted-reconcile);
@@ -1099,14 +1080,6 @@ src/elixir-playground.blsp  M-x elixir-playground (C-c p e): the second client o
                             `editor/treesit/parse-state` for mid-typing vs broken, a
                             defmodule/binding dependency rule, and the term's type as the
                             hint (the BEAM computes it; no checker can)
-src/elixir-test.blsp        C-c t without the VM boot: a SECOND agent, booted
-                            `MIX_ENV=test mix run` (`:dev` and `:test` are different
-                            environments — different config, different database, an Ecto
-                            sandbox in only one), answering `TEST` by requiring the named
-                            files and calling `ExUnit.run/1`. Verdicts stream back one per
-                            test (evalsession's `:more` replies) into the same *Tests*
-                            buffer the cold runner fills. The cold path stays and is never
-                            slower: a run with no warm node uses it AND starts one
 elixir/bedit_agent.exs      bedit's agent ON the BEAM: a session (binding + modules across
                             requests), IO capture, per-request timeout, `:erlang.trace`
                             over the modules the SESSION defined (the spy cascade), and the
@@ -1142,10 +1115,6 @@ src/results.blsp            the results-buffer abstraction behind *Tests* / *Run
 src/eolnotes.blsp           END-OF-LINE NOTES: derived text shown at a line, never inserted —
                             a playground's results, a verdict, a type hint — as one owner-keyed
                             buffer annotation the margin, the ghost text and the echo row read
-src/testadapter.blsp        one result vocabulary, two runners: Brood's structured
-                            test/*report-sink* lines and ExUnit's `mix test --trace` text
-                            both decode into the same {:group :name :passed :where …}, so
-                            C-c t means the same thing in every project
 src/compile.blsp            M-x compile: run a build in the project root, C-x ` next-error,
                             M-x project-task (mix tasks / npm scripts). The error locations
                             are an Emacs-style regexp TABLE (`*error-patterns*`), which
@@ -1993,4 +1962,46 @@ src/languages/markdown-preview.blsp
     the cursor per key, level with the source's scroll (a post-step),
     re-rendering on the idle beat off the loop (`:on-idle`), and opening
     on its own with init.blsp's `:markdown-preview`
+```
+
+## testrun — running a project's tests (C-c t): the cold and warm runners, the adapters each language's test tool is read through
+
+```
+src/testrun.blsp
+    native test runs (C-c t): the commands and the *Tests* mode; a run goes to
+    a warm session when one is ready, else the cold runner
+src/testrun/cold.blsp
+    a dedicated nest subprocess streams per-test JSON (std's
+    test/*report-sink*) into the *Tests* buffer — never in-image (%isolate
+    would revert the editor's globals + kill its pids). The folds every
+    runner fills *Tests* with
+src/testrun/warm.blsp
+    a project with a WARM test session uses it instead (`*warm-backends*`,
+    one row per language: Elixir's `MIX_ENV=test` node, Brood's
+    eval-server child) — same rows, same marks, without the runtime
+    start. A warm run RECOMPILES / RELOADS what changed first, so it
+    never reports on the code the session booted with, and says so
+    when it had to. The cold path stays and is never slower: a run
+    with no warm session uses it AND starts one
+src/testrun/brood.blsp
+    C-c t in a Brood project without the project load: an eval-server
+    child answering `:test` / `:teststop`, streaming per-test
+    verdicts AND the spy entries a test traces.
+    Measured here — 1.21s cold (435ms of it loading sixty modules)
+    against ~200ms warm, and it reloads changed src/ per run
+    (project/reload-changed), so it is never stale
+src/testrun/elixir.blsp
+    C-c t without the VM boot: a SECOND agent, booted
+    `MIX_ENV=test mix run` (`:dev` and `:test` are different
+    environments — different config, different database, an Ecto
+    sandbox in only one), answering `TEST` by requiring the named
+    files and calling `ExUnit.run/1`. Verdicts stream back one per
+    test (evalsession's `:more` replies) into the same *Tests*
+    buffer the cold runner fills. The cold path stays and is never
+    slower: a run with no warm node uses it AND starts one
+src/testrun/adapter.blsp
+    one result vocabulary, two runners: Brood's structured
+    test/*report-sink* lines and ExUnit's `mix test --trace` text
+    both decode into the same {:group :name :passed :where …}, so
+    C-c t means the same thing in every project
 ```
