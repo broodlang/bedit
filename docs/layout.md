@@ -714,29 +714,6 @@ src/tsbrackets.blsp         show-paren over a tree-sitter parse: a bracket is a 
                             `:bracket-match-tree`. A pair in the middle of its parent (an HCL
                             block's braces) is found among the parent's children, anonymous
                             tokens included (`node-children` all?), with no length cap
-src/org.blsp                Org text: `org-spans` (the colouring), and the OUTLINE as facts over
-                            lines read one at a time: a heading's parts (level, keyword,
-                            priority, title), where a subtree or a list item ends, siblings and
-                            parents, the TODO and priority steps, an ordered list renumbered,
-                            what a `[2/3]` cookie counts. Pure; org-mode is the mode over it
-                            (moved from brood's std by ADR-417)
-src/org-mode.blsp           org-mode: the mode over `org` — folding (TAB, S-TAB) and Org's
-                            STRUCTURE EDITING: M-RET (a heading or item where point is, splitting
-                            at point, before it from its start), C-RET (after the subtree),
-                            M-S-RET / C-S-RET (TODO, a checkbox item); M-arrows promote / demote
-                            / move a heading or item, M-S- with what is under it (folds carried);
-                            S-arrows the keyword and priority (shift-select off a heading);
-                            C-c C-c a checkbox and every `[2/3]` cookie above it; C-c C-t,
-                            C-c C-n / p / f / b / u; breadcrumbs. Each change is one rewrite of
-                            a run of lines (`org-rewrite`), so one undo step
-src/mail.blsp               mail: mbox-mode (C-c C-n / C-c C-p between messages, on rope
-                            searches that cost the distance, not the offset), eml-mode, and
-                            C-c C-v — the message at point DECODED in *Message* (Gnus's
-                            article buffer) over `mail-message`: the headers that matter, the
-                            text part, the attachments, RET saves one
-src/mail-message.blsp       Internet mail messages: RFC 5322 headers, the MIME part tree,
-                            encoded words, quoted-printable / base64, legacy charsets — what
-                            mail.blsp decodes with (std's `mime` until brood ADR-417)
 src/gutter.blsp             the line-number gutter text-mode names as its `:gutter-*`
                             services: the number column, the diff-hl bar, and the margin
                             marks (● ✓ ✗ ⚠) read through one precedence table (`register-gutter-mark`,
@@ -2013,4 +1990,41 @@ src/packages/review.blsp
     *Package Diff: NAME* section tree, painted as every diff
     (vcsproc's hunk sections) — and update-all's one *Package Diff*, a
     folded section per package (`review-all-tree`). Applying / dropping is packages'
+```
+
+## org — Org: the outline document model and the .org mode over it
+
+```
+src/org.blsp
+    Org text: `org-spans` (the colouring), and the OUTLINE as facts over
+    lines read one at a time: a heading's parts (level, keyword,
+    priority, title), where a subtree or a list item ends, siblings and
+    parents, the TODO and priority steps, an ordered list renumbered,
+    what a `[2/3]` cookie counts. Pure; org-mode is the mode over it
+    (moved from brood's std by ADR-417)
+src/org/mode.blsp
+    org-mode: the mode over `org` — folding (TAB, S-TAB) and Org's
+    STRUCTURE EDITING: M-RET (a heading or item where point is, splitting
+    at point, before it from its start), C-RET (after the subtree),
+    M-S-RET / C-S-RET (TODO, a checkbox item); M-arrows promote / demote
+    / move a heading or item, M-S- with what is under it (folds carried);
+    S-arrows the keyword and priority (shift-select off a heading);
+    C-c C-c a checkbox and every `[2/3]` cookie above it; C-c C-t,
+    C-c C-n / p / f / b / u; breadcrumbs. Each change is one rewrite of
+    a run of lines (`org-rewrite`), so one undo step
+```
+
+## mail — mail: reading and writing a message, its headers and parts
+
+```
+src/mail.blsp
+    mail: mbox-mode (C-c C-n / C-c C-p between messages, on rope
+    searches that cost the distance, not the offset), eml-mode, and
+    C-c C-v — the message at point DECODED in *Message* (Gnus's
+    article buffer) over `mail-message`: the headers that matter, the
+    text part, the attachments, RET saves one
+src/mail/message.blsp
+    Internet mail messages: RFC 5322 headers, the MIME part tree,
+    encoded words, quoted-printable / base64, legacy charsets — what
+    mail.blsp decodes with (std's `mime` until brood ADR-417)
 ```
