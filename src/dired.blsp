@@ -61,7 +61,11 @@ unknown — always that width so the name column stays aligned."
         " "
         (string/pad-left (str (datetime/day date)) 2)
         " "
-        (datetime/format date "%H:%M")))))
+        ;; the time from its fields: `datetime/format`, which reads its pattern on every call,
+        ;; was most of a large listing's text (/usr/bin, 2278 rows: 111 of 175 ms)
+        (string/pad-left (str (datetime/hour date)) 2 "0")
+        ":"
+        (string/pad-left (str (datetime/minute date)) 2 "0")))))
 
 ;; ---- listing: stat each entry once, sorted as the switches say, then render --------
 ;; Emacs's dired sorts the way its `ls` switches say (`dired-listing-switches`, `-al`):
@@ -264,18 +268,27 @@ for deletion, a space otherwise."
   "The dired buffer text: the header line then one `ed-dired-row` per entry (columns
 sized to the listing), a row marked `*` when its name is in `marks`, `D` when it is in
 `flags` (flagged for deletion, Emacs `d`)."
-  (let (cols (ed-dired-cols entries))
+  (let (cols (ed-dired-cols entries)
+        ;; sets: every row asks, and a listing is unbounded
+        marked (into #{} marks)
+        flagged (into #{} flags))
     (str (ed-dired-header dir)
       "\n"
       (string/join (map entries
-                     (fn (entry)
-                       (ed-dired-row (cond
-                                       (includes? flags (:name entry)) "D"
-                                       (includes? marks (:name entry)) "*"
-                                       else " ")
-                         entry cols)))
+                     (fn (entry) (ed-dired-row (mark-cell (:name entry) marked flagged) entry cols)))
         "\n")
       "\n")))
+
+(defn- mark-cell (name marked flagged)
+  ;; the mark cell of `name`'s row: `D` flagged for deletion, `*` marked, a space otherwise
+  (cond
+    (includes? flagged name) "D"
+    (includes? marked name) "*"
+    else " "))
+
+(defn- ed-dired-mark-cell (buffer name)
+  ;; the mark cell `name`'s row shows under `buffer`'s marks and flags ([[mark-cell]])
+  (mark-cell name (or (:dired-marks buffer) '()) (or (:dired-flags buffer) '())))
 
 (defn ed-dired-switches (m dir)
   "The `ls` switches `dir` is listed with: the ones set for it by `s` / `C-u s` (kept per
@@ -789,12 +802,28 @@ deletion flag on the same entry (one mark cell per row); unmarking clears both."
   (ed-dired-set-in (ed-dired-set-in m :dired-marks name false) :dired-flags name true))
 
 (defn- ed-dired-remark (m change)
-  "Apply `change` (`(m name) -> m`) to the entry under point, then advance to the next
-line and re-render. The `.`/`..` pseudo-entries can't be marked — just advance past them."
+  "Apply `change` (`(m name) -> m`) to the entry under point, rewrite that row's mark cell
+([[ed-dired-mark-cell]]) and advance to the next row. The `.`/`..` pseudo-entries can't be
+marked — just advance past them.
+
+Only the one cell changes, as in Emacs: the listing is not read from the disk again nor built
+again, which cost a key in /usr/bin (2278 entries) about 100 ms — a stat of every entry, then
+every row's text."
   (let (name (ed-dired-name-at m)
-        next (+ (buffer-current-line (ed-current-buf m)) 2) ; 1-based line below point
+        line (buffer-current-line (ed-current-buf m))
         changed (if (ed-dired-entry? name) (change m name) m))
-    (ed-show-dired changed (ed-dired-state m :dired-dir) next)))
+    (ed-apply changed
+      (fn (buffer)
+        (let (celled (if (ed-dired-entry? name)
+                       (let (start (text/line->char (buffer-rope buffer) line))
+                         ;; the listing is read-only to the reader, not to dired
+                         (set-read-only (replace-region (set-read-only buffer false)
+                                          start
+                                          (inc start)
+                                          (ed-dired-mark-cell buffer name))
+                           true))
+                       buffer))
+          (ed-dired-move-to-filename (ed-goto-line celled (+ line 2))))))))
 
 (defcommand cmd-dired-mark
   (m key)
@@ -816,9 +845,25 @@ Emacs `dired-flag-file-deletion`). `x` deletes every flagged entry after a confi
 (defcommand cmd-dired-unmark-all
   (m key)
   "Remove every mark and every deletion flag (U)."
-  (ed-show-dired (ed-dired-clear-marks m (ed-dired-state m :dired-dir))
-    (ed-dired-state m :dired-dir)
-    (inc (buffer-current-line (ed-current-buf m)))))
+  (ed-dired-recell (ed-dired-clear-marks m (ed-dired-state m :dired-dir))))
+
+(defn- ed-dired-recell (m)
+  ;; every row's mark cell rewritten from the current listing's marks and flags, in one edit
+  ;; of its own lines — for a change to many rows at once, which need not read the directory
+  ;; again any more than one row's does ([[ed-dired-remark]])
+  (ed-apply m
+    (fn (buffer)
+      (let (names (vec (or (:dired-names buffer) []))
+            marked (into #{} (or (:dired-marks buffer) '()))
+            flagged (into #{} (or (:dired-flags buffer) '()))
+            ;; line 0 is the header; line k is the row of the k-th name
+            rows (map (seq/enumerate (string/split (buffer-text buffer) "\n"))
+                   (fn ([index line])
+                     (if (and (> index 0) (<= index (count names)) (> (count line) 0))
+                       (str (mark-cell (nth names (dec index)) marked flagged)
+                         (string/substring line 1 (count line)))
+                       line))))
+        (buffer-replace-text buffer (string/join rows "\n"))))))
 
 (defcommand cmd-dired-toggle-marks
   (m key)
@@ -831,11 +876,9 @@ Emacs `dired-flag-file-deletion`). `x` deletes every flagged entry after a confi
         flagged (into #{} (or (ed-dired-state m :dired-flags) '())))
     ;; a flagged row keeps its D — one mark cell per row, so it is neither marked nor
     ;; unmarked by the toggle
-    (ed-show-dired (ed-dired-put m
-                     :dired-marks (seq/reject all
-                       (fn (name) (or (contains? marked name) (contains? flagged name)))))
-      (ed-dired-state m :dired-dir)
-      (inc (buffer-current-line (ed-current-buf m))))))
+    (ed-dired-recell (ed-dired-put m
+                       :dired-marks (seq/reject all
+                         (fn (name) (or (contains? marked name) (contains? flagged name))))))))
 
 (defn- ed-dired-prompt (m prompt initial run)
   "A path prompt for a dired file op, the one find-file and C-x C-w use (`ed-path-prompt`,
