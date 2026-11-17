@@ -1,0 +1,195 @@
+(defmodule startpage
+  "The start page: what bedit opens on when it is given no file — the files and projects you
+were in last, the keys that open everything else, and where to learn. Read-only, no line
+numbers. Every action line is a link (RET or a click follows it), and the digits open the
+recent files by number. The keys are rendered for the profile the editor starts in, with the
+init file's own bindings (`userkeys/profile-keymap-with`), so they are the keys you will press.
+
+A line's action is kept on the buffer (`:start-actions`, line index → action), not found by
+matching its text: `[:file path]`, `[:project root]` or `[:command symbol]`."
+  (:use editor/buffer)
+  (:use interactive) ; defcommand
+  (:use model)
+  (:use modes) ; register-special-type — read-only, no gutter
+  (:use theme)) ; defchrome and the palette — the page's colours follow the theme
+
+(def recent-shown 9) ; recent files listed (one per digit key)
+(def projects-shown 5)
+
+(def margin "    ") ; the page's left margin, so it does not hug the window edge
+
+;; the page's two top lines, which `start-fontify` knows by their text
+(def- page-title "bedit")
+(def- tagline "an Emacs-style editor, written in Brood")
+
+(defn- entry-line (key text width)
+  ;; one action line: the key in a column `width` wide, then what it does (`keycolumns`)
+  (str margin "  " (keycolumns/entry-cell {:key key :text text} width)))
+
+(defn- section (title rows)
+  ;; a titled block of `[text action]` rows and a blank line after it, or nothing when empty
+  (if (empty? rows) [] (into (into [[(str margin title) nil]] rows) [["" nil]])))
+
+;; the command lines, by section: `[command what-it-does]`
+(def open-entries
+  [['commands/cmd-find-file "a file"]
+    ['project-commands/cmd-project-switch "a project"]
+    ['commands/cmd-switch-buffer "a buffer"]
+    ['commands/cmd-scratch-buffer "the scratch buffer"]])
+
+(def learn-entries
+  [['tutor/cmd-tutorial "the tutorial: bedit in a few minutes"]
+    ['help/cmd-help-for-help "help on keys, commands and settings"]
+    ['themes/cmd-theme-select "choose a theme"]
+    ['lifecycle/cmd-open-settings "your settings (init.blsp)"]
+    ['playground/cmd-brood-playground "the Brood playground"]])
+
+(defn page-rows (keymap recent projects)
+  "The page as `[text action]` rows, top to bottom: the title, open, recent files (numbered,
+up to [[recent-shown]]), projects, learn, and the version. `keymap` renders the keys, in one
+column as wide as the widest; `recent` and `projects` are paths, most recent first.
+
+    (count (startpage/page-rows {} [] []))   ;=> 18"
+  (let (key-of (fn (command) (keyhelp/ed-command-key keymap command))
+        width (keycolumns/key-width (map (append open-entries learn-entries)
+                                      (fn ([command _]) {:key (key-of command)})))
+        command-rows (fn (entries)
+                       (map entries
+                         (fn ([command what])
+                           [(entry-line (key-of command) what width)
+                             [:command command]])))
+        files (map (seq/enumerate (take recent recent-shown))
+                (fn ([index path])
+                  [(entry-line (str (inc index)) (path/abbreviate path) width) [:file path]]))
+        roots (map (take projects projects-shown)
+                (fn (root) [(entry-line "" (path/abbreviate root) width) [:project root]])))
+    (append [["" nil] [(str margin page-title) nil] [(str margin tagline) nil] ["" nil]]
+      (section "Open" (command-rows open-entries))
+      (section "Recent files" files)
+      (section "Projects" roots)
+      (section "Learn" (command-rows learn-entries))
+      [[(str margin page-title " " (about/bedit-version) " · brood " (system/brood-version)) nil]])))
+
+(defn start-page (keymap recent projects)
+  "The start page buffer for `keymap`, `recent` files and `projects` ([[page-rows]]): typed
+`:start-page`, read-only, its actions kept by line (`:start-actions`), point on the first
+action's key so RET there opens a file."
+  (let (rows (page-rows keymap recent projects)
+        actions (fold (seq/enumerate rows)
+                  {}
+                  (fn (acc entry)
+                    (let ([index [_ action]] entry) (if (nil? action) acc (assoc acc index action)))))
+        text (str (string/join (map rows first) "\n") "\n")
+        page (editor/layers/set-buffer-type (make-buffer text "*start*") :start-page))
+    (assoc (set-read-only (goto-char page (first-action-offset rows)) true) :start-actions actions)))
+
+(defn- first-action-offset (rows)
+  ;; where the first action line's key starts, as a character offset into the page
+  (letrec (walk (fn (remaining offset)
+                  (cond
+                    (empty? remaining) 0
+                    (not (nil? (second (first remaining)))) (+ offset (count margin) 2)
+                    else (walk (rest remaining) (+ offset (count (first (first remaining))) 1)))))
+    (walk rows 0)))
+
+(defn action-at (buffer line)
+  "The action of `buffer`'s line `line` (0-based), or nil for a plain line."
+  (get (:start-actions buffer) line))
+
+(defn- run-action (m key action)
+  (let ([kind target] action)
+    (case kind
+      :file (pool/ed-visit-file m target)
+      :project (pool/ed-visit-file m target)
+      :command
+        (if (bound? target)
+          ((reflect/eval target) m key)
+          (message m "that one is still loading — one second, then try again"))
+      m)))
+
+;; check-allow: an action's command is resolved late (`reflect/eval`), so its result is unknown
+;; to the checker; every command answers a model
+(check-allow :trusted
+  (defcommand cmd-start-page-follow
+    (m key)
+    "Follow the start page line under point (RET, or a click): open the file or project, or
+run the command it names. A plain line does nothing."
+    (let (buffer (ed-current-buf m)
+          action (action-at buffer (buffer-current-line buffer)))
+      (if (nil? action) m (run-action m key action))))
+
+  (defcommand cmd-start-page-recent
+    (m key)
+    "Open the recent file whose number was pressed (1-9 on the start page)."
+    (let (number (string/->number (->string key))
+          files (recent-actions (ed-current-buf m)))
+      (if (and (int? number) (<= 1 number) (<= number (count files)))
+        (run-action m key (nth files (dec number)))
+        (message m (str "no recent file " key))))))
+
+(defn recent-actions (buffer)
+  "The `[:file path]` actions of start page `buffer`, top to bottom — what 1-9 open."
+  (map (seq/sort-by (seq/filter (into [] (:start-actions buffer))
+                      (fn ([_ action]) (= (first action) :file)))
+         first)
+    second))
+
+(defn start-line-loc (buffer line-index)
+  "The link affordance hook: truthy on an action line (the pointer cursor, the underline)."
+  (when-let (action (action-at buffer line-index)) {:start action}))
+
+(theme/defchrome start-face-title {:fg *text* :bold true})
+(theme/defchrome start-face-heading {:fg *mauve* :bold true})
+(theme/defchrome start-face-key {:fg *peach*})
+(theme/defchrome start-face-dim {:fg *overlay1*})
+
+(defn start-fontify (src)
+  "The start page's colours: the name bold, the tagline and the version dim, the section
+headings in the accent, and an action line's key column in the key colour (its text stays
+the reader's colour; the link affordance underlines it under the pointer).
+
+It knows a line by its text and indent, not by `:start-actions`: a `:fontify` is handed the
+text alone, and faces stored on the buffer instead (`:face-spans`) would keep the colours of
+the theme the page was built under."
+  (let (indent (count margin))
+    (fontify-lines src
+      (fn (line offset)
+        (let (whole (fn (face) (list [offset (+ offset (count line)) face]))
+              body (string/trim line))
+          (cond
+            (= body "") '()
+            (= body page-title) (whole start-face-title)
+            ;; the version line is `bedit 0.10.0 · brood 0.54.0`
+            (or (= body tagline) (string/starts-with? body (str page-title " ")))
+              (whole start-face-dim)
+            ;; a heading sits at the margin; an action line is indented past it
+            (not (string/starts-with? line (str margin " "))) (whole start-face-heading)
+            else
+              (let (key-start (+ indent 2)
+                    ;; the key runs to the two spaces that end its column
+                    gap (index-of (string/substring line key-start (count line)) "  ")
+                    key-end (if (< gap 0) key-start (+ key-start gap)))
+                (if (> key-end key-start)
+                  (list [(+ offset key-start) (+ offset key-end) start-face-key])
+                  '()))))))))
+
+(def start-page-keymap
+  (fold (map (range 1 10) ->string)
+    (-> {}
+      (editor/keymap/keymap-bind [:enter] 'startpage/cmd-start-page-follow))
+    (fn (keymap digit) (editor/keymap/keymap-bind keymap [digit] 'startpage/cmd-start-page-recent))))
+
+(def start-page-layer
+  {:name 'start-page
+   :doc "The start page — RET or a click follows a line, 1-9 open a recent file."
+   :keymap start-page-keymap
+   :writable {:never "the start page is generated; its lines open what they name"}
+   ;; its own first lines say what it is: a header line would only repeat *start*
+   :header-line false
+   :fontify 'startpage/start-fontify
+   :line-loc 'startpage/start-line-loc
+   :on-click 'startpage/cmd-start-page-follow})
+
+(register-special-type :start-page 'startpage/start-page-layer)
+
+;; no guest trait: a line opens a file, which a guest's session never may (`guest`)

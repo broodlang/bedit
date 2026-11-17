@@ -26,11 +26,12 @@ every module loads."
   (single-key-description k))
 
 (defn ed-cmd-label (v)
-  "A short label for a keymap binding: a prefix sub-keymap → `+prefix`, else the command
+  "A short label for a keymap binding: a prefix sub-keymap → `+` and the name it was described
+with (`keymap-name`, brood ADR-745: `+project`), `+prefix` when it has none; else the command
 symbol's name with the module path and `cmd-` prefix stripped (`commands/cmd-find-file`
 → `find-file`)."
   (if (map? v)
-    "+prefix"
+    (str "+" (or (keymap-name v) "prefix"))
     (let (base (last (string/split (->string v) "/")))
       (if (string/starts-with? base "cmd-") (string/substring base 4 (count base)) base))))
 
@@ -39,12 +40,110 @@ symbol's name with the module path and `cmd-` prefix stripped (`commands/cmd-fin
 `key-description`, the inverse of `key-parse`."
   (key-description keys))
 
+;; ---- a keymap's keys in its groups: the which-key panel and the *Help* listings ----------
+;; One grouping for every place that lists a prefix's keys: the which-key panel
+;; (`whichkey/panel-items`), C-x C-h's `describe-prefix-bindings` and C-h b's `describe-bindings`.
+;; The names and headings come off the keymap itself (brood ADR-745): a prefix key shows the
+;; `+name` its map was described with, and the keys sit under the headings their bindings gave
+;; them, in the map's heading order, the keys none names last under "other".
+
+(def ed-heading-mark
+  ;; what leads a group's heading line, so it reads as a heading in the window and the terminal
+  "── ")
+
+(def- other-heading
+  ;; the heading of the keys a grouped map leaves ungrouped
+  "other")
+
+(defn ed-key-groups (keymap &optional chord)
+  "`keymap`'s keys as `keycolumns` groups (`{:title :rows}`): its groups in its heading order
+(`keymap-groups`), then \"other\" for the keys none names; one untitled group when it names
+none. A row is `{:key :text :binding :sequence}` — `:sequence` the key after prefix `chord`
+(default none), `:key` that sequence's label, `:text` the binding's ([[ed-cmd-label]], `+name`
+for a sub-prefix) — and a group's rows are sorted by `:key`.
+
+    (map (keyhelp/ed-key-groups {\"b\" 'x/cmd-b \"a\" 'x/cmd-a}) (fn (group) (map (:rows group) :key)))   ;=> ((\"a\" \"b\"))"
+  (let (chord (vec (or chord []))
+        rows (fn (members)
+               (seq/sort-by (map members
+                              (fn ([key binding])
+                                (let (sequence (conj chord key))
+                                  {:key (ed-keys-label sequence)
+                                   :text (ed-cmd-label binding)
+                                   :binding binding
+                                   :sequence sequence})))
+                 :key))
+        groups (keymap-groups keymap))
+    (if (and (= (count groups) 1) (nil? (first (first groups))))
+      [{:title nil :rows (rows (second (first groups)))}]
+      (vec (map groups
+             (fn ([heading members]) {:title (or heading other-heading) :rows (rows members)}))))))
+
+(defn ed-prefix-sections (keymap chord)
+  "Every binding under prefix `chord` (whose map is `keymap`) as listing sections
+`{:chord :name :groups}`: the prefix's own keys in their groups ([[ed-key-groups]]), then each
+sub-prefix's section, recursively, in the order its key is listed — each binding in exactly one
+section, a sub-prefix's key in its parent's as `+name`.
+
+    (map (keyhelp/ed-prefix-sections {\"a\" 'x/cmd-a \"p\" {\"f\" 'x/cmd-f}} []) :chord)   ;=> ([] [\"p\"])"
+  (let (groups (ed-key-groups keymap chord))
+    (into [{:chord (vec chord) :name (keymap-name keymap) :groups groups}]
+      (mapcat (mapcat groups :rows)
+        (fn (row)
+          (if (map? (:binding row)) (ed-prefix-sections (:binding row) (:sequence row)) []))))))
+
+(defn- section-title (section)
+  ;; a sub-prefix section's title line, Emacs's `describe-prefix-bindings` heading; nil for
+  ;; the keys of the root map, which its host titles
+  (let (chord (:chord section) name (:name section))
+    (when (not (empty? chord))
+      (str "Key bindings starting with "
+        (ed-keys-label chord)
+        (if (and (string? name) (not (= name (ed-keys-label chord)))) (str " (+" name ")") "")
+        ":"))))
+
+(defn ed-sections-text (sections row-line)
+  "[[ed-prefix-sections]] as *Help* text, Emacs's `describe-bindings` shape: each section's
+title line, then each group under its heading line (`── files`, none for an untitled group), one
+line per row, a blank line between two groups or sections. `(row-line row width)` writes a row,
+`width` the widest `:key` of all the sections, so one key column lines up the whole listing.
+
+    (keyhelp/ed-sections-text (keyhelp/ed-prefix-sections {\"a\" 'x/cmd-a} [:ctrl-x]) (fn (row width) (:key row)))   ;=> \"Key bindings starting with C-x:\\n\\nC-x a\""
+  (let (width (fold sections
+                0
+                (fn (widest section)
+                  (fold (mapcat (:groups section) :rows)
+                    widest
+                    (fn (most row) (math/max most (string/display-width (:key row)))))))
+        group-text (fn (group)
+                     (string/join (append (if (keycolumns/titled? group)
+                                            [(str ed-heading-mark (:title group))]
+                                            [])
+                                    (map (:rows group) (fn (row) (row-line row width))))
+                       "\n"))
+        section-text (fn (section)
+                       (let (title (section-title section)
+                             body (string/join (map (:groups section) group-text) "\n\n"))
+                         (if (nil? title) body (str title "\n\n" body)))))
+    (string/join (seq/reject (map sections section-text) (fn (text) (= text ""))) "\n\n")))
+
 (defn ed-cancel-key? (input)
   "Whether `input` is a cancel key (Esc / C-g) — what every modal overlay reads as quit.
 Key vocabulary, so it lives beside the labels rather than in `input`: the dispatcher owns
 the overlays, and a module that one of those overlays drives (`transient`) would close a
 cycle around the whole of `input` just to ask this."
   (or (= input :escape) (= input :ctrl-g)))
+
+(defn ed-meta-key (key)
+  "`key` with Meta added — what `ESC key` means (Emacs's ESC prefix): `\"x\"` → `:alt-x`,
+`:ctrl-f` → `:ctrl-meta-f`, a key already Meta as itself. A key Meta cannot modify (a mouse
+event, a timer) comes back unchanged.
+
+    (keyhelp/ed-meta-key \"x\")   ;=> :alt-x"
+  (if (or (keyword? key) (string? key))
+    (let (meta (key-parse (str "M-" (single-key-description key))))
+      (if (and (vector? meta) (= (count meta) 1)) (first meta) key))
+    key))
 
 ;; ---- key-accurate help text: ask the keymap, don't hardcode -------------------
 ;; Any text that tells the user which key to press goes stale the moment a key is
@@ -131,11 +230,18 @@ the keymap — matched by `ed-command-tail`. For one command; for a list of them
         sep (if (= 1 (count prompt)) "" " "))
     (str prompt sep name)))
 
+(defn ed-command-key (km command)
+  "How to run `command` in keymap `km`, as text: the key bound to it ([[ed-where-is]]), else
+the command prompt and its name (`M-x find-file`, `:find-file` in Vim's profile) — what a
+`\\[command]` hole renders as ([[ed-substitute-command-keys]]), for a caller that has the
+command rather than a template.
+
+    (keyhelp/ed-command-key {} 'commands/cmd-find-file)   ;=> \"M-x find-file\""
+  (or (ed-where-is km command) (ed-run-by-name km (ed-cmd-label command))))
+
 (defn- ed-subst-hole (km hole)
-  ;; One `\\[command]` hole -> the key bound to it, else how to run it by name.
-  (let (sym (symbol (string/trim hole)))
-    (or (ed-where-is km sym)
-      (ed-run-by-name km (ed-cmd-label sym)))))
+  ;; One `\\[command]` hole -> [[ed-command-key]]
+  (ed-command-key km (symbol (string/trim hole))))
 
 (defn ed-substitute-command-keys (km text)
   "Emacs's `substitute-command-keys`: replace every `\\[command]` hole in `text` with

@@ -131,6 +131,11 @@ pane and the recency back as they were. `on-done` gets the model and the accepte
                 (if (nil? index) mm (ed-show-index mm index))))
           :on-abort (fn (mm) (assoc mm :layout layout :buffer-mru recency))))))
 
+(defcommand cmd-scratch-buffer
+  (m key)
+  "Switch to `*scratch*` (Emacs's `scratch-buffer`), making a fresh one when it was killed."
+  (pool/ed-switch-to-named (pool/ed-ensure-scratch m) pool/scratch-name))
+
 (defcommand cmd-switch-buffer
   (m key)
   "Prompt for a buffer to switch to (C-x b), the Emacs way: the default — named in the
@@ -210,6 +215,23 @@ the current buffer's own `active-command-lists`, sorted."
     (sort (append (seq/reject command-names (fn (n) (contains? owned n)))
             (apply append active-command-lists)))))
 
+(defn- ed-mx-run (m name)
+  "Run the command `name` chosen at an M-x-style prompt: refused in a guest's session when it
+may not run it, else `interactive/run-command` — and, in the live editor (`:recent-files`, so
+tests and headless runs never write the shared cache, as recentf), remembered as recently run
+(`remember-command!`, the M-x history C-x ESC ESC repeats). Remembered after the command runs,
+so one that throws is not."
+  (let (result (if (and (:guest-session m) (not (ed-guest-allows-name? name)))
+                 (ed-guest-refusal m)
+                 (interactive/run-command m name (fn (mm nm) (message mm (str "no command: " nm))))))
+    (do
+      (when (and (:recent-files m) (interactive/command-sym name)) (remember-command! name))
+      result)))
+
+(defn- ed-mx-names (m names)
+  ;; `names` less what a guest's session may not run (`ed-guest-allows-name?`)
+  (if (:guest-session m) (seq/filter names ed-guest-allows-name?) names))
+
 (defcommand cmd-execute-extended-command
   (m key)
   "Prompt for an interactive command name and run it (M-x). Completes against the
@@ -219,41 +241,44 @@ commands appear first (most-recent at the top), then the alphabetical remainder 
 history is **persisted across restarts** via the same recentf mechanism (`recent-commands`
 / `remember-command!`), floated by the shared `projects/float-recent`."
   (let (buf (ed-current-buf m)
-        every-name (ed-mx-command-names (interactive/command-names)
-                     (ed-all-layer-commands)
-                     (ed-active-mode-commands buf))
-        ;; a guest's session is offered, and runs, only what it may (`ed-guest-allows-name?`)
-        all-names (if (:guest-session m) (seq/filter every-name ed-guest-allows-name?) every-name))
+        all-names (ed-mx-names m
+                    (ed-mx-command-names (interactive/command-names)
+                      (ed-all-layer-commands)
+                      (ed-active-mode-commands buf))))
     (assoc m
       :minibuffer
         (assoc (ed-name-prompt "M-x "
                  all-names
-                 (fn (mm t)
-                   ;; persist real commands as recent — live editor only (`:recent-files`), so tests
-                   ;; and headless runs never write the shared cache (mirrors recentf's guard).
-                   ;; Run after the command executes so a command that throws is not persisted.
-                   (let (result (if (and (:guest-session mm) (not (ed-guest-allows-name? t)))
-                                  (ed-guest-refusal mm)
-                                  (interactive/run-command mm
-                                    t
-                                    (fn (mmm nm) (message mmm (str "no command: " nm))))))
-                     (do
-                       (when (and (:recent-files mm) (interactive/command-sym t))
-                         (remember-command! t))
-                       result)))
+                 ed-mx-run
                  15
+                 ;; the persisted M-x history, floated to the top
                  (if (:recent-files m) (recent-commands) []))
-          ; persisted M-x history, floated to the top
           ;; marginalia per row: the key bound to the command in THIS buffer's live keymap,
           ;; its declared contract, its docstring's first line (`plume/plume-command-annotation`)
           :category :command
           :anno-keys (ed-key-table (editor/layers/scope-keymap (userkeys/ed-user-scope buf m)))))))
 
-;; ---- keyboard-quit (C-g / ESC): the universal cancel ------------------------
+(defcommand cmd-repeat-complex-command
+  (m key)
+  "Run again a command run by name (C-x ESC ESC, Emacs's `repeat-complex-command`): a prompt
+over M-x's history (`recent-commands`), the most recent first, so RET repeats the last one
+and C-n or typing picks an older one. What it runs is run as M-x runs it, and goes back to
+the top of the history. Says so when nothing has been run by name yet."
+  (let (history (ed-mx-names m
+                  (seq/filter (if (:recent-files m) (recent-commands) [])
+                    (fn (name) (not (nil? (interactive/command-sym name)))))))
+    (if (empty? history)
+      (message m "No repeatable command")
+      (assoc m
+        :minibuffer
+          (assoc (ed-name-prompt "Repeat complex command: " history ed-mx-run 15 history)
+            :category :command)))))
+
+;; ---- keyboard-quit (C-g / ESC ESC ESC): the universal cancel ---------------
 
 (defcommand cmd-keyboard-quit
   (m key)
-  "C-g / ESC (`keyboard-quit`): the universal cancel. Deactivates the region (clears the
+  "C-g / ESC ESC ESC (`keyboard-quit`): the universal cancel. Deactivates the region (clears the
 mark), drops a half-typed chord (`:pending`) and any numeric prefix argument, and
 **cancels every background worker in flight** that its feature registered as cancellable
 (`model/register-task-reply`'s `:cancel-on-quit?` — a running evaluation, the advisory

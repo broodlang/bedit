@@ -79,9 +79,39 @@ non-zero and `make drive` stops."
   "Wait `ms` without a message — the driver's own pause between screen reads."
   (receive (:never nil) (after ms nil)))
 
+(defn- occurrences (text needle)
+  "How many times `needle` occurs in `text`."
+  (dec (count (string/split text needle))))
+
+(defn- watch-output (state chunk)
+  "The session's counts of the `:watch` sequences, with those in `chunk` added. The stream's
+last few chars are kept (`:tail`), so a sequence cut between two chunks is still counted —
+and none counted twice, the tail being shorter than any watched sequence."
+  (let (watched (:watch state))
+    (if (empty? watched)
+      state
+      (let (keep (dec (fold watched 0 (fn (longest needle) (max longest (count needle)))))
+            tail (:tail state)
+            text (str tail chunk)
+            seen (fold watched
+                   (:seen state)
+                   (fn (seen needle)
+                     (assoc seen
+                       needle
+                       (+ (get seen needle 0) (occurrences text needle)))))
+            length (count text))
+        (assoc state :seen seen :tail (string/substring text (max 0 (- length keep)) length))))))
+
 (defn- feed (state chunk)
-  "Fold a chunk of the child's output into the session's terminal."
-  (assoc state :vt (vt/feed (:vt state) chunk)))
+  "Fold a chunk of the child's output into the session's terminal, and answer what the child
+asked it, as a terminal does: the vt's `:replies` (device attributes, a mode report, the
+cursor's position) written back — so the editor learns, as it would from xterm, that this
+terminal has left and right margins (mode 69) and scrolls a side-by-side pane in them."
+  (let (fed (vt/feed (:vt state) chunk)
+        replies (:replies fed))
+    (do
+      (when (not (empty? replies)) (write-keys state (string/join replies "")))
+      (watch-output (assoc state :vt fed) chunk))))
 
 (defn- feed-burst (state chunk)
   "Fold `chunk` and every other chunk ALREADY queued, as one feed. An editor repaint is
@@ -159,6 +189,7 @@ behind its own mailbox, so a reply arrived long after the driver had given up on
     ([:proc-closed p code] (session-loop (answer-pending (assoc state :exited code))))
     ([:screen from] (do (send from [:screen (screen-text state)]) (session-loop state)))
     ([:exited from] (do (send from [:exited (:exited state)]) (session-loop state)))
+    ([:seen from needle] (do (send from [:seen (get (:seen state) needle 0)]) (session-loop state)))
     ([:send from keys pause]
       (do
         (write-keys state keys)
@@ -203,7 +234,7 @@ reads, so the tree-sitter modes still have a parser."
         p (os/spawn-pty prog
             ["run" script]
             {:cwd (get opts :cwd (file/cwd)) :cols cols :rows rows :env env}))
-    (let (booted (alt-screen-loop {:proc p :vt (vt/make cols rows)}
+    (let (booted (alt-screen-loop {:proc p :vt (vt/make cols rows) :watch (get opts :watch []) :seen {} :tail ""}
                    (+ (os/now) (get opts :boot 20000))))
       (do
         (send me [:started (vt/mode (:vt booted) :alt-screen)])
@@ -225,9 +256,9 @@ wait longer than it, so a 60-second `wait-for` reported \"never appeared\" after
 (defn start (script &optional (opts {}))
   "Start the editor on `script` (a path under `tools/`, or absolute) over a pty and let it
 take over the terminal (the alternate screen — see above), then settle. `opts`: `:cols`
-`:rows` `:env` `:cwd` `:prog`, `:boot` (ms to wait for the takeover, default 20000) and
-`:settle` (ms to paint afterwards, default 300).
-Returns the session."
+`:rows` `:env` `:cwd` `:prog`, `:watch` (sequences of the editor's output to count, read by
+[[seen]]), `:boot` (ms to wait for the takeover, default 20000) and `:settle` (ms to paint
+afterwards, default 300). Returns the session."
   (let (path (if (string/starts-with? script "/") script (path/join (file/cwd) "tools" script))
         me (self)
         s (spawn (session-boot path opts me)))
@@ -278,6 +309,12 @@ since the repaint that removes it is no more instant than the one that drew it."
                   (>= (os/now) deadline) false
                   else (do (nap poll-ms) (go deadline)))))
     (go (+ (os/now) timeout))))
+
+(defn seen (s needle)
+  "How many times the editor has written `needle` — one of the sequences `start` was told to
+`:watch` — since it started: what proves a check exercised the path it means to, a scroll
+the terminal did rather than a repaint."
+  (or (ask s [:seen (self) needle] :seen) 0))
 
 (defn exit-code (s)
   "The editor process's exit code once it has exited, else nil — what a quit is timed by.

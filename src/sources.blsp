@@ -1,0 +1,112 @@
+(defmodule sources
+  "A SOURCE TABLE: ranked rows that features register when their modules load, and that the
+view (or the gutter, the echo row, the row table) reads without naming any of them. One
+mechanism for every kind of source — the highlight, override and line-note sources, the pane
+layers, the frame overlays, the row extras, the echo sources, the text faces, the span overlays,
+the margin marks — so a new kind is a table id and its row shape, never another copy of the
+register / rank / run / deps code.
+
+A row is a map with a `:rank` (lowest first; ties by name, `registry/ranked`) and the symbols
+to call, resolved late (`reflect/call-if-bound`) so a redefinition takes effect at once and a
+row whose module has not loaded answers its fallback. Every table is a `std/registry` written
+through `ownership/claim!`, so a package's rows go back with the package.
+
+The same tables hold the editor's HOOKS — the steps around an event, the idle jobs, the visit
+steps, the file handlers, the error sinks (`model`'s `register-*`). How a row is called is the
+one thing that differs:
+- a SOURCE row is called STRAIGHT. A source is read on every frame and registers nothing, so
+  there is no package to claim for, and the claimant and timing per call were 3-5% of a frame;
+- a HOOK row is called through [[call-hook]]: under its package's claimant (a row it registers
+  as it runs goes back with the package), timed under its name for a slow turn's report.
+  [[fold-hooks]] threads a value (the model) through every row that way.
+Three ways to read a source table:
+- [[run]] — every row, as a list, timed as ONE part of a slow frame's report
+  (`turnprofile/timed-each`): a table that PAINTS;
+- [[first-answer]] — the first row with a non-blank answer: a table where one source wins (the
+  echo row, a buffer's text faces);
+- [[deps]] — every row's `:deps` read, the value a memo is keyed on.
+A read that folds every row ([[rows]]) is untimed: it is a few field reads.")
+
+(defn register (table name row)
+  "Add `row` to the source table `table` under `name` (which the row then carries as `:name`),
+replacing any row registered under `name`. Called when the source's module loads; answers the
+row.
+
+    (sources/register :doc/sources :a {:rank 1 :run 'str})   ;~> {:rank 1 :run str :name :a}"
+  (ownership/claim! table name (assoc row :name name)))
+
+(defn rows (table)
+  "The rows of `table`, lowest `:rank` first."
+  (map (registry/ranked table) second))
+
+(defn- row-hook (pair)
+  ;; what a slow group names a `[key row]` pair by: its `:run`
+  (:run (second pair)))
+
+(defn run (table group call)
+  "`(call row)` for each row of `table`, lowest `:rank` first, as a list — timed as ONE part
+named `group` of a slow phase's report, each row under its `:run` only when the group itself was
+slow (`turnprofile/timed-each`). `call` calls the row's symbol straight
+(`reflect/call-if-bound`)."
+  (turnprofile/timed-each group (registry/ranked table) row-hook (fn ([_ row]) (call row))))
+
+(defn blank? (answer)
+  "Whether a source's `answer` says nothing: nil, `false`, `\"\"` or an empty collection.
+
+    (sources/blank? \"\")   ;=> true
+    (sources/blank? [[0 1 :a]])   ;=> false"
+  (cond
+    (or (nil? answer) (= answer false)) true
+    (or (string? answer) (vector? answer) (list? answer) (map? answer) (set? answer))
+      (empty? answer)
+    else false))
+
+(defn first-answer (table answer)
+  "`[value row]` of the first row of `table`, lowest `:rank` first, whose `(answer row)` is not
+[[blank?]], or nil when none has one. Asks no row after it."
+  (reduce (registry/ranked table)
+    nil
+    (fn (found [_ row])
+      (or found (let (value (answer row)) (when (not (blank? value)) [value row]))))))
+
+(defn deps (table m pane buf &optional (keep? nil))
+  "`[name value]` for each row of `table` (that `keep?`, when given) naming a `:deps` symbol —
+`(model pane buf) -> value`, every input of the row's `:run` that is not on the buffer or the
+pane — in `:rank` order. Part of the key of a memo the rows paint into: an input a row leaves
+out of its `:deps` is paint that goes stale."
+  (seq/keep (registry/ranked table)
+    (fn ([_ row])
+      (let (row-deps (:deps row))
+        (when (and row-deps (or (nil? keep?) (keep? row)))
+          [(:name row) (reflect/call-if-bound row-deps nil m pane buf)])))))
+
+;; ---- hooks: rows called under their package's claimant, timed ---------------------
+
+(defn call-hook (sym fallback & arguments)
+  "Call the hook `sym` with `arguments` if its module has loaded, else answer `fallback` — under
+its package's claimant (`ownership/with-symbol-claimant`), so a row it registers as it runs goes
+back with the package, and timed under its name for a slow turn's report (`turnprofile`). The
+one way a hook row is called (`model/ed-call-hook` is this).
+
+    (sources/call-hook 'no-such/hook :fallback 1)   ;=> :fallback"
+  ;; resolved ONCE, now (`reflect/bound-value`, brood ADR-743), so a redefinition still takes
+  ;; on the next call; a hook whose module has not loaded answers its fallback at once, with
+  ;; no claimant and no part in the slow-turn report — it ran nothing
+  (let (hook (reflect/bound-value sym :sources/unloaded))
+    (if (= hook :sources/unloaded)
+      fallback
+      (turnprofile/timed sym
+        (fn () (ownership/with-symbol-claimant sym (fn () (apply hook arguments))))))))
+
+(defn fold-hooks (table key init & arguments)
+  "`init` threaded through the hook every row of `table` names under `key`, lowest `:rank`
+first: each called through [[call-hook]] with what the row before it left and then `arguments`,
+its answer passed on — and passed over (the value unchanged) when its module has not loaded.
+The read for a table of HOOKS (the steps around an event, the idle beat's jobs). A hook that
+takes the value elsewhere than first folds [[rows]] itself.
+
+    (sources/fold-hooks :doc/no-hooks :run 0 :input)   ;=> 0"
+  (fold (rows table)
+    init
+    (fn (acc row)
+      (let (hook (get row key)) (if (nil? hook) acc (apply call-hook hook acc acc arguments))))))

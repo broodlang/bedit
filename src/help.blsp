@@ -54,61 +54,99 @@ labelling costs ~25 µs a key (`keyhelp/ed-key-table`), so it is never done in t
   "The key column's width for DECORATED entries: the widest label plus two, at least 8."
   (fold decorated 8 (fn (widest entry) (math/max widest (+ 2 (count (:label entry)))))))
 
+(sig help-binding-row (map int -> string))
 (defn- help-binding-row (entry key-width)
   "One DECORATED entry as a report line: the key sequence, the command's M-x name, and —
 for a shadowed binding — which layer took the chord away from it."
   (let (label (:label entry)
-        pad (string/repeat " " (math/max 1 (- key-width (count label))))
         shadow (:shadowed-by entry))
     (str "  "
-      label
-      pad
+      (string/pad-right-cells label (math/max (inc (string/display-width label)) key-width))
       (:name entry)
       (if (nil? shadow) "" (str "   (shadowed by " (->string shadow) ")")))))
 
 (defn- help-by-layer (entries)
-  "DECORATED `entries` grouped into `[layer-name rows]` pairs, layers in precedence order
-(highest first) and each layer's rows sorted by key label. Grouping is by LAYER rather than
-by key because that is the question being asked: a binding you did not expect is explained
-by which layer owns it, and the layers are already in the order that decides who wins."
+  "`entries` grouped into `[layer-name entries]` pairs, layers in precedence order (highest
+first). Grouping is by LAYER rather than by key because that is the question being asked: a
+binding you did not expect is explained by which layer owns it, and the layers are already in
+the order that decides who wins."
   (let (order (seq/distinct (map entries :layer)))
     (map order
-      (fn (layer)
-        [layer (seq/sort-by (seq/filter entries (fn (entry) (= (:layer entry) layer))) :label)]))))
+      (fn (layer) [layer (seq/filter entries (fn (entry) (= (:layer entry) layer)))]))))
 
-(sig help-bindings-text (seqable -> string))
-(defn help-bindings-text (entries)
-  "The *Bindings* buffer text for `scope-bindings` `entries`: a section per layer, highest
-precedence first, each row `key   command`, with a shadowed row saying who shadowed it.
+(defn- help-entries-keymap (entries)
+  "A keymap of `entries`' bindings — the shape of a layer whose own keymap is not at hand,
+listed with no groups."
+  (fold entries
+    {}
+    (fn (keymap entry) (editor/keymap/keymap-bind keymap (:sequence entry) (:command entry)))))
+
+(defn- help-layer-text (layer entries keymap)
+  "One layer's section of the *Bindings* text: its title, then its bindings as
+`keyhelp/ed-prefix-sections` lists `keymap` (the layer's own, its groups and prefix names) —
+the grouping which-key and C-x C-h show — each leaf row saying, from its `scope-bindings`
+entry, who shadows it."
+  (let (by-sequence (fold entries {} (fn (index entry) (assoc index (:sequence entry) entry)))
+        row-line (fn (row width)
+                   (let (entry (get by-sequence (:sequence row))
+                         prefix? (map? (:binding row)))
+                     (help-binding-row
+                       {:label (:key row)
+                        ;; the M-x name, not the function's — `find-file`, not
+                        ;; `cmd-find-file`. A reader who finds a command here
+                        ;; wants to type it into M-x
+                        :name (if prefix?
+                                (:text row)
+                                (command-friendly-name (ed-command-tail (:binding row))))
+                        :shadowed-by (when entry (:shadowed-by entry))}
+                       (math/max 8 (+ 2 (math/floor width)))))))
+    (str (->string layer)
+      " layer  ("
+      (ed-count-noun (count entries) "binding")
+      ")\n"
+      (ed-sections-text (ed-prefix-sections keymap []) row-line))))
+
+(sig help-bindings-text (seqable &optional any -> string))
+(defn help-bindings-text (entries &optional keymaps)
+  "The *Bindings* text for `scope-bindings` `entries`: a section per layer, highest precedence
+first, each listing its keys under the group headings its keymap gave them (`keymaps`,
+`{layer-name keymap}`; a layer not in it is listed ungrouped), a sub-prefix as `+name` with its
+own keys after, each row `key   command`, a shadowed row saying who shadowed it.
 
 Shadowed bindings are LISTED, not filtered out. A binding that silently vanished is the
 single hardest thing to debug about a layered keymap, and the answer — some layer above took
 the whole chord — is exactly what this line says."
-  (let (decorated (help-decorate entries)
-        width (help-key-width decorated)
-        groups (help-by-layer decorated))
-    (string/join (map groups
-                   (fn (group)
-                     (let ([layer rows] group)
-                       (string/join (cons (str (->string layer)
-                                            " layer  ("
-                                            (ed-count-noun (count rows) "binding")
-                                            ")")
-                                      (map rows (fn (entry) (help-binding-row entry width))))
-                         "\n"))))
-      "\n\n")))
+  (string/join (map (help-by-layer entries)
+                 (fn ([layer rows])
+                   (help-layer-text layer
+                     rows
+                     (or (get (or keymaps {}) layer) (help-entries-keymap rows)))))
+    "\n\n"))
+
+(defn- help-layer-keymaps (layers)
+  "`{layer-name keymap}` for the resolved `layers`, the first of two layers with one name
+keeping it, as `scope-bindings` names them."
+  (fold layers
+    {}
+    (fn (keymaps layer)
+      (if (contains? keymaps (:name layer))
+        keymaps
+        (assoc keymaps (:name layer) (or (:keymap layer) {}))))))
 
 (defcommand cmd-describe-bindings
   (m key)
-  "List every key binding in force, grouped by the layer that owns it (C-h b). Shadowed
-bindings are shown too, marked with the layer that took their chord — Emacs's
-`describe-bindings`, plus the provenance a layered keymap needs it to have."
-  (let (entries (scope-bindings (help-scope m)))
+  "List every key binding in force, grouped by the layer that owns it and, within a layer, under
+the group headings its keymap gives its keys (C-h b). Shadowed bindings are shown too, marked
+with the layer that took their chord — Emacs's `describe-bindings`, plus the provenance a
+layered keymap needs it to have."
+  (let (scope (help-scope m)
+        entries (scope-bindings scope)
+        keymaps (help-layer-keymaps (active-layers {:layers (compose-layers scope)})))
     (ed-show-named m
       "*Bindings*"
       (str "Key bindings in force, highest-precedence layer first.\n"
         "A shadowed binding is unreachable: some layer above owns its chord.\n\n"
-        (help-bindings-text entries)
+        (help-bindings-text entries keymaps)
         "\n")
       :help)))
 

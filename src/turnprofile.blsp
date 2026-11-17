@@ -1,16 +1,18 @@
 ;; WHERE A SLOW TURN'S TIME WENT. The watchdog (brood ADR-490) says which input a slow turn of
 ;; the loop was folding, or that the view was slow, and how long it took — not where the time
 ;; went. A turn's update and its view each fill a table of this loop's own (`begin!`): the
-;; update's stages (`stage!`) and every hook it called (`note!` — post-steps, timers, chips,
-;; highlight sources, pane layers: whatever `model/ed-call-hook` and `model/ed-call-deferred`
-;; run), each by name with its time and calls. A phase that took longer than the watchdog's line
-;; leaves its breakdown behind (`finish!`), and the slow-turn log takes it with the report
+;; update's stages (`stage!`), every hook it called (`note!` — post-steps, timers, chips:
+;; whatever `model/ed-call-hook` and `model/ed-call-deferred` run) and every group of view
+;; sources it ran (`timed-each` — the highlight sources, the pane layers, the frame overlays,
+;; each group one part, its sources named only when the group was slow), each by name with its
+;; time and calls. A phase that took longer than the watchdog's line leaves its breakdown
+;; behind (`finish!`), and the slow-turn log takes it with the report
 ;; (`slowlog/ed-ev-ui-slow`): `update 64 ms: post-steps 51 · bedit-agent/chip/tick 44 ×3`.
 ;;
 ;; A table, not the model: hooks run deep inside model functions that answer other things
 ;; (a chip's segment, a highlight source's ranges), and the time is spent there. Each loop —
-;; a second frame has its own — keys its table by its pid. Costs two clock reads and two table
-;; increments a hook call.
+;; a second frame has its own — keys its table by its pid. Costs two clock reads and one table
+;; tally a hook call (`[ns calls]`, brood ADR-742), and a clock read a source in a group of them (`timed-each`).
 
 (defmodule turnprofile
   "Where a slow turn of the editor loop spent its time: the update's stages and every hook it
@@ -43,9 +45,8 @@ the loop has used so far: a slow phase says how much of its time the loop RAN ([
 (defn note! (name ns)
   "Add `ns` nanoseconds and one call to `name` in this loop's phase, when one is being kept."
   (let (counts (table-of (self)))
-    (when counts
-      (table/incr counts name ns)
-      (table/incr counts [:calls name] 1))))
+    ;; one tally `[ns calls]` a part: both fields under one lock and one key (brood ADR-742)
+    (when counts (table/tally counts name [ns 1]))))
 
 (defn timed (name thunk)
   "`(thunk)`, its time noted under `name`."
@@ -54,19 +55,59 @@ the loop has used so far: a slow phase says how much of its time the loop RAN ([
     (note! name (- (os/now-ns) started))
     result))
 
+;; ---- a group of view sources, one part ------------------------------------------------
+;; The view runs its sources by the table (the highlight sources, the pane layers, the frame
+;; overlays — `sources/run`), a dozen groups a frame, most of them a few microseconds.
+;; A part per source (`timed`: two clock reads and a table write) was 3-5% of a frame, so a
+;; group is timed as a whole, with a clock read per source:
+;; - under `*group-note-ns*` it is not noted at all: the report rounds to a tenth of a
+;;   millisecond, so it would read 0.0 among the parts of a phase that took 50;
+;; - past it, it is one part under the group's name;
+;; - past `*group-detail-ns*`, each of its sources is a part under its own name as well, so a
+;;   slow report still says which one it was.
+(defdyn *group-note-ns* 50000) ; a test binds it to tell the two lines apart on a busy machine
+(defdyn *group-detail-ns* 1000000)
+
+(defn- each-timed (items call before results times)
+  ;; tail-recursive: `[results times ended]`, the first two reversed — each item's time runs
+  ;; from the clock read that ended the item before it, so a group costs one read an item
+  (if (empty? items)
+    [results times before]
+    (let (value (call (first items))
+          after (os/now-ns))
+      (each-timed (rest items) call after (cons value results) (cons (- after before) times)))))
+
+(defn- note-group! (counts group items name-of total times)
+  ;; a group past the note line as one part, and past the detail line each item too
+  (table/tally counts group [total 1])
+  (when (> total *group-detail-ns*)
+    (fold (seq/zip items times) nil (fn (_ [item ns]) (note! (name-of item) ns)))))
+
+(defn timed-each (group items name-of call)
+  "`(call item)` for each of `items`, in order, as a list — timed as ONE part named `group` (and
+each item under `(name-of item)` when the group was slow; see the comment above). With no
+phase being kept (a test, a script) it is `map`."
+  (let (counts (table-of (self)))
+    (if (nil? counts)
+      (map items call)
+      (let (started (os/now-ns)
+            [results times ended] (each-timed items call started '() '())
+            total (- ended started))
+        (when (> total *group-note-ns*)
+          (note-group! counts group items name-of total (reverse times)))
+        (reverse results)))))
+
 (defn stage! (name ns)
   "Note one of the update's own stages (`fold`, `post-steps`): told apart from a hook's name."
   (note! (str "stage " name) ns))
 
 (defn- parts (counts)
-  ;; `[[name ms calls] …]`, costliest first, at most `*kept-parts*`
-  (let (all (table/snapshot counts)
-        named (seq/filter (vec all) (fn ([key _]) (not (vector? key)))))
-    (vec (take (map (seq/sort-by named (fn ([_ ns]) (- ns)))
-                 (fn ([name ns])
-                   [(->string name)
-                     (/ (math/round (/ ns 100000)) 10.0)
-                     (or (get all [:calls name]) 1)]))
+  ;; `[[name ms calls] …]`, costliest first, at most `*kept-parts*` — every part is a tally
+  ;; `[ns calls]` ([[note!]]); the table's other row, `[:cpu-start]`, is a plain number
+  (let (named (seq/filter (vec (table/snapshot counts)) (fn ([_ tally]) (vector? tally))))
+    (vec (take (map (seq/sort-by named (fn ([_ [ns _]]) (- ns)))
+                 (fn ([name [ns calls]])
+                   [(->string name) (/ (math/round (/ ns 100000)) 10.0) calls]))
            *kept-parts*))))
 
 (defn finish! (phase ns &optional (context nil))

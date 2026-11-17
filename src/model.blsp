@@ -86,8 +86,11 @@ pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
 (sig ed-log-buffer (-> buffer))
 (defn ed-log-buffer (&optional (name "*Messages*"))
   "A fresh log/output buffer named `name` (default `*Messages*`) with undo turned off
-— append-only sinks don't want an undo history."
-  (disable-undo (make-buffer "" name)))
+— append-only sinks don't want an undo history. `*Messages*` is read-only, as in Emacs: only
+its sink writes it ([[ed-append-end]] unlocks for the append), so a key typed while it is shown
+is refused rather than landing in the log. Other sinks stay writable: a shell is one."
+  (let (log (disable-undo (make-buffer "" name)))
+    (if (= name "*Messages*") (set-read-only log true) log)))
 
 ;; ---- a tree-sitter mode without its grammar -------------------------------------
 ;; A language whose mode is a tree-sitter grammar (`language-core/deflanguage`) colours nothing
@@ -527,7 +530,7 @@ functions. `brood-mode` is the first to supply these (see `modes`)."
   "A `:gutter-cell` service result normalised to a **list of `[text face]` chunks**. The
 service may return either a single `[text face]` pair (a plain line number) or a list of such
 chunks (a file buffer's diff-hl change bar *plus* the number — see `gutter/line-number-cell`).
-The one decoder both the native view (`panebody/ed-gutter-line-ops`) and the web mirror
+The one decoder both the native view (`panebody/ed-gutter-cell-ops`) and the web mirror
 (`web/web-gutter-html`) share, so the two read the shape alike."
   (if (string? (first cell)) (list cell) cell))
 
@@ -539,17 +542,13 @@ loaded, else answer `fallback`. The one guard every such call shares: a module n
 opened yet is not a client, and asking it anything is an unbound symbol. A package's hook
 runs under its package's claimant (`ownership/with-symbol-claimant`), so a row it registers
 as it runs goes back with the package."
-  (turnprofile/timed sym
-    (fn () (ownership/with-symbol-claimant sym (fn () (reflect/call-if-bound sym fallback m))))))
+  (sources/call-hook sym fallback m))
 
 (defn ed-call-hook (sym fallback & arguments)
   "[[ed-call-deferred]] for a hook that takes `arguments` rather than a model alone: a registry
 row's symbol, called under its package's claimant if its module has loaded, else `fallback`.
-Timed under its name for a slow turn's report (`turnprofile`)."
-  (turnprofile/timed sym
-    (fn ()
-      (ownership/with-symbol-claimant sym
-        (fn () (apply reflect/call-if-bound sym fallback arguments))))))
+Timed under its name for a slow turn's report (`turnprofile`): `sources/call-hook`."
+  (apply sources/call-hook sym fallback arguments))
 
 ;; ---- the off-loop job table: what is in flight, and what to call it ----------
 ;; MODEL vocabulary — which model field holds which handle — read by the dispatcher
@@ -579,7 +578,11 @@ Timed under its name for a slow turn's report (`turnprofile`)."
 ;;
 ;; Every `register-*` table in this file is a `std/registry` (brood ADR-412): a registration
 ;; is one atomic write, it survives an `%isolate` restore, and the startup image carries it
-;; with the module that made it.
+;; with the module that made it. A table of ROWS run in turn (the steps, the jobs, the sinks,
+;; the handlers) is a `sources` table: registered by `sources/register`, read by `sources/rows`,
+;; each hook called by `sources/call-hook` (the package's claimant, timed) — one mechanism
+;; for all of them. A table keyed by what it answers for (a reply slot, an event tag, a role)
+;; is a plain lookup.
 
 (defn register-task-reply (slot fold failure label &optional (options {}))
   "Declare an off-the-loop job a feature runs: the model field `slot` its task handle is
@@ -655,13 +658,11 @@ feature's module loads; re-registering a tag replaces its handler."
 is not its own. A feature that keeps processes on the model (a language server's
 connection) registers one when its module loads, so it hears of a death the moment it
 happens rather than on the next request that would have gone to it."
-  (ownership/claim! :model/down-handlers name handler))
+  (sources/register :model/down-handlers name {:run handler}))
 
 (defn ed-run-down-handlers (m pid reason)
   "Every registered down handler offered the dead `pid` in turn ([[register-down-handler]])."
-  (fold (vals (registry/entries :model/down-handlers))
-    m
-    (fn (acc handler) (reflect/call-if-bound handler acc acc pid reason))))
+  (sources/fold-hooks :model/down-handlers :run m pid reason))
 
 ;; ---- what is still running when the editor quits -------------------------------
 ;; Emacs asks "Active processes exist; kill them and exit anyway?" before C-x C-c takes a
@@ -677,7 +678,7 @@ happens rather than on the next request that would have gone to it."
 `query` is a symbol naming a `(model) -> [string]` fn that says what is running now, one
 line per process (`*compilation*: make`), empty when nothing is. Called when the feature's
 module loads; C-x C-c reads every row ([[ed-live-processes]]) and asks before quitting."
-  (ownership/claim! :model/exit-queries name query))
+  (sources/register :model/exit-queries name {:run query}))
 
 ;; The same question for ONE buffer: Emacs's kill-buffer-query-functions. C-x k on a buffer
 ;; whose work would stop with it (an agent mid-turn) asks first; which buffers, and why, only
@@ -688,22 +689,22 @@ module loads; C-x C-c reads every row ([[ed-live-processes]]) and asks before qu
 `query` is a symbol naming a `(model buffer) -> string or nil` fn saying why for `buffer`
 (`its agent is working`), nil when nothing is lost. C-x k asks before killing a buffer any row
 has a reason for ([[ed-kill-reasons]])."
-  (ownership/claim! :model/kill-queries name query))
+  (sources/register :model/kill-queries name {:run query}))
 
 (defn ed-kill-reasons (m buffer)
   "Why killing `buffer` would lose work, one string per registered query that says so
 ([[register-kill-query]]) — empty when nothing would."
-  (vec (seq/keep (vals (registry/entries :model/kill-queries))
-         (fn (query)
-           (let (reason (reflect/call-if-bound query nil m buffer))
+  (vec (seq/keep (sources/rows :model/kill-queries)
+         (fn (row)
+           (let (reason (reflect/call-if-bound (:run row) nil m buffer))
              (if (string? reason) reason nil))))))
 
 (defn ed-live-processes (m)
   "What every registered feature says it has running ([[register-exit-query]]), one line
 each, sorted — empty when quitting loses nothing. A query whose module is not loaded says
 nothing, which is right: it cannot have started anything."
-  (vec (sort (mapcat (vals (registry/entries :model/exit-queries))
-               (fn (query) (or (reflect/call-if-bound query [] m) []))))))
+  (vec (sort (mapcat (sources/rows :model/exit-queries)
+               (fn (row) (or (reflect/call-if-bound (:run row) [] m) []))))))
 
 ;; ---- the idle beat's jobs ------------------------------------------------------
 ;; The `:idle-recompute` beat (Emacs's idle timer) runs everything deferred off the per-key
@@ -731,17 +732,17 @@ nothing, which is right: it cannot have started anything."
   "Add an idle-beat job `name` — `{:order :run :stale?}`, the
 hooks as symbols (resolved late, so a redefinition hot-swaps; see the comment above) —
 replacing any job already registered under `name`. Called when the job's module loads."
-  (ownership/claim! :model/idle-jobs name (assoc job :name name :rank (:order job))))
+  (sources/register :model/idle-jobs name (assoc job :rank (:order job))))
 
 (defn ed-idle-jobs ()
   "The registered idle jobs, in `:order` — the order the beat runs them in."
-  (map (registry/ranked :model/idle-jobs) second))
+  (sources/rows :model/idle-jobs))
 
 (defn ed-idle-due? (m)
   "Whether some idle job has work pending — i.e. the `:idle-recompute` beat should be armed.
 A job whose module has not loaded is never due. Asked after every event, and order does not matter to an `any?`, so it
 reads the table unsorted."
-  (any? (vals (registry/entries :model/idle-jobs))
+  (any? (sources/rows :model/idle-jobs)
     (fn (job)
       (let (stale (:stale? job))
         (and (not (nil? stale)) (ed-call-deferred m stale false))))))
@@ -750,7 +751,7 @@ reads the table unsorted."
   "The `:idle-recompute` beat: every registered job's `:run`, in `:order`, each seeing the
 model the previous one left. All of them at once — the headless path (tests, a batch run);
 a live loop runs the beat in slices ([[ed-run-idle-slice]])."
-  (fold (ed-idle-jobs) m (fn (acc job) (ed-call-deferred acc (:run job) acc))))
+  (sources/fold-hooks :model/idle-jobs :run m))
 
 ;; How much of ONE loop turn the idle beat may take before it yields. The beat runs a dozen
 ;; jobs — the LSP push, eldoc, the check's launch, the git summary, auto-save, auto-revert —
@@ -775,8 +776,7 @@ slices as within one."
                       ;; a slice yields at its deadline, or as soon as a key is waiting
                       (and (> i from)
                         (or (>= (os/now) deadline)
-                          ;; through call-if-bound until every build's brood has it (ADR-726)
-                          (reflect/call-if-bound 'editor/ui/ui-input-pending? false)))
+                          (editor/ui/ui-input-pending?)))
                         (ed-set-timer (assoc acc :idle-resume i) :idle-continue {:every 1})
                       else (step (ed-call-deferred acc (:run (nth jobs i)) acc) (inc i)))))
       (step m from))))
@@ -917,11 +917,11 @@ init setting) when true or false, the desktop's preference (`:os-reduce-motion`)
   "Add a live-evaluating buffer — `{:timer :stale? :launch :reanchor}`, the hooks as
 symbols (resolved late, so a redefinition hot-swaps) — replacing any client registered
 under the same `:timer`. Called when the client's module loads."
-  (ownership/claim! :model/live-eval-clients (:timer client) client))
+  (sources/register :model/live-eval-clients (:timer client) client))
 
 (defn ed-live-eval-clients ()
   "Every registered live-evaluating buffer, in a stable order (by timer name)."
-  (map (registry/ranked :model/live-eval-clients) second))
+  (sources/rows :model/live-eval-clients))
 
 ;; ---- timers a feature arms ----------------------------------------------------
 ;; A repeating timer a feature wants while it has work: git's background upstream watch
@@ -1131,11 +1131,11 @@ away (Emacs bug#82143: the preview outlived a major-mode change)."
 (defn register-slot-keeper (name keeper)
   "Add the row `name`, `{:order :slots :drop}` (see the comment above), replacing any row
 registered under `name`. Called when the keeper's module loads."
-  (ownership/claim! :model/slot-keepers name (assoc keeper :name name :rank (:order keeper))))
+  (sources/register :model/slot-keepers name (assoc keeper :rank (:order keeper))))
 
 (defn ed-slot-keepers ()
   "The registered slot keepers, in `:order`: the order a kill runs them in."
-  (map (registry/ranked :model/slot-keepers) second))
+  (sources/rows :model/slot-keepers))
 
 (defn shift-slot-index (index killed)
   "Where something aimed at pool slot `index` aims once slot `killed` is removed: nil when it
@@ -1202,13 +1202,13 @@ previous one left. The buffer itself is still in `:buffers`; removing it is the 
 (defn register-visit-step (name step)
   "Add the visit step `name`, `{:order :run :instead :passing}` (see the comment above),
 replacing any step registered under `name`. Called when the step's module loads."
-  (ownership/claim! :model/visit-steps name (assoc step :name name :rank (:order step))))
+  (sources/register :model/visit-steps name (assoc step :rank (:order step))))
 
 (defn ed-visit-steps (m buf &optional (passing? false))
   "Run the visit steps over `buf`, a buffer just made from a file, in `:order`, and answer
 `{:buffer :instead :notes}`: the buffer they left, the first note that replaces the open
 notice, and the notes that follow it. With `passing?`, only the steps marked `:passing`."
-  (fold (map (registry/ranked :model/visit-steps) second)
+  (fold (sources/rows :model/visit-steps)
     {:buffer buf :instead nil :notes []}
     (fn (acc step)
       (if (and passing? (not (:passing step)))
@@ -1262,11 +1262,11 @@ notice, and the notes that follow it. With `passing?`, only the steps marked `:p
 (defn register-file-handler (name handler)
   "Add the file handler `name` (see the comment above), replacing any registered under
 `name`. Called when the handler's module loads."
-  (ownership/claim! :model/file-handlers name (assoc handler :name name :rank (:order handler))))
+  (sources/register :model/file-handlers name (assoc handler :rank (:order handler))))
 
 (defn ed-file-handlers ()
   "The registered file handlers, in `:order`."
-  (map (registry/ranked :model/file-handlers) second))
+  (sources/rows :model/file-handlers))
 
 (defn ed-path-handler (spec)
   "The file handler claiming the typed path `spec`, or nil: the editor reads it itself."
@@ -1295,11 +1295,11 @@ notice, and the notes that follow it. With `passing?`, only the steps marked `:p
 (defn register-overlay (name rank overlay)
   "Add the key overlay `name` at `rank` (an `Overlay` record), replacing any registered under
 `name`. Called when the overlay's module loads."
-  (ownership/claim! :model/overlays name {:name name :rank rank :overlay overlay}))
+  (sources/register :model/overlays name {:rank rank :overlay overlay}))
 
 (defn ed-overlays ()
   "The registered key overlays, in the order they are offered a key."
-  (map (registry/ranked :model/overlays) (fn ([_ row]) (:overlay row))))
+  (map (sources/rows :model/overlays) :overlay))
 
 ;; [[register-presenter]]: who shows what the pool cannot show as text, by ROLE, so `pool`
 ;; names no feature: `:directory` `(m path)` (dired — Emacs's `find-file-run-dired`),
@@ -1343,12 +1343,12 @@ would take the chord's next key, and leave the chord waiting for the key after i
 (defn register-paste-taker (name taker)
   "Add the paste taker `name`, replacing any registered under `name`. Called when its module
 loads."
-  (ownership/claim! :model/paste-takers name taker))
+  (sources/register :model/paste-takers name {:run taker}))
 
 (defn ed-take-paste (m text)
   "The model after the first paste taker that takes `text`, or nil when none does."
-  (first (seq/keep (vals (registry/entries :model/paste-takers))
-           (fn (taker) (ed-call-hook taker nil m text)))))
+  (first (seq/keep (sources/rows :model/paste-takers)
+           (fn (row) (ed-call-hook (:run row) nil m text)))))
 
 ;; [[register-inlay-click]]: what a click on an INLAY row does (`wrap/inlay-lines` — a row of
 ;; derived text above a line), by the OWNER of the row — a `(m index line text cell) -> model`
@@ -1372,12 +1372,12 @@ registered for it. Called when its module loads."
 (defn register-macro-guard (name guard)
   "Add the macro guard `name`, replacing any registered under `name`. Called when its module
 loads."
-  (ownership/claim! :model/macro-guards name guard))
+  (sources/register :model/macro-guards name {:run guard}))
 
 (defn ed-macro-private? (m input)
   "Whether a registered macro guard keeps `input` out of the macro being recorded."
-  (any? (vals (registry/entries :model/macro-guards))
-    (fn (guard) (= true (ed-call-hook guard false m input)))))
+  (any? (sources/rows :model/macro-guards)
+    (fn (row) (= true (ed-call-hook (:run row) false m input)))))
 
 ;; [[register-error-sink]]: an error the editor CAUGHT — a command that raised, a frame that
 ;; failed to paint, a fontify, a loop the supervisor restarted — offered to every sink, a
@@ -1388,16 +1388,16 @@ loads."
 (defn register-error-sink (name sink)
   "Add the error sink `name`, replacing any registered under `name`. Called when its module
 loads."
-  (ownership/claim! :model/error-sinks name sink))
+  (sources/register :model/error-sinks name {:run sink}))
 
 (defn ed-report-error (error where)
   "Offer `error`, caught at `where`, to every error sink: true when one of them had not seen
 its kind before, which is when the user is worth pointing at M-x report-bug."
-  (fold (vals (registry/entries :model/error-sinks))
+  (fold (sources/rows :model/error-sinks)
     false
-    (fn (fresh sink)
+    (fn (fresh row)
       (let (answer (check-allow :discarded-catch
-                     (try (ed-call-hook sink nil error where) (catch _e nil))))
+                     (try (ed-call-hook (:run row) nil error where) (catch _e nil))))
         (or fresh (= answer :new))))))
 
 (defn ed-error-text (error where)
@@ -1410,16 +1410,16 @@ of error no sink had seen — where to send it."
 (defn register-resize-step (name step)
   "Add `step`, a `(model) -> model` symbol the window's resize runs through, replacing any
 registered under `name`. Called when its module loads."
-  (ownership/claim! :model/resize-steps name step))
+  (sources/register :model/resize-steps name {:run step}))
 
 (defn register-palette-step (name step)
   "Add `step`, a `(model) -> model` symbol a theme switch runs through, replacing any registered
 under `name`. Called when its module loads."
-  (ownership/claim! :model/palette-steps name step))
+  (sources/register :model/palette-steps name {:run step}))
 
 (defn- ed-run-steps (m id)
-  ;; each row of the registry `id`, order not mattering, over the model the last left
-  (fold (vals (registry/entries id)) m (fn (acc step) (ed-call-deferred acc step acc))))
+  ;; each row of the source table `id`, over the model the last left
+  (sources/fold-hooks id :run m))
 
 (defn ed-run-resize-steps (m)
   "`m` after a window resize: every resize step."
@@ -1430,121 +1430,196 @@ under `name`. Called when its module loads."
   (ed-run-steps m :model/palette-steps))
 
 ;; ---- what paints into a frame ---------------------------------------------------
-;; The view lays out a frame and names none of the features that paint in it. Three tables,
-;; each a ROW a module registers at load. An unloaded row paints nothing, so a module with a
-;; row is `:use`d from `main`.
+;; The view lays out a frame and names none of the features that paint in it. Each kind of
+;; source below is a SOURCE TABLE (`sources`): rows `{:rank …}` naming the symbols to call,
+;; registered by a module as it loads, ranked, and read STRAIGHT — never through
+;; [[ed-call-hook]]; a table that paints is timed as one part of a slow frame (`sources/run`).
+;; Each `register-*` here is that table's name and its row shape; nothing else is per kind. An
+;; unloaded row paints nothing, so a module with a row is `:use`d from `main`.
 ;;
-;; [[register-highlight-source]] `{:rank :run :deps}`: a pane's highlight ranges, under the
-;; region and the overlays, lowest `:rank` painted first.
+;; [[register-highlight-source]] `{:rank :run :deps}`: a pane's highlight ranges (whitespace,
+;; the region, a search match, the hovered link), lowest `:rank` painted first, a later one
+;; over an earlier.
 ;;   :run   `(model pane buf {:top :rows}) -> ranges` symbol, `[from to face]`.
 ;;   :deps  optional `(model pane buf) -> value` symbol: every input of `:run` that is not on
-;;          the buffer or the pane. The pane's paint is a memo keyed on these, so an input
-;;          left out here is paint that goes stale. Called per pane per frame, so it reads.
+;;          the buffer or the pane (`sources/deps`). The pane's paint is a memo keyed on these,
+;;          so an input left out here is paint that goes stale. Called per pane per frame.
+;; [[register-override-source]] `{:rank :run :deps}`: one-character faces in the SELECTED pane,
+;;   merged onto the text under the highlight ranges (the bracket pair at point, a diagnostic's
+;;   wave), lowest `:rank` first; a later one wins where two land on a character.
+;;   :run   `(model pane buf geometry) -> overrides` symbol, `[pos face]`.
+;;   :deps  optional, as a highlight source's.
+;; [[register-line-note-source]] `{:rank :run :deps}`: end-of-line notes (ghost text past a line's
+;;   end: a diagnostic's ⚠, a fold's …), laid out by `eolview`; a line's notes in `:rank` order.
+;;   :run   `(model pane buf geometry) -> {line [note …]}` symbol, for the lines `geometry` shows;
+;;          a note is `{:kind :text …}` (`eolnotes`' shape).
+;;   :deps  optional, as a highlight source's.
 ;; [[register-pane-layer]] `{:rank :slot :run :deps}`: ops in a pane.
 ;;   :slot  `:with-text`, inside the pane's memoised text layers (scrolling with the text, over
 ;;          the notes, under the completion preview and the caret); `:over-text`, not memoised,
 ;;          under the scrollbar and the mode line; or `:chrome`, above them.
 ;;   :run   `(model pane buf geometry) -> ops` symbol; `geometry` is nil on an unselected pane
 ;;          at rest, except in `:with-text`, which always has one.
-;;   :deps  for `:with-text`: `(model pane buf) -> value`, every input of `:run` off the buffer
-;;          and the pane, in the text layers' memo key ([[ed-pane-layer-deps]]).
+;;   :deps  for `:with-text`: as a highlight source's, in the text layers' memo key.
 ;; [[register-frame-overlay]] `{:rank :run}`: ops over the whole frame, lowest `:rank` under.
 ;;   :run   `(model cols rows) -> ops` symbol.
+;; [[register-row-extra]] `{:rank :key :run}`: what lays a buffer's ROWS out beyond its text, its
+;;   inlay rows and its long-lines policy (`scroll/ed-row-extras`, the map the row table and
+;;   every row↔line question read): the lines a fold hides, a line's inline text. A buffer with
+;;   any is row-wise (`scroll/ed-row-wise?`).
+;;   :key   the key of the extras map the value goes under, where `wrap` reads it.
+;;   :run   `(buffer) -> value` symbol; a blank value leaves the key out. Asked several times a
+;;          frame per pane, so it reads what the buffer already holds (a memo at most).
+;; [[register-echo-source]] `{:rank :run}`: what the echo row says while no minibuffer is open
+;;   (`echoarea/ed-echo-or-eldoc`) — a standing question, the latest message, a diagnostic on
+;;   point's line, a note there, the eldoc hint — the first by `:rank` with something to say.
+;;   :run   `(model buffer) -> string` symbol, `buffer` the current one; nil or `""` passes to
+;;          the next. Called every frame.
+;; [[register-text-faces]] `{:rank :spans :palette}`: faces a PRODUCER stamped on a buffer's text
+;;   (a build's ANSI colours, its `:ansi` text property — `ansicolor`), painted under the mode's
+;;   own colouring. The lowest `:rank` with spans on a buffer is its layer.
+;;   :spans    `(buffer) -> spans` symbol, ascending `[from to attributes]` or a span tree; `[]`
+;;             for none.
+;;   :palette  `() -> palette` symbol the attributes are resolved through as they are painted
+;;             (`spanpaint/ed-span-layers`), so a theme switch recolours them.
+;; [[register-span-overlay]] `{:rank :spans}`: faces painted OVER everything else a buffer's text
+;;   has, where it says (a language server's semantic tokens — `lsp-semantic`), the colouring
+;;   under it showing everywhere else. The lowest `:rank` with spans on a buffer is painted.
+;;   :spans  `(buffer first-line last-line) -> spans` symbol: ascending `[from to face]` covering
+;;           at least what reaches into those lines — a frame asks for what it shows, so an
+;;           overlay kept against an older text carries only that much; nil or `[]` for none.
 
 (defn register-highlight-source (name source)
-  "Add the highlight source `name`, `{:rank :run :deps}` (see the comment above), replacing any
-registered under `name`. Called when the source's module loads."
-  (ownership/claim! :model/highlight-sources name (assoc source :name name)))
+  "Add the highlight source `name` (see the comment above), replacing any under `name`."
+  (sources/register :model/highlight-sources name source))
+
+(defn register-override-source (name source)
+  "Add the override source `name` (see the comment above), replacing any under `name`."
+  (sources/register :model/override-sources name source))
+
+(defn register-line-note-source (name source)
+  "Add the line-note source `name` (see the comment above), replacing any under `name`."
+  (sources/register :model/line-note-sources name source))
+
+(defn register-pane-layer (name layer)
+  "Add the pane layer `name` (see the comment above), replacing any under `name`."
+  (sources/register :model/pane-layers name layer))
+
+(defn register-frame-overlay (name overlay)
+  "Add the frame overlay `name` (see the comment above), replacing any under `name`."
+  (sources/register :model/frame-overlays name overlay))
+
+(defn register-row-extra (name extra)
+  "Add the row extra `name` (see the comment above), replacing any under `name`."
+  (sources/register :model/row-extras name extra))
+
+(defn register-echo-source (name source)
+  "Add the echo source `name` (see the comment above), replacing any under `name`."
+  (sources/register :model/echo-sources name source))
 
 (defn register-text-faces (name row)
-  "Add the text-face source `name`, `{:rank :spans :palette}`: faces a PRODUCER stamped on a
-buffer's text (a build's ANSI colours, its `:ansi` text property — `ansicolor`), painted under
-the mode's own colouring. `:spans` is a `(buffer) -> spans` symbol (ascending, `[from to
-attributes]`; `[]` for none), `:palette` a `() -> palette` symbol the attributes are resolved
-through as they are painted (`spanpaint/ed-span-layers`), so a theme switch recolours them.
-The lowest `:rank` with spans on a buffer is its layer. Called when the source's module loads."
-  (ownership/claim! :model/text-faces name (assoc row :name name)))
+  "Add the text-face source `name` (see the comment above), replacing any under `name`."
+  (sources/register :model/text-faces name row))
 
 (defn register-span-overlay (name row)
-  "Add the span overlay `name`, `{:rank :spans}`: faces painted OVER everything else a buffer's
-text has, where it says (a language server's semantic tokens — `lsp-semantic`), the colouring
-under it showing everywhere else. `:spans` is a `(buffer first-line last-line) -> spans` symbol:
-ascending `[from to face]` spans covering at least what reaches into those lines of the
-buffer's text — a frame asks for what it shows, so an overlay kept against an older text carries only
-that much; nil or `[]` for none. The lowest `:rank` with spans on a buffer is painted. Called
-when the overlay's module loads."
-  (ownership/claim! :model/span-overlays name (assoc row :name name)))
+  "Add the span overlay `name` (see the comment above), replacing any under `name`."
+  (sources/register :model/span-overlays name row))
 
-(defn- first-ranked-spans (registry answer)
-  ;; the first non-empty spans `(answer row)` gives, rows of `registry` in `:rank` order, with
-  ;; the row they came from: `[spans row]`, or nil when no row has any
-  (reduce (registry/ranked registry)
-    nil
-    (fn (found [_ row])
-      (or found
-        (let (spans (answer row))
-          (when (and spans (not (empty? spans))) [spans row]))))))
+;; ---- reading them -------------------------------------------------------------------
+
+(defn ed-highlight-ranges (m pane buf top rows)
+  "Every highlight source's ranges for `pane`, whose lines from `top` show `rows` of `buf`, lowest
+`:rank` first."
+  (let (context {:top top :rows rows})
+    (mapcat (sources/run :model/highlight-sources
+              "highlight sources"
+              (fn (source) (reflect/call-if-bound (:run source) '() m pane buf context)))
+      identity)))
+
+(defn ed-pane-override-lists (m pane buf geometry)
+  "Every override source's `[pos face]` list for `pane`, lowest `:rank` first, the empty ones
+dropped — a list per source, so a caller can keep a lone source's list as the very value it
+was (a memo's `=` then answers at once)."
+  (seq/reject (sources/run :model/override-sources
+                "override sources"
+                (fn (source) (reflect/call-if-bound (:run source) '() m pane buf geometry)))
+    empty?))
+
+(defn ed-pane-line-notes (m pane buf geometry)
+  "Every line-note source's notes for `pane`, merged by line in `:rank` order — `{line [note …]}`,
+`{}` when none has any."
+  (fold (sources/run :model/line-note-sources
+          "line-note sources"
+          (fn (source) (reflect/call-if-bound (:run source) {} m pane buf geometry)))
+    {}
+    (fn (acc notes-by-line)
+      (fold (or notes-by-line {})
+        acc
+        (fn (merged [line notes]) (assoc merged line (append (get merged line '()) notes)))))))
+
+(def- *pane-layer-groups*
+  ;; the part a slot's layers are timed as (`sources/run`)
+  {:with-text "pane layers :with-text"
+   :over-text "pane layers :over-text"
+   :chrome "pane layers :chrome"})
+
+(defn ed-pane-layer-ops (m pane buf geometry slot)
+  "Every pane layer in `slot`, lowest `:rank` first, as one list of ops."
+  (mapcat (sources/run :model/pane-layers
+            (get *pane-layer-groups* slot "pane layers")
+            (fn (layer)
+              (if (= (:slot layer) slot)
+                (reflect/call-if-bound (:run layer) '() m pane buf geometry)
+                '())))
+    identity))
+
+(defn ed-pane-source-deps (m pane buf)
+  "What every source that paints into a pane's TEXT layers reads beyond `buf` and `pane` — the
+highlight, override and line-note sources' `:deps` and the `:with-text` pane layers'
+(`sources/deps`) — one value the pane's memoised paint is keyed on (`panecompose`), so a source
+registered later keys it with no edit there. Rows with no `:deps` add nothing."
+  [(sources/deps :model/highlight-sources m pane buf)
+    (sources/deps :model/override-sources m pane buf)
+    (sources/deps :model/line-note-sources m pane buf)
+    (sources/deps :model/pane-layers m pane buf (fn (layer) (= (:slot layer) :with-text)))])
+
+(defn ed-frame-overlay-ops (m cols rows)
+  "Every frame overlay's ops, one group per overlay, lowest `:rank` first."
+  (sources/run :model/frame-overlays
+    "frame overlays"
+    (fn (overlay) (reflect/call-if-bound (:run overlay) '() m cols rows))))
+
+(defn ed-row-extras-of (buf extras)
+  "`extras` with every row extra `buf` has under its `:key`, in `:rank` order (a blank one left
+out)."
+  (fold (sources/rows :model/row-extras)
+    extras
+    (fn (acc extra)
+      (let (value (reflect/call-if-bound (:run extra) nil buf))
+        (if (sources/blank? value) acc (assoc acc (:key extra) value))))))
+
+(defn ed-echo-text (m)
+  "What the first echo source by `:rank` with anything to say says of `m`, or `\"\"`."
+  (let (buf (ed-current-buf m)
+        found (sources/first-answer :model/echo-sources
+                (fn (source)
+                  (let (said (reflect/call-if-bound (:run source) nil m buf))
+                    (when (string? said) said)))))
+    (if found (first found) "")))
 
 (defn ed-span-overlay (buf first-line last-line)
   "The spans of the first span overlay ([[register-span-overlay]]) with any over lines
 `first-line`..`last-line` of `buf`, or nil when none has."
-  (first (first-ranked-spans :model/span-overlays
+  (first (sources/first-answer :model/span-overlays
            (fn (row) (reflect/call-if-bound (:spans row) [] buf first-line last-line)))))
 
 (defn ed-text-faces (buf)
   "`[spans palette]` of the first text-face source ([[register-text-faces]]) with spans on
 `buf`, or nil when none has any."
-  (let (found (first-ranked-spans :model/text-faces
+  (let (found (sources/first-answer :model/text-faces
                 (fn (row) (reflect/call-if-bound (:spans row) [] buf))))
     (when found
       (let ([spans row] found) [spans (reflect/call-if-bound (:palette row) nil)]))))
-
-(defn register-pane-layer (name layer)
-  "Add the pane layer `name`, `{:rank :slot :run}` (see the comment above), replacing any
-registered under `name`. Called when the layer's module loads."
-  (ownership/claim! :model/pane-layers name (assoc layer :name name)))
-
-(defn register-frame-overlay (name overlay)
-  "Add the frame overlay `name`, `{:rank :run}` (see the comment above), replacing any
-registered under `name`. Called when the overlay's module loads."
-  (ownership/claim! :model/frame-overlays name (assoc overlay :name name)))
-
-(defn ed-highlight-sources ()
-  "The registered highlight sources, lowest `:rank` first: the order they paint in."
-  (map (registry/ranked :model/highlight-sources) second))
-
-(defn ed-highlight-ranges (m pane buf top rows)
-  "Every highlight source's ranges for `pane`, whose lines from `top` show `rows` of `buf`."
-  (let (context {:top top :rows rows})
-    (mapcat (ed-highlight-sources)
-      (fn (source) (ed-call-hook (:run source) '() m pane buf context)))))
-
-(defn ed-highlight-deps (m pane buf)
-  "What the highlight sources read beyond `buf` and `pane`, a value the pane's paint is keyed on.
-Sources with no `:deps` add nothing."
-  (seq/keep (ed-highlight-sources)
-    (fn (source)
-      (let (deps (:deps source))
-        (when deps [(:name source) (ed-call-hook deps nil m pane buf)])))))
-
-(defn ed-pane-layer-ops (m pane buf geometry slot)
-  "Every pane layer in `slot`, lowest `:rank` first, as one list of ops."
-  (mapcat (registry/ranked :model/pane-layers)
-    (fn ([_ layer])
-      (if (= (:slot layer) slot) (ed-call-hook (:run layer) '() m pane buf geometry) '()))))
-
-(defn ed-pane-layer-deps (m pane buf slot)
-  "What the pane layers in `slot` read beyond `buf` and `pane`, a value the memoised layers are
-keyed on. Layers with no `:deps` add nothing."
-  (seq/keep (registry/ranked :model/pane-layers)
-    (fn ([_ layer])
-      (when (and (= (:slot layer) slot) (:deps layer))
-        [(:name layer) (ed-call-hook (:deps layer) nil m pane buf)]))))
-
-(defn ed-frame-overlay-ops (m cols rows)
-  "Every frame overlay's ops, one group per overlay, lowest `:rank` first."
-  (map (registry/ranked :model/frame-overlays)
-    (fn ([_ overlay]) (ed-call-hook (:run overlay) '() m cols rows))))
 
 (defn ed-layer-modeline-segments (m buf)
   "The status-bar segments `buf`'s active layers contribute via a `:modeline` service — each a
@@ -1570,27 +1645,23 @@ nils are dropped. The view appends these (and the global git branch) on the sele
 (resolved late, so a redefinition hot-swaps; a deferred module's hook is skipped until it
 loads) and `:order` its position in the chain — replacing any hook registered under `name`.
 Called when the hook's module loads."
-  (ownership/claim! :model/post-steps name (assoc step :name name :rank (:order step))))
+  (sources/register :model/post-steps name (assoc step :rank (:order step))))
 
 (defn ed-run-post-steps (m)
   "Every registered post-step hook's `:run`, in `:order`, each seeing the model the previous
 one left."
-  (fold (registry/ranked :model/post-steps)
-    m
-    (fn (acc [_ step]) (ed-call-deferred acc (:run step) acc))))
+  (sources/fold-hooks :model/post-steps :run m))
 
 (defn register-input-step (name step)
   "Add `step`, a `(model input) -> model` symbol run on every event BEFORE the timers are
 reconciled and the post-steps run — what an input marks for the idle beat to act on (a web
 mirror's snapshot gone stale) — replacing any registered under `name`. Called when its module
 loads."
-  (ownership/claim! :model/input-steps name step))
+  (sources/register :model/input-steps name {:run step}))
 
 (defn ed-run-input-steps (m input)
   "Every registered input step over `m`, each seeing the model the previous one left."
-  (fold (vals (registry/entries :model/input-steps))
-    m
-    (fn (acc step) (ed-call-hook step acc acc input))))
+  (sources/fold-hooks :model/input-steps :run m input))
 
 (defn register-tail-step (name step)
   "Add `step`, `{:order :run}` with `:run` a `(before after input) -> model` symbol, run at the
@@ -1598,21 +1669,21 @@ very end of an event once the buffers' processes have its edits (`hosted`) — w
 model before the event with the one after (collab's presence and follow) — replacing any
 registered under `name`. Not run for a keyboard macro's replay, whose events each run their own.
 Called when its module loads."
-  (ownership/claim! :model/tail-steps name (assoc step :name name :rank (:order step))))
+  (sources/register :model/tail-steps name (assoc step :rank (:order step))))
 
 (defn ed-run-tail-steps (before after input)
   "Every registered tail step, in `:order`, over `after`."
-  (fold (registry/ranked :model/tail-steps)
+  (fold (sources/rows :model/tail-steps)
     after
-    (fn (acc [_ step]) (ed-call-hook (:run step) acc before acc input))))
+    (fn (acc step) (ed-call-hook (:run step) acc before acc input))))
 
 (defn ed-run-recover-steps (before after input)
   "The tail steps marked `:recover true`, in `:order`, over `after`: what still runs when a
 command threw and `input`'s turn is abandoned for `before` with an error echo (`after`). The
 hosted propagate is one — the echo's append to *Messages* must reach that buffer's process."
-  (fold (registry/ranked :model/tail-steps)
+  (fold (sources/rows :model/tail-steps)
     after
-    (fn (acc [_ step])
+    (fn (acc step)
       (if (= true (:recover step)) (ed-call-hook (:run step) acc before acc input) acc))))
 
 ;; ---- a turn's last word: steps after it is committed, inputs that change nothing --------
@@ -1623,37 +1694,35 @@ is COMMITTED (`input/ed-update-turn`): after every tail step, and after a thrown
 recovery too, outside the turn's guard — what must happen to a turn that stands and never to
 one rolled back (a held tree handle freed once nothing names it: `syntaxtree`). Replaces any
 registered under `name`. Called when its module loads."
-  (ownership/claim! :model/commit-steps name (assoc step :name name :rank (:order step))))
+  (sources/register :model/commit-steps name (assoc step :rank (:order step))))
 
 (defn ed-run-commit-steps (before after)
   "Every registered commit step, in `:order`, over `after`."
-  (fold (registry/ranked :model/commit-steps)
+  (fold (sources/rows :model/commit-steps)
     after
-    (fn (acc [_ step]) (ed-call-hook (:run step) acc before acc))))
+    (fn (acc step) (ed-call-hook (:run step) acc before acc))))
 
 (defn register-identity-step (name step)
   "Add `step`, a `(model identity) -> model` symbol, run when a client says who it is (its
 attach identity `{:name :guest}`, `events/ed-apply-client-identity`): collab records the
 participant name and announces it on every shared buffer. Called when its module loads."
-  (ownership/claim! :model/identity-steps name step))
+  (sources/register :model/identity-steps name {:run step}))
 
 (defn ed-run-identity-steps (m identity)
   "Every registered identity step ([[register-identity-step]]) over `m`."
-  (fold (vals (registry/entries :model/identity-steps))
-    m
-    (fn (acc step) (ed-call-hook step acc acc identity))))
+  (sources/fold-hooks :model/identity-steps :run m identity))
 
 (defn register-inert-input (name test)
   "Declare inputs that change nothing: `test` is a `(model input) -> bool` symbol, true for an
 input the model already reflects (our own edit echoed back by a hosted buffer's process:
 `hosted`), which the loop then hands back unchanged, drawing nothing. Called when its module
 loads."
-  (ownership/claim! :model/inert-inputs name test))
+  (sources/register :model/inert-inputs name {:run test}))
 
 (defn ed-inert-input? (m input)
   "True when a registered test ([[register-inert-input]]) says `input` changes nothing in `m`."
-  (any? (vals (registry/entries :model/inert-inputs))
-    (fn (test) (= true (reflect/call-if-bound test false m input)))))
+  (any? (sources/rows :model/inert-inputs)
+    (fn (row) (= true (reflect/call-if-bound (:run row) false m input)))))
 
 ;; ---- the pool buffer, the panes showing it, their restrictions ------------------
 
@@ -2096,7 +2165,7 @@ down, dropped when that line went ([[ed-carry-line]])."
   "A feature that keeps window layouts besides the live one: `carry` names a `(model
 buffer-name f) -> model` function applying the pane-payload function `f` to every kept window
 showing the buffer named `buffer-name`. Called when the feature's module loads."
-  (ownership/claim! :model/layout-keepers name carry))
+  (sources/register :model/layout-keepers name {:run carry}))
 
 ;; check-allow: a keeper is resolved late (`reflect/eval`), so its result is unknown to the
 ;; checker; every keeper answers a model
@@ -2111,9 +2180,9 @@ changes."
     (let (carry (fn (pane) (ed-carry-pane pane before after lo hi inserted))
           name (buffer-name (ed-buf-at m idx))
           shown (ed-map-panes m (fn (pane) (if (= (:buffer pane) idx) (carry pane) pane))))
-      (fold (vals (registry/entries :model/layout-keepers))
+      (fold (sources/rows :model/layout-keepers)
         shown
-        (fn (acc keeper) ((reflect/eval keeper) acc name carry))))))
+        (fn (acc keeper) ((reflect/eval (:run keeper)) acc name carry))))))
 
 ;; ---- cutting an output buffer's head ------------------------------------------
 ;; A log or a stream (*Messages*, *Tests*, *Run*, *compilation*, a shell) grows for as long
@@ -2364,13 +2433,24 @@ reports reads as. \"1 lines\" in a report whose claim is precision reads as care
     (model/ed-count-noun 3 \"file\")   ;=> \"3 files\""
   (str amount " " noun (if (= amount 1) "" "s")))
 
-(sig ed-read-char (model any any -> model))
-(defn ed-read-char (m prompt then)
+(sig ed-read-char (model any any &optional map -> model))
+(defn ed-read-char (m prompt then &optional (options {}))
   "Show `prompt` in the echo area and route the *next* key to `then` (a `(model key) ->
 model` continuation), via the read-char transient (`input`). Esc/C-g aborts. The shared
 one-key reader behind zap-to-char, the register / bookmark commands and every y/n question.
-The prompt stands until the key comes: a [[message]] meanwhile shows beside it, not over it."
-  (assoc (message (dissoc m :read-char) prompt) :read-char {:then then :prompt prompt}))
+The prompt stands until the key comes: a [[message]] meanwhile shows beside it, not over it.
+
+`options`: `:takes-cancel` hands ESC and C-g to `then` too instead of aborting (a reader that
+wants every key: the ESC prefix, `input/ed-read-key`); `:quiet` shows the prompt without
+logging it to *Messages* as a [[message]] would (a prompt that is not news, `ESC-`)."
+  (let (shown (if (:quiet options)
+                (assoc (dissoc m :read-char) :echo prompt)
+                (message (dissoc m :read-char) prompt)))
+    (assoc shown
+      :read-char
+        (if (:takes-cancel options)
+          {:then then :prompt prompt :takes-cancel true}
+          {:then then :prompt prompt}))))
 
 (defn ed-yes-key? (key)
   "Whether `key` — what an `ed-read-char` continuation was handed for a `(y or n)`

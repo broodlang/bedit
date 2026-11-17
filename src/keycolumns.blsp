@@ -1,0 +1,166 @@
+(defmodule keycolumns
+  "Keys and what they do, in titled groups, laid out in columns — the shape the which-key panel
+(`whichkey/panel-items`), a transient menu's card (`overlayview`) and the start page
+(`startpage`) share. Pure data, no theme and no display: each host paints the lines its own
+way (which-key as text cells, the transient card as render ops).
+
+An ENTRY is a map with `:key` (the key as a label, `\"C-x C-f\"`) and `:text` (what it does);
+a host may carry more on it (a transient row's `:index`). A GROUP is `{:title :rows}`, its rows
+entries, its title a heading or `\"\"`/nil for none. A LINE is `[:heading title]`, `[:row entry]`
+or `[:blank]`, one row of a column.")
+
+(def key-gap
+  ;; cells between an entry's key column and its text
+  2)
+
+(defn key-width (entries)
+  "The widest `:key` of `entries`, in cells — the width of their key column.
+
+    (keycolumns/key-width [{:key \"a\"} {:key \"C-x\"}])   ;=> 3"
+  (fold entries 0 (fn (widest entry) (math/max widest (string/display-width (:key entry))))))
+
+(defn entry-cell (entry width)
+  "`entry` as one line of text: its key padded to `width` cells, the [[key-gap]], its text.
+
+    (keycolumns/entry-cell {:key \"f\" :text \"find\"} 3)   ;=> \"f    find\""
+  (str (string/pad-right-cells (:key entry) width) (string/repeat " " key-gap) (:text entry)))
+
+(defn titled? (group)
+  "Whether `group` has a heading to show."
+  (let (title (:title group)) (and (string? title) (not (= title "")))))
+
+(defn group-lines (group)
+  "`group`'s lines: its heading when it has one ([[titled?]]), then a row per entry.
+
+    (keycolumns/group-lines {:title \"G\" :rows [{:key \"a\" :text \"A\"}]})   ;=> [[:heading \"G\"] [:row {:key \"a\" :text \"A\"}]]"
+  (into (if (titled? group) [[:heading (:title group)]] [])
+    (map (:rows group) (fn (entry) [:row entry]))))
+
+(defn column-lines (column)
+  "A column of whole groups as its lines, top to bottom: each group's [[group-lines]], a blank
+line between two."
+  (vec (rest (mapcat column (fn (group) (into [[:blank]] (group-lines group)))))))
+
+(defn- pack-columns (groups limit)
+  ;; `groups`, in order, packed into columns of whole groups no taller than `limit` lines; a
+  ;; group taller than `limit` takes a column of its own
+  (fold groups
+    []
+    (fn (columns group)
+      (let (last-column (last columns))
+        (if (and last-column (<= (count (column-lines (conj last-column group))) limit))
+          (assoc columns (dec (count columns)) (conj last-column group))
+          (conj columns [group]))))))
+
+(defn balanced-columns (groups count-wanted)
+  "`groups` split, in order and whole, into at most `count-wanted` columns, the tallest as
+short as it can be — Magit's transient layout. A column is a vector of groups; lay one out with
+[[column-lines]]."
+  (let (tallest (fold groups 0 (fn (most group) (math/max most (count (group-lines group)))))
+        total (count (column-lines groups)))
+    (letrec (search (fn (limit)
+                      (let (columns (pack-columns groups limit))
+                        (if (or (<= (count columns) count-wanted) (>= limit total))
+                          columns
+                          (search (inc limit))))))
+      (search tallest))))
+
+(defn flow-lines (groups rows)
+  "`groups` as one run of lines for columns `rows` lines tall, read down then across — which-key's
+grid, where a long group runs on into the next column. A blank line parts two groups unless the
+next starts a column, and a heading never ends a column (it moves to the top of the next, so it
+is never parted from its first row).
+
+    (keycolumns/flow-lines [{:title \"A\" :rows [{:key \"a\"}]} {:title \"B\" :rows [{:key \"b\"}]}] 3)   ;=> [[:heading \"A\"] [:row {:key \"a\"}] [:blank] [:heading \"B\"] [:row {:key \"b\"}]]"
+  (fold groups
+    []
+    (fn (lines group)
+      (let (at-top? (fn (placed) (= 0 (math/mod (count placed) rows)))
+            spaced (if (at-top? lines) lines (conj lines [:blank]))
+            placed (if (and (titled? group) (= (dec rows) (math/mod (count spaced) rows)))
+                     (conj spaced [:blank])
+                     spaced))
+        (into placed (group-lines group))))))
+
+;; ---- a grid of text cells: columns side by side, paged ----------------------------------
+;; which-key's panel: its lines as text cells (`whichkey/panel-items`), run down then across in
+;; columns of a set height, as many columns as fit the width, and — when more cells than that
+;; grid holds — split into pages, each ending in a cell that says which page it is.
+
+(def column-gap
+  ;; cells between two columns of a grid
+  3)
+
+(defn- fitted-columns (columns available)
+  ;; the leading `columns` (each a vector of cells) that fit side by side in `available`, each
+  ;; as `{:cells :width :used :gap}` — its widest cell, the width of the columns before it and
+  ;; the gap that separates it from them. The first always fits; the first that does not ends
+  ;; the grid
+  (reverse
+    (second
+      (seq/reduce-while columns
+        [0 '()]
+        (fn (state cells)
+          (let ([used placed] state
+                width (fold cells
+                        0
+                        (fn (widest cell) (math/max widest (string/display-width cell))))
+                gap (if (empty? placed) 0 column-gap)
+                end (+ used gap width))
+            (if (and (not (empty? placed)) (> end available))
+              ;; no room for another column
+              [:halt state]
+              [:cont [end (cons {:cells cells :width width :used used :gap gap} placed)]])))))))
+
+(defn- grid-row (grid index)
+  ;; row `index` of `grid` (`fitted-columns`): each column's `index`th cell (blank past its
+  ;; end) padded to the column's width, after its gap — the row so far padded to the width of
+  ;; the columns before it
+  (fold grid
+    ""
+    (fn (row column)
+      (str (string/pad-right-cells row (:used column))
+        (string/pad-right "" (:gap column))
+        (string/pad-right-cells (nth (:cells column) index "") (:width column))))))
+
+(defn- grid-count (grid)
+  ;; how many cells `grid` holds
+  (fold grid 0 (fn (total column) (+ total (count (:cells column))))))
+
+(sig grid-pages (any any any -> (vector vector)))
+(defn- grid-pages (cells laid label-of)
+  ;; `cells` split into the pages the grid `laid` lays out: one page when they all fit, else
+  ;; pages each keeping its last cell for the page label — each filled with as many cells as
+  ;; fit beside a label as wide as the widest it could need, so the real label always fits
+  (if (>= (grid-count (laid cells)) (count cells))
+    [cells]
+    (let (widest-label (label-of (count cells) (count cells)))
+      (letrec (paginate (fn (remaining pages)
+                          (if (empty? remaining)
+                            pages
+                            (let (fitted (grid-count (laid (conj remaining widest-label)))
+                                  size (if (> fitted (count remaining))
+                                         (count remaining)
+                                         (math/max 1 (dec fitted))))
+                              (paginate (vec (drop remaining size))
+                                (conj pages (vec (take remaining size))))))))
+        (paginate (vec cells) [])))))
+
+(defn grid-rows (cells rows-per-column available page label-of)
+  "`cells` (text) laid out down then across in columns of `rows-per-column` rows, as that many
+(or fewer) row strings — each column padded to its widest cell, [[column-gap]] between two,
+columns added while they fit in `available` cells. More cells than the grid holds are split
+into pages, page `page` shown (it wraps: one past the last is the first, -1 the last), its last
+cell `(label-of index total)` (1-based) saying which page it is.
+
+    (keycolumns/grid-rows [\"a\" \"b\" \"c\"] 2 20 0 str)   ;=> (\"a   c\" \"b\")"
+  (let (rows-per-column (math/max 1 rows-per-column)
+        laid (fn (shown) (fitted-columns (seq/chunk-every shown rows-per-column) available))
+        pages (grid-pages cells laid label-of)
+        index (math/mod page (count pages))
+        shown (if (= (count pages) 1)
+                cells
+                (conj (nth pages index) (label-of (inc index) (count pages))))
+        grid (laid shown))
+    (map (range (math/min rows-per-column (count shown)))
+      (fn (row) (string/trim-right (grid-row grid row))))))
