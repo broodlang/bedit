@@ -1021,35 +1021,6 @@ src/filename.blsp           a typed path read the Emacs way (`substitute-in-file
                             (`pool/ed-confirm-overwrite`). A prompt opens in a directory spelled
                             as one (`filename/as-dir`, `pool/ed-default-dir-input`)
 src/completion.blsp         shared fuzzy ranking + vertical-menu card (complete + plume)
-src/dired.blsp              Dired (C-x d, C-x C-j): an `ls -l` listing, its state ON the buffer
-                            (`:dired-dir`, `:dired-names` — a line's entry by index — marks, flags,
-                            `:dired-links`: a symlink's row ends `name -> target`, `file/read-link`),
-                            single keys to open, sort, mark, flag, R / C / D / x (off the loop, one
-                            at a time; another machine's directory through its file handler's ops).
-                            `ed-dired-rename-entries`: entries renamed to names given, all at once —
-                            swaps and cycles through temporary names, `/` moves (parents made),
-                            an existing target asked about — and `ed-dired-set-attributes`: links
-                            re-pointed (`file/symlink` `{:replace true}`) and modes set (`file/chmod`,
-                            brood ADR-697; a handler's `:make-symbolic-link` / `:set-file-modes`) —
-                            what wdired applies
-src/wdired.blsp             wdired-mode: C-x C-q in Dired makes the file NAMES editable over
-                            `editspans` (the columns, header, `.` / `..` read-only; no Dired keymap,
-                            so `m` types an m) — and a symlink's TARGET after ` -> `
-                            (`:wdired-allow-to-redirect-links`, on, as Emacs) and the PERMISSIONS
-                            (`:wdired-allow-to-change-permissions`: off; true — each character a
-                            toggle, SPC flips, r w x s t S T - set, through `cmd-wdired-set-bit`, a
-                            `:typing` command, so the writable guard holds; `:advanced` — free text,
-                            read by `fileperm/perms->mode`). C-c C-c / C-x C-s re-point the links and
-                            set the modes first (`dired/ed-dired-set-attributes`), then rename through
-                            dired's `ed-dired-rename-entries`, an erased name flags its entry `D`; each
-                            change stands alone, a failure said. C-c C-k / C-c ESC put everything
-                            back; C-x C-q leaves, asking when changed (`editspans/leave`,
-                            dired's `:writable {:enter …}` entering it — dired binds no C-x C-q); C-n / C-p
-                            / C-a keep to the name column, RET refused
-src/fileops.blsp            what dired's deletes need past brood's `file/`: a path removed for good and
-                            what that takes counted. Copy, move and the TRASH are brood's
-                            (`file/copy-tree`, `file/move`, `file/trash`; a test binds
-                            `file/*trash-home*`, a test run otherwise gets its scratch home's)
 src/fileperm.blsp           the `ls -l` permission string (`rwx`, `perms-string`, setuid / setgid /
                             sticky as `s` / `t`) and back (`perms->mode`, wdired) — dired + plume marginalia
 src/plume.blsp              the minibuffer completion UI — vertical list + marginalia + N/M counter (our Vertico/Marginalia)
@@ -1931,4 +1902,41 @@ src/tramp/ssh.blsp
     is private (`sidecar/private-spec`); auto-revert, diff-hl, LSP, the
     formatter, editorconfig, dir-locals, compile, M-! and the project walk
     skip it (`sshpath/remote?`). The mode line says `@host` (`@host # root`)
+```
+
+## dired — a directory listed and acted on: marks, copy, rename, delete, the listing edited as text
+
+```
+src/dired.blsp
+    Dired (C-x d, C-x C-j): an `ls -l` listing, its state ON the buffer
+    (`:dired-dir`, `:dired-names` — a line's entry by index — marks, flags,
+    `:dired-links`: a symlink's row ends `name -> target`, `file/read-link`),
+    single keys to open, sort, mark, flag, R / C / D / x (off the loop, one
+    at a time; another machine's directory through its file handler's ops).
+    `ed-dired-rename-entries`: entries renamed to names given, all at once —
+    swaps and cycles through temporary names, `/` moves (parents made),
+    an existing target asked about — and `ed-dired-set-attributes`: links
+    re-pointed (`file/symlink` `{:replace true}`) and modes set (`file/chmod`,
+    brood ADR-697; a handler's `:make-symbolic-link` / `:set-file-modes`) —
+    what wdired applies
+src/dired/writable.blsp
+    wdired-mode: C-x C-q in Dired makes the file NAMES editable over
+    `editspans` (the columns, header, `.` / `..` read-only; no Dired keymap,
+    so `m` types an m) — and a symlink's TARGET after ` -> `
+    (`:wdired-allow-to-redirect-links`, on, as Emacs) and the PERMISSIONS
+    (`:wdired-allow-to-change-permissions`: off; true — each character a
+    toggle, SPC flips, r w x s t S T - set, through `cmd-wdired-set-bit`, a
+    `:typing` command, so the writable guard holds; `:advanced` — free text,
+    read by `fileperm/perms->mode`). C-c C-c / C-x C-s re-point the links and
+    set the modes first (`dired/ed-dired-set-attributes`), then rename through
+    dired's `ed-dired-rename-entries`, an erased name flags its entry `D`; each
+    change stands alone, a failure said. C-c C-k / C-c ESC put everything
+    back; C-x C-q leaves, asking when changed (`editspans/leave`,
+    dired's `:writable {:enter …}` entering it — dired binds no C-x C-q); C-n / C-p
+    / C-a keep to the name column, RET refused
+src/dired/fileops.blsp
+    what dired's deletes need past brood's `file/`: a path removed for good and
+    what that takes counted. Copy, move and the TRASH are brood's
+    (`file/copy-tree`, `file/move`, `file/trash`; a test binds
+    `file/*trash-home*`, a test run otherwise gets its scratch home's)
 ```
