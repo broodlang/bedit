@@ -89,27 +89,30 @@ feature work — surfacing it is half the point of this project.
 
 **The full map, one entry per module, is [docs/layout.md](docs/layout.md)** — read the entry
 for a module before changing it. A new `src/` module gets its entry THERE
-(`tests/layout_doc_test.blsp` enforces it); this section stays a list of families, one line each.
+(`tests/layout_doc_test.blsp` enforces it); this section stays one line per context or family.
 Never add module detail here: it is loaded into every session.
 
-| Family | Modules (`src/`) |
+**Contexts, Phoenix style.** A context is `src/<name>.blsp` (its API) and, when it has details to
+hide, the folder `src/<name>/` (`<name>/<detail>` modules). Other code calls a context's own
+functions — or its commands, by name — never its details: `nest deps` lists any reference into
+another context's detail and any cycle between contexts (none today; keep it that way). A module
+used across the editor (the kernel, a library) stays a top-level file with no folder. A context
+must not take a std module's name (`vcs` shadowed std's: hence `vc`).
+
+| Contexts (folders) | `processes` `shells` `vc` `lsp` `diagnostics` `tramp` `dired` `tutor` `decorations` `collab` `languages` `testrun` `packages` `org` `mail`, and `diffs` (one file) |
 |---|---|
-| startup + loop | `main` `startup` `model` (the registries every feature plugs into) `input` `events` `lifeline` `offloop` |
-| text model | `textpos` `bufferops` `wrap` `inlinetext` `folds` `codefold` `stringstate` `stringlex` `stringwarm` `conventions` `editorconfig` `dirlocals` |
-| view | `view` `panes` `panegeometry` `panebody` `spanpaint` `spancache` `syntaxtree` `linecache` `treewarm` `modeline` `statusbar` `headerline` `echoarea` `hittest` `overlayview` `ui-kit` `theme` `themes` `desktopprefs` `appearance` `scrollbar` `scroll` `eolview` `eolnotes` `linkview` `foldview` `gutter` |
-| decorations | `whitespace` `fillindicator` `glyphless` `rainbow` `pulse` `spell` `diffhl` `codecrumbs` `tsbrackets` |
-| commands | `commands` `motion` `structural` `indent` `typing` `killing` `editing` `region` `textops` `comment` `fill` `electric` `kmacro` `registers` `window-commands` `search-commands` `isearch` `query-replace` `avy` `embark` `menu` `mouse` `clipboard` `browse-kill-ring` `yankmedia` |
-| keys + modes | `keymaps` `vim` `userkeys` `interactive` `transient` `transient-core` `whichkey` `keyhelp` `help` `modes` `brood-mode` `lisp-modes` `lang-*` `language-core` `lex-*` `org` `org-mode` `mail` `mail-message` |
+| kernel + loop | `main` `startup` `startpage` `model` (the registries every feature plugs into) `sources` `input` `events` `lifeline` `offloop` `interactive` `modes` `pool` `theme` |
+| text | `textpos` `bufferops` `wrap` `inlinetext` `folds` `codefold` `stringstate` `stringlex` `stringwarm` `conventions` `editorconfig` `dirlocals` `syntaxtree` `tsbrackets` |
+| view | `view` `panes` `panegeometry` `panebody` `panecompose` `display-settings` `spanpaint` `spancache` `linecache` `treewarm` `modeline` `statusbar` `headerline` `echoarea` `hittest` `overlayview` `ui-kit` `themes` `desktopprefs` `appearance` `scrollbar` `scroll` `eolview` `eolnotes` `linkview` `foldview` `gutter` |
+| editing + keys | `commands` `motion` `structural` `indent` `typing` `killing` `editing` `region` `textops` `comment` `fill` `electric` `kmacro` `registers` `window-commands` `search-commands` `isearch` `query-replace` `avy` `embark` `menu` `mouse` `clipboard` `browse-kill-ring` `yankmedia` `keymaps` `vim` `userkeys` `transient` `transient-core` `whichkey` `keyhelp` `keycolumns` `help` |
 | minibuffer + completion | `minibuffer` `lossage` `mincomplete` `filename` `completion` `plume` `complete-*` `cape` `snippet` `savehist` `passwd` |
-| files | `pool` `file-save` `lifecycle` `autosave` `backup` `sidecar` `autorevert` `recover` `charset` `charset-tables` `filecoding` `hexl` `imageview` `docview` `sudoedit` `remotejob` `ssh*` `dired` `wdired` `fileops` `fileperm` `lastsession` `saveplace` `reopen` `solong` `sibling` `thingatpt` |
-| config + packages | `config-paths` `config` `display-rules` `hooks` `ownership` `package-*` `packages` `grammars` `grammarcheck` `about` `bugreport` `slowlog` `turnprofile` |
-| projects + build | `projects` `project-commands` `project-search` `toolchain` `compile` `results` `formatter` `xrefgrep` `projectdiag` `editspans` `searchedit` `testrun*` `testadapter` `brood-test` `elixir-test` `apprun` |
-| diagnostics + LSP | `diagstore` `diagcheck` `diagnostics` `eldoc` `lsp*` |
-| eval + playgrounds | `eval-command(s)` `shell-command` `sandbox` `sandbox-events` `session` `liveeval` `playground-core` `playground` `elixir-*` `tutor*` `aside` `workings` `mdpreview` `debugger` `beam` `process-list` `attach` |
-| processes | `procstream` `ansicolor` `comint` `bshell` `terminal` `formbuf` |
-| VCS | `vcscore` `vcsproc` `diffpaint` `section` `sectionbuf` `git*` `mur*` `timemachine` `smerge` |
-| multi-frame + remote | `hosted` `frames` `tabbar` `winner` `remote` `guest` `collab*` `web` |
-| tests + tools | `tests/support/testkit.blsp` (shared helpers), `tests/guards_test` `tests/strict_ratchet_test` `tests/layout_doc_test`, `tools/drive-*.blsp` (live pty drivers), `tools/screenshot.blsp`, `tools/affected-tests.sh`, `tools/ci/*` |
+| files | `file-save` `lifecycle` `autosave` `backup` `sidecar` `autorevert` `recover` `charset` `charset-tables` `filecoding` `hexl` `imageview` `docview` `sshpath` `fileperm` `lastsession` `saveplace` `reopen` `solong` `sibling` `thingatpt` |
+| buffer kinds | `section` `sectionbuf` `formbuf` `aside` |
+| config | `config-paths` `config` `display-rules` `hooks` `ownership` `grammars` `grammarcheck` `about` `bugreport` `slowlog` `turnprofile` |
+| projects + build | `projects` `project-commands` `project-search` `toolchain` `compile` `results` `formatter` `xrefgrep` `projectdiag` `editspans` `searchedit` `apprun` |
+| eval + sessions | `eval-command` `eval-commands` `shell-command` `session` `sandbox` `sandbox-events` `elixir-sandbox` `liveeval` `playground-core` `playground` `elixir-playground` `workings` `debugger` `beam` `process-list` `attach` `eldoc` |
+| multi-frame + remote | `hosted` `guest` `frames` `tabbar` `winner` `remote` `web` |
+| tests + tools | `tests/support/testkit.blsp` (shared helpers: `press`, `source-files` …), `tests/guards_test` `tests/strict_ratchet_test` `tests/layout_doc_test`, `tools/drive-*.blsp` (live pty drivers), `tools/screenshot.blsp`, `tools/affected-tests.sh`, `tools/ci/*` |
 
 ## Commands
 
