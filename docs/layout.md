@@ -1205,13 +1205,6 @@ elixir/bedit_agent.exs      bedit's agent ON the BEAM: a session (binding + modu
                             because a release bundle carries code and no assets (ADR-038).
                             Needs Elixir 1.14+ (`dbg/2`'s `:dbg_callback`); below that it
                             still evaluates and says so once (`elixir-sandbox/version-notice`)
-src/tutor.blsp              the interactive Brood tutorial (C-h t): the *Tutorial* buffer, its pages,
-                            commands and mode; the prose guard
-src/tutor-course.blsp       the course as text: the keys asked of the live keymaps, the sections, a
-                            lesson rendered, the contents page, the box syntax (`tutor-regions`)
-src/tutor-live.blsp         the boxes as they run: eval-on-type in the sandbox, ✓/✗ gutter, ghost
-                            results, progress on disk, the checker's warnings; the third client of
-                            playground-core
 src/aside.blsp              the PREVIEW PANE mechanism every side pane is a small spec over
                             (`{:key :buffer :type}`): shown beside the page, refreshed in place,
                             latched closed once the reader closes it, its key a `toggle`, a
@@ -1230,7 +1223,6 @@ src/mdpreview.blsp          C-c C-p in a .md buffer: the document rendered besid
                             the cursor per key, level with the source's scroll (a post-step),
                             re-rendering on the idle beat off the loop (`:on-idle`), and opening
                             on its own with init.blsp's `:markdown-preview`
-src/tutor-lessons.blsp      the tutorial's CONTENT only — the lessons vector (grow the course here)
 src/toolchain.blsp          the project TYPE as data: marker file -> which commands compile,
                             test, run and REPL here (mix / nest / cargo / npm / go /
                             terraform / make),
@@ -1939,4 +1931,21 @@ src/dired/fileops.blsp
     what that takes counted. Copy, move and the TRASH are brood's
     (`file/copy-tree`, `file/move`, `file/trash`; a test binds
     `file/*trash-home*`, a test run otherwise gets its scratch home's)
+```
+
+## tutor — learning bedit: the interactive tutorial, its course and lessons, a lesson checked live
+
+```
+src/tutor.blsp
+    the interactive Brood tutorial (C-h t): the *Tutorial* buffer, its pages,
+    commands and mode; the prose guard
+src/tutor/course.blsp
+    the course as text: the keys asked of the live keymaps, the sections, a
+    lesson rendered, the contents page, the box syntax (`tutor-regions`)
+src/tutor/live.blsp
+    the boxes as they run: eval-on-type in the sandbox, ✓/✗ gutter, ghost
+    results, progress on disk, the checker's warnings; the third client of
+    playground-core
+src/tutor/lessons.blsp
+    the tutorial's CONTENT only — the lessons vector (grow the course here)
 ```
