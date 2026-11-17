@@ -297,71 +297,6 @@ src/ownership.blsp          WHO registered each registry row: every `register-*`
                             run under the claimant of their symbol's namespace
                             (`with-symbol-claimant`, `own-namespace!`), so a row its code
                             registers as it runs is the package's too
-src/package-store.blsp      what is on disk under ~/.config/bedit/packages: installed packages, their
-                            manifests, source files, modules and declared settings. Files only
-src/package-ledger.blsp     what a loaded package did to the image, so it can be taken back:
-                            `note-loaded` records a load, `retire-package` undoes one (below).
-                            No network, no buffers, no model
-src/package-review.blsp     what an update would change, read from the disk in the update's task:
-                            the installed copy against the staged one as unified-diff files
-                            (`tree-diff`), the CHANGELOG entries between the versions, and the
-                            *Package Diff: NAME* section tree, painted as every diff
-                            (vcsproc's hunk sections) — and update-all's one *Package Diff*, a
-                            folded section per package (`review-all-tree`). Applying / dropping is packages'
-src/packages.blsp           bedit's package manager (M-x package-list): install / update / remove
-                            hive packages that `:enhances bedit` at RUNTIME, into
-                            ~/.config/bedit/packages (the elpa model) — never the build's _deps.
-                            The list fetch, an install and an update run OFF the loop (a task in
-                            `:package-job`: one at a time, C-g stops it, C-x C-c asks), each a
-                            failure CARRYING ITS REASON (brood ADR-559) said in the echo area
-                            and on *Packages*' status line. An install lands in a staging dir
-                            and moves into place only when it verified and enhances this bedit,
-                            so a failed or cancelled one keeps the copy there; an update RETIRES
-                            the old version first (`retire-package`, ONE call): every bedit
-                            registry row it made taken back (`ownership/release-under!` — idle
-                            jobs, task replies, handlers, exit queries, chips, commands, modes,
-                            file types, settings, themes; a core row it replaced comes back);
-                            every std registry entry its loads wrote DIRECTLY (brood's
-                            `registry/written-by` over its modules and, for a file with no
-                            `defmodule`, the file's path — editor/layers' tables, faces, a
-                            `registry/put` of its own) taken back, a map entry it replaced given
-                            to the layer below it through a per-entry STACK (two packages writing
-                            one entry come off in either order), conditional on the entry still
-                            being the package's (brood ADR-582); any row
-                            still NAMING the package (a hook symbol in its namespace, a function
-                            defined there) dropped as a backstop; every core global it REDEFINED
-                            restored through a per-global STACK (two packages patching one
-                            function come off in either order, the live patch always the top
-                            one's); and every global it FIRST defined removed (`plugin-definitions`:
-                            noted at load — sited under its dir and unbound before, a file with no
-                            `defmodule` included — brood's `reflect/undef`; a core name is never
-                            undefined). Open buffers in a mode it took away are seeded again —
-                            the new version's mode, the core one it replaced, else fundamental,
-                            said in *Messages* (`ed-settle-package-buffers`, Emacs's
-                            `unload-feature`) — then it reloads the sources in load order (brood's
-                            `reflect/source-load-order`); a remove retires the same way, refuses
-                            a library another package uses (`removal-refusal`) and takes the
-                            libraries only it used along (`orphaned-by`). Both are
-                            model-level (`update-plugin!` / `remove!` take and answer the model),
-                            so every caller puts the buffers right; docs/packages.md has the one
-                            limit (KI-356). What
-                            became of each installed package
-                            is kept (`package-status`: loaded / broken / incompatible, with the
-                            reason): startup says every one it did not load in *Messages*
-                            (`load-problems` — a bedit upgrade past a package's range is said,
-                            not dropped), *Packages* and C-h P mark it. A package prompt (M-x
-                            package-install, C-h P) fetches the list itself when it has none,
-                            saying so (`package-prompt`); `package-info` is what C-h P shows.
-                            An update is SHOWN first (`:package-review-updates`, default on):
-                            staged off the loop, *Package Diff: NAME* (package-review), C-c C-c
-                            moves the staged copy in and applies it, C-c C-k / q deletes it;
-                            an open review's staging dir is kept in `:packages/reviews`.
-                            M-x package-update-all (U in *Packages*): ONE job stages every
-                            outdated package side by side (`.staging-<id>-<name>`), ONE
-                            *Package Diff* (a folded section each, `review-all-tree`), C-c C-c
-                            applies all, C-c C-k drops all; a failed one is named, the rest go
-                            on; without review each is applied as it lands.
-                            The registry calls are `*registry*` (tests stub it)
 src/help.blsp               the C-h map: C-h b (by layer, each layer's keys under its keymap's group headings,
                             `keyhelp/ed-key-groups`) / m / w / a / l / k, C-h f (a function's *Help*
                             page: the whole docstring, keys in force, arguments, signature,
@@ -2004,4 +1939,78 @@ src/testrun/adapter.blsp
     test/*report-sink* lines and ExUnit's `mix test --trace` text
     both decode into the same {:group :name :passed :where …}, so
     C-c t means the same thing in every project
+```
+
+## packages — extending bedit: installing, reviewing and removing packages, the store they live in, the ledger of what each changed
+
+```
+src/packages.blsp
+    bedit's package manager (M-x package-list): install / update / remove
+    hive packages that `:enhances bedit` at RUNTIME, into
+    ~/.config/bedit/packages (the elpa model) — never the build's _deps.
+    The list fetch, an install and an update run OFF the loop (a task in
+    `:package-job`: one at a time, C-g stops it, C-x C-c asks), each a
+    failure CARRYING ITS REASON (brood ADR-559) said in the echo area
+    and on *Packages*' status line. An install lands in a staging dir
+    and moves into place only when it verified and enhances this bedit,
+    so a failed or cancelled one keeps the copy there; an update RETIRES
+    the old version first (`retire-package`, ONE call): every bedit
+    registry row it made taken back (`ownership/release-under!` — idle
+    jobs, task replies, handlers, exit queries, chips, commands, modes,
+    file types, settings, themes; a core row it replaced comes back);
+    every std registry entry its loads wrote DIRECTLY (brood's
+    `registry/written-by` over its modules and, for a file with no
+    `defmodule`, the file's path — editor/layers' tables, faces, a
+    `registry/put` of its own) taken back, a map entry it replaced given
+    to the layer below it through a per-entry STACK (two packages writing
+    one entry come off in either order), conditional on the entry still
+    being the package's (brood ADR-582); any row
+    still NAMING the package (a hook symbol in its namespace, a function
+    defined there) dropped as a backstop; every core global it REDEFINED
+    restored through a per-global STACK (two packages patching one
+    function come off in either order, the live patch always the top
+    one's); and every global it FIRST defined removed (`plugin-definitions`:
+    noted at load — sited under its dir and unbound before, a file with no
+    `defmodule` included — brood's `reflect/undef`; a core name is never
+    undefined). Open buffers in a mode it took away are seeded again —
+    the new version's mode, the core one it replaced, else fundamental,
+    said in *Messages* (`ed-settle-package-buffers`, Emacs's
+    `unload-feature`) — then it reloads the sources in load order (brood's
+    `reflect/source-load-order`); a remove retires the same way, refuses
+    a library another package uses (`removal-refusal`) and takes the
+    libraries only it used along (`orphaned-by`). Both are
+    model-level (`update-plugin!` / `remove!` take and answer the model),
+    so every caller puts the buffers right; docs/packages.md has the one
+    limit (KI-356). What
+    became of each installed package
+    is kept (`package-status`: loaded / broken / incompatible, with the
+    reason): startup says every one it did not load in *Messages*
+    (`load-problems` — a bedit upgrade past a package's range is said,
+    not dropped), *Packages* and C-h P mark it. A package prompt (M-x
+    package-install, C-h P) fetches the list itself when it has none,
+    saying so (`package-prompt`); `package-info` is what C-h P shows.
+    An update is SHOWN first (`:package-review-updates`, default on):
+    staged off the loop, *Package Diff: NAME* (package-review), C-c C-c
+    moves the staged copy in and applies it, C-c C-k / q deletes it;
+    an open review's staging dir is kept in `:packages/reviews`.
+    M-x package-update-all (U in *Packages*): ONE job stages every
+    outdated package side by side (`.staging-<id>-<name>`), ONE
+    *Package Diff* (a folded section each, `review-all-tree`), C-c C-c
+    applies all, C-c C-k drops all; a failed one is named, the rest go
+    on; without review each is applied as it lands.
+    The registry calls are `*registry*` (tests stub it)
+src/packages/store.blsp
+    what is on disk under ~/.config/bedit/packages: installed packages, their
+    manifests, source files, modules and declared settings. Files only
+src/packages/ledger.blsp
+    what a loaded package did to the image, so it can be taken back:
+    `note-loaded` records a load, `retire-package` undoes one (below).
+    No network, no buffers, no model
+src/packages/review.blsp
+    what an update would change, read from the disk in the update's task:
+    the installed copy against the staged one as unified-diff files
+    (`tree-diff`), the CHANGELOG entries between the versions, and the
+    *Package Diff: NAME* section tree, painted as every diff
+    (vcsproc's hunk sections) — and update-all's one *Package Diff*, a
+    folded section per package (`review-all-tree`). Applying / dropping is packages'
 ```
