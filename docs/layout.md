@@ -14,7 +14,10 @@ src/main.blsp               entry point — window / daemon startup (--serve/--a
                             to (`open-frontend`) A hung-up terminal
                             and a window whose compositor or X server died (`[:hangup :display-lost]`,
                             brood ADR-631) end the loop the same way: every unsaved buffer to its
-                            sidecar first (`display-hangup`), no restart
+                            sidecar first (`display-hangup`), no restart. *scratch* is always in the
+                            pool (`pool/ed-ensure-scratch`), built by `startup-scratch`: init.blsp's
+                            `:scratch-message`, keys rendered, a plain buffer; `:startup-buffer
+                            :scratch` opens on it rather than the start page (the welcome)
 src/showparen.blsp          show-paren: the bracket pair at point as two one-character overrides (the end at
                             point underlined, its partner a block, an unmatched one red), through the
                             mode's `:bracket-match` / `:bracket-match-tree` — an override source
@@ -24,7 +27,7 @@ src/startpage.blsp          the start page bedit opens on with no file: recent f
                             projects, the keys that open everything, where to learn, the version —
                             read-only, each action line a link (`:start-actions` by line, not matched
                             by text); keys rendered for the starting profile with init.blsp's own
-                            bindings. A `:welcome` template keeps the old editable welcome scratch
+                            bindings. `:startup-buffer :scratch` opens on *scratch* instead
 src/startup.blsp            the ONE startup path the window and `--serve` share: the runtime's
                             (grammars, slow-turn log, savehist, colours + `:theme`, packages), a
                             model's (init.blsp's model settings, recentf, save-place), a window's
@@ -850,7 +853,8 @@ src/pool.blsp               the buffer pool and where its buffers are shown — 
                             is `frames/frames-spawn-showing`; a pane split off for a buffer closes
                             when that buffer is killed, Emacs's quit-restore, `:opened-for`), `ed-pop-to-file`
                             (next-error), find-file + its path prompt, the default dir and
-                            project root. A person's visit of a file over `*read-off-loop-bytes*`
+                            project root. `*scratch*` (`ed-scratch-buffer`, `ed-ensure-scratch`: Emacs's, always
+                            there, a startup-prepared one or an empty one, `:dir` inherited). A person's visit of a file over `*read-off-loop-bytes*`
                             (2 MB; `ed-find-file-soon`, `ed-visit-file`'s opener) is read OFF the
                             loop: a read-only `Loading…` buffer at once (`file-loading-buffer`, a root
                             read's too), the file in its place in every pane showing it when the
