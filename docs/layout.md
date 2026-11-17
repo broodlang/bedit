@@ -154,34 +154,6 @@ src/sidecar.blsp            where a sidecar lives and the note a visit shows whe
 src/autorevert.blsp         auto-revert of files changed on disk (one undoable edit, std's
                             `revert-buffer`; idle beat, order 120, after the sidecars). A file
                             edited as root is left alone
-src/sudoedit.blsp           editing a file as ROOT (Emacs's TRAMP `/sudo::` and `sudo-edit`), the first
-                            file handler (`model/register-file-handler`), over brood's
-                            `sudo` (ADR-588): `C-x C-f /sudo::/etc/hosts` (or `/sudo:USER@:PATH`, this
-                            machine only), `M-x sudo-edit` (the current file, its unsaved text kept),
-                            `C-x C-w /sudo::PATH`. The buffer remembers (`:sudo`, `:sudo-user`, carried
-                            to other frames and a restarted loop by `hosted-meta`): C-x C-s writes it
-                            through sudo in place (`file-save/ed-save-prepare` / `ed-save-landed`), the mode line says
-                            `# root`. A password sudo wants is read masked (`passwd/ed-read-passwd`),
-                            handed to sudo once and kept nowhere — sudo's own timestamp serves the
-                            next save. Every sudo call is a task on `remotejob`'s queue (`:sudo-proc`,
-                            one at a time, C-g stops it): an open shows `Loading…` at once, a save stays modified
-                            until its write lands (`file-save/ed-save-prepare` / `ed-save-landed`), and
-                            C-x C-c / C-x s save root files after their questions and go on when
-                            the last lands. A file is read as BYTES (`sudo/read-bytes`) and goes through
-                            `charset` as any file does; a binary opens as the read-only hex view; a large one is asked about
-                            first (`pool/ed-file-of-spec`); one buffer per file AND user (the
-                            registry `:key` names the user); killing `Loading…` cancels the open.
-                            Under -nw, C-z suspends (`frames/cmd-suspend-frame`, `term/suspend`)
-                            and SIGHUP / SIGTERM auto-save every unsaved buffer before the
-                            terminal is restored (`main/terminal-hangup`). Named to dodge std's `sudo`
-src/remotejob.blsp          the ONE queue a file reached another way runs on, shared by sudoedit and
-                            sshedit (each hands it a spec map: its model keys, its work, its fold):
-                            a job (open / save / revert / listing) is a task, one at a time per
-                            method, a second waiting its turn and never dropped; `Loading…` killed
-                            cancels an open; a password asked for masked only when the prompt is
-                            free (`ask`, `run-waiting`); C-g (`quit`), C-x C-c (`live`), the common
-                            head of a landed job's fold (`landed`), and a save / save-all that keep
-                            the buffer modified until the write lands (`save`, `save-all`)
 src/sshpath.blsp            the TRAMP `/ssh:[user@]host[#port]:path` syntax in ONE place, pure: `parse`,
                             `spec`, `canonical` (a buffer's key), `dirname`, `join`, `remote-start` (a
                             `/ssh:` typed over a path), and `remote?` — what every local tool asks
@@ -194,76 +166,6 @@ src/sshpath.blsp            the TRAMP `/ssh:[user@]host[#port]:path` syntax in O
                             {:method :user}` on the parts, `*become-methods*`, `become-user?`, its
                             own connection). filename, sidecar, mincomplete, dired and the handler all
                             read it
-src/sshremote.blsp          the transport under `/ssh:`: the system `ssh` (`*program*`, a test's
-                            stand-in runs the scripts locally) with one SHARED connection per host
-                            (ControlMaster, the socket in `state/ssh/`, owner-only, ControlPersist
-                            5 min), BatchMode always — a failure classified (`classify`: host key
-                            never accepted, auth, connection dropped). Each operation is a POSIX sh
-                            script on ssh's stdin (`/bin/sh -s` is all the login shell parses; args
-                            `os/shell-quote`d): a read through base64 (bytes, a size limit asked
-                            first), an atomic write (staged beside the file with its mode, size +
-                            SHA-256 checked, renamed), `ls -1pa` for the prompt (kept 10 s, a
-                            table), `stat` rows for dired (`list-entries`, GNU or BSD, a link's `readlink` target) and its
-                            mkdir / mv / cp -pR / rm -rf / ln -sfn / chmod (`make-directory`, `transfer`, `delete-path`, `make-symlink`, `set-mode`,
-                            `file-kind`: never over a directory, over another entry only when told
-                            — a copy staged beside it and renamed over it). Between two machines,
-                            or a host and this one (`run-local`), `cross-transfer`: a tar archive
-                            STREAMED through an OS pipe, never held here — staged where it is
-                            (`stage-pack-script`, size + SHA-256), a receiver left where it goes
-                            (`receiver-script`), one local `sh` running `ssh FROM cat | ssh TO sh
-                            RECEIVER` (`os/pipeline`, brood ADR-696; `stream-side`) — any size; a root-hop side
-                            is carried through the editor instead (`pack-script` /
-                            `unpack-script`, ≤ `*transfer-max-bytes*`, 200 MB). Unpacked in a
-                            staging dir, size + SHA-256 + entry count checked, then renamed; a
-                            move deletes only after. `~user` resolved by the remote shell, the name
-                            checked first. Jump hosts become a nested `ProxyCommand` of `ssh -W`
-                            (`proxy-command`; batch mode for every hop, riding the hop's own
-                            ControlMaster — ssh's `-J` passes no options on), run by `/bin/sh`
-                            (`SHELL`); a route that fails is tried hop by hop (`route-failure`,
-                            `blame-route`), naming the hop. A password opens a connection once —
-                            the host's or a hop's (`connect-with-password`, `hop-parts`: SSH_ASKPASS
-                            helper reading ssh's own stdin, refusing yes/no questions). A root-hop
-                            path's scripts run in `sshsudo`'s root shell (`run`, `become-request`,
-                            `become-connect`; `-tt` for su / doas: `ssh-options`' `tty`)
-src/sshsudo.blsp            the ROOT HOPS' ROOT SHELL (`|sudo:`, `|su:`, `|doas:`), kept open as TRAMP
-                            keeps one (no credential cache can serve the next ssh command: a new
-                            session each). ONE METHOD TABLE (`*methods*`): each method's command,
-                            whether it needs a terminal (su and doas read a password only from
-                            one: ssh `-tt`, the shell then `stty raw -echo`, stderr away so never
-                            interactive), its prompt regex (`prompts-in`) and whose password
-                            (`password-question`, `who`). sudo is told its prompt by
-                            `SUDO_PROMPT`, never `-p` (sudo-rs < 0.2.5 refuses `-p`; its own
-                            `[sudo: authenticate]` is the fallback). A process per route + method +
-                            user over the host's ControlMaster, ended 5 min idle or when the link
-                            drops. The password is written once, only at the method's prompt (a
-                            NOPASSWD / `nopass` rule never gets it); a second prompt, or the method
-                            ending after it, is a wrong one. Each request a script run by its own
-                            `sh` from a temp file, output and errors Base64 between per-request
-                            markers (`request-text`, `parse-reply`), answered as `os/cmd`'s map.
-                            `stop-all` (a test passes its socket dir)
-src/sshedit.blsp            editing a file on ANOTHER MACHINE (Emacs's TRAMP `/ssh:`), the second file
-                            handler (`model/register-file-handler`, sudoedit's shape): `C-x C-f
-                            /ssh:host:/etc/x`. The buffer VISITS the TRAMP path (`buffer-file` is
-                            the spec, `:ssh` its mark, carried by `hosted-meta`), so no local tool
-                            takes it for a file here. Every ssh call a task on `remotejob`'s queue
-                            (`:ssh-proc`, one at a time, C-g stops it): `Loading…` at once, a save
-                            stays modified until it lands (`file-save/ed-save-prepare` /
-                            `ed-save-landed`), a dropped connection said. A password the host, a
-                            jump host or the root hop (`|sudo:`, `|su:`, `|doas:`) wants is read masked
-                            (`passwd/ed-read-passwd`; the job's `:password-for`) and used once.
-                            charset as any file (binary → hex, large → asked); a directory opens in
-                            DIRED (the handler's `:dired`, `ed-ssh-dired`: listed off the loop, then
-                            `dired/ed-dired-show-entries`), whose `+` `R` `C` `D` `x` go through the
-                            handler's file operations (`:make-directory`, `:rename-file`,
-                            `:copy-file` — within a host, between hosts or to and from this machine,
-                            replacing an entry only when asked — `:file-kind`, `:delete-file`, wdired's
-                            `:make-symbolic-link` / `:set-file-modes`,
-                            `:expand-file-name`, `:parent-directory`, Emacs's
-                            file-name-handler-alist — dired names no handler). CI's `ssh-real` job
-                            drives all of it against a real sshd (tools/ci/ssh-real.sh). Its sidecar
-                            is private (`sidecar/private-spec`); auto-revert, diff-hl, LSP, the
-                            formatter, editorconfig, dir-locals, compile, M-! and the project walk
-                            skip it (`sshpath/remote?`). The mode line says `@host` (`@host # root`)
 src/bugreport.blsp          M-x report-bug (Emacs's report-emacs-bug): every error the editor CATCHES
                             (a command, a render error frame, a fontify, a loop the supervisor
                             restarted) reaches its error sink (`model/register-error-sink`),
@@ -1918,4 +1820,115 @@ src/diagnostics/pane.blsp
     C-c ! *Diagnostics*: every warning and error in the buffer, one row per
     finding (`line:col` and the message) in a pane beside it, RET or a click
     visiting it; the command toggles
+```
+
+## tramp — files reached another way (Emacs's TRAMP): as root here, or on another machine over ssh
+
+```
+src/tramp.blsp
+    the context module: loads the sudo and ssh methods, each of which registers a file handler
+    (model/register-file-handler); nothing outside calls into the context
+src/tramp/sudo.blsp
+    editing a file as ROOT (Emacs's TRAMP `/sudo::` and `sudo-edit`), the first
+    file handler (`model/register-file-handler`), over brood's
+    `sudo` (ADR-588): `C-x C-f /sudo::/etc/hosts` (or `/sudo:USER@:PATH`, this
+    machine only), `M-x sudo-edit` (the current file, its unsaved text kept),
+    `C-x C-w /sudo::PATH`. The buffer remembers (`:sudo`, `:sudo-user`, carried
+    to other frames and a restarted loop by `hosted-meta`): C-x C-s writes it
+    through sudo in place (`file-save/ed-save-prepare` / `ed-save-landed`), the mode line says
+    `# root`. A password sudo wants is read masked (`passwd/ed-read-passwd`),
+    handed to sudo once and kept nowhere — sudo's own timestamp serves the
+    next save. Every sudo call is a task on `remotejob`'s queue (`:sudo-proc`,
+    one at a time, C-g stops it): an open shows `Loading…` at once, a save stays modified
+    until its write lands (`file-save/ed-save-prepare` / `ed-save-landed`), and
+    C-x C-c / C-x s save root files after their questions and go on when
+    the last lands. A file is read as BYTES (`sudo/read-bytes`) and goes through
+    `charset` as any file does; a binary opens as the read-only hex view; a large one is asked about
+    first (`pool/ed-file-of-spec`); one buffer per file AND user (the
+    registry `:key` names the user); killing `Loading…` cancels the open.
+    Under -nw, C-z suspends (`frames/cmd-suspend-frame`, `term/suspend`)
+    and SIGHUP / SIGTERM auto-save every unsaved buffer before the
+    terminal is restored (`main/terminal-hangup`). Named to dodge std's `sudo`
+src/tramp/job.blsp
+    the ONE queue a file reached another way runs on, shared by sudoedit and
+    sshedit (each hands it a spec map: its model keys, its work, its fold):
+    a job (open / save / revert / listing) is a task, one at a time per
+    method, a second waiting its turn and never dropped; `Loading…` killed
+    cancels an open; a password asked for masked only when the prompt is
+    free (`ask`, `run-waiting`); C-g (`quit`), C-x C-c (`live`), the common
+    head of a landed job's fold (`landed`), and a save / save-all that keep
+    the buffer modified until the write lands (`save`, `save-all`)
+src/tramp/ssh-transport.blsp
+    the transport under `/ssh:`: the system `ssh` (`*program*`, a test's
+    stand-in runs the scripts locally) with one SHARED connection per host
+    (ControlMaster, the socket in `state/ssh/`, owner-only, ControlPersist
+    5 min), BatchMode always — a failure classified (`classify`: host key
+    never accepted, auth, connection dropped). Each operation is a POSIX sh
+    script on ssh's stdin (`/bin/sh -s` is all the login shell parses; args
+    `os/shell-quote`d): a read through base64 (bytes, a size limit asked
+    first), an atomic write (staged beside the file with its mode, size +
+    SHA-256 checked, renamed), `ls -1pa` for the prompt (kept 10 s, a
+    table), `stat` rows for dired (`list-entries`, GNU or BSD, a link's `readlink` target) and its
+    mkdir / mv / cp -pR / rm -rf / ln -sfn / chmod (`make-directory`, `transfer`, `delete-path`, `make-symlink`, `set-mode`,
+    `file-kind`: never over a directory, over another entry only when told
+    — a copy staged beside it and renamed over it). Between two machines,
+    or a host and this one (`run-local`), `cross-transfer`: a tar archive
+    STREAMED through an OS pipe, never held here — staged where it is
+    (`stage-pack-script`, size + SHA-256), a receiver left where it goes
+    (`receiver-script`), one local `sh` running `ssh FROM cat | ssh TO sh
+    RECEIVER` (`os/pipeline`, brood ADR-696; `stream-side`) — any size; a root-hop side
+    is carried through the editor instead (`pack-script` /
+    `unpack-script`, ≤ `*transfer-max-bytes*`, 200 MB). Unpacked in a
+    staging dir, size + SHA-256 + entry count checked, then renamed; a
+    move deletes only after. `~user` resolved by the remote shell, the name
+    checked first. Jump hosts become a nested `ProxyCommand` of `ssh -W`
+    (`proxy-command`; batch mode for every hop, riding the hop's own
+    ControlMaster — ssh's `-J` passes no options on), run by `/bin/sh`
+    (`SHELL`); a route that fails is tried hop by hop (`route-failure`,
+    `blame-route`), naming the hop. A password opens a connection once —
+    the host's or a hop's (`connect-with-password`, `hop-parts`: SSH_ASKPASS
+    helper reading ssh's own stdin, refusing yes/no questions). A root-hop
+    path's scripts run in `sshsudo`'s root shell (`run`, `become-request`,
+    `become-connect`; `-tt` for su / doas: `ssh-options`' `tty`)
+src/tramp/ssh-root.blsp
+    the ROOT HOPS' ROOT SHELL (`|sudo:`, `|su:`, `|doas:`), kept open as TRAMP
+    keeps one (no credential cache can serve the next ssh command: a new
+    session each). ONE METHOD TABLE (`*methods*`): each method's command,
+    whether it needs a terminal (su and doas read a password only from
+    one: ssh `-tt`, the shell then `stty raw -echo`, stderr away so never
+    interactive), its prompt regex (`prompts-in`) and whose password
+    (`password-question`, `who`). sudo is told its prompt by
+    `SUDO_PROMPT`, never `-p` (sudo-rs < 0.2.5 refuses `-p`; its own
+    `[sudo: authenticate]` is the fallback). A process per route + method +
+    user over the host's ControlMaster, ended 5 min idle or when the link
+    drops. The password is written once, only at the method's prompt (a
+    NOPASSWD / `nopass` rule never gets it); a second prompt, or the method
+    ending after it, is a wrong one. Each request a script run by its own
+    `sh` from a temp file, output and errors Base64 between per-request
+    markers (`request-text`, `parse-reply`), answered as `os/cmd`'s map.
+    `stop-all` (a test passes its socket dir)
+src/tramp/ssh.blsp
+    editing a file on ANOTHER MACHINE (Emacs's TRAMP `/ssh:`), the second file
+    handler (`model/register-file-handler`, sudoedit's shape): `C-x C-f
+    /ssh:host:/etc/x`. The buffer VISITS the TRAMP path (`buffer-file` is
+    the spec, `:ssh` its mark, carried by `hosted-meta`), so no local tool
+    takes it for a file here. Every ssh call a task on `remotejob`'s queue
+    (`:ssh-proc`, one at a time, C-g stops it): `Loading…` at once, a save
+    stays modified until it lands (`file-save/ed-save-prepare` /
+    `ed-save-landed`), a dropped connection said. A password the host, a
+    jump host or the root hop (`|sudo:`, `|su:`, `|doas:`) wants is read masked
+    (`passwd/ed-read-passwd`; the job's `:password-for`) and used once.
+    charset as any file (binary → hex, large → asked); a directory opens in
+    DIRED (the handler's `:dired`, `ed-ssh-dired`: listed off the loop, then
+    `dired/ed-dired-show-entries`), whose `+` `R` `C` `D` `x` go through the
+    handler's file operations (`:make-directory`, `:rename-file`,
+    `:copy-file` — within a host, between hosts or to and from this machine,
+    replacing an entry only when asked — `:file-kind`, `:delete-file`, wdired's
+    `:make-symbolic-link` / `:set-file-modes`,
+    `:expand-file-name`, `:parent-directory`, Emacs's
+    file-name-handler-alist — dired names no handler). CI's `ssh-real` job
+    drives all of it against a real sshd (tools/ci/ssh-real.sh). Its sidecar
+    is private (`sidecar/private-spec`); auto-revert, diff-hl, LSP, the
+    formatter, editorconfig, dir-locals, compile, M-! and the project walk
+    skip it (`sshpath/remote?`). The mode line says `@host` (`@host # root`)
 ```
