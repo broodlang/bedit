@@ -1,0 +1,91 @@
+(defmodule showparen
+  "Show-paren: the bracket pair at point painted as two one-character overrides — the end at
+point underlined, its partner as a block, a lone unmatched bracket in the error face — through
+the buffer's mode (`:bracket-match`, or `:bracket-match-tree` over the held parse). Registered
+as an override source (`model/register-override-source`), so the view names no bracket."
+  (:use editor/buffer)
+  (:use model)
+  (:use theme) ; face-bracket-here / -match / -error
+  (:use memo))
+
+(def ed-bracket-scan 4000) ; max chars each side of point the bracket matcher scans
+
+;; check-allow: a hit comes back out of the memo's store, which the checker reads as
+;; unknown; the store only ever holds what the body below built, a list of `[pos face]`.
+(check-allow :trusted
+  (defmemo ed-bracket-overrides-at 1 (rope pt bm faces)
+    "`ed-bracket-overrides` for point `pt` in `rope`, matched by the mode's `bm` and painted
+in `faces` (`[here match error]`). Memoised on all four — one entry: it hits on idle frames,
+ticks and blink events where nothing changed, and misses after any edit or motion. The
+faces are in the key so a theme switch repaints the pair at once; before, the old colours
+stayed until point moved."
+    (let ([face-here face-match face-error] faces
+          n (count rope)
+          lo (math/max 0 (- pt ed-bracket-scan))
+          hi (math/min n (+ pt ed-bracket-scan))
+          clipped (or (> lo 0) (< hi n))
+          r (bm (text/slice rope lo hi) (- pt lo)))
+      (cond
+        (nil? r) '()
+        (= (second r) :unmatched) (if clipped '() (list [(+ lo (first r)) face-error]))
+        ;; The two ends get DIFFERENT faces, so the solid block always means "the other end":
+        ;; the bracket at point (the one just left of the cursor, else under it — the
+        ;; matcher's own adjacency rule) takes an underline accent the cursor sits on, its
+        ;; partner the block. One glance answers which end of the pair you are at.
+        else
+          (let (relpt (- pt lo)
+                a (first r)
+                b (second r)
+                adj (if (or (= a (dec relpt)) (= a relpt)) a b)
+                far (if (= adj a) b a))
+            (list [(+ lo adj) face-here] [(+ lo far) face-match]))))))
+
+(sig ed-bracket-overrides-at (any int fn vector -> list))
+
+;; check-allow: as `ed-bracket-overrides-at`'s — a hit is the memo store's, a `[pos face]` list
+(check-allow :trusted
+  (defmemo ed-bracket-tree-overrides-at 1 (tree rope pt bm faces)
+    "`ed-bracket-overrides` over the buffer's held `tree` of exactly `rope`: the mode's
+`:bracket-match-tree` service `bm` matches in the whole document, so there is no window
+and no clipping — an `:unmatched` is the parse's own verdict. Memoised like the window's."
+    (let ([face-here face-match face-error] faces
+          r (bm tree rope pt))
+      (cond
+        (nil? r) '()
+        (= (second r) :unmatched) (list [(first r) face-error])
+        else
+          (let (a (first r)
+                b (second r)
+                adj (if (or (= a (dec pt)) (= a pt)) a b))
+            (list [adj face-here] [(if (= adj a) b a) face-match]))))))
+
+(sig ed-bracket-tree-overrides-at (any any int fn vector -> list))
+
+(defn ed-bracket-overrides (buf &optional (tree nil))
+  "`[pos face]` overrides for the bracket pair adjacent to point, via `buf`'s mode
+`:bracket-match` service: the matched pair in the match face, a lone unmatched bracket
+in the error face, or `()` when there's no service or no bracket at point. The match is
+sought within a `ed-bracket-scan`-char window each side of point (not the whole
+buffer), so a deep point in a large file costs O(window), not O(point); a partner
+beyond the window is treated as not found, and a window-clipped `:unmatched` is
+suppressed (no false red) rather than scanning the rest of the buffer.
+
+`tree` is the buffer's held parse of exactly its text, when the caller has one
+(`syntaxtree`): a tree-sitter mode's `:bracket-match-tree` then reads the pair off it
+(`tsbrackets/match-tree`) — no window, no parse of a slice."
+  (let (bm-tree (when tree (ed-mode-service buf :bracket-match-tree))
+        bm (ed-mode-service buf :bracket-match)
+        faces [face-bracket-here face-bracket-match face-bracket-error])
+    (cond
+      ;; no bracket match on a buffer whose line may be a megabyte of brackets (so-long)
+      (:line-services-off buf) '()
+      bm-tree (ed-bracket-tree-overrides-at tree (buffer-rope buf) (buffer-point buf) bm-tree faces)
+      (nil? bm) '()
+      else (ed-bracket-overrides-at (buffer-rope buf) (buffer-point buf) bm faces))))
+
+(defn bracket-source (m pane buf geometry)
+  "The override source's run: the pair at point in the selected pane, over the held parse when
+there is one (`syntaxtree/pane-held-tree`)."
+  (ed-bracket-overrides buf (syntaxtree/pane-held-tree m (map/get-in pane [:payload :buffer]) buf)))
+
+(register-override-source :bracket-pair {:rank 10 :run 'showparen/bracket-source})

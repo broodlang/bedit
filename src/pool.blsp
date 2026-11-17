@@ -342,6 +342,38 @@ unchanged. (Routes through `ed-map-panes` over all leaf payloads.)"
         (assoc window
           :buffer (cond (< shown killed) shown (> shown killed) (dec shown) else target))))))
 
+(defn ed-close-opened-for (m index name)
+  "`m` with every pane that was split off to show buffer `name` (`:opened-for`, set where
+[[ed-display-buffer]] splits) and still shows it, at pool `index`, closed — Emacs's
+`quit-window` on a window made for its buffer, so `q` in a report opened beside your work
+gives the frame back as it was. The last pane is never closed; selection moves to the
+sibling of a closed selected pane (`pane-delete`)."
+  (let (layout (:layout m)
+        here (pane-selected-path layout)
+        opened (seq/find (pane-leaf-paths layout)
+                 (fn (path)
+                   (let (payload (pane-payload-at layout path))
+                     (and (= (:buffer payload) index) (= (:opened-for payload) name)))))
+        others (seq/filter (pane-leaf-paths layout) (fn (path) (not (= path opened)))))
+    (if (or (nil? opened) (empty? others))
+      m
+      (let (
+            ;; selection stays where it was unless it was on the closed pane. The paths shift
+            ;; when a split collapses, so the selected pane is tagged before and found by its
+            ;; tag after — not by its payload, which a pane split from it (C-x 2) shares
+            tagged (if (= here opened)
+                     layout
+                     (pane-update-path layout here (fn (pane) (assoc pane :keep-selected true))))
+            closed (pane-delete (pane-select-path tagged opened))
+            back (seq/find (pane-leaf-paths closed)
+                   (fn (path) (:keep-selected (pane-payload-at closed path))))
+            restored (if (nil? back)
+                       closed
+                       (pane-update-path (pane-select-path closed back)
+                         back
+                         (fn (pane) (dissoc pane :keep-selected)))))
+        (ed-close-opened-for (assoc m :layout restored) index name)))))
+
 (defn- ed-kill-replacement (m removed killed-idx)
   "The pool index, in `removed` (the pool after the kill), of the buffer a pane that showed
 the killed one turns to — Emacs's `other-buffer`: the most recently selected buffer that no
@@ -356,7 +388,12 @@ killed slot when nothing was ever selected (a fresh session's pool)."
                     (when (not (= index killed-idx)) (buffer-name (nth (:buffers m) index))))))
         recent (seq/filter (ed-recent-buffers m)
                  (fn (name) (and (not (= name killed-name)) (includes? names name))))
-        pick (or (seq/find recent (fn (name) (not (includes? shown name)))) (first recent)))
+        ;; a buffer no other pane shows, *Messages* last: a pane is left on the log only
+        ;; when nothing else is open
+        pick (or (seq/find recent
+                   (fn (name) (and (not (includes? shown name)) (not (= name "*Messages*")))))
+               (seq/find recent (fn (name) (not (includes? shown name))))
+               (first recent)))
     (if (nil? pick) (math/min killed-idx (dec (count removed))) (index-of names pick))))
 
 (defn ed-closed-with-source (m name)
@@ -392,7 +429,7 @@ loop."
         ;; (Emacs deletes a killed buffer's auto-save file) — on every kill path, here
         _ (when (buffer-file buf) (ed-forget-auto-save buf))
         ;; everything kept by pool index follows the pool (`model/register-slot-keeper`)
-        m0 (ed-drop-slot m killed-idx)
+        m0 (ed-close-opened-for (ed-drop-slot m killed-idx) killed-idx (buffer-name buf))
         removed (seq/remove-nth (:buffers m0) killed-idx)
         label (str "killed " (buffer-name buf))
         m1 (if (ed-has-editable? removed)
@@ -499,12 +536,14 @@ behind `ed-display-buffer` (an existing window wins over a fresh split, like Ema
 `display-buffer`). Reads each pane's payload by path (`pane-payload-at`, std editor/pane)."
   (seq/find (pane-leaf-paths layout) (fn (p) (= index (:buffer (pane-payload-at layout p))))))
 
-(defn- ed-place-aside (layout index)
-  "Show buffer `index` in a pane beside the selected one, returning `{:layout :path}`: re-point the
-next MAIN pane in traversal order, else split one off — the selected pane, or, when that is a
-side window, the first main pane — the new pane at `:path`. A side window is never taken for
-another buffer: it belongs to what its rule sent there. Selection is left untouched — the caller
-decides whether to move onto `:path`."
+(defn- ed-place-aside (layout index name)
+  "Show buffer `index` (named `name`) in a pane beside the selected one, returning
+`{:layout :path}`: re-point the next MAIN pane in traversal order, else split one off — the
+selected pane, or, when that is a side window, the first main pane — the new pane at `:path`,
+remembering it was opened for `name` (`:opened-for`, Emacs's `quit-restore`): killing that
+buffer closes the pane rather than leaving it on whatever was recent ([[ed-close-opened-for]]).
+A side window is never taken for another buffer: it belongs to what its rule sent there.
+Selection is left untouched — the caller decides whether to move onto `:path`."
   (let (other (ed-other-pane-path layout)
         here (pane-selected-path layout)
         side? (fn (path) (not (nil? (:side (pane-payload-at layout path))))))
@@ -514,7 +553,7 @@ decides whether to move onto `:path`."
                    here)
             target (or main here)
             split (pane-select-path (pane-split (pane-select-path layout target)
-                                      :col (ed-pane index))
+                                      :col (assoc (ed-pane index) :opened-for name))
                     (append target (list :a))))
         ;; selection back where it was: the side window, or the pane that was split (now `:a`)
         {:layout (if (= target here) split (pane-select-path split here))
@@ -524,14 +563,14 @@ decides whether to move onto `:path`."
                  (fn (w) (assoc w :buffer index :top 0 :point nil :mark nil)))
        :path other})))
 
-(sig ed-place-other (map int -> (record &open :layout map :path list)))
-(defn- ed-place-other (layout index)
-  "Where buffer `index` goes when it is shown in a pane OTHER than the selected one,
+(sig ed-place-other (map int string -> (record &open :layout map :path list)))
+(defn- ed-place-other (layout index name)
+  "Where buffer `index` (named `name`) goes when it is shown in a pane OTHER than the selected one,
 `{:layout :path}`: the pane already showing it when there is one (`ed-pane-showing` — reuse
 wins, as in Emacs `display-buffer`), else a pane beside the selected one (`ed-place-aside`).
 Selection is left untouched."
   (let (existing (ed-pane-showing layout index))
-    (if (nil? existing) (ed-place-aside layout index) {:layout layout :path existing})))
+    (if (nil? existing) (ed-place-aside layout index name) {:layout layout :path existing})))
 
 ;; ---- display-buffer rules (Emacs's `display-buffer-alist`) --------------------------------
 ;; WHERE a buffer goes is the user's to say: init.blsp's `:display-buffer` is an ordered list of
@@ -665,7 +704,7 @@ cursor)."
                        :none (if (nil? showing) nil {:layout layout :path showing})
                        :reuse {:layout layout :path showing}
                        :side (ed-place-side layout index (:side action) (:size action))
-                       (ed-place-other layout index))
+                       (ed-place-other layout index name))
               m1 (if (and (= kind :new-frame) (nil? framed))
                    (message m1 "a new frame needs the live editor; shown beside instead")
                    m1))
@@ -734,7 +773,7 @@ that pane and put point on the line — the placement half of [[ed-pop-to-file]]
 location naming a BUFFER lands exactly where one naming a file does. A nil `line` leaves
 point where it was: Emacs's `pop-to-buffer` on a buffer you asked to see again. A pane
 already showing the buffer is reused, the current one included."
-  (let (placed (ed-place-other (:layout m) index)
+  (let (placed (ed-place-other (:layout m) index (buffer-name (ed-buf-at m index)))
         m1 (assoc m :layout (pane-select-path (:layout placed) (:path placed))))
     ;; point moves; the loop's own scroll-clamp on the (now-selected) source pane
     ;; brings it on screen this tick, as with `cmd-goto-definition`.

@@ -9,7 +9,7 @@ minibuffer's prompt and candidate list (Plume), and the which-key grid."
   (:use plume) ; marginalia annotations + the N/M counter
   (:use theme)
   (:use ui-kit)
-  (:use whichkey :only []) ; the which-key panel's turned page
+  (:use whichkey :only []) ; the which-key panel's cells and its turned page
   (:use editor/ui :only [ui-memo])
   (:use editor/display) ; text / frect render ops
   (:use conventions :only [*glyphless-chars*])) ; how an invisible character is shown
@@ -26,41 +26,34 @@ prompt without one. Shown after the input so you see what completion will offer.
       ; memoized on the input text (minibuffer/mb-candidates)
       (if (empty? candidates) "   {no match}" (str "   {" (string/join candidates " ") "}")))))
 
-(defn- ed-diagnostic-on-line (m buf)
-  "The `\"warning: …\"` text of the first cached diagnostic on `buf`'s current line
-(a diagnostic's 1-based `:line` maps to the 0-based buffer line), or nil."
-  (let (hit (first (get (or (:diag-by-line m) {}) (buffer-current-line buf) '())))
-    (when hit (str "warning: " (:message hit)))))
-
-(defn ed-eol-note-on-line (buf)
-  "The end-of-line note on `buf`'s current line, in full — the echo-row seat of the
-feedback (the gutter shows the glyph, the ghost text may be clipped; here the whole
-text fits). Silent once the note is stale: an edited line's old result shouldn't
-keep talking."
-  (when (not (eolnotes/eol-notes-stale? buf))
-    (eolnotes/eol-note-at buf (buffer-current-line buf))))
-
 (defn ed-echo-or-eldoc (m)
-  "The echo-row text when no minibuffer is open, by precedence: the latest explicit
-`message`; else a **diagnostic on the current line**; else the tutorial note on the
-current line (the full verdict/hint for the box at point); else the model's cached
-`:eldoc` hint (the current buffer mode's signature for point, e.g. `(map coll f)`,
-refreshed by `input/ed-post-step` once per event); else `\"\"`.
+  "The echo-row text when no minibuffer is open: what the first registered echo source by rank
+has to say (`model/register-echo-source`), else `\"\"`. A standing one-key QUESTION (a y/n read, a
+query-replace's y/n/!/./q — `model/ed-standing-question`) comes first: its prompt stays on the
+row until it is answered, with any message that arrived meanwhile after it in brackets. Then the
+latest explicit `message`; then what features register — a diagnostic on point's line
+(`diagpaint`), the note there in full (`eolnotes`), the mode's eldoc hint (`eldoc`)."
+  (ed-echo-text m))
 
-A standing one-key QUESTION (a y/n read, a query-replace's y/n/!/./q —
-`model/ed-standing-question`) comes before all of them: its prompt stays on the row until
-it is answered, with any message that arrived meanwhile after it in brackets."
-  (let (question (ed-standing-question m)
-        echo (:echo m))
-    (cond
-      question (ed-with-question-message (:prompt question) (:message question))
-      (not (= echo "")) echo
-      else
-        (let (buf (ed-current-buf m)
-              diagnostic (ed-diagnostic-on-line m buf))
-          ;; the eldoc hint is cached on the model by `ed-post-step` (computed once per
-          ;; event, not re-derived here every frame) — just paint it.
-          (or diagnostic (ed-eol-note-on-line buf) (:eldoc m) "")))))
+(defn question-echo (m _buf)
+  "The echo source of a standing one-key question: its prompt, any message since in brackets."
+  (let (question (ed-standing-question m))
+    (when question (ed-with-question-message (:prompt question) (:message question)))))
+
+(defn message-echo (m _buf)
+  "The echo source of the latest explicit `message`."
+  (:echo m))
+
+(register-echo-source :question {:rank 0 :run 'echoarea/question-echo})
+(register-echo-source :message {:rank 10 :run 'echoarea/message-echo})
+
+(defn ed-mb-counter (minibuffer)
+  "The `N/M` counter a selection prompt leads with (`plume-count-label`), `N/M+` when its
+ranked list was cut at the prompt's `:rank-cap` (more match than are shown)."
+  (let (total (count (mb-candidates minibuffer)))
+    (plume-count-label (mb-sel minibuffer)
+      total
+      (and (not (nil? (:rank-source minibuffer))) (>= total (or (:rank-cap minibuffer) 20))))))
 
 (defn ed-echo-line (m columns rows)
   "The bottom row (`rows-1`): the active minibuffer prompt + input if one is open,
@@ -79,9 +72,7 @@ plain prompt (find-file) keeps the inline ` {a b c}` here."
         (ed-fit-cells
           (let (selecting? (:accept-selection minibuffer)
                 ;; a Plume prompt leads with the `N/M` candidate counter
-                counter (if selecting?
-                          (plume-count-label (mb-sel minibuffer) (count (mb-candidates minibuffer)))
-                          ""))
+                counter (if selecting? (ed-mb-counter minibuffer) ""))
             (str counter
               (mb-prompt minibuffer)
               (ed-mb-shown (mb-shown-text minibuffer) (ed-mb-input-col minibuffer))
@@ -116,10 +107,7 @@ caret and its shadow all measure this, so they agree on where the input's charac
   "The echo-row column where `minibuffer`'s INPUT begins: after the `N/M ` counter (a
 selection prompt) and the prompt, in display cells — where `ed-echo-line` puts it, the caret
 and the shadow measure from."
-  (+ (if (:accept-selection minibuffer)
-       (string/display-width (plume-count-label (mb-sel minibuffer)
-                               (count (mb-candidates minibuffer))))
-       0)
+  (+ (if (:accept-selection minibuffer) (string/display-width (ed-mb-counter minibuffer)) 0)
     (string/display-width (mb-prompt minibuffer))))
 
 (sig ed-mb-shadow-ops (map int int -> any))
@@ -289,97 +277,16 @@ prompt or a composition: a buffer pane paints its own at point (`ed-preedit-op`)
       (let (column (ed-mb-caret-column minibuffer columns))
         (list (ed-preedit-op m (ed-mb-row m rows) column (- columns column)))))))
 
-(defn- ed-which-key-rows (keymap)
-  "Sorted `\"<key>   <command>\"` rows for the entries of pending sub-keymap `keymap`, the key
-column padded to a common width so the command column lines up across rows."
-  (let (pairs (%map-pairs keymap)
-        key-width (fold pairs
-                    0
-                    (fn (widest pair)
-                      (math/max widest (string/display-width (ed-key-label (first pair)))))))
-    (sort (map pairs
-            (fn (pair)
-              (str (string/pad-right-cells (ed-key-label (first pair)) key-width)
-                "   "
-                (ed-cmd-label (second pair))))))))
-
-(defn- ed-grid-columns (columns available)
-  "The leading `columns` (each a vector of cells) that fit side by side in `available`, each as
-`{:cells :width :used :gap}` — its widest cell, the width of the columns before it and the
-gap that separates it from them. The first always fits; the first that does not ends the
-grid."
-  (reverse
-    (second
-      (seq/reduce-while columns
-        [0 '()]
-        (fn (state cells)
-          (let ([used placed] state
-                width (fold cells
-                        0
-                        (fn (widest cell) (math/max widest (string/display-width cell))))
-                gap (if (empty? placed) 0 3)
-                end (+ used gap width))
-            (if (and (not (empty? placed)) (> end available))
-              [:halt state] ; no room for another column
-              [:cont [end (cons {:cells cells :width width :used used :gap gap} placed)]])))))))
-
-(defn- ed-grid-row (grid index)
-  "Row `index` of the laid-out `grid` (`ed-grid-columns`): each column's `index`th cell (blank past
-its end) padded to the column's width, after its gap — the row so far padded to the width
-of the columns before it."
-  (fold grid
-    ""
-    (fn (row column)
-      (str (string/pad-right-cells row (:used column))
-        (string/pad-right "" (:gap column))
-        (string/pad-right-cells (nth (:cells column) index "") (:width column))))))
-
-(defn- ed-grid-fitted (grid)
-  "How many cells the laid-out `grid` (`ed-grid-columns`) holds."
-  (fold grid 0 (fn (total column) (+ total (count (:cells column))))))
-
 (defn- ed-page-label (index total)
   "The last cell of a paged which-key panel: which page this is and the keys that turn it."
   (str "page " index "/" total " · C-h n/p"))
 
-(sig ed-which-key-pages (any any -> (vector vector)))
-(defn- ed-which-key-pages (items laid)
-  "`items` split into the pages the grid `laid` lays out: one page when they all fit, else
-pages each keeping its last cell for the page label. Each page is filled with as many items
-as fit beside a label as wide as the widest it could need (`ed-page-label` over the item
-count), so the real label always fits."
-  (if (>= (ed-grid-fitted (laid items)) (count items))
-    [items]
-    (let (widest-label (ed-page-label (count items) (count items)))
-      (letrec (paginate (fn (remaining pages)
-                          (if (empty? remaining)
-                            pages
-                            (let (fitted (ed-grid-fitted (laid (conj remaining widest-label)))
-                                  size (if (> fitted (count remaining))
-                                         (count remaining)
-                                         (math/max 1 (dec fitted))))
-                              (paginate (vec (drop remaining size))
-                                (conj pages (vec (take remaining size))))))))
-        (paginate (vec items) [])))))
-
 (defn- ed-which-key-columns (items rows-per-column available &optional (page 0))
-  "`items` laid out down-then-across in columns of `rows-per-column` rows, as `rows-per-column` (or fewer) row
-strings — each column padded to its widest entry plus a gap, columns added while they
-fit in `available` (Emacs which-key's grid, `ed-grid-columns`). A prefix with more continuations
-than one column holds spreads them across; one with more than the grid holds (`C-x` has 60+
-at 80 columns) is split into pages (`ed-which-key-pages`), page `page` shown (it wraps: one
-past the last is the first, -1 the last), its last cell saying which page it is
-(`page 1/3 · C-h n/p`) — `C-h n` / `C-h p` turn them (`whichkey`)."
-  (let (rows-per-column (math/max 1 rows-per-column)
-        laid (fn (shown) (ed-grid-columns (seq/chunk-every shown rows-per-column) available))
-        pages (ed-which-key-pages items laid)
-        index (math/mod page (count pages))
-        shown (if (= (count pages) 1)
-                items
-                (conj (nth pages index) (ed-page-label (inc index) (count pages))))
-        grid (laid shown))
-    (map (range (math/min rows-per-column (count shown)))
-      (fn (index) (string/trim-right (ed-grid-row grid index))))))
+  "`items` laid out as which-key's grid (`keycolumns/grid-rows`): down then across in columns
+of `rows-per-column` rows, as many as fit in `available`. A prefix with more continuations than
+the grid holds (`C-x` has 60+ at 80 columns) is split into pages, page `page` shown, its last
+cell saying which (`page 1/3 · C-h n/p`) — `C-h n` / `C-h p` turn them (`whichkey`)."
+  (keycolumns/grid-rows items rows-per-column available page ed-page-label))
 
 (defn ed-which-key-ops (m columns rows)
   "When a prefix chord has been pending past the which-key delay (`:which-key` set by
@@ -391,7 +298,7 @@ row, the same shape as Plume's candidate list. `[]` otherwise, so a fast chord (
         visible (dec (ed-echo-rows m rows)) ; reserved rows minus the echo row
         window (if (or (nil? keymap) (not (:which-key m)) (:minibuffer m) (:menu m))
                  '()
-                 (ed-which-key-columns (ed-which-key-rows keymap)
+                 (ed-which-key-columns (whichkey/panel-items m keymap visible)
                    visible
                    columns
                    (whichkey/page m))))

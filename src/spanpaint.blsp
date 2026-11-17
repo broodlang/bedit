@@ -1,14 +1,15 @@
 (defmodule spanpaint
   "What colours a line: the span band a pane keeps (`spancache`) sliced per line and tiled onto
-its text, the layers under the mode's colouring (ANSI, diagnostics underlines), bracket matches as
-overrides, and the highlight ranges (the region, the transient overlays) cut to a line."
+its text, the layers under the mode's colouring (ANSI, semantic tokens), and the one-character
+overrides and the highlight ranges every source gives, grouped and cut to a line. It names no
+feature: the bracket pair, a diagnostic's wave, the region and a search match are sources
+their own modules register."
   (:use editor/buffer)
   (:use model)
   (:use spancache)
   (:use editor/highlight)
   (:use theme)
   (:use ui-kit)
-  (:use editor/display)
   (:use memo))
 
 ;; ---- tiling a line: spans, overrides and ranges as `[substring face]` chunks ----
@@ -35,163 +36,13 @@ highlight ranges."
       hl-ranges
       (append (map overrides (fn (o) (let ([p f] o) [p (inc p) f]))) hl-ranges))))
 
-(defn- ed-chunks->ops-impl (row x col limit chunks acc)
-  "Tail-recursive: `text` ops for `[substring face]` `chunks` laid left-to-right from
-screen column `x`, where `col` is the LINE column the next chunk starts at (its tab stops
-are the line's, not the chunk's — ADR-342) and `limit` the screen column past which
-nothing is painted. Each chunk's tabs are expanded at its column (`string/expand-tabs`)
-and it advances `x` by its cell width, so a wide glyph or a tab pushes what follows."
-  (if (or (empty? chunks) (>= x limit))
-    (reverse acc)
-    (let (chunk (first chunks)
-          s (first chunk)
-          f (second chunk)
-          ;; a VIRTUAL chunk (inline text, `ed-splice-inline`) is not the line's: its tabs are
-          ;; not the line's to expand and it moves no tab stop after it
-          virtual? (= (nth chunk 2 nil) :virtual)
-          expanded (if virtual? s (string/expand-tabs s col))
-          ;; ONE width per chunk where there were three. The expansion occupies exactly
-          ;; `(string/display-width s col)` cells (std's guarantee), so its width is also the
-          ;; line-column advance; and only a chunk that overruns the limit needs the clip,
-          ;; whose own width is then measured again. A row is a dozen chunks and a typing
-          ;; frame re-renders every row, so these were most of a row's cost.
-          full-cells (string/display-width expanded)
-          room (- limit x)
-          shown (if (<= full-cells room) expanded (ed-fit-cells expanded room))
-          cells (if (<= full-cells room) full-cells (string/display-width shown)))
-      (ed-chunks->ops-impl row
-        (+ x cells)
-        (if virtual? col (+ col full-cells))
-        limit
-        (rest chunks)
-        (cons (if (nil? f) (text row x shown) (text row x shown f)) acc)))))
+;; Laying the chunks out — tab stops, cell widths, the clip, inline hints as virtual chunks —
+;; is std's: `editor/display/chunk-ops` and `editor/display/splice-inline`.
 
-(sig ed-chunks->ops (int int list &optional int int -> list))
-
-(defn ed-chunks->ops (row x chunks &optional (col 0) (limit 100000))
-  "`text` ops for `[substring face]` `chunks`, starting at screen column `x` on `row`;
-`col` is the line column the first chunk starts at (0 unless the view is h-scrolled) and
-`limit` the screen column to clip at."
-  (ed-chunks->ops-impl row x col limit chunks '()))
-
-(sig ed-splice-inline-step (list list int list -> any))
-(defn- ed-splice-inline-step (chunks inline at acc)
-  "Tail-recursive: `acc` (reversed) plus `chunks`, the first starting at char `at` of the
-row's text, with each of `inline` (`[index text face]`, ascending by index) inserted as a
-virtual chunk before the char at its index — splitting the chunk it falls inside."
-  (cond
-    (empty? inline) (append (reverse acc) chunks)
-    (empty? chunks)
-    ;; past the row's last char: what is anchored at its end, in order
-      (append (reverse acc)
-        (map inline (fn (annotation) [(second annotation) (nth annotation 2) :virtual])))
-    else
-      (let (annotation (first inline)
-            anchor (first annotation)
-            index (if (int? anchor) anchor at)
-            chunk (first chunks)
-            s (first chunk)
-            n (count s))
-        (cond
-          (<= index at)
-            (ed-splice-inline-step chunks
-              (rest inline)
-              at
-              (cons [(second annotation) (nth annotation 2) :virtual] acc))
-          (>= index (+ at n)) (ed-splice-inline-step (rest chunks) inline (+ at n) (cons chunk acc))
-          else
-            (let (cut (- index at))
-              (ed-splice-inline-step (cons [(string/substring s cut n) (second chunk)]
-                                       (rest chunks))
-                inline
-                index
-                (cons [(string/substring s 0 cut) (second chunk)] acc)))))))
-
-(defn ed-splice-inline (chunks inline)
-  "`[substring face]` `chunks` tiling a row's text with its INLINE annotations spliced in —
-`inline` is `[index text face]`, `index` the char of the row's text the annotation is painted
-before (its length: after the last), ascending — each a VIRTUAL chunk `[text face :virtual]`
-that `ed-chunks->ops` paints without moving the line's tab stops. `chunks` itself for none.
-
-    (spanpaint/ed-splice-inline [[\"f(1)\" nil]] [[2 \"x: \" :dim]])   ;=> ([\"f(\" nil] [\"x: \" :dim :virtual] [\"1)\" nil])"
-  (if (empty? inline) chunks (ed-splice-inline-step (seq chunks) (seq inline) 0 '())))
-
-;; ---- overrides: the bracket pair at point, grouped by line -----------------------
-
-(def ed-bracket-scan 4000) ; max chars each side of point the bracket matcher scans
-
-;; check-allow: a hit comes back out of the memo's store, which the checker reads as
-;; unknown; the store only ever holds what the body below built, a list of `[pos face]`.
-(check-allow :trusted
-  (defmemo ed-bracket-overrides-at 1 (rope pt bm faces)
-    "`ed-bracket-overrides` for point `pt` in `rope`, matched by the mode's `bm` and painted
-in `faces` (`[here match error]`). Memoised on all four — one entry: it hits on idle frames,
-ticks and blink events where nothing changed, and misses after any edit or motion. The
-faces are in the key so a theme switch repaints the pair at once; before, the old colours
-stayed until point moved."
-    (let ([face-here face-match face-error] faces
-          n (count rope)
-          lo (math/max 0 (- pt ed-bracket-scan))
-          hi (math/min n (+ pt ed-bracket-scan))
-          clipped (or (> lo 0) (< hi n))
-          r (bm (text/slice rope lo hi) (- pt lo)))
-      (cond
-        (nil? r) '()
-        (= (second r) :unmatched) (if clipped '() (list [(+ lo (first r)) face-error]))
-        ;; The two ends get DIFFERENT faces, so the solid block always means "the other end":
-        ;; the bracket at point (the one just left of the cursor, else under it — the
-        ;; matcher's own adjacency rule) takes an underline accent the cursor sits on, its
-        ;; partner the block. One glance answers which end of the pair you are at.
-        else
-          (let (relpt (- pt lo)
-                a (first r)
-                b (second r)
-                adj (if (or (= a (dec relpt)) (= a relpt)) a b)
-                far (if (= adj a) b a))
-            (list [(+ lo adj) face-here] [(+ lo far) face-match]))))))
-
-(sig ed-bracket-overrides-at (any int fn vector -> list))
-
-;; check-allow: as `ed-bracket-overrides-at`'s — a hit is the memo store's, a `[pos face]` list
-(check-allow :trusted
-  (defmemo ed-bracket-tree-overrides-at 1 (tree rope pt bm faces)
-    "`ed-bracket-overrides` over the buffer's held `tree` of exactly `rope`: the mode's
-`:bracket-match-tree` service `bm` matches in the whole document, so there is no window
-and no clipping — an `:unmatched` is the parse's own verdict. Memoised like the window's."
-    (let ([face-here face-match face-error] faces
-          r (bm tree rope pt))
-      (cond
-        (nil? r) '()
-        (= (second r) :unmatched) (list [(first r) face-error])
-        else
-          (let (a (first r)
-                b (second r)
-                adj (if (or (= a (dec pt)) (= a pt)) a b))
-            (list [adj face-here] [(if (= adj a) b a) face-match]))))))
-
-(sig ed-bracket-tree-overrides-at (any any int fn vector -> list))
-
-(defn ed-bracket-overrides (buf &optional (tree nil))
-  "`[pos face]` overrides for the bracket pair adjacent to point, via `buf`'s mode
-`:bracket-match` service: the matched pair in the match face, a lone unmatched bracket
-in the error face, or `()` when there's no service or no bracket at point. The match is
-sought within a `ed-bracket-scan`-char window each side of point (not the whole
-buffer), so a deep point in a large file costs O(window), not O(point); a partner
-beyond the window is treated as not found, and a window-clipped `:unmatched` is
-suppressed (no false red) rather than scanning the rest of the buffer.
-
-`tree` is the buffer's held parse of exactly its text, when the caller has one
-(`syntaxtree`): a tree-sitter mode's `:bracket-match-tree` then reads the pair off it
-(`tsbrackets/match-tree`) — no window, no parse of a slice."
-  (let (bm-tree (when tree (ed-mode-service buf :bracket-match-tree))
-        bm (ed-mode-service buf :bracket-match)
-        faces [face-bracket-here face-bracket-match face-bracket-error])
-    (cond
-      ;; no bracket match on a buffer whose line may be a megabyte of brackets (so-long)
-      (:line-services-off buf) '()
-      bm-tree (ed-bracket-tree-overrides-at tree (buffer-rope buf) (buffer-point buf) bm-tree faces)
-      (nil? bm) '()
-      else (ed-bracket-overrides-at (buffer-rope buf) (buffer-point buf) bm faces))))
+;; ---- overrides, grouped by line ---------------------------------------------------
+;; One-character faces (the bracket pair at point — `showparen`; a diagnostic's wave —
+;; `diagpaint`) are override sources (`model/register-override-source`); what is here groups
+;; them by line for the row memo.
 
 (sig ed-overrides-by-line (any any -> map))
 
@@ -267,10 +118,10 @@ forty thousand faces) does not walk that history every frame to reach its first 
 
 (defn ed-span-tree? (spans)
   "Whether `spans` is a span tree (brood's `editor/span-tree`, ADR-731: text properties a buffer
-keeps in one) rather than a vector of spans — false on a brood without them.
+keeps in one) rather than a vector of spans.
 
     (spanpaint/ed-span-tree? [[0 1 :a]])   ;=> false"
-  (= true (reflect/call-if-bound 'editor/span-tree/tree? false spans)))
+  (editor/span-tree/tree? spans))
 
 (defn ed-spans-window (rope spans top last-line)
   "`spans` cut to the lines `top`..`last-line`: every span that reaches into them and no
@@ -421,6 +272,39 @@ a theme.
 face itself when the layer has no palette."
   (if (or (nil? palette) (nil? face)) face (ansi/face face palette)))
 
+(defn- ed-face-in (spans at)
+  "[[ed-face-at]] over one span value that is not two layers: a vector, a span tree, or
+several as [[ed-span-sources]] (the first face found wins)."
+  (cond
+    (nil? spans) nil
+    (map? spans)
+      (fold (:span-sources spans) nil (fn (found source) (or found (ed-face-in source at))))
+    ;; a span tree (a buffer's text property, brood ADR-731): the span over `at`, O(log n)
+    (ed-span-tree? spans)
+      (when-let (span (first (editor/span-tree/clip spans at (inc at)))) (nth span 2 nil))
+    else
+      (let (v (if (vector? spans) spans (into [] spans))
+            n (count v)
+            i (ed-span-seek v n at))
+        (when (and (< i n) (<= (first (nth v i)) at)) (nth (nth v i) 2 nil)))))
+
+(defn ed-face-at (spans at)
+  "The face of the span in `spans` (ascending `[start end face]`, a span tree, several as
+[[ed-span-sources]], or two [[ed-span-layers]]) covering offset `at`, by bisection, or nil
+where none does. Of two layers the upper's face wins; the lower's shows where the upper
+has none, an SGR attribute resolved as it is painted. Every shape a span value takes is
+this module's, so this is the one place that reads one.
+
+    (spanpaint/ed-face-at [[0 2 {:bold true}] [4 6 {:italic true}]] 5)   ;=> {:italic true}
+    (spanpaint/ed-face-at [[0 2 {:bold true}]] 3)   ;=> nil"
+  (if (and (map? spans) (contains? spans :span-under))
+    (or (ed-face-in (:span-over spans) at)
+      ;; the lower layer may be two layers itself (semantic tokens over ANSI over the mode):
+      ;; a recursion as deep as the layers, which is two
+      (ed-span-face (check-allow :non-tail-recursion (ed-face-at (:span-under spans) at))
+        (:palette spans)))
+    (ed-face-in spans at)))
+
 (defn- ed-span-resolve (spans palette)
   "One line's lower-layer `spans` with their faces as painted (`ed-span-face`)."
   (if (nil? palette)
@@ -486,63 +370,9 @@ its semantic faces over font-lock."
         coloured (if (nil? output) own (ed-span-layers own (first output) (second output))))
     (if (nil? overlay) coloured (ed-span-layers overlay coloured))))
 
-;; ---- diagnostics: the checker's findings as underline overrides -------------------
-
-(def ed-face-diagnostic {:underline {:style :wave}}) ; merged onto the token's syntax face: a wave, as flymake draws one (brood ADR-513)
-
-(defn ed-visible-diagnostics (m from to)
-  "`[line diagnostics]` for each line in `[from, to)` the model's line index
-(`:diag-by-line`, `diagstore/ed-diag-index`) has findings on — `()` when it has none. The one
-per-VISIBLE-line read the underline and the ghost note share: a large file's checker output
-(thousands of findings) must cost a frame nothing beyond the lines on screen."
-  (let (index (or (:diag-by-line m) {}))
-    (if (empty? index)
-      '()
-      (seq/keep (range (math/max 0 from) (math/max 0 to))
-        (fn (line) (let (ds (get index line)) (when ds [line ds])))))))
-
-(defn- ed-line-diagnostic-overrides (buf line ds)
-  "`[pos ed-face-diagnostic]` for each character of each token the diagnostics `ds` mark on
-`line` (`ed-diag-span-end`). Reads only that line's text, never the whole buffer; the word a
-diagnostic marks never crosses a newline."
-  (let (bol (text/line->char (buffer-rope buf) line)
-        text (buffer-line-at buf line))
-    (mapcat ds
-      (fn (d)
-        (let (from (diagstore/ed-diag-col0 d))
-          (map (range from (diagstore/ed-diag-span-end text from))
-            (fn (p) [(+ bol p) ed-face-diagnostic])))))))
-
-(sig ed-diagnostic-overrides (model buffer int int -> any))
-
-(defn ed-diagnostic-overrides (m buf top vrows)
-  "`[pos ed-face-diagnostic]` overrides underlining each diagnostic's token on the
-`vrows` lines from `top` — the pane's viewport — from the model's line index
-(`ed-visible-diagnostics`); `()` when there are none. Lines past EOF (stale between
-rechecks) are skipped, so a deleted line can't index out of range."
-  (mapcat (ed-visible-diagnostics m top (math/min (buffer-line-count buf) (+ top vrows)))
-    (fn ([line ds]) (ed-line-diagnostic-overrides buf line ds))))
-
-;; ---- highlight ranges: the region + transient overlays ---------------------------
-
-(defn ed-hl-ranges (m buf selected?)
-  "The highlight ranges `[lo hi face]` to paint over `buf` in a pane: the active region
-(point↔mark, a `:bg` tint, so syntax colours show through it); and the model's transient `:overlays` (a search, a query-replace
-matches), gated to the selected pane. Order is priority (the tiler merges later-wins):
-region then overlays. (The hl-line current-line highlight is NOT a char range — it's a
-full-width `rect` band painted by `panebody/ed-hl-line-band`, so it covers the whole line, not just
-its text.)"
-  (let (region-b (buffer-region-bounds buf)
-        ;; a rectangle region (C-x SPC, C-M-drag) tints its block on each line, not the span
-        region (cond
-                 (nil? region-b) nil
-                 (bufferops/rectangle-mark-active? buf)
-                   (map (bufferops/rectangle-ranges buf) (fn ([from to]) [from to face-region]))
-                 else (list [(first region-b) (second region-b) face-region]))
-        overlays (if selected?
-                   (map (or (:overlays m) '()) (fn (o) [(:start o) (:end o) (:face o)]))
-                   '()))
-    (append region overlays)))
+;; ---- highlight ranges, cut to a line ---------------------------------------------
+;; The ranges are the highlight sources' (`model/register-highlight-source`): the region's
+;; (`region`), the current search match (`isearch`), the hovered link (`linkview`) among them.
 
 (defn ed-ranges-on-line (ranges lo hi)
   "The `[start end face]` highlight `ranges` that touch the chars `[lo, hi)` — a line —

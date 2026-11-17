@@ -9,6 +9,7 @@ tree out over it, so screen coordinates line up. Pure (data→data)."
   (:use model) ; ed-buf-at — the pool lookup ed-scroll-pane needs
   (:use editor/buffer) ; buffer-line-count (scroll clamp)
   (:use editor/pane) ; pane-layout / divider-at / pane-select-at / pane-set-ratio / pane-* ops
+  (:use memo) ; defmemo — the layout, laid out once per tree and body
   (:use wrap)) ; rows-from / row-of — the visual-line break rule the row table is built on
 ;; ---- pane layout (shared geometry: view & hit-testing agree) ----------------
 
@@ -29,16 +30,30 @@ with no row between them (`{:row-seam 0}`), as Emacs and vim do there — the up
 line is the separator, and a drag on it resizes; a window keeps a divider row for its hairline."
   (if (:terminal m) {:row-seam 0} nil))
 
-(sig ed-body-layout (map int int -> layout))
-(defn ed-body-layout (m cols rows)
-  "The pane layout (`{:panes :dividers}`) over the body rect above the minibuffer —
+;; check-allow: a hit comes back out of the memo's store, which the checker reads as
+;; unknown; the store only ever holds what `pane-layout` built.
+(check-allow :trusted
+  (defmemo ed-layout-at 2 (tree rect opts)
+    "`pane-layout` of the pane `tree` over the body `rect` with `opts`, remembered on all three —
+the tree is the model's `:layout`, the same cell until a split, a selection or a scroll makes
+a new one. The ONE place the pane tree is laid out: the view, the pointer's hit-tests and the
+code inside an event all read it, so a frame lays it out once however many ask."
+    (pane-layout tree rect opts)))
+
+;; check-allow: the layout comes out of `ed-layout-at`'s memo store, which the checker reads
+;; as unknown; the store only ever holds what `pane-layout` built
+(check-allow :trusted
+  (sig ed-body-layout (map int int -> layout))
+  (defn ed-body-layout (m cols rows)
+    "The pane layout (`{:panes :dividers}`) over the body rect above the minibuffer —
 everything above the bottom `ed-echo-rows` rows (the prompt, plus Plume's candidate
 list when one is open: the minibuffer grows downward and the body shrinks to sit above
-it). Used by the view and by mouse hit-testing, so a click maps to the pane the view drew."
-  (ed-header-layout m
-    (pane-layout (:layout m)
-      (ed-body-rect m cols (- rows (ed-echo-rows m rows)))
-      (ed-layout-opts m))))
+it). What the view paints and every hit-test reads ([[ed-layout-at]]), so a click maps to the
+pane the view drew."
+    (ed-header-layout m
+      (ed-layout-at (:layout m)
+        (ed-body-rect m cols (- rows (ed-echo-rows m rows)))
+        (ed-layout-opts m)))))
 
 (defn ed-card-stage (m cols rows &optional (cell nil))
   "The STAGE a floating card covers (`ui-kit/ui-place`): `[0 row cols h]`, the window's
@@ -107,14 +122,14 @@ without knowing. A pane too short to spare a row keeps it."
       (cond
         (not (nil? override)) (= override true)
         (ed-mode-service buf :no-line-numbers) false
-        else (not (= false (scroll/ed-line-numbers-for buf)))))))
+        else (not (= false (display-settings/ed-line-numbers-for buf)))))))
 
 (defn ed-gutter-shown? (buf pane)
   "Whether the left gutter shows for `pane`. Only for a mode that offers a `:gutter-width`
 service; then an explicit per-pane `:line-numbers` (set by C-x l) wins; otherwise it is on
 unless the mode opts out with `:no-line-numbers` (special buffers like *git-status*, which
 want no gutter by default the way Magit has none) or the init file's `:line-numbers` turns
-numbering off for its mode (`scroll/ed-line-numbers-for`)."
+numbering off for its mode (`display-settings/ed-line-numbers-for`)."
   (numbered? buf (:payload pane) (ed-mode-service buf :gutter-width)))
 
 (sig ed-gutter-width (buffer (or bool nil) -> int))
@@ -140,8 +155,16 @@ shifts every column in it."
   ;; several times a frame per pane, and a mode-service lookup resolves every layer of the
   ;; buffer's stack each time
   (let (gutter-width (ed-mode-service buf :gutter-width)
-        w (when (numbered? buf (:payload pane) gutter-width) (gutter-width buf)))
+        w (if (numbered? buf (:payload pane) gutter-width)
+            (gutter-width buf)
+            (fringe-width buf)))
     (if (int? w) w 0)))
+
+(defn- fringe-width (buf)
+  ;; an unnumbered pane's mark column — the mode's `:gutter-fringe-width` service (a file's
+  ;; change bar, Emacs's fringe), none for a mode that wants no gutter at all
+  (let (fringe (ed-mode-service buf :gutter-fringe-width))
+    (when (and fringe (not (ed-mode-service buf :no-line-numbers))) (fringe buf))))
 
 (defn ed-selected-text-rows (m cols rows)
   "The text height of the *selected* pane in BUFFER lines — its rect height less the
@@ -275,37 +298,69 @@ at (`ed-selected-text-cols` is this for the selected pane). At least 1."
   (math/max 1
     (- (ed-pane-cols pane buf) (ed-pane-gutter-width buf pane) (ed-right-margin-width buf))))
 
-(sig ed-pane-rows (pane buffer -> (or nil vector)))
+(sig ed-pane-rows (pane buffer -> vector))
 (defn ed-pane-rows (pane buf)
   "The pane's row table — `[line from to inlay]` for each row from the pane's top, one more
-than the pane shows so a smooth-scroll step has its extra row — or nil when the rows are
-simply `top + k` (the arithmetic in `ed-pane-line-at`).
+than the pane shows so a smooth-scroll step has its extra row. Always a table: every
+row↔line question reads it, with no second path for the common case.
 
-A table is built for a buffer whose long lines do not simply scroll (wrapped, truncated —
-`scroll/ed-long-lines`), and for one carrying INLAY rows
-(`wrap/inlay-lines` — derived text on a row of its own). Both are the same fact: the
-pane's rows are no longer one per line, in order, from the top (or, truncated, a row no
-longer shows its whole line). Nil is kept for the common
-case rather than always building one, because most buffers need neither.
+A buffer whose long lines do not simply scroll (wrapped, truncated — `scroll/ed-long-lines`),
+or that carries INLAY rows (`wrap/inlay-lines` — derived text on a row of its own) or folds,
+is ROW-WISE ([[ed-pane-row-wise?]]): its rows are no longer one per line, in order, from the
+top, and `wrap/rows-from` counts them. Any other buffer's table is one whole line per row
+from the top, scrolled `hscroll` columns (`[line hscroll nil nil]`, [[ed-line-rows]]).
 
-The table itself is memoised on its inputs in `wrap/rows-from` — at the leaf, so the three
-hit-test sites here and `input/ed-point-into-view` (which asks `rows-from` directly) all get
-the same answer without rebuilding it."
-  (let (inlays (ed-row-extras buf))
-    (if (ed-row-wise? buf inlays)
-      ;; point's line, if it is cut short and point lies past the cut, shown from where point
-      ;; is visible — after the memo, which is keyed without point. A pane started part-way
-      ;; down its top line (`ed-pane-top-row`) drops that line's rows above its start
-      (let (w (ed-pane-text-cols pane buf)
-            skip (ed-pane-top-row pane buf w inlays)
-            table (wrap/rows-from buf
-                    (ed-pane-top pane buf)
-                    w
-                    (inc (ed-pane-vrows pane buf))
-                    inlays
-                    skip))
-        (wrap/follow-point table buf w))
-      nil)))
+Both are memoised on their inputs — `wrap/rows-from` at the leaf, so the hit-test sites here
+and `input/ed-point-into-view` (which asks `rows-from` directly) all get the same answer
+without rebuilding it, and [[ed-line-rows]] on the four ints it reads, so a frame where the
+pane did not scroll hands the view the SAME table as the last."
+  ;; the guard is the proof of the declared vector: the memoised table comes back unknown
+  (let (rows (first (ed-pane-row-table pane buf))) (if (vector? rows) rows [])))
+
+(defn ed-pane-row-table (pane buf)
+  "`[rows row-wise?]`: [[ed-pane-rows]] and [[ed-pane-row-wise?]] from one read of the buffer's
+row extras — what the view's geometry asks, once per pane per frame."
+  (let (inlays (ed-row-extras buf)
+        row-wise? (ed-row-wise? buf inlays))
+    [(ed-pane-row-table-of pane buf inlays row-wise?) row-wise?]))
+
+(defn- ed-pane-row-table-of (pane buf inlays row-wise?)
+  ;; the table itself, given the extras and whether they make the buffer row-wise
+  (if row-wise?
+    ;; point's line, if it is cut short and point lies past the cut, shown from where point
+    ;; is visible — after the memo, which is keyed without point. A pane started part-way
+    ;; down its top line (`ed-pane-top-row`) drops that line's rows above its start
+    (let (w (ed-pane-text-cols pane buf)
+          skip (ed-pane-top-row pane buf w inlays)
+          table (wrap/rows-from buf
+                  (ed-pane-top pane buf)
+                  w
+                  (inc (ed-pane-vrows pane buf))
+                  inlays
+                  skip))
+      (wrap/follow-point table buf w))
+    (ed-line-rows (ed-pane-top pane buf)
+      (ed-pane-hscroll pane)
+      (inc (ed-pane-vrows pane buf))
+      (buffer-line-count buf))))
+
+(sig ed-pane-row-wise? (pane buffer -> bool))
+(defn ed-pane-row-wise? (pane buf)
+  "Whether `pane`'s rows are counted by `wrap/rows-from` (`scroll/ed-row-wise?`) rather than
+one whole line per row from its top — what a reader asks only when the two differ in more than
+the table, as a horizontal scroll does: an unwrapped row starts `hscroll` columns in."
+  (ed-row-wise? buf (ed-row-extras buf)))
+
+;; check-allow: a hit comes back out of the memo's store, which the checker reads as unknown;
+;; the store only ever holds what the body below built, a vector of rows.
+(check-allow :trusted
+  (defmemo ed-line-rows 8 (top hscroll limit line-count)
+    "The row table of a pane whose lines simply scroll: `[line hscroll nil nil]` for each of
+the `limit` lines from `top`, stopping at the buffer's `line-count`. Remembered, so the same
+viewport is the same table (the view's memo deps compare it at once)."
+    (into []
+      (map (range top (math/max top (math/min line-count (+ top limit))))
+        (fn (line) [line hscroll nil nil])))))
 
 (sig ed-pane-top-continued? (pane buffer -> bool))
 (defn ed-pane-top-continued? (pane buf)
@@ -339,52 +394,56 @@ inside window cells, so only the exact position says which of its rows a click i
         [_rw rh] (ed-zoom-ratio pane))
     (math/floor (/ (math/max 0 (- row py)) rh))))
 
+(sig ed-pane-row-at (pane buffer number -> int))
+(defn- ed-pane-row-at (pane buf row)
+  "Screen row `row` (absolute) of `pane` as an index into its row table: [[ed-pane-row-index]],
+one further while the smooth-scroll fraction is half a cell or more — the row then shows more
+of the next table row than of its own (`ed-pane-view-top`)."
+  (+ (ed-pane-row-index pane buf row) (if (>= (ed-pane-scroll-frac pane) 0.5) 1 0)))
+
 (sig ed-pane-line-at (pane buffer number -> (or nil int)))
 (defn ed-pane-line-at (pane buf row)
-  "The buffer line screen row `row` (absolute) of `pane` shows — `ed-pane-view-top` plus
-the row's offset into the pane's text area divided by the font scale, or the row table's
-entry when the buffer wraps — or nil for a row below the buffer's last line (a hover
-there is over nothing; a CLICK there wants the last line, which is
+  "The buffer line screen row `row` (absolute) of `pane` shows — its row table's entry
+([[ed-pane-row-at]]: the offset into the pane's text area divided by the font scale, a
+half-scrolled row counting as the next) — or nil for a row below the buffer's last line (a
+hover there is over nothing; a CLICK there wants the last line, which is
 `ed-pane-line-at-clamped`). The one row→line mapping; the inverse of the view's pane
 geometry."
-  (let (k (ed-pane-row-index pane buf row)
-        rows (ed-pane-rows pane buf))
-    (if (nil? rows)
-      (let (line (+ (ed-pane-view-top pane buf) k))
-        (if (< line (buffer-line-count buf)) line nil))
-      ;; a row table entry is untyped data (`wrap/rows-from`): the guard is the proof
-      ;; that what comes back is the line this declares
-      (let (line (when (< k (count rows)) (first (nth rows k))))
-        (if (int? line) line nil)))))
+  (let (k (ed-pane-row-at pane buf row)
+        rows (ed-pane-rows pane buf)
+        ;; a row table entry is untyped data (`wrap/rows-from`): the guard is the proof
+        ;; that what comes back is the line this declares
+        line (when (< k (count rows)) (first (nth rows k))))
+    (if (int? line) line nil)))
 
 (sig ed-pane-row-entry (pane buffer number -> vector))
 (defn ed-pane-row-entry (pane buf row)
   "The row entry (`wrap/row-cell`'s `[line from to inlay clip display]`) of screen row `row`
-(absolute) of `pane` — the row table's entry, or for an unwrapped pane `[line hscroll nil
-nil]` — with a row below the text standing for the LAST line's start (where a click below
-the end of a short buffer lands, as in Emacs) and an INLAY row for the line it sits above.
+(absolute) of `pane` — the row table's entry — with a row below the text standing for the
+LAST line's start (where a click below the end of a short buffer lands, as in Emacs; scrolled
+as the pane is when its lines simply scroll) and an INLAY row for the line it sits above.
 What a click, a drag and a hover hand `wrap/row-column`, so they map a cell to the char the
 view painted there."
   (let (rows (ed-pane-rows pane buf)
-        line (ed-pane-line-at-clamped pane buf row))
-    (if (nil? rows)
-      [line (ed-pane-hscroll pane) nil nil]
-      (let (k (ed-pane-row-index pane buf row)
-            entry (when (< k (count rows)) (nth rows k)))
-        ;; a row table entry is untyped data: the guard is the proof it is a text row
-        (if (and (vector? entry) (nil? (nth entry 3 nil)) (int? (first entry)))
-          entry
-          [line 0 nil nil])))))
+        k (ed-pane-row-at pane buf row)
+        entry (when (< k (count rows)) (nth rows k)))
+    ;; a row table entry is untyped data: the guard is the proof it is a text row
+    (if (and (vector? entry) (nil? (nth entry 3 nil)) (int? (first entry)))
+      entry
+      [(ed-pane-line-at-clamped pane buf row)
+        (if (ed-pane-row-wise? pane buf) 0 (ed-pane-hscroll pane))
+        nil
+        nil])))
 
 (defn ed-pane-inlay-row (pane buf row)
   "`[line text]` when screen row `row` (absolute) of `pane` is an INLAY row — derived text
-above buffer line `line` (`wrap/inlay-lines`) — else nil: what a click on it is about."
-  (let (rows (ed-pane-rows pane buf))
-    (when (not (nil? rows))
-      (let (k (ed-pane-row-index pane buf row)
-            entry (when (and (>= k 0) (< k (count rows))) (nth rows k)))
-        (when (and (vector? entry) (int? (first entry)) (string? (nth entry 3 nil)))
-          [(first entry) (nth entry 3)])))))
+above buffer line `line` (`wrap/inlay-lines`) — else nil: what a click on it is about. The row is
+[[ed-pane-row-at]]'s, as a click on a text row's is, so a half-scrolled pane maps both alike."
+  (let (rows (ed-pane-rows pane buf)
+        k (ed-pane-row-at pane buf row)
+        entry (when (and (>= k 0) (< k (count rows))) (nth rows k)))
+    (when (and (vector? entry) (int? (first entry)) (string? (nth entry 3 nil)))
+      [(first entry) (nth entry 3)])))
 
 (sig ed-pane-row-hscroll (pane buffer number -> int))
 (defn ed-pane-row-hscroll (pane buf row)
@@ -393,43 +452,60 @@ horizontal scroll for an unwrapped buffer, the row's segment start for a wrapped
 ([[ed-pane-row-entry]]'s `from`)."
   (let (from (second (ed-pane-row-entry pane buf row))) (if (int? from) from 0)))
 
-(sig ed-rows-line-rows ((or nil vector) int int int -> (list (tuple int int (or nil int) vector))))
-(defn ed-rows-line-rows (rows top line hscroll)
-  "The pane text rows buffer `line` occupies, each `[k from to entry]` (row index from 0, the
-line's chars on it — `to` nil for an unwrapped pane, where the row runs to the pane's
-edge — and the row's ENTRY, what `wrap/row-cell` measures a column on):
-`'([(- line top) hscroll nil [line hscroll nil nil]])` when `rows` is nil (unwrapped: one row
-per line, the caller range-checks `k`), else the table's rows for the line in order — `'()`
-when none is on screen. The line half of the geometry for anything painted AT a line: the
-hl-line band, a region's end-of-line fill, a ghost note, a link zone."
-  (if (nil? rows)
-    (list [(- line top) hscroll nil [line hscroll nil nil]])
-    (reverse
-      (fold (range (count rows))
-        '()
-        (fn (acc k)
-          (let (r (nth rows k))
-            ;; INLAY rows are skipped: this answers "which rows does this line's
-            ;; TEXT occupy?", and an inlay is not the line's text. A caller that
-            ;; included them would fill a region through a signature, or place the
-            ;; cursor on a row with no columns to be at.
-            (if (and (= (first r) line) (nil? (nth r 3 nil)))
-              (cons [k (second r) (nth r 2) r] acc)
-              acc)))))))
+(defn ed-shown-text-rows (rows height)
+  "`[k entry]` for each TEXT row among the first `height` rows of a row table `rows` (an INLAY
+row — derived text on a row of its own, `wrap/inlay-lines` — left out), `k` its index from the
+pane's top: the rows a layer that marks the buffer's text walks (avy's targets, the fill-column
+rule).
 
-(sig ed-rows-offset-row ((or nil vector) int int int int int -> (or nil (tuple int int vector))))
-(defn ed-rows-offset-row (rows top line col hscroll vrows)
+    (panes/ed-shown-text-rows [[0 0 nil nil] [1 0 nil \"sig\"] [1 0 nil nil]] 2)   ;=> ([0 [0 0 nil nil]])"
+  (seq/keep (range (math/min height (count rows)))
+    (fn (k) (let (entry (nth rows k)) (when (nil? (nth entry 3 nil)) [k entry])))))
+
+(defn- ed-rows-first-at (rows line low high)
+  ;; the first index of `[low, high)` whose row is on `line` or a later one (`high` when
+  ;; none is), by halving: a table's rows run down the lines in order
+  (if (>= low high)
+    low
+    (let (middle (math/quot (+ low high) 2)
+          at (first (nth rows middle)))
+      (if (and (int? at) (< at line))
+        (ed-rows-first-at rows line (inc middle) high)
+        (ed-rows-first-at rows line low middle)))))
+
+(sig ed-rows-line-rows (vector int -> (list (tuple int int (or nil int) vector))))
+(defn ed-rows-line-rows (rows line)
+  "The pane text rows buffer `line` occupies, each `[k from to entry]` (row index from 0, the
+line's chars on it — `to` nil for a row that runs to the pane's edge — and the row's ENTRY,
+what `wrap/row-cell` measures a column on): the table's rows for the line in order, `'()` when
+none is on screen. Found by halving, then the line's own rows. The line half of the geometry
+for anything painted AT a line: the hl-line band, a region's end-of-line fill, a ghost note, a
+link zone."
+  (let (size (count rows))
+    (letrec (walk (fn (k acc)
+                    (let (r (when (< k size) (nth rows k)))
+                      (if (or (nil? r) (not (= (first r) line)))
+                        (reverse acc)
+                        ;; INLAY rows are skipped: this answers "which rows does this line's
+                        ;; TEXT occupy?", and an inlay is not the line's text. A caller that
+                        ;; included them would fill a region through a signature, or place
+                        ;; the cursor on a row with no columns to be at.
+                        (walk (inc k)
+                          (if (nil? (nth r 3 nil)) (cons [k (second r) (nth r 2) r] acc) acc))))))
+      (walk (ed-rows-first-at rows line 0 size) '()))))
+
+(sig ed-rows-offset-row (vector int int int -> (or nil (tuple int int vector))))
+(defn ed-rows-offset-row (rows line col vrows)
   "`[k from entry]` — the pane text row (0-based) char column `col` of buffer `line` sits on,
 that row's first char column and its row entry (what `wrap/row-cell` turns the column into a
-cell on) — when it is among the `vrows` rows shown, else nil. Unwrapped (`rows` nil) `k` is
-`line - top` and `from` the pane's `hscroll`; wrapped, the line's rows decide (`wrap/row-of`
-picks the segment holding the column, the last one for a column at the line's end). The
-cursor, a remote caret and the hl-line band ask here, so they land on the row the text was
-painted on."
-  (let (mine (ed-rows-line-rows rows top line hscroll))
+cell on) — when it is among the `vrows` rows shown, else nil. The line's rows decide
+(`wrap/row-of` picks the segment holding the column, the last one for a column at the line's
+end; a line on one row is on that row wherever the column is). The cursor, a remote caret and
+the hl-line band ask here, so they land on the row the text was painted on."
+  (let (mine (ed-rows-line-rows rows line))
     (if (empty? mine)
       nil
-      (let ([k from _ entry] (if (nil? rows)
+      (let ([k from _ entry] (if (empty? (rest mine))
                                (first mine)
                                (nth mine (wrap/row-of (map mine (fn ([_k f t _e]) [f t])) col))))
         (if (and (>= k 0) (< k vrows)) [k from entry] nil)))))
@@ -466,12 +542,7 @@ turn that binds it."
 
 (defn ed-pane-point-row (pane buf vrows)
   "`ed-rows-offset-row` for `buf`'s point in `pane`: the row the cursor is on."
-  (ed-rows-offset-row (ed-pane-rows pane buf)
-    (ed-pane-top pane buf)
-    (buffer-current-line buf)
-    (buffer-column buf)
-    (ed-pane-hscroll pane)
-    vrows))
+  (ed-rows-offset-row (ed-pane-rows pane buf) (buffer-current-line buf) (buffer-column buf) vrows))
 
 (defn ed-pane-line-at-clamped (pane buf row)
   "`ed-pane-line-at`, with a row below the text answering the LAST line — where a click
@@ -480,7 +551,7 @@ below the end of a short buffer lands, as in Emacs."
 
 (defn ed-selected-text-cols (m cols rows)
   "The text width (in columns) of the *selected* pane — `ed-pane-text-cols` for it. What
-horizontal scrolling keeps point within (matches the width `view/ed-pane-ops` paints the
+horizontal scrolling keeps point within (matches the width `panecompose/ed-pane-ops` paints the
 lines into). At least 1."
   (let (panes (:panes (ed-body-layout m cols rows))
         sel (ed-selected-pane panes))
@@ -491,30 +562,47 @@ lines into). At least 1."
   "The number of BUFFER lines `pane`'s text area shows in its own cells: its rect height
 less the mode-line row, divided by the cell ratio (a zoomed pane shows fewer lines). The
 single source of the viewport height the fontify window and its cache key are built on
-— `view/ed-pane-ops` reads it too, so the cached band always matches what's painted."
+— `panecompose/ed-pane-ops` reads it too, so the cached band always matches what's painted."
   (let ([_x _y _w h] (or (:rect pane) [0 0 80 24])
         [_rw rh] (ed-zoom-ratio pane))
     (math/max 0 (math/floor (/ (math/max 0 (dec h)) rh)))))
 
-(sig ed-layout-now (model -> (or nil layout)))
-(defn ed-layout-now (m)
-  "The pane layout over the window as it was last painted — `ed-body-layout` at the
-`[cols rows]` `ed-refresh-spans` cached on `:_lc` after the previous event — or nil before
+(defn ed-note-frame-size (m cols rows)
+  "`m` remembering the window was `cols`×`rows` for this event's frame ([[ed-frame-size]]) — the
+one fact about the frame code inside the NEXT event cannot recompute (`spancache` notes it
+when it refreshes the panes)."
+  (assoc m :_lc [cols rows]))
+
+(defn ed-frame-size (m)
+  "`[cols rows]` of the window as last painted ([[ed-note-frame-size]]), or nil before any frame."
+  (get m :_lc))
+
+;; check-allow: the layout comes out of `ed-layout-at`'s memo store, which the checker reads
+;; as unknown; the store only ever holds what `pane-layout` built
+(check-allow :trusted
+  (sig ed-layout-now (model -> (or nil layout)))
+  (defn ed-layout-now (m)
+    "The pane layout over the window as it was last painted — `ed-body-layout` at the
+[[ed-frame-size]] noted after the previous event — or nil before
 any frame (headless, or the first event). For code that runs INSIDE an event (a `:post-key`
 hook, an idle beat) and needs a pane's geometry — which pane shows a buffer, how many rows
 it has — without being handed the window size: the layout is recomputed over the current
 `:layout`, so a split this very event is already in it; only the window size is a frame old."
-  (let (lc (get m :_lc))
-    (if (nil? lc) nil (ed-body-layout m (nth lc 0) (nth lc 1)))))
+    (let (size (ed-frame-size m))
+      (if (nil? size) nil (ed-body-layout m (nth size 0) (nth size 1))))))
 
-(sig ed-resting-layout (map int int -> layout))
-(defn- ed-resting-layout (m cols rows)
-  "The pane layout with the echo area at its resting height, one row: what the panes are
+;; check-allow: the layout comes out of `ed-layout-at`'s memo store, which the checker reads
+;; as unknown; the store only ever holds what `pane-layout` built
+(check-allow :trusted
+  (sig ed-resting-layout (map int int -> layout))
+  (defn- ed-resting-layout (m cols rows)
+    "The pane layout with the echo area at its resting height, one row: what the panes are
 when no which-key panel or candidate list has grown the echo area. That growth is
 transient — it covers the bottom of the panes while it is open — so nothing measured for
 SCROLLING may see it: a pane shortened by a which-key panel scrolled point back into view
 on the next key (C-x p, point in the window's lower half), and stayed scrolled after."
-  (ed-header-layout m (pane-layout (:layout m) (ed-body-rect m cols (dec rows)) (ed-layout-opts m))))
+    (ed-header-layout m
+      (ed-layout-at (:layout m) (ed-body-rect m cols (dec rows)) (ed-layout-opts m)))))
 
 (defn ed-viewport (m cols rows)
   "[textrows textcols] for the selected pane at its resting height ([[ed-resting-layout]]) —

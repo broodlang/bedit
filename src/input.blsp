@@ -401,7 +401,7 @@ the prefix."
 ;; `overlay-route` — and re-registering an impl hot-swaps a live overlay (late
 ;; binding, same as commands).
 
-(defrecord read-char-overlay ()) ; ed-read-char: the next key is handed to a continuation (zap, registers)
+(defrecord read-char-overlay ()) ; ed-read-char / ed-read-key: the next key is handed to a continuation
 (impl Overlay
   read-char-overlay
   (overlay-active? (_ m) (:read-char m))
@@ -409,10 +409,12 @@ the prefix."
   ;; a reader that holds the keyboard for an answer still on its way (vcsproc's hold) names
   ;; what C-g must also cancel — `:on-cancel`, a `(model) -> model` symbol, run late
   (overlay-handle (_ m input)
-    (let (on-cancel (map/get-in m [:read-char :on-cancel]))
+    (let (on-cancel (map/get-in m [:read-char :on-cancel])
+          ;; a reader that takes every key ([[ed-read-key]]) is handed ESC and C-g as answers
+          cancel? (and (ed-cancel-key? input) (not (map/get-in m [:read-char :takes-cancel]))))
       (cond
-        (and (ed-cancel-key? input) on-cancel) ((reflect/eval on-cancel) m)
-        (ed-cancel-key? input) (message (dissoc m :read-char) "quit")
+        (and cancel? on-cancel) ((reflect/eval on-cancel) m)
+        cancel? (message (dissoc m :read-char) "quit")
         ;; the prompt leaves the echo area with its answer, as Emacs's does: a continuation
         ;; that says nothing must not leave it standing over the next buffer
         else ((map/get-in m [:read-char :then]) (assoc (dissoc m :read-char) :echo "") input)))))
@@ -434,6 +436,70 @@ the prefix."
   (overlay-handle (_ m input) (ed-repeat-run m input))
   (overlay-exit (_ m) (dissoc m :repeat)))
 
+;; ---- ESC: the Meta prefix (Emacs's ESC map) ---------------------------------
+;; A terminal sends Meta+x as ESC then x, and brood's decoder turns the two into `:alt-x` when
+;; they arrive together. A lone ESC — pressed, released, then x — is Emacs's ESC prefix: the
+;; next key with Meta added, so `ESC x` is M-x and `ESC <` is M-<, in the terminal and the
+;; window alike. `ESC ESC ESC` is keyboard-escape-quit: the cancel C-g is, routed as C-g, so it
+;; leaves whatever is open (a prompt, a search, a menu) the way C-g leaves it. The prefix is
+;; ESC's binding in the Emacs keymap (`cmd-esc-prefix`) and isearch's, as Emacs's isearch
+;; reads ESC; a prompt, a menu and a popup keep ESC as their cancel.
+;;
+;; It is a one-key read ([[ed-read-key]]), not a mechanism of its own: the key after ESC is
+;; the read's answer, and the read is what makes everything else wait for it — a prompt that
+;; wants to open (`model/ed-prompt-free?`), a paste (`model/ed-modal-open?`), the echo area,
+;; which shows `ESC-` as the standing question.
+
+(defn ed-read-key (m prompt then)
+  "`m` reading the next key for `then`, a `(model key) -> model` continuation, with `prompt`
+standing in the echo area: [[model/ed-read-char]] for a reader that wants EVERY key — ESC and
+C-g reach `then` rather than cancelling the read — and whose prompt is not news to log in
+*Messages*. The ESC prefix reads with it."
+  (ed-read-char m prompt then {:takes-cancel true :quiet true}))
+
+(defn- ed-esc-label (escapes)
+  ;; the echo of `escapes` ESCs waiting for their key: `ESC-`, `ESC ESC-`
+  (str (string/join (seq/repeat escapes "ESC") " ") "-"))
+
+(defn- ed-esc-wait (m escapes carried)
+  "`m` waiting for the key after `escapes` ESCs (`ed-esc-prefixed`); `carried` is what ESC's
+own dispatch displaced, put back before the key runs, or nil."
+  (ed-read-key m
+    (ed-esc-label escapes)
+    (fn (answered key) (ed-esc-prefixed answered escapes carried key))))
+
+(defn- ed-esc-prefixed (m escapes carried input)
+  "The key after `escapes` ESCs: a third ESC, or C-g, cancels (routed as C-g); a second ESC
+waits on; any other key is routed with Meta added (`keyhelp/ed-meta-key`). What ESC's dispatch
+displaced (`carried`: the prefix argument, the command before it) is back on the model first."
+  (let (restored (if (nil? carried)
+                   m
+                   (assoc m
+                     :prefix-arg (:prefix-arg carried)
+                     :this-command (:this-command carried))))
+    (cond
+      (or (= input :ctrl-g) (and (= input :escape) (>= escapes 2)))
+        (ed-route-transient restored :ctrl-g)
+      (= input :escape) (ed-esc-wait m (inc escapes) carried)
+      else (ed-route-transient restored (ed-meta-key input)))))
+
+(defcommand cmd-esc-prefix
+  (m _key)
+  "ESC (`ESC-prefix`): the next key is read with Meta added — `ESC x` is M-x, as in a terminal
+that cannot send Meta. `ESC ESC ESC` cancels (keyboard-escape-quit). Like a prefix key it is
+not a command of its own to what follows: a prefix argument typed before it reaches the Meta
+key (`C-u ESC f` is `C-u M-f`), and so does the command before it (`C-y ESC y` is a yank-pop)."
+  ;; dispatched as a key, this is the current command, and dispatch clears the argument once
+  ;; it returns: both are carried to the Meta key. Run by name (isearch's ESC), nothing was
+  ;; displaced and nothing is carried
+  (ed-esc-wait m
+    1
+    (when (= (:this-command m) 'input/cmd-esc-prefix)
+      {:prefix-arg (:prefix-arg m) :this-command (:last-command m)})))
+
+;; it reads the argument itself (by carrying it), so it runs once, never `C-u`'s four times
+(register-prefix-consuming 'input/cmd-esc-prefix)
+
 ;; The input layer's own rows. The ranks between them are held for the features' rows, and the
 ;; order is load-bearing (tests/registries_test pins it):
 ;;   10 describe-key (help)  20 read-char  30 menu  40 query-replace  50 isearch  60 minibuffer
@@ -448,6 +514,7 @@ the prefix."
 ;; so a key it does not own skips every overlay under it straight to dispatch. Above the
 ;; terminal, it sent a char-mode program's keys to self-insert in its read-only buffer for as
 ;; long as a suggestion stood, and none reached the program to change the screen and clear it.
+
 (register-overlay :read-char 20 (read-char-overlay))
 (register-overlay :minibuffer 60 (minibuffer-overlay))
 (register-overlay :repeat 120 (repeat-overlay))
@@ -886,11 +953,16 @@ guarded try: a propagate error here must not recurse into another echo."
     (try (ed-run-recover-steps m0 recovered input) (catch _propagate-error recovered))))
 
 (defn- ed-sync-title (result)
-  ;; Update the OS title bar from the result model every event (cheap: a string set).
+  ;; The title as the model has it, set when it changes: through the loop's display
+  ;; (`display-configure`) — a window's title bar, the terminal's title (OSC 2), a thin
+  ;; client's window — or, with no display bound (a test), the model's window if it has one
   (let (win (:window result)
-        title (ed-window-title result))
-    (when (and win (not (= title (:window-title result))))
-      (theme/gui-only gui/title win title))
+        title (ed-window-title result)
+        display editor/ui/*display*)
+    (when (not (= title (:window-title result)))
+      (cond
+        (not (nil? display)) (editor/frontend/display-configure display {:title title})
+        win (theme/gui-only gui/title win title)))
     (assoc result :window-title title)))
 
 (defn- ed-key-up? (input)

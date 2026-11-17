@@ -1,0 +1,118 @@
+(defmodule diagpaint
+  "What a diagnostic paints in a pane: the wave under the token it marks, an override source
+(`model/register-override-source`), and the per-visible-line read every diagnostic paint shares
+([[ed-visible-diagnostics]]: the ghost note after a line reads it too). The checker's findings
+come from the model's line index (`diagstore/ed-diag-index`), so a frame costs the lines it
+shows, never the whole file's findings."
+  (:use editor/buffer)
+  (:use model)
+  (:use gutter :only [register-gutter-mark])) ; the ⚠/✗ row in the margin
+
+(def ed-face-diagnostic {:underline {:style :wave}}) ; merged onto the token's syntax face: a wave, as flymake draws one (brood ADR-513)
+
+(defn ed-visible-diagnostics (m from to)
+  "`[line diagnostics]` for each line in `[from, to)` the model's line index
+(`:diag-by-line`, `diagstore/ed-diag-index`) has findings on — `()` when it has none. The one
+per-VISIBLE-line read the underline and the ghost note share: a large file's checker output
+(thousands of findings) must cost a frame nothing beyond the lines on screen."
+  (let (index (or (:diag-by-line m) {}))
+    (if (empty? index)
+      '()
+      (seq/keep (range (math/max 0 from) (math/max 0 to))
+        (fn (line) (let (ds (get index line)) (when ds [line ds])))))))
+
+(defn- ed-line-diagnostic-overrides (buf line ds)
+  "`[pos ed-face-diagnostic]` for each character of each token the diagnostics `ds` mark on
+`line` (`ed-diag-span-end`). Reads only that line's text, never the whole buffer; the word a
+diagnostic marks never crosses a newline."
+  (let (bol (text/line->char (buffer-rope buf) line)
+        text (buffer-line-at buf line))
+    (mapcat ds
+      (fn (d)
+        (let (from (diagstore/ed-diag-col0 d))
+          (map (range from (diagstore/ed-diag-span-end text from))
+            (fn (p) [(+ bol p) ed-face-diagnostic])))))))
+
+(sig ed-diagnostic-overrides (model buffer int int -> any))
+
+(defn ed-diagnostic-overrides (m buf top vrows)
+  "`[pos ed-face-diagnostic]` overrides underlining each diagnostic's token on the
+`vrows` lines from `top` — the pane's viewport — from the model's line index
+(`ed-visible-diagnostics`); `()` when there are none. Lines past EOF (stale between
+rechecks) are skipped, so a deleted line can't index out of range."
+  (mapcat (ed-visible-diagnostics m top (math/min (buffer-line-count buf) (+ top vrows)))
+    (fn ([line ds]) (ed-line-diagnostic-overrides buf line ds))))
+
+(defn diagnostic-source (m pane buf geometry)
+  "The override source's run: the waves on the lines the selected pane shows."
+  (ed-diagnostic-overrides m buf (:top geometry) (:render-height geometry)))
+
+(defn diagnostic-deps (m pane buf)
+  "What [[diagnostic-source]] reads off the model: the checked text and the line index."
+  [(:diag-rope m) (:diag-by-line m)])
+
+(register-override-source :diagnostic-wave
+  {:rank 20 :run 'diagpaint/diagnostic-source :deps 'diagpaint/diagnostic-deps})
+
+;; ---- the ⚠ note after the line -----------------------------------------------------
+
+(defn- ed-diag-note (d)
+  "A checker diagnostic in the end-of-line note's shape: a `:warn`, its message after a ⚠."
+  {:kind :warn :warn true :text (str "⚠ " (:message d))})
+
+(defn ed-diag-notes (m buf top text-h)
+  "The advisory checker's cached diagnostics as end-of-line notes on the `text-h` lines
+from `top`, keyed by 0-based line — `{line (⚠-note …)}` — for `buf` ONLY when it is the
+very rope the diagnostics were computed from (`:diag-rope`), so a warning can never sit on
+a line the text has moved out from under; `{}` otherwise. Per VISIBLE line off the model's
+index ([[ed-visible-diagnostics]]), like the wave under the token: this runs every frame. The
+gutter's ⚠ was easy to miss beside a live buffer's own ·/✓ marks, and the type note beside
+a form said `: bool` about `(< number)` while the checker knew the argument could not be
+ordered; the message belongs on the line, in the note's voice. Not on a form whose run
+already FAILED (`eolnotes/error-spans`): its error is on screen, and the ⚠ would repeat it."
+  (if (not (= (buffer-rope buf) (:diag-rope m)))
+    {}
+    (let (failed (eolnotes/error-spans buf))
+      (into {}
+        (seq/keep (ed-visible-diagnostics m top (+ top text-h))
+          (fn ([line ds])
+            (when (not (any? failed (fn ([from to]) (and (>= line from) (<= line to)))))
+              [line (map ds ed-diag-note)])))))))
+
+(defn diagnostic-note-source (m pane buf geometry)
+  "The line-note source's run: the ⚠ notes on the lines the pane shows."
+  (ed-diag-notes m buf (:top geometry) (:render-height geometry)))
+
+(register-line-note-source :diagnostic-notes
+  {:rank 20 :run 'diagpaint/diagnostic-note-source :deps 'diagpaint/diagnostic-deps})
+
+;; ---- the mark in the margin -------------------------------------------------------
+
+(defn mark-diagnostic-glyph (ds stale)
+  "The margin mark of a line's diagnostics."
+  ;; the checker's / the language server's findings on a line: ✗ for something that will
+  ;; not compile, ⚠ for an advisory. Worst-first, because one cell can only say one thing
+  ;; and an error outranks a warning about the same line.
+  (let (error? (any? ds results/diagnostic-error?))
+    (cond
+      stale [(if error? "✗" "⚠") gutter/gutter-face-test-stale]
+      error? ["✗" gutter/gutter-face-test-fail]
+      else ["⚠" gutter/gutter-face-warn])))
+
+;; last: a line that already carries a verdict keeps it. A playground form that RAISED says ✗
+;; about what it did, which outranks an advisory about what it might do.
+(register-gutter-mark :diagnostic
+  {:rank 50
+   :annotation :diagnostic-lines
+   :glyph 'diagpaint/mark-diagnostic-glyph
+   :on-click 'diagnostics/open-from-margin})
+
+(defn diagnostic-echo (m buf)
+  "The echo source of a diagnostic on point's line: `warning: …`, the first cached finding on
+the current buffer's current line (a diagnostic's 1-based `:line` is the 0-based line's
+index entry), or nil."
+  (let (hit (first (get (or (:diag-by-line m) {}) (buffer-current-line buf) '())))
+    (when hit (str "warning: " (:message hit)))))
+
+;; on the echo row after a message, before a note on the line and the eldoc hint
+(register-echo-source :diagnostic {:rank 20 :run 'diagpaint/diagnostic-echo})

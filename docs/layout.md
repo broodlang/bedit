@@ -15,6 +15,16 @@ src/main.blsp               entry point — window / daemon startup (--serve/--a
                             and a window whose compositor or X server died (`[:hangup :display-lost]`,
                             brood ADR-631) end the loop the same way: every unsaved buffer to its
                             sidecar first (`display-hangup`), no restart
+src/showparen.blsp          show-paren: the bracket pair at point as two one-character overrides (the end at
+                            point underlined, its partner a block, an unmatched one red), through the
+                            mode's `:bracket-match` / `:bracket-match-tree` — an override source
+src/diagpaint.blsp          a diagnostic's paint in a pane: the wave under its token (an override source)
+                            and `ed-visible-diagnostics`, the per-visible-line read the ghost note shares
+src/startpage.blsp          the start page bedit opens on with no file: recent files (1-9 open them) and
+                            projects, the keys that open everything, where to learn, the version —
+                            read-only, each action line a link (`:start-actions` by line, not matched
+                            by text); keys rendered for the starting profile with init.blsp's own
+                            bindings. A `:welcome` template keeps the old editable welcome scratch
 src/startup.blsp            the ONE startup path the window and `--serve` share: the runtime's
                             (grammars, slow-turn log, savehist, colours + `:theme`, packages), a
                             model's (init.blsp's model settings, recentf, save-place), a window's
@@ -66,7 +76,8 @@ src/model.blsp              the ui-run model: buffer pool, panes, *Messages*,
                             (hosted and collab recover their slots). The core names no feature: a
                             module registers its rows when it loads, each row CLAIMED for the
                             file that registered it (`ownership/claim!`), so a package's rows
-                            go back with the package. Also the OUTPUT CAP
+                            go back with the package; every table of rows (the view's sources and
+                            the hooks) is a `sources` table. Also the OUTPUT CAP
                             every streaming sink shares (`ed-cap-output-at`: past
                             `:output-buffer-max-lines` a buffer's oldest lines are cut,
                             point / mark / `:input-start` / `:line-links` and every pane's
@@ -102,7 +113,15 @@ src/clipboard.blsp          the kill ring and what it shares text with: kills mi
                             a task for the local window, the client for a served session); one
                             ring for every frame (a shared agent)
 src/keyhelp.blsp            key / command LABELS for help text: `C-x C-e` spellings, where-is
-                            over the live keymap, `\[command]` substitution, docstrings
+                            over the live keymap, `\[command]` substitution (`ed-command-key` for one command), docstrings,
+                            and a prefix map's keys in its groups (`ed-key-groups`, the headings in the map's order, "other"
+                            last, a sub-prefix as `+name`) — the ONE grouping the which-key panel, C-x C-h and C-h b list
+                            by, and those listings' sections and text (`ed-prefix-sections`, `ed-sections-text`)
+src/keycolumns.blsp         keys and what they do, in titled groups, laid into columns — pure data
+                            the which-key panel (flowing, `flow-lines`), a transient card (whole
+                            groups balanced, `balanced-columns`) and the start page (`entry-cell`)
+                            share, and which-key's grid of text cells (`grid-rows`: columns side by
+                            side while they fit, paged past that); each host paints the lines its own way
 src/scroll.blsp             keeping point on screen: the scroll-margin clamp, horizontal scroll,
                             `ed-max-top`, and the snap that ends a glide on a line; in a
                             row-wise (wrapped) buffer the pane starts on a screen ROW of its top
@@ -112,7 +131,15 @@ src/scroll.blsp             keeping point on screen: the scroll-margin clamp, ho
                             buffer and per line — the buffer's toggle (M-x toggle-truncate-lines,
                             visual-line-mode), the `:long-lines` setting for its mode, the line's
                             KIND (`:line-kinds`: a section heading truncates, its body wraps),
-                            the mode's `:long-lines` facet, the setting's `:default`
+                            the mode's `:long-lines` facet, the setting's `:default`. What lays a
+                            row out besides is registered (`model/register-row-extra`: folds'
+                            hidden lines, inlinetext's annotations); the settings it reads are
+                            `display-settings`'
+src/display-settings.blsp   the init file's per-mode DISPLAY settings, as globals config re-binds:
+                            `:line-numbers` (code numbered, prose and special buffers not, by
+                            default), `:long-lines` + `:truncation-ellipsis`, `:wrap-prefix`, and
+                            the per-mode lookup (`ed-mode-setting`, a directory file's first:
+                            `ed-local-setting`) every per-mode switch reaches a buffer through
 src/autosave.blsp           `#file#` auto-save sidecars written (owner-only, on the idle beat, order
                             110, and a timer of their own). Only a MODIFIED buffer is ever written
 src/backup.blsp             backup files (Emacs make-backup-files, `:make-backup-files`, on): the first
@@ -326,6 +353,7 @@ src/slowlog.blsp            the SLOW-TURN LOG: every turn of the loop the watchd
                             `main` activates it, so a test never writes the user's file. The loop runs
                             `(proc/flag :responsive true)` (brood ADR-517), so every `os/cmd` it makes
                             arrives as `[:blocking-call …]` and is logged here too, phase `blocking`.
+                            Both are noted as they happen in *Slow Log*, never *Messages*.
                             And KEY-TO-PAINT latency as a distribution (brood ADR-612): the idle
                             beat records the window's key histogram (`gui/latency-histogram`) every
                             few hundred keys, quitting records the rest, and M-x slow-turns heads
@@ -333,8 +361,9 @@ src/slowlog.blsp            the SLOW-TURN LOG: every turn of the loop the watchd
                             Measuring is for CI or the other machine: tests feed made-up histograms
 src/turnprofile.blsp        WHERE A SLOW TURN'S TIME WENT: each turn's update and view fill a table of the
                             loop's own — the update's stages (fold, post-steps, spans, tail) and every
-                            hook `model/ed-call-hook` / `ed-call-deferred` ran (post-steps, timers, chips,
-                            highlight sources, pane layers), by name with time and calls; a phase past
+                            hook `model/ed-call-hook` / `ed-call-deferred` ran (post-steps, timers, chips)
+                            and every view source table `sources/run` ran (`timed-each`: one part a table,
+                            its sources named only when it was slow), by name with time and calls; a phase past
                             the watchdog's 50 ms keeps its costliest parts, which the slow-turn log takes
                             with the report (`slowlog`: *Messages* and M-x slow-turns say where it went)
 src/theme.blsp              every colour the editor paints (Catppuccin Mocha), referenced by role;
@@ -441,7 +470,8 @@ src/packages.blsp           bedit's package manager (M-x package-list): install 
                             applies all, C-c C-k drops all; a failed one is named, the rest go
                             on; without review each is applied as it lands.
                             The registry calls are `*registry*` (tests stub it)
-src/help.blsp               the C-h map: C-h b / m / w / a / l / k, C-h f (a function's *Help*
+src/help.blsp               the C-h map: C-h b (by layer, each layer's keys under its keymap's group headings,
+                            `keyhelp/ed-key-groups`) / m / w / a / l / k, C-h f (a function's *Help*
                             page: the whole docstring, keys in force, arguments, signature,
                             module and source line — brood's reflect, seeing through contract
                             shims, ADR-560) and C-h v (an init.blsp setting's page: doc, type,
@@ -486,35 +516,60 @@ src/view.blsp               pure view: model -> render frame (editor/display ops
                             bracket match. The frame names the bottom mode line as its SEAM (`ed-seam-op`, brood
                             ADR-610): the window anchors it and the echo area to its bottom edge
                             and puts the leftover pixels above it; row 0 is a band (no top
-                            margin) only under a header line
+                            margin) only under a header line. The panes themselves are
+                            `panecompose`'s; this is the frame's glue
+src/sources.blsp            a SOURCE TABLE, the one mechanism behind every table of ranked rows:
+                            the view's sources (`model`'s highlight / override / line-note sources,
+                            pane layers, frame overlays, row extras, echo sources, text faces, span
+                            overlays; `gutter`'s margin marks) and `model`'s HOOKS (the steps
+                            around an event, idle jobs, visit steps, file handlers, sinks, …):
+                            `register` (claimed through `ownership`), `rows` by rank, `run` (each
+                            row called straight, the table timed as ONE part of a slow frame,
+                            `turnprofile/timed-each`), `first-answer` (the first non-`blank?` row),
+                            `deps` (the rows' `:deps`, a memo's key), and for hooks `call-hook`
+                            (the package's claimant, timed; `model/ed-call-hook` is it) and
+                            `fold-hooks`. A new kind is a table id and a row shape
+src/panecompose.blsp        one pane's frame from its parts: geometry, body, the registered
+                            sources (highlight, override, line-note, pane layers), the preview
+                            and caret inside its scroll and zoom regions, then its scrollbar and
+                            mode line. Its text layers are one memo, keyed on every source's
+                            `:deps` (`model/ed-pane-source-deps`)
 src/panegeometry.blsp       a pane body's geometry map and the named column spans every layer
-                            measures with (the view's lowest layer)
+                            measures with (the view's lowest layer); `:rows` is ALWAYS a row
+                            table (`panes/ed-pane-rows`), `:row-wise` when wrap counted it
 src/spanpaint.blsp          what colours a line: the span band sliced per line, the layers under
-                            the mode's colours, bracket overrides, the highlight ranges
+                            the mode's colours, the override sources' one-character faces and the
+                            highlight ranges, grouped and cut to a line
 src/panebody.blsp           one pane's body: visible rows (folds, wraps), each row's text and the
-                            gutter beside it
+                            gutter beside it; a row's text facts are a `row-fact` record
 src/linkview.blsp           the pointer and hover band over a clickable location
 src/eolview.blsp            end-of-line notes and the inline completion preview, as painted
-                            (`view` is now the pane, its chrome and the frame over these)
+                            (`panecompose` is the pane over these, `view` the frame)
 src/hittest.blsp            the mouse side of the view: every hit-test / hover fold that takes
                             a model and returns one (:hover, :diag-hover, :link-hover, a chip
                             click, the context menu's hit) — recomputed from the same widget /
                             segments / layout the view drew, so input never imports the renderer
-src/echoarea.blsp           the echo area under the bottom mode line as render ops: the message or eldoc
-                            line, the minibuffer's prompt and candidate list (Plume), the which-key grid
-                            — paged when it does not fit (`ed-which-key-pages`, the last cell
+src/echoarea.blsp           the echo area under the bottom mode line as render ops: the idle line
+                            (the first registered echo source with something to say,
+                            `model/register-echo-source`: a question, a message, then diagpaint's
+                            diagnostic, eolnotes' note, eldoc's hint), the minibuffer's prompt
+                            and candidate list (Plume), the which-key grid (`keycolumns/grid-rows`: paged when it does not fit, the last cell
                             `page 1/3 · C-h n/p`, the page `whichkey/page`)
 src/whichkey.blsp           C-h after a prefix (Emacs which-key's `which-key-C-h-dispatch`): the
                             paging menu — n / p turn the panel's page, u takes the chord's last
                             key back, h lists every binding under the prefix in *Help* (Emacs's
-                            describe-prefix-bindings), a / C-g abort; any other key goes to the
+                            describe-prefix-bindings, grouped as the panel is), a / C-g abort; any other key goes to the
                             prefix, so the chord still completes. A prefix that binds C-h keeps
-                            it. `input/ed-dispatch` asks it before the keymap
+                            it. `input/ed-dispatch` asks it before the keymap. Also the panel's
+                            CELLS (`panel-items`, the groups run down then across by `keycolumns`, laid out by `echoarea`): a prefix key as the
+                            `+name` its map was described with, the keys under the headings
+                            their bindings gave them (`keyhelp/ed-key-groups`, brood ADR-745)
 src/modeline.blsp           a pane's mode line: its segments (`ed-statusbar-segments`, the registered
                             chips included), the bar painted from them, the pointer's layout and the
                             hover tooltips. What `hittest` asks again, so `input` never imports the view
 src/overlayview.blsp        the cards over the panes as ui-kit widgets: the context menu and the
-                            transient menu, paint and zones in one pass
+                            transient menu, paint and zones in one pass. The transient card is
+                            Magit's: groups side by side in balanced columns (`keycolumns`), each row KEY first
 src/codecrumbs.blsp         the header line's crumbs for code: the definitions around point by name, off the
                             held parse (each `deflanguage` names a `:breadcrumbs` that calls it); a Lisp's
                             top-level form
@@ -542,7 +597,7 @@ src/tabbar.blsp             TABS (Emacs tab-bar-mode, C-x t …): each tab a win
                             slot keeper) and its text (a layout keeper); a click is
                             `hittest/ed-tab-bar-click`; lastsession saves the tabs. Per frame
 src/whitespace.blsp         trailing whitespace and tabs as highlight ranges (Emacs whitespace-mode,
-                            `:show-whitespace`, per mode through `scroll/ed-mode-setting`)
+                            `:show-whitespace`, per mode through `display-settings/ed-mode-setting`)
 src/fillindicator.blsp      the fill-column rule (Emacs display-fill-column-indicator-mode,
                             `:fill-column-indicator` per mode, M-x display-fill-column-indicator-mode
                             per buffer): `│` at `conventions/fill-column` on each row that leaves
@@ -634,7 +689,8 @@ src/input.blsp              dispatch: fold a key or tick into the next model, fi
                             key overlays (`model/register-overlay`, `rank` order, listed here
                             with why, pinned by tests/registries_test; each feature's in its
                             own module), the post-event step
-                            (`ed-post-step`); and the
+                            (`ed-post-step`); ESC as Emacs's Meta prefix (`cmd-esc-prefix`, a
+                            one-key read, `ed-read-key`: ESC x is M-x, ESC ESC ESC cancels); and the
                             keyboard-macro REPLAY (`ed-run-macro`): N passes (C-u N C-x e), or
                             until one fails (C-u 0), each stopping at the first key whose
                             command fails (`model/ed-ding` or a throw), as Emacs's does — in
@@ -791,7 +847,8 @@ src/pool.blsp               the buffer pool and where its buffers are shown — 
                             :size} | :new-frame}` — then the defaults, rules too,
                             `display-rules/*display-buffer-defaults*`; a side window is `editor/pane`'s
                             `pane-split-edge`, brood ADR-590, its pane marked `:side`; a new frame
-                            is `frames/frames-spawn-showing`), `ed-pop-to-file`
+                            is `frames/frames-spawn-showing`; a pane split off for a buffer closes
+                            when that buffer is killed, Emacs's quit-restore, `:opened-for`), `ed-pop-to-file`
                             (next-error), find-file + its path prompt, the default dir and
                             project root. A person's visit of a file over `*read-off-loop-bytes*`
                             (2 MB; `ed-find-file-soon`, `ed-visit-file`'s opener) is read OFF the
@@ -820,7 +877,9 @@ src/file-save.blsp          writing a pool buffer to its file: `ed-save-buf-at` 
 src/menu.blsp               the right-click context menu's model ops (open / move / run /
                             close); an item names its command by SYMBOL, resolved when it
                             runs, so a redefined command reaches the menu too
-src/keymaps.blsp            keybinding profiles (emacs / modal vim) as model-scope layers
+src/keymaps.blsp            keybinding profiles (emacs / modal vim) as model-scope layers, and the
+                            which-key name and groups of each prefix map, in the keymap itself
+                            (`keymap-describe`, a heading on each `keymap-bind`; brood ADR-745)
 src/vim.blsp                the Vim grammar over the modal profile: `[count] operator [count]
                             motion|text-object`, `.` repeat, the normal-mode commands and the mode
                             transitions (Esc, I, A, o, O, v)
@@ -939,7 +998,8 @@ src/lex-*.blsp              the lexical highlighters, each a pure `[start end fa
                             mdpreview paints). std's `editor/*` until brood ADR-417
 src/gutter.blsp             the line-number gutter text-mode names as its `:gutter-*`
                             services: the number column, the diff-hl bar, and the margin
-                            marks (● ✓ ✗ ⚠) read through one precedence table that both
+                            marks (● ✓ ✗ ⚠) read through one precedence table (`register-gutter-mark`,
+                            a `sources` table its owners fill: debugger, testrun-cold, eolnotes, diagpaint) that both
                             paints and resolves a click
 src/grammars.blsp           tree-sitter grammars the runtime was not built with: where they
                             live (~/.config/bedit/grammars), declaring them at startup, and
@@ -1001,7 +1061,7 @@ src/dirlocals.blsp          a project's `.bedit-locals.blsp` (Emacs's .dir-local
                             declared `:safe true` (Emacs's safe-local-variable: the layout
                             conventions, the display switches) is taken; the rest is refused and
                             said in the visit's note. Resolved after .editorconfig and before
-                            init.blsp (`conventions/dir-local`, `scroll/ed-local-setting`); C-h v
+                            init.blsp (`conventions/dir-local`, `display-settings/ed-local-setting`); C-h v
                             and M-x describe-indentation name it as the source
 src/hooks.blsp              init.blsp's `:hooks` (Emacs's after-save-hook / <mode>-hook) as DATA:
                             `{:after-save [cmd …] :mode {rust [cmd …]}}`, each a command by its M-x
@@ -1261,7 +1321,7 @@ src/wrap.blsp              where a line falls on screen rows: the pure break rul
                             row's `display` is `{:prefix :inline}`: the WRAP PREFIX (Emacs
                             `wrap-prefix` / adaptive-wrap — a continuation row starts under its
                             line's indent, `:indent`, or fill prefix under the mode's markers, `:adaptive`; the init file's
-                            `:wrap-prefix` per mode, `scroll/ed-wrap-prefix-style`; dropped past
+                            `:wrap-prefix` per mode, `display-settings/ed-wrap-prefix-style`; dropped past
                             half the row) and the row's INLINE annotations (`inlinetext`), both of
                             which the breaks leave room for
 src/inlinetext.blsp         INLINE ANNOTATIONS (Emacs's `before-string` overlay, what an LSP
@@ -1272,7 +1332,7 @@ src/inlinetext.blsp         INLINE ANNOTATIONS (Emacs's `before-string` overlay,
                             buffer text: it takes cells in the row table (`scroll/ed-row-extras`
                             `:inline`, so the buffer lays out row-wise), point cannot be inside
                             it, a click on it is its anchor, a copy never includes it; painted as
-                            VIRTUAL chunks (`spanpaint/ed-splice-inline`) in the hint voice
+                            VIRTUAL chunks (`editor/display/splice-inline`) in the hint voice
 src/folds.blsp              outline FOLDING in an editable buffer (org's TAB): a fold is a
                             marker on its heading, the mode's `:fold-extent` says what it
                             covers, and the row table gives the hidden lines no rows — so the
