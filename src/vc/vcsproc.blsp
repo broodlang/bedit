@@ -1,4 +1,4 @@
-(defmodule vcsproc
+(defmodule vc/vcsproc
   "What every version control's command line shares in the editor, git's and mur's alike:
 the PROCESS LOG (`$`, Magit's `magit-process-buffer`) — every command a VCS porcelain ran,
 its exit code, how long it took and its output — and running one OFF the loop (`vcs-launch`),
@@ -15,144 +15,9 @@ synchronous form headless runs use. Nothing here knows any one VCS's arguments o
   (:use model) ; message / ed-apply / ed-buffer-index-by-name / ed-headless? / register-task-reply
   (:use pool) ; ed-display-buffer / ed-upsert-named / ed-goto-line
   (:use interactive) ; defcommand
-  (:use section) ; section — a diff's hunks as sections
   (:use task) ; task — a network command, off the loop
-  (:use theme :only [*base* *blue* *green* *overlay0* *red* *subtext*])) ; the palette
-;; `theme` (a project source module, loaded with the image) provides the *green* / *red* /
-;; *blue* / *subtext* dynamic-var colour globals this file reads bare.
-
-;; ---- unified diffs, as every VCS prints them ---------------------------------------
-;; git and mur both print a unified diff (`git diff`, `mur diff`), so the faces of one, and
-;; the classifiers that pick them from a line, are the shared vocabulary of every diff view:
-;; a section buffer's hunk lines, a plain-text report's raw output, the process log.
-
-(theme/defchrome vcs-face-add {:fg *green*}) ; an added (+) line; a command that exited 0
-(theme/defchrome vcs-face-del {:fg *red*}) ; a removed (-) line; a command that failed
-(theme/defchrome vcs-face-hunk {:fg *blue* :bold true}) ; a @@ hunk header; a command still running
-(theme/defchrome vcs-face-file {:fg *subtext* :bold true}) ; diff --git / +++ / --- file headers
-(theme/defchrome vcs-face-meta {:fg *subtext*}) ; index / mode / rename metadata
-
-;; Magit's look: an added or removed line is a faint tint of its colour across the whole pane
-;; (`:section-bands`), the words that changed in it a stronger one, the code itself in its
-;; language's colours; a hunk heading is a bar. Blended from the palette (`theme/mix`), so a
-;; theme switch re-derives them.
-(theme/defchrome vcs-face-add-band {:bg (theme/mix *green* *base* 0.12)}) ; an added line's background
-(theme/defchrome vcs-face-del-band {:bg (theme/mix *red* *base* 0.12)}) ; a removed line's background
-(theme/defchrome vcs-face-add-refine {:bg (theme/mix *green* *base* 0.32)}) ; the words an added line changed
-(theme/defchrome vcs-face-del-refine {:bg (theme/mix *red* *base* 0.32)}) ; the words a removed line changed
-(theme/defchrome vcs-face-hunk-band {:bg (theme/mix *blue* *base* 0.14)}) ; a @@ hunk heading's bar
-(theme/defchrome vcs-face-hunk-range {:fg *overlay0*}) ; a hunk heading's `@@ -a,b +c,d @@`
-
-(defn vcs-whole-line (off line face)
-  "A whole-line span `[off end face]`, or `()` when `face` is nil."
-  (if (nil? face) '() (list [off (+ off (count line)) face])))
-
-(defn vcs-diff-line-face (line)
-  "The face of one diff BODY line by its first character, or nil for context."
-  (cond
-    (string/starts-with? line "+") vcs-face-add
-    (string/starts-with? line "-") vcs-face-del
-    (string/starts-with? line "\\") vcs-face-meta
-    else nil))
-
-(defn vcs-diff-text-face (line)
-  "The face for a line of raw unified-diff TEXT: headers, hunk headers, `+` and `-` lines;
-nil for a context line. For the plain-text reports (`!`'s output, `mur diff`); a section
-buffer colours by what a line IS instead (its row)."
-  (cond
-    (string/starts-with? line "@@") vcs-face-hunk
-    (or (string/starts-with? line "+++") (string/starts-with? line "---")) vcs-face-file
-    (string/starts-with? line "diff ") vcs-face-file
-    (or (string/starts-with? line "index ")
-      (string/starts-with? line "new ")
-      (string/starts-with? line "deleted ")
-      (string/starts-with? line "rename ")
-      (string/starts-with? line "similarity ")
-      (string/starts-with? line "old mode")
-      (string/starts-with? line "new mode"))
-      vcs-face-meta
-    else (vcs-diff-line-face line)))
-
-(defn vcs-diff-fontify (src)
-  "The `:fontify` of a plain-text report holding a unified diff — colour each line."
-  (modes/fontify-lines src (fn (l off) (vcs-whole-line off l (vcs-diff-text-face l)))))
-
-;; A file's diff in a section buffer is the same tree whichever VCS printed it: each hunk a
-;; section headed by its `@@` line, its lines the body — parsed by std's `diff`, so a body line
-;; knows the file line it is (`diff/hunk-new-line`) and a hunk can be turned back into a patch.
-
-(defn vcs-hunk-sections (file value &optional (paint? true))
-  "The hunk sections of one parsed `std/diff` file: each `@@` header a heading, its lines the
-body, each section's value `value` with `:file` and `:hunk` added. Keyed by position and
-header, so a re-render keeps a folded hunk folded. A hunk's value also carries how to paint
-it (`diffpaint`): `:syntax`, its lines in their language's colours, and `:refine`, the words
-that changed — when `paint?` (the buffer's budget, `diffpaint/paint-keys`, has room for this
-file) and the file is small enough to paint (`diffpaint/paint?`). A hunk's paint is
-remembered (`diffpaint/hunk-paint`), so rebuilding a tree repaints only the hunks that changed."
-  (let (hunks (:hunks file)
-        path (or (:new-path file) (:old-path file))
-        painted? (and paint? (diffpaint/paint? file)))
-    (map (range (count hunks))
-      (fn (i)
-        (let (h (nth hunks i)
-              paint (if painted? (diffpaint/hunk-paint path (:lines h)) {:syntax nil :refine {}}))
-          (section :hunk
-            (merge value {:file file :hunk h :syntax (:syntax paint) :refine (:refine paint)})
-            (:header h)
-            (:lines h)
-            {:key (str i " " (:header h))}))))))
-
-(defn vcs-hunk-line (row hunk)
-  "The line of the NEW file the section `row` stands for inside `hunk` (a `vcs-hunk-sections`
-value): a body line the line it is (or, removed, sits at); the heading the hunk's first line.
-
-    (vcsproc/vcs-hunk-line {:heading? false :line 2} {:hunk {:new-start 10 :lines [\" a\" \"-b\" \"+c\"]}})   ;=> 11"
-  (if (and row (not (:heading? row)) (int? (:line row)))
-    (diff/hunk-new-line (:hunk hunk) (:line row))
-    (:new-start (:hunk hunk) 1)))
-
-(defn- vcs-hunk-heading-spans (line)
-  "A `@@ -a,b +c,d @@ context` heading: the line ranges quiet, the context (the function the
-hunk is in) in the hunk face."
-  (let (after (if (> (count line) 2)
-                (index-of (string/substring line 2 (count line)) "@@")
-                -1)
-        close (if (< after 0) -1 (+ after 2)))
-    (if (< close 0)
-      (vcs-whole-line 0 line vcs-face-hunk)
-      (list [0 (+ close 2) vcs-face-hunk-range] [(+ close 2) (count line) vcs-face-hunk]))))
-
-(defn vcs-hunk-spans (row line)
-  "The faces of `line`, a line of a `vcs-hunk-sections` hunk that section `row` stands for:
-its heading's ranges and context, or a body line's sign in green or red, its code in its
-language's colours (the line whole in green or red when the language has none) and the
-words it changed under a stronger tint."
-  (if (:heading? row)
-    (vcs-hunk-heading-spans line)
-    (let (value (:value row)
-          index (:line row)
-          sign-face (vcs-diff-line-face line)
-          syntax (when (and (vector? (:syntax value)) (int? index)) (nth (:syntax value) index nil))
-          spans (cond
-                  (string/starts-with? line "\\") (vcs-whole-line 0 line sign-face)
-                  (nil? syntax) (vcs-whole-line 0 line sign-face)
-                  (nil? sign-face) syntax
-                  else (into [[0 1 sign-face]] syntax))
-          changed (get (or (:refine value) {}) index))
-      (if (empty? changed)
-        spans
-        (diffpaint/overlay (into [] spans)
-          changed
-          (if (string/starts-with? line "+") vcs-face-add-refine vcs-face-del-refine))))))
-
-(defn vcs-hunk-band (row line)
-  "The background of `line` in a hunk (a `:section-bands` service's answer for one): the
-heading's bar, an added or removed line's tint, nil for context."
-  (cond
-    (:heading? row) vcs-face-hunk-band
-    (string/starts-with? line "+") vcs-face-add-band
-    (string/starts-with? line "-") vcs-face-del-band
-    else nil))
+  ;; the journal's lines are coloured as a diff's are
+  (:use diffs :only [vcs-whole-line vcs-face-add vcs-face-del vcs-face-hunk]))
 
 ;; ---- the journal: what the VCS actually ran (`$`) -------------------------------
 ;; Magit's `$` (`magit-process-buffer`): every invocation, its exit code and its output,
@@ -293,7 +158,7 @@ buffer re-rendered if it is open."
   "The model with running entry `id` completed by result `r` — unchanged when that entry has
 already been trimmed away. Re-renders the buffer if it is open, so a `pull` you are watching
 stops reading `run` the moment it lands. A finished command may have changed what the mode
-line's summary says, so its stamp goes too (`vcscore/vcs-summary-fresh?`): the next idle beat asks."
+line's summary says, so its stamp goes too (`vc/vcscore/vcs-summary-fresh?`): the next idle beat asks."
   (vcs-journal-sync (assoc (dissoc m :vcs-summary-asked-key)
                       :vcs-journal
                         (into []
@@ -465,7 +330,7 @@ or commit killed mid-write leaves `index.lock` behind)."
           [])
     (if (:vcs-queue-proc m) ["vc: a working-tree command"] [])))
 
-(register-exit-query :vcs 'vcsproc/vcs-live)
+(register-exit-query :vcs 'vc/vcsproc/vcs-live)
 
 ;; check-allow: `runner` and `then` are opaque caller-supplied functions; the declaration
 ;; is the contract (ADR-341's `:trusted`).
@@ -528,7 +393,7 @@ question you have when one is slow. `vcs-apply-op` completes it; the entry times
 
 (check-allow :trusted
   ;; a command that can outlast a frame — network, so a task
-  (register-task-reply :vcs-op-proc 'vcsproc/vcs-apply-op nil "vc")
+  (register-task-reply :vcs-op-proc 'vc/vcsproc/vcs-apply-op nil "vc")
   (sig vcs-apply-op (model any -> model))
   (defn vcs-apply-op (m r)
     "Fold a finished `vcs-launch`: report the outcome and run its `then`. A nil `r` is the
@@ -620,7 +485,7 @@ failing or being dropped lets go: another read finishing first (a `r u` asked be
   (assoc (message m (str label "… (C-g cancels)"))
     :read-char
       {:then (fn (mm _key) (vcs-hold mm label token))
-       :on-cancel 'vcsproc/vcs-hold-cancel
+       :on-cancel 'vc/vcsproc/vcs-hold-cancel
        :vcs-hold token}))
 
 (defn- vcs-let-go (m tokens)
@@ -655,7 +520,7 @@ in flight takes no turn — staging and reading go on beside it."
 ;; of another repo: `U`, then a switch to a file in repo B before the read landed, must not
 ;; unstage everything in B. So each follow-up runs with the repo it was asked in
 ;; PINNED (`:vcs-pinned-root`), and a porcelain's root resolution reads the pin first
-;; (`gitcore/git-resolve-root`, `murcore/mur-resolve-root`).
+;; (`vc/gitcore/git-resolve-root`, `vc/murcore/mur-resolve-root`).
 
 (defn vcs-pinned-root (m)
   "The repo the follow-up running now was asked in, or nil outside one."
@@ -720,7 +585,7 @@ good, since the loop keeps the model from before a failed update."
 (check-allow :trusted
   ;; a working-tree command, queued; quick, so no activity label, and no C-g: half a stage is
   ;; a lock left behind
-  (register-task-reply :vcs-queue-proc 'vcsproc/vcs-apply-queued nil nil)
+  (register-task-reply :vcs-queue-proc 'vc/vcsproc/vcs-apply-queued nil nil)
   (sig vcs-apply-queued (model any -> model))
   (defn vcs-apply-queued (m r)
     "Fold a finished queued command through its `then`, then start the next. A nil `r` is the
@@ -739,10 +604,10 @@ task having errored or timed out, said plainly."
   ;; a read a command waits on (a prompt's candidates, the branch a push goes from); the
   ;; whole event, because nil is an answer a read can give (no upstream) and a failure is not
   (register-task-reply :vcs-gather-proc
-    'vcsproc/vcs-apply-gather
+    'vc/vcsproc/vcs-apply-gather
     nil
     "vc"
-    {:folds-event? true :cancel-on-quit? true :on-quit 'vcsproc/vcs-gather-quit})
+    {:folds-event? true :cancel-on-quit? true :on-quit 'vc/vcsproc/vcs-gather-quit})
   (sig vcs-apply-gather (model any -> model))
   (defn vcs-apply-gather (m event)
     "Fold a finished `vcs-gather`: its answer through its `then`, or — when the task errored
@@ -786,10 +651,10 @@ loop (`said-here?`)."
 ;; log here.
 (def vcs-process-keymap
   (-> {}
-    (keymap-bind ["q"] 'vcsproc/cmd-vcs-quit)
-    (keymap-bind ["g"] 'vcsproc/cmd-vcs-process)
-    (keymap-bind ["k"] 'vcsproc/cmd-vcs-process-clear)
-    (keymap-bind ["$"] 'vcsproc/cmd-vcs-process)
+    (keymap-bind ["q"] 'vc/vcsproc/cmd-vcs-quit)
+    (keymap-bind ["g"] 'vc/vcsproc/cmd-vcs-process)
+    (keymap-bind ["k"] 'vc/vcsproc/cmd-vcs-process-clear)
+    (keymap-bind ["$"] 'vc/vcsproc/cmd-vcs-process)
     (keymap-bind [:ctrl-n] 'motion/cmd-next-line)
     (keymap-bind [:ctrl-p] 'motion/cmd-previous-line)
     (keymap-bind [:down] 'motion/cmd-next-line)
@@ -799,15 +664,15 @@ loop (`said-here?`)."
   {:name 'vcs-process
    :writable :toggle
    :doc "What the version control actually ran: every command, its exit code, how long it took and its output."
-   :keymap vcsproc/vcs-process-keymap
+   :keymap vc/vcsproc/vcs-process-keymap
    ;; NOT "vcs-process": a layer's `:commands` are subtracted from the GLOBAL M-x set
    ;; (`model/ed-all-layer-commands`), and `M-x vcs-process` has to work from anywhere —
    ;; the buffer it opens is exactly where you are not
    :commands '("vcs-process-clear" "vcs-quit")
-   :fontify 'vcsproc/vcs-process-fontify})
+   :fontify 'vc/vcsproc/vcs-process-fontify})
 
 (register-type-layers :vcs-process
-  (list 'vcsproc/vcs-process-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
+  (list 'vc/vcsproc/vcs-process-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
 
 ;; ---- a status buffer, shown before its collection lands -----------------------------
 ;; *git-status* and *mur-status* collect in a task and render when it answers; meanwhile the
