@@ -126,7 +126,7 @@ src/keymaps.blsp            keybinding profiles (emacs / modal vim) as model-sco
 src/interactive.blsp        the `defcommand` macro + the M-x command registry
 src/modes.blsp              modes as layers: the keymaps (data) + brood-mode services
 src/complete-at-point.blsp  completion-at-point (the in-buffer Tab popup)
-src/lsp.blsp                LSP client — completion, goto-def/references, hover, rename, format, imenu
+src/lsp/client.blsp                LSP client — completion, goto-def/references, hover, rename, format, imenu
 src/mincomplete.blsp        minibuffer prompt completion (path / name)
 src/completion.blsp         shared fuzzy ranking + vertical-menu renderer (complete + minibuffer)
 src/fileperm.blsp           the `ls -l` permission string (dired + minibuffer marginalia)

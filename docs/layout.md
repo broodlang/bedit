@@ -21,8 +21,6 @@ src/main.blsp               entry point — window / daemon startup (--serve/--a
 src/showparen.blsp          show-paren: the bracket pair at point as two one-character overrides (the end at
                             point underlined, its partner a block, an unmatched one red), through the
                             mode's `:bracket-match` / `:bracket-match-tree` — an override source
-src/diagpaint.blsp          a diagnostic's paint in a pane: the wave under its token (an override source)
-                            and `ed-visible-diagnostics`, the per-visible-line read the ghost note shares
 src/startpage.blsp          the start page bedit opens on with no file: recent files (1-9 open them) and
                             projects, the keys that open everything, where to learn, the version —
                             read-only, each action line a link (`:start-actions` by line, not matched
@@ -98,8 +96,6 @@ src/model.blsp              the ui-run model: buffer pool, panes, *Messages*,
                             minibuffer message, and lands in *Messages* as always
 src/textpos.blsp            pure text geometry under the model: an offset's line, column, ends, and
                             what an edit changed (the splice log)
-src/diagstore.blsp          the diagnostics cache the view reads, whoever produced it, a
-                            diagnostic's position converted in one place, the quiet window
 src/lossage.blsp            the recent keys (C-h l), a bounded ring on the model
 src/minibuffer.blsp         the minibuffer: a one-line prompt over std's lineedit with a list under
                             it, modal (`minibuffer-handle`); ranks on the key for a small source,
@@ -292,12 +288,6 @@ src/lifeline.blsp           the editor loop under a SUPERVISOR (`main` runs `sup
                             has one KEEPER doing that across every session (`start-keeper`), a terminal
                             display taking `:term` and `:hup` while entered (ADR-586).
                             Its `emergency-save!` is a served session's crash hook too (remote)
-src/diagcheck.blsp          the advisory diagnostics CHECK, off the loop on the idle beat — in
-                            the sandbox child for a brood buffer (its own session client), an
-                            in-image task otherwise; folds into the model's diagnostics cache
-src/diagnostics.blsp        C-c ! *Diagnostics*: every warning and error in the buffer, one row per
-                            finding (`line:col` and the message) in a pane beside it, RET or a click
-                            visiting it; the command toggles
 src/eldoc.blsp              the idle beat's point-driven hints: the eldoc line (off the loop),
                             when an LSP signature hint is due, the inline completion preview
 src/treewarm.blsp           a large tree-sitter buffer's parse warmed off the loop, so the first
@@ -1108,81 +1098,6 @@ src/snippet.blsp            SNIPPETS (Emacs's yasnippet / tempel): templates in 
                             grows at both edges, which std's left-gravity markers cannot say —
                             and mirrors are rewritten in the typing's own undo group; the
                             expansion is one undo step
-src/lsp-protocol.blsp       the protocol, pure: what each answer means, positions in UTF-16 units, the
-                            document sync, what each request puts on the wire, and the connection
-                            as a state machine (`lsp-ingest`, `lsp-issue`). No process, no server. A server's
-                            REFRESH request (`workspace/semanticTokens|inlayHint|codeLens/refresh`,
-                            `*lsp-refresh-requests*`) is answered null and queued on `:refreshes`,
-                            which the connection sends the editor as `[:lsp-refresh-… conn]`
-                            A ContentModified / ServerCancelled answer to what the idle beat asks by
-                            itself (semantic tokens, lenses, inlay hints) comes back `:lsp-retry`
-                            (`lsp-retry?`), and the fold makes it due again rather than empty
-src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, goto-def/references,
-                            hover, rename, format, imenu, INLAY HINTS (the lines on screen on the idle beat, as
-                            `inlinetext` annotations owned by `:lsp-inlay`; opt-in per mode by
-                            `:lsp-inlay-hints`, M-x lsp-inlay-hints-mode per buffer; the range cut to the text, `inlay-range`,
-                            since rust-analyzer answers a position past it with no hints), and `publishDiagnostics` folded into
-                            the model's diagnostics, so every language gets the underline / ⚠ note
-                            / gutter mark the Brood checker used to have to itself. Answers
-                            server->client requests too (`client/registerCapability` — a server
-                            BLOCKS on that reply), advertises `refreshSupport` for semantic tokens,
-                            inlay hints and lenses and the client commands it runs
-                            (`experimental.commands`, `lsp-lens/*client-commands*` — rust-analyzer
-                            sends no lens without them), and starts the server IN the project root, which
-                            is how one that builds the project finds it. Elixir is Expert
-                            (expert-lsp.org), which narrates its own startup — forwarded to
-                            *Messages*, because it answers nothing until its engine is up.
-                            THE SERVER TABLE (`*lsp-server-specs*`): per server its file types,
-                            command alternatives (the first installed runs), root markers
-                            (`Cargo.lock` before `Cargo.toml`) and whether it is an ADD-ON or
-                            SHARED. A buffer reaches every server its extension names (pyright
-                            and ruff for .py), each rooted where its markers say, or none — so
-                            wos source beside a running brood-lsp is never checked as Brood.
-                            Lookups go to the first server offering the feature; diagnostics
-                            and completions merge. A shared server (rust-analyzer, gopls,
-                            pyright, TypeScript) takes a further project as a workspace folder
-                            when it says it can and both pin the same toolchain
-                            (`ed-lsp-identity`). `:lsp-servers` files them; M-x lsp-servers
-                            lists them
-src/lsp-servers.blsp        the servers as the model holds them: where each starts, which projects
-                            share one, filing them under `:lsp-servers`, a server dying or merged,
-                            the document push, what they published, asking one — about any pool
-                            buffer (`ed-lsp-ask-server-at`, `ed-lsp-push-text-at`), and which of a
-                            server's buffers are on screen (`ed-lsp-shown`, what a refresh re-asks). lsp-commands is the
-                            commands and the folds of their answers
-src/lsp-commands.blsp       the editor's side of a language server: definition and back, references,
-                            imenu, hover, signature help, code actions, rename, format, and the
-                            folds of the server's replies, notices, diagnostics and edits; the
-                            `LspRequest` fold impls
-src/lsp-requests.blsp       the LSP request-kind records + `LspRequest` ability — the shape/fold vocabulary
-                            shared by lsp (connection side) and lsp-commands (model side); eager-loaded so
-                            lsp-commands can register fold impls while lsp stays deferred
-src/lsp-semantic.blsp       LSP SEMANTIC TOKENS (`semanticTokens/full`, `/full/delta`): the integer
-                            array (a delta applied) turned into spans by a TASK off the loop, each token
-                            type + modifiers a `:syntax/*` face (`:syntax/variable` is its own; a
-                            definition `:syntax/definition`; strings / comments / numbers left to
-                            the mode), stamped on the pool buffer as `:semantic-spans`, which
-                            `spanpaint/ed-buffer-spans` lays OVER the mode's colouring. Asked on the
-                            idle beat when the text moved (order 55); carried through the splice
-                            log by a post-step (order 45) until the next answer, never dropped on a
-                            keystroke. `:lsp-semantic-tokens` (default on where offered), M-x
-                            lsp-semantic-tokens-mode. A server's refresh asks each of its buffers on
-                            screen again (a delta against the last answer, as VS Code asks). Its request kinds and their `LspRequest` impls
-                            (all four halves) live here, not in lsp-requests / lsp-protocol
-src/lsp-lens.blsp           LSP CODE LENS (`codeLens`, `codeLens/resolve`): each lens a dim INLAY
-                            row above its line (`wrap/inlay-lines`, owner `:lsp-code-lens`), titles
-                            joined ` | `, indented as the line; anchored by a char offset carried
-                            through the splice log (post-step order 46), asked on the idle beat
-                            (order 60), unresolved ones resolved, asked again on the server's refresh.
-                            A CLICK on a lens row (`model/register-inlay-click`) or M-x
-                            lsp-code-lens-run runs the lens: a SERVER command (one it lists in
-                            `executeCommandProvider`) through `workspace/executeCommand` (a code
-                            action's path: its edits come back as `workspace/applyEdit`), a CLIENT
-                            command through `*client-commands*` — rust-analyzer's `runSingle` as
-                            its cargo command in *compilation* (`runnable-command`,
-                            `compile/compile-run`), `showReferences` / `gotoLocation` a jump or a
-                            picker, `debugSingle` said — and any other said, never sent.
-                            `:lsp-code-lens` (default off), M-x lsp-code-lens-mode
 src/mincomplete.blsp        minibuffer prompt completion (path / name); a directory's sorted listing
                             is a `defmemo` on its path and mtime, asked only once the directory
                             has been quiet a second (a listing in the same clock tick as an entry
@@ -1891,4 +1806,116 @@ src/vc/timemachine.blsp
     task — the history once, a revision when first stepped to, cached;
     a step supersedes the fetch in flight. git and mur both provide
     the rows (gitview, murhistory); mur has no blame
+```
+
+## lsp — language servers: the client, the wire, the servers a buffer has, the commands, semantic colours, code lenses
+
+```
+src/lsp.blsp
+    the context's API: a file's connection, the diagnostics servers published for a path, a code
+    action; loads the parts that register at load (autostart, the text push, semantic tokens, lenses)
+src/lsp/protocol.blsp
+    the protocol, pure: what each answer means, positions in UTF-16 units, the
+    document sync, what each request puts on the wire, and the connection
+    as a state machine (`lsp-ingest`, `lsp-issue`). No process, no server. A server's
+    REFRESH request (`workspace/semanticTokens|inlayHint|codeLens/refresh`,
+    `*lsp-refresh-requests*`) is answered null and queued on `:refreshes`,
+    which the connection sends the editor as `[:lsp-refresh-… conn]`
+    A ContentModified / ServerCancelled answer to what the idle beat asks by
+    itself (semantic tokens, lenses, inlay hints) comes back `:lsp-retry`
+    (`lsp-retry?`), and the fold makes it due again rather than empty
+src/lsp/client.blsp
+    LSP client (proc-spawn + JSON-RPC) — completion, goto-def/references,
+    hover, rename, format, imenu, INLAY HINTS (the lines on screen on the idle beat, as
+    `inlinetext` annotations owned by `:lsp-inlay`; opt-in per mode by
+    `:lsp-inlay-hints`, M-x lsp-inlay-hints-mode per buffer; the range cut to the text, `inlay-range`,
+    since rust-analyzer answers a position past it with no hints), and `publishDiagnostics` folded into
+    the model's diagnostics, so every language gets the underline / ⚠ note
+    / gutter mark the Brood checker used to have to itself. Answers
+    server->client requests too (`client/registerCapability` — a server
+    BLOCKS on that reply), advertises `refreshSupport` for semantic tokens,
+    inlay hints and lenses and the client commands it runs
+    (`experimental.commands`, `lsp-lens/*client-commands*` — rust-analyzer
+    sends no lens without them), and starts the server IN the project root, which
+    is how one that builds the project finds it. Elixir is Expert
+    (expert-lsp.org), which narrates its own startup — forwarded to
+    *Messages*, because it answers nothing until its engine is up.
+    THE SERVER TABLE (`*lsp-server-specs*`): per server its file types,
+    command alternatives (the first installed runs), root markers
+    (`Cargo.lock` before `Cargo.toml`) and whether it is an ADD-ON or
+    SHARED. A buffer reaches every server its extension names (pyright
+    and ruff for .py), each rooted where its markers say, or none — so
+    wos source beside a running brood-lsp is never checked as Brood.
+    Lookups go to the first server offering the feature; diagnostics
+    and completions merge. A shared server (rust-analyzer, gopls,
+    pyright, TypeScript) takes a further project as a workspace folder
+    when it says it can and both pin the same toolchain
+    (`ed-lsp-identity`). `:lsp-servers` files them; M-x lsp-servers
+    lists them
+src/lsp/servers.blsp
+    the servers as the model holds them: where each starts, which projects
+    share one, filing them under `:lsp-servers`, a server dying or merged,
+    the document push, what they published, asking one — about any pool
+    buffer (`ed-lsp-ask-server-at`, `ed-lsp-push-text-at`), and which of a
+    server's buffers are on screen (`ed-lsp-shown`, what a refresh re-asks). lsp-commands is the
+    commands and the folds of their answers
+src/lsp/commands.blsp
+    the editor's side of a language server: definition and back, references,
+    imenu, hover, signature help, code actions, rename, format, and the
+    folds of the server's replies, notices, diagnostics and edits; the
+    `LspRequest` fold impls
+src/lsp/requests.blsp
+    the LSP request-kind records + `LspRequest` ability — the shape/fold vocabulary
+    shared by lsp (connection side) and lsp-commands (model side); eager-loaded so
+    lsp-commands can register fold impls while lsp stays deferred
+src/lsp/semantic.blsp
+    LSP SEMANTIC TOKENS (`semanticTokens/full`, `/full/delta`): the integer
+    array (a delta applied) turned into spans by a TASK off the loop, each token
+    type + modifiers a `:syntax/*` face (`:syntax/variable` is its own; a
+    definition `:syntax/definition`; strings / comments / numbers left to
+    the mode), stamped on the pool buffer as `:semantic-spans`, which
+    `spanpaint/ed-buffer-spans` lays OVER the mode's colouring. Asked on the
+    idle beat when the text moved (order 55); carried through the splice
+    log by a post-step (order 45) until the next answer, never dropped on a
+    keystroke. `:lsp-semantic-tokens` (default on where offered), M-x
+    lsp-semantic-tokens-mode. A server's refresh asks each of its buffers on
+    screen again (a delta against the last answer, as VS Code asks). Its request kinds and their `LspRequest` impls
+    (all four halves) live here, not in lsp-requests / lsp-protocol
+src/lsp/lens.blsp
+    LSP CODE LENS (`codeLens`, `codeLens/resolve`): each lens a dim INLAY
+    row above its line (`wrap/inlay-lines`, owner `:lsp-code-lens`), titles
+    joined ` | `, indented as the line; anchored by a char offset carried
+    through the splice log (post-step order 46), asked on the idle beat
+    (order 60), unresolved ones resolved, asked again on the server's refresh.
+    A CLICK on a lens row (`model/register-inlay-click`) or M-x
+    lsp-code-lens-run runs the lens: a SERVER command (one it lists in
+    `executeCommandProvider`) through `workspace/executeCommand` (a code
+    action's path: its edits come back as `workspace/applyEdit`), a CLIENT
+    command through `*client-commands*` — rust-analyzer's `runSingle` as
+    its cargo command in *compilation* (`runnable-command`,
+    `compile/compile-run`), `showReferences` / `gotoLocation` a jump or a
+    picker, `debugSingle` said — and any other said, never sent.
+    `:lsp-code-lens` (default off), M-x lsp-code-lens-mode
+```
+
+## diagnostics — the warnings and errors a buffer has, from the Brood checker or a language server: the store, the check, the paint, the pane
+
+```
+src/diagnostics.blsp
+    the context's API: setting and stamping a buffer's findings, a finding's line and column as
+    every reader converts them, the pane's report rows; loads the check and the paint
+src/diagnostics/paint.blsp
+    a diagnostic's paint in a pane: the wave under its token (an override source)
+    and `ed-visible-diagnostics`, the per-visible-line read the ghost note shares
+src/diagnostics/store.blsp
+    the diagnostics cache the view reads, whoever produced it, a
+    diagnostic's position converted in one place, the quiet window
+src/diagnostics/check.blsp
+    the advisory diagnostics CHECK, off the loop on the idle beat — in
+    the sandbox child for a brood buffer (its own session client), an
+    in-image task otherwise; folds into the model's diagnostics cache
+src/diagnostics/pane.blsp
+    C-c ! *Diagnostics*: every warning and error in the buffer, one row per
+    finding (`line:col` and the message) in a pane beside it, RET or a click
+    visiting it; the command toggles
 ```
