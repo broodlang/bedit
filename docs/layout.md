@@ -1261,13 +1261,6 @@ src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclien
 src/guest.blsp              a guest's session (brood ADR-415): editing what it was given, nothing
                             more — the allowlist (`ed-guest-allows?`, the `:guest` command trait)
                             that tests/guest_allowed.txt pins
-src/collab.blsp             shared-buffer collaboration: presence carets, delta merges, follow/mirror
-src/collabview.blsp         collab presence as the panes paint it: other participants' selections
-                            (a highlight source) and carets with their name tags (a `:with-text`
-                            pane layer)
-src/collab-commands.blsp    the shared-session commands: M-x share-session, follow or mirror a
-                            participant, stop sharing, what the session is doing; the mechanism
-                            (presence, the file registry, follow) is `collab`'s
 tests/*_test.blsp           pure model/view tests, one suite per area (no window needed)
 tests/support/testkit.blsp  what the tests share: `m-of`, `cur`, `press` (keys through the real dispatch at
                             80×24), `type-str`, `after`, and `said` (the message shown, beside a standing
@@ -1963,4 +1956,19 @@ src/decorations/spell.blsp
 src/decorations/whitespace.blsp
     trailing whitespace and tabs as highlight ranges (Emacs whitespace-mode,
     `:show-whitespace`, per mode through `display-settings/ed-mode-setting`)
+```
+
+## collab — editing together: who is in a shared buffer, their carets and selections, sharing and joining
+
+```
+src/collab.blsp
+    shared-buffer collaboration: presence carets, delta merges, follow/mirror
+src/collab/view.blsp
+    collab presence as the panes paint it: other participants' selections
+    (a highlight source) and carets with their name tags (a `:with-text`
+    pane layer)
+src/collab/commands.blsp
+    the shared-session commands: M-x share-session, follow or mirror a
+    participant, stop sharing, what the session is doing; the mechanism
+    (presence, the file registry, follow) is `collab`'s
 ```
