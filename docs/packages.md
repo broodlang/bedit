@@ -290,7 +290,7 @@ Built on Part 1 and on the config registries from
    open `*Package Diff: NAME*` — `NAME old → new`, the package's own `CHANGELOG.md` (or `NEWS`)
    entries for the versions after the installed one up to the new one, then every file the
    new version adds, deletes or changes as hunk sections painted as every diff in bedit is
-   (`src/package-review.blsp` over `vcsproc/vcs-hunk-sections` and `diffpaint`; TAB folds).
+   (`src/packages/review.blsp` over `diffs/vcs-hunk-sections` and `diffs`; TAB folds).
    `C-c C-c` moves the staged copy into place and applies it live; `C-c C-k` or `q` deletes
    the staged copy and keeps the installed one. Until `C-c C-c` the installed copy is never
    touched, so a failed fetch, a refusal, a C-g, a drop or a review left open all keep it. An
@@ -361,7 +361,7 @@ Built on Part 1 and on the config registries from
 ## What removing or updating a package takes back (built)
 
 Removing a package (`packages/remove!`, `d` in *Packages*) and updating one
-(`packages/update-plugin!`) go through ONE retirement, `package-ledger/retire-package`, and then
+(`packages/update-plugin!`) go through ONE retirement, `packages/ledger/retire-package`, and then
 put the open buffers right. Like Emacs's `unload-feature`, it leaves the editor as it was
 before the package loaded:
 
@@ -375,7 +375,7 @@ before the package loaded:
   `registry/put` of its own) are found with Brood's `registry/written-by` (ADR-582): the
   kernel credits each write a load made to its module, or to the FILE for a file with no
   `defmodule`, so the package's writers are its module symbols and its files' absolute paths
-  (`package-ledger/package-writers`). A list member is taken back (`registry/retract`). A map entry
+  (`packages/ledger/package-writers`). A list member is taken back (`registry/retract`). A map entry
   keeps a per-entry stack, `:packages/std-layers`: what it held before any package, then each
   package's write in load order. Retiring the package whose write is live gives the entry to
   the layer below it — another package's write, credited to that package again — or to what

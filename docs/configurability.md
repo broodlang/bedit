@@ -207,7 +207,7 @@ follows, are the table in `src/modes.blsp`.
 A letter bound to a command declared `:typing` (`interactive/declare-trait`) counts as typing,
 so the guard allows it: wdired's permission toggles (`:wdired-allow-to-change-permissions true`,
 Emacs's `wdired-toggle-bit`) bind `r` `w` `x` `s` `t` `S` `T` `-` and SPC to
-`wdired/cmd-wdired-set-bit`, which sets the permission character under point inside a permission
+`dired/writable/cmd-wdired-set-bit`, which sets the permission character under point inside a permission
 span and inserts the letter anywhere else — a file name still takes every letter. wdired's
 other spans: a symlink's target after ` -> ` (`:wdired-allow-to-redirect-links`, on by default,
 as Emacs), and the nine permission characters (off by default; `:advanced` makes them free

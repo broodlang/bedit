@@ -62,8 +62,11 @@ for path in $(printf '%s\n' "$changed" | grep -E '\.blsp$'); do
             add "$path" ;;
         src/*)
             src_changed=1
-            module=$(basename "$path" .blsp)
-            add "tests/$(echo "$module" | tr '-' '_')_test.blsp"
+            # the module the file holds: `src/shells/terminal.blsp` is `shells/terminal`
+            module=${path#src/}
+            module=${module%.blsp}
+            # its own test file, by its last name (`tests/terminal_test.blsp`), when there is one
+            add "tests/$(basename "$module" | tr '-' '_')_test.blsp"
             for test_file in $(naming "$module"); do add "$test_file"; done ;;
     esac
 done

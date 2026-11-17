@@ -135,7 +135,7 @@ hit-test (`view/ed-modeline-segment-at`), so a segment is clickable/hoverable ex
 its glyphs are drawn — the discipline the completion card already uses. Layers extend the bar
 two ways: a per-buffer mode adds a segment through its `:modeline` service; global chrome
 (the git branch + working-tree indicator) is cached on the model (`:git-segments`, built off
-the idle beat by `gitbar/git-statusbar-segments`) and rendered for the selected pane.
+the idle beat by `vc/gitbar/git-chip`) and rendered for the selected pane.
 
 **Interaction zones** (`display/zone` + `zone-at`) are the model-side dual of `cursor-zone`:
 a plain `{:rect :id :cursor}` the *model* hit-tests on pointer-move / click (so it can react —

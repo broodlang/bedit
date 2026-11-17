@@ -612,7 +612,7 @@ src/charset-tables.blsp     the single-byte codings as DATA, one row per coding,
 src/filecoding.blsp         C-x RET f (the next save's coding) and C-x RET r (read the file again as
                             another coding or the hex view): how a file reads is a guess, and this
                             overrules it either way. A file edited as root reads through sudo
-                            (`sudoedit/ed-sudo-revert`, M-x revert-buffer too)
+                            (`tramp/sudo/ed-sudo-revert`, M-x revert-buffer too)
                             A file MIXING line endings (read as LF, its CRs kept) is said on visit
                             (a visit step) and M-x convert-line-endings makes it all LF or CRLF,
                             one undoable edit
@@ -1011,7 +1011,7 @@ src/aside.blsp              the PREVIEW PANE mechanism every side pane is a smal
                             the `:display-buffer` rules
 src/workings.blsp           the "show me how it actually ran" pane over `aside`: the per-region
                             report cache and the rule for what earns a split — the tutorial's
-                            *Workings* (`tutor-live/*workings-spec*`) and the two playgrounds' spy
+                            *Workings* (`tutor/live/*workings-spec*`) and the two playgrounds' spy
                             panes are its clients
 src/toolchain.blsp          the project TYPE as data: marker file -> which commands compile,
                             test, run and REPL here (mix / nest / cargo / npm / go /
@@ -1475,7 +1475,7 @@ src/lsp/client.blsp
     server->client requests too (`client/registerCapability` — a server
     BLOCKS on that reply), advertises `refreshSupport` for semantic tokens,
     inlay hints and lenses and the client commands it runs
-    (`experimental.commands`, `lsp-lens/*client-commands*` — rust-analyzer
+    (`experimental.commands`, `lsp/lens/*client-commands*` — rust-analyzer
     sends no lens without them), and starts the server IN the project root, which
     is how one that builds the project finds it. Elixir is Expert
     (expert-lsp.org), which narrates its own startup — forwarded to
