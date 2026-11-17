@@ -1194,6 +1194,9 @@ src/processes/ansicolor.blsp
 ## shells — the program buffers you type into: the input region (comint), the project shell and Brood REPL, the terminal
 
 ```
+src/shells.blsp
+    the context's API: a package's terminal session (term-run), a line buffer's typed input,
+    the live sessions a quit asks about; the terminal stays deferred
 src/shells/comint.blsp
     the INPUT REGION of a line-oriented program's buffer (Emacs's comint):
     `:input-start`, the process mark, the boundary guard, the ↑/↓/C-r
@@ -1394,10 +1397,10 @@ src/vc/gitstage.blsp
     its first marker (smerge). Below the status, which it refreshes
     by name
 src/vc/mur.blsp
-    the TOP of the mur porcelain (git.blsp's counterpart): `:use`s every
+    the TOP of the mur porcelain (vc/git.blsp's counterpart): `:use`s every
     mur module, and holds its menus — C-x M-g (and ? in *mur-status*)
     every mur verb, C-c g mur about this file — both reached through
-    `vcscore` rows (`:dispatch`, `:file-menu`), as git's are. main loads it
+    `vc/vcscore` rows (`:dispatch`, `:file-menu`), as git's are. main loads it
 src/vc/murcore.blsp
     the ground the mur porcelain stands on: `mur-mur` (the client, as
     the editor's own seat, MUR_RUNNER=bedit), `mur-json` over its
@@ -1576,7 +1579,7 @@ src/tramp/sudo.blsp
     through sudo in place (`file-save/ed-save-prepare` / `ed-save-landed`), the mode line says
     `# root`. A password sudo wants is read masked (`passwd/ed-read-passwd`),
     handed to sudo once and kept nowhere — sudo's own timestamp serves the
-    next save. Every sudo call is a task on `remotejob`'s queue (`:sudo-proc`,
+    next save. Every sudo call is a task on `tramp/job`'s queue (`:sudo-proc`,
     one at a time, C-g stops it): an open shows `Loading…` at once, a save stays modified
     until its write lands (`file-save/ed-save-prepare` / `ed-save-landed`), and
     C-x C-c / C-x s save root files after their questions and go on when
@@ -1626,7 +1629,7 @@ src/tramp/ssh-transport.blsp
     `blame-route`), naming the hop. A password opens a connection once —
     the host's or a hop's (`connect-with-password`, `hop-parts`: SSH_ASKPASS
     helper reading ssh's own stdin, refusing yes/no questions). A root-hop
-    path's scripts run in `sshsudo`'s root shell (`run`, `become-request`,
+    path's scripts run in `tramp/ssh-root`'s root shell (`run`, `become-request`,
     `become-connect`; `-tt` for su / doas: `ssh-options`' `tty`)
 src/tramp/ssh-root.blsp
     the ROOT HOPS' ROOT SHELL (`|sudo:`, `|su:`, `|doas:`), kept open as TRAMP
@@ -1650,7 +1653,7 @@ src/tramp/ssh.blsp
     handler (`model/register-file-handler`, sudoedit's shape): `C-x C-f
     /ssh:host:/etc/x`. The buffer VISITS the TRAMP path (`buffer-file` is
     the spec, `:ssh` its mark, carried by `hosted-meta`), so no local tool
-    takes it for a file here. Every ssh call a task on `remotejob`'s queue
+    takes it for a file here. Every ssh call a task on `tramp/job`'s queue
     (`:ssh-proc`, one at a time, C-g stops it): `Loading…` at once, a save
     stays modified until it lands (`file-save/ed-save-prepare` /
     `ed-save-landed`), a dropped connection said. A password the host, a
@@ -1823,7 +1826,7 @@ src/languages/web.blsp
     JavaScript, TypeScript, TSX (each extending the last), CSS, HTML
 src/languages/config.blsp
     HCL + Terraform, shell, JSON, TOML, YAML, Dockerfile, and the line-lexed
-    formats. All four are `language-core` specs, one file a family
+    formats. All four are `languages/core` specs, one file a family
 src/languages/core.blsp
     `deflanguage` declares a tree-sitter language from ONE spec
     (faces, indent, heredocs, injections, formatter) and generates its
@@ -1859,9 +1862,9 @@ src/languages/lex-gitignore.blsp
     .gitignore-style ignore files and .gitattributes (Emacs git-modes)
 src/languages/lex-*.blsp
     the lexical highlighters, each a pure `[start end face]` span fn
-    for a `:fontify` service: `lex-configs` (JSON / YAML / TOML /
-    Makefile / INI / commit, as `editor/lexer` tables), `lex-shell`,
-    `lex-dotenv`, `lex-dockerfile`, `lex-markdown` (spans, a fence
+    for a `:fontify` service: `languages/lex-configs` (JSON / YAML / TOML /
+    Makefile / INI / commit, as `editor/lexer` tables), `languages/lex-shell`,
+    `languages/lex-dotenv`, `languages/lex-dockerfile`, `languages/markdown` (spans, a fence
     coloured as its info string's language over the whole fence —
     `markdown-fence-pass`, kept by body text — and the rendering
     mdpreview paints). std's `editor/*` until brood ADR-417
@@ -2021,7 +2024,7 @@ src/mail.blsp
     mail: mbox-mode (C-c C-n / C-c C-p between messages, on rope
     searches that cost the distance, not the offset), eml-mode, and
     C-c C-v — the message at point DECODED in *Message* (Gnus's
-    article buffer) over `mail-message`: the headers that matter, the
+    article buffer) over `mail/message`: the headers that matter, the
     text part, the attachments, RET saves one
 src/mail/message.blsp
     Internet mail messages: RFC 5322 headers, the MIME part tree,
