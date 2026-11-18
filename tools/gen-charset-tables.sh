@@ -1,9 +1,9 @@
 #!/bin/sh
-# Writes src/charset-tables.blsp: the high half of each single-byte coding, from iconv, so the
+# Writes src/charset/tables.blsp: the high half of each single-byte coding, from iconv, so the
 # tables are the platform's and not anyone's typing. A byte iconv calls undefined maps to itself,
 # which keeps every byte round-tripping. Rerun with: sh tools/gen-charset-tables.sh
 set -eu
-out=src/charset-tables.blsp
+out=src/charset/tables.blsp
 
 high_codes() {
   byte=128
@@ -24,7 +24,7 @@ row() { # key label iconv-name names common-letters
 
 {
   cat <<'HEADER'
-(defmodule charset-tables
+(defmodule charset/tables
   "The single-byte codings, as data: one row per coding, generated from iconv by
 tools/gen-charset-tables.sh, so adding a coding is adding a row there. `:high` is what bytes
 128 to 255 mean, `:names` what people call it, and `:common` the letters a text in it is

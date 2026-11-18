@@ -201,13 +201,6 @@ src/syntaxtree.blsp         the tree-sitter parse each pool buffer KEEPS (brood 
                             `*tree-sync-max*` (250 KB) the update runs OFF the loop, one in
                             flight, coalescing a burst; meanwhile the band is carried (spans
                             shifted past the edits) and a structural key catches the tree up once
-src/linecache.blsp          the line-state highlight cache a LEXER mode keeps (brood ADR-471):
-                            a mode's `:line-lexer` builder (markdown's fence, org's #+BEGIN_
-                            block, the `lex-*` formats stateless), `:line-caches` by pool index,
-                            threaded by the span refresh, dropped on kill; an edit re-lexes the
-                            lines it touched, exact at any depth — no lead-in, no restart. A
-                            mode's `:line-band-pass` then sees the band: what spans lines, as
-                            markdown's fences coloured as their language (brood ADR-489)
 src/config-paths.blsp       where the editor's files live and who it is: `*app-id*`, `config-dir`, the
                             init file's path, the test-run guard. No setting is read here, so
                             the state files and the package store stand below the settings table
@@ -312,39 +305,8 @@ src/panes.blsp              pane-layout geometry: the body rect, a pane's cell, 
                             — and how panes are laid out (`ed-layout-opts`): a TERMINAL stacks split
                             panes with no row between them (std's `{:row-seam 0}`), the upper
                             pane's mode line the separator and the handle a drag resizes by
-src/spancache.blsp          what a pane is coloured with, kept across frames: fontified a window at a
-                            time, a band from a held tree or a line cache, a long line clipped to
-                            what is shown; the gutter's cells likewise; `ed-refresh-spans` once per
-                            event. `ed-visible-windows`, the char ranges a per-window highlight reads
 src/scrollbar.blsp          the overlay scrollbar: the thumb as render ops, the pointer's grab and drag,
                             its fade; `model/ed-scrollbar-wake` stays below it, as every scroll calls it
-src/mouse.blsp              `[:mouse …]` folded into the model: a click, a drag selection, the
-                            scrollbar's thumb, a divider's resize, the wheel on the pane under the
-                            pointer. A middle click places point (`ed-mouse-set-point`) and commands
-                            yanks PRIMARY there, read off the loop (Emacs `mouse-yank-primary`).
-                            A C-M-drag selects a rectangle (`:rectangle?` on the `:text-drag`).
-                            A press on an INLAY row (`panes/ed-pane-inlay-row`) goes to its
-                            owner's `model/register-inlay-click` (a code lens runs), else to its line
-src/view.blsp               pure view: model -> render frame (editor/display ops). Names no
-                            feature: a pane body's layers share ONE geometry map, the mode
-                            line's feature chips come from the statusbar registry, and what
-                            else paints is a row in `model`: `register-highlight-source`
-                            (`{:rank :run :deps}`, a pane's ranges: rainbow, glyphless,
-                            whitespace, spell, isearch, other participants' selections; `:deps` is
-                            every input off the buffer, in the pane's memo key, or paint goes
-                            stale — tests/view_memo_test), `register-pane-layer` (`{:rank :slot
-                            :run :deps}`: the pulse, the header line, and in the `:with-text`
-                            slot — memoised with the text, scrolling with it — other
-                            participants' carets) and `register-frame-overlay`
-                            (`{:rank :run}`: the minibuffer list, avy, which-key, the popup, the
-                            transient, the menu, the tooltips). A row's module is `:use`d from
-                            `main`: an unloaded row paints nothing (tests/registries_test
-                            pins the lists). A `:line-services-off` buffer (so-long) gets no
-                            bracket match. The frame names the bottom mode line as its SEAM (`ed-seam-op`, brood
-                            ADR-610): the window anchors it and the echo area to its bottom edge
-                            and puts the leftover pixels above it; row 0 is a band (no top
-                            margin) only under a header line. The panes themselves are
-                            `panecompose`'s; this is the frame's glue
 src/sources.blsp            a SOURCE TABLE, the one mechanism behind every table of ranked rows:
                             the view's sources (`model`'s highlight / override / line-note sources,
                             pane layers, frame overlays, row extras, echo sources, text faces, span
@@ -356,32 +318,13 @@ src/sources.blsp            a SOURCE TABLE, the one mechanism behind every table
                             `deps` (the rows' `:deps`, a memo's key), and for hooks `call-hook`
                             (the package's claimant, timed; `model/ed-call-hook` is it) and
                             `fold-hooks`. A new kind is a table id and a row shape
-src/panecompose.blsp        one pane's frame from its parts: geometry, body, the registered
-                            sources (highlight, override, line-note, pane layers), the preview
-                            and caret inside its scroll and zoom regions, then its scrollbar and
-                            mode line. Its text layers are one memo, keyed on every source's
-                            `:deps` (`model/ed-pane-source-deps`)
 src/panegeometry.blsp       a pane body's geometry map and the named column spans every layer
                             measures with (the view's lowest layer); `:rows` is ALWAYS a row
                             table (`panes/ed-pane-rows`), `:row-wise` when wrap counted it
 src/spanpaint.blsp          what colours a line: the span band sliced per line, the layers under
                             the mode's colours, the override sources' one-character faces and the
                             highlight ranges, grouped and cut to a line
-src/panebody.blsp           one pane's body: visible rows (folds, wraps), each row's text and the
-                            gutter beside it; a row's text facts are a `row-fact` record
 src/linkview.blsp           the pointer and hover band over a clickable location
-src/eolview.blsp            end-of-line notes and the inline completion preview, as painted
-                            (`panecompose` is the pane over these, `view` the frame)
-src/hittest.blsp            the mouse side of the view: every hit-test / hover fold that takes
-                            a model and returns one (:hover, :diag-hover, :link-hover, a chip
-                            click, the context menu's hit) — recomputed from the same widget /
-                            segments / layout the view drew, so input never imports the renderer
-src/echoarea.blsp           the echo area under the bottom mode line as render ops: the idle line
-                            (the first registered echo source with something to say,
-                            `model/register-echo-source`: a question, a message, then diagpaint's
-                            diagnostic, eolnotes' note, eldoc's hint), the minibuffer's prompt
-                            and candidate list (Plume), the which-key grid (`keycolumns/grid-rows`: paged when it does not fit, the last cell
-                            `page 1/3 · C-h n/p`, the page `whichkey/page`)
 src/whichkey.blsp           C-h after a prefix (Emacs which-key's `which-key-C-h-dispatch`): the
                             paging menu — n / p turn the panel's page, u takes the chord's last
                             key back, h lists every binding under the prefix in *Help* (Emacs's
@@ -472,9 +415,6 @@ src/ui-kit.blsp             the widget kit over editor/display: a widget is `(ar
                             transient, context menu, completion + info card and tooltips keep
                             `:card-gap` off the mode line / echo area / header line and the
                             window's edges, over the stage `panes/ed-card-stage` names
-src/events.blsp             what reaches the loop besides keys, one `[:tag …]` handler each by symbol:
-                            resize, mouse, a task's reply, a process down, redirected output, a
-                            client's identity. A feature's own tags register in `model`
 src/input.blsp              dispatch: fold a key or tick into the next model, first through the
                             key overlays (`model/register-overlay`, `rank` order, listed here
                             with why, pinned by tests/registries_test; each feature's in its
@@ -591,24 +531,6 @@ src/fill.blsp               M-q and auto-fill over std's `string/fill` / `string
                             comments break
 src/registers.blsp          registers (C-x r SPC / j / s / i) behind a `Register` ability, and
                             bookmarks (C-x r m / b)
-src/charset.blsp            the encodings a file may be in besides UTF-8 (Emacs's coding systems):
-                            the single-byte ones as DATA (`charset-tables`, one row each, generated
-                            from iconv by tools/gen-charset-tables.sh) and UTF-16. `detect` says what a
-                            file's bytes are: the charset its `.editorconfig` declares, a UTF-16 mark,
-                            UTF-8, a binary (a NUL or a control byte: the hex view), a SCRIPT (Cyrillic,
-                            Greek, Hebrew, Arabic: high bytes running together, mostly the row's
-                            `:common` letters; KOI8-R told from windows-1251 that way), else init.blsp's
-                            `:file-coding`, which is what tells Polish from French. Every byte comes
-                            back on a save. No multi-byte legacy coding (Shift-JIS, GBK, Big5). A buffer in one
-                            remembers `:coding` beside `:eol` and `:bom` (the registry `:meta` carries
-                            it, the mode line shows it); `charset/save` writes it and refuses a
-                            character it has no form for, leaving the file (`file-content`, which a
-                            root file's save shares). `tool-view` is the text as a program's captured
-                            output shows the file, which is what the diff gutter compares with
-src/charset-tables.blsp     the single-byte codings as DATA, one row per coding, generated from
-                            iconv by tools/gen-charset-tables.sh: what bytes 128-255 mean, the names
-                            people call it, the letters a text in it is mostly made of
-                            (`charset/detect` reads that)
 src/filecoding.blsp         C-x RET f (the next save's coding) and C-x RET r (read the file again as
                             another coding or the hex view): how a file reads is a guess, and this
                             overrules it either way. A file edited as root reads through sudo
@@ -915,9 +837,6 @@ src/codefold.blsp           code folding, Emacs's hideshow (C-c @): every `defla
                             `:brackets` node from its own; the closing line stays), a Lisp folds the
                             form opening on a line; over `folds`, Org's mechanism
 src/foldview.blsp           a folded line ends in ` …` (a `:with-text` pane layer)
-src/xrefgrep.blsp           M-. and M-? with no language server for the file (none configured or not
-                            installed): the project searched for a line defining the word (jumped to
-                            when it is the only one) or for every use — dumb-jump
 src/projectdiag.blsp        C-x p !: every warning and error in the project — open buffers' findings and
                             what the language servers published for files not open — errors first;
                             RET visits, `a` asks the server for the fixes there (code actions)
@@ -1453,6 +1372,10 @@ src/vc/timemachine.blsp
 
 ## lsp — language servers: the client, the wire, the servers a buffer has, the commands, semantic colours, code lenses
 
+src/lsp/xrefgrep.blsp
+    M-. and M-? with no language server for the file (none configured or not
+    installed): the project searched for a line defining the word (jumped to
+    when it is the only one) or for every use — dumb-jump
 ```
 src/lsp.blsp
     the context's API: a file's connection, the diagnostics servers published for a path, a code
@@ -2030,4 +1953,114 @@ src/mail/message.blsp
     Internet mail messages: RFC 5322 headers, the MIME part tree,
     encoded words, quoted-printable / base64, legacy charsets — what
     mail.blsp decodes with (std's `mime` until brood ADR-417)
+```
+
+## view — the frame: the model drawn as render ops, pane by pane, the echo area under them
+
+```
+src/view.blsp
+    pure view: model -> render frame (editor/display ops). Names no
+    feature: a pane body's layers share ONE geometry map, the mode
+    line's feature chips come from the statusbar registry, and what
+    else paints is a row in `model`: `register-highlight-source`
+    (`{:rank :run :deps}`, a pane's ranges: rainbow, glyphless,
+    whitespace, spell, isearch, other participants' selections; `:deps` is
+    every input off the buffer, in the pane's memo key, or paint goes
+    stale — tests/view_memo_test), `register-pane-layer` (`{:rank :slot
+    :run :deps}`: the pulse, the header line, and in the `:with-text`
+    slot — memoised with the text, scrolling with it — other
+    participants' carets) and `register-frame-overlay`
+    (`{:rank :run}`: the minibuffer list, avy, which-key, the popup, the
+    transient, the menu, the tooltips). A row's module is `:use`d from
+    `main`: an unloaded row paints nothing (tests/registries_test
+    pins the lists). A `:line-services-off` buffer (so-long) gets no
+    bracket match. The frame names the bottom mode line as its SEAM (`ed-seam-op`, brood
+    ADR-610): the window anchors it and the echo area to its bottom edge
+    and puts the leftover pixels above it; row 0 is a band (no top
+    margin) only under a header line. The panes themselves are
+    `panecompose`'s; this is the frame's glue
+src/view/panecompose.blsp
+    one pane's frame from its parts: geometry, body, the registered
+    sources (highlight, override, line-note, pane layers), the preview
+    and caret inside its scroll and zoom regions, then its scrollbar and
+    mode line. Its text layers are one memo, keyed on every source's
+    `:deps` (`model/ed-pane-source-deps`)
+src/view/panebody.blsp
+    one pane's body: visible rows (folds, wraps), each row's text and the
+    gutter beside it; a row's text facts are a `row-fact` record
+src/view/eolview.blsp
+    end-of-line notes and the inline completion preview, as painted
+    (`panecompose` is the pane over these, `view` the frame)
+src/view/echoarea.blsp
+    the echo area under the bottom mode line as render ops: the idle line
+    (the first registered echo source with something to say,
+    `model/register-echo-source`: a question, a message, then diagpaint's
+    diagnostic, eolnotes' note, eldoc's hint), the minibuffer's prompt
+    and candidate list (Plume), the which-key grid (`keycolumns/grid-rows`: paged when it does not fit, the last cell
+    `page 1/3 · C-h n/p`, the page `whichkey/page`)
+```
+
+## events — what reaches the loop besides keys: each [:tag …] event's handler, the mouse and where it landed
+
+```
+src/events.blsp
+    what reaches the loop besides keys, one `[:tag …]` handler each by symbol:
+    resize, mouse, a task's reply, a process down, redirected output, a
+    client's identity. A feature's own tags register in `model`
+src/events/mouse.blsp
+    `[:mouse …]` folded into the model: a click, a drag selection, the
+    scrollbar's thumb, a divider's resize, the wheel on the pane under the
+    pointer. A middle click places point (`ed-mouse-set-point`) and commands
+    yanks PRIMARY there, read off the loop (Emacs `mouse-yank-primary`).
+    A C-M-drag selects a rectangle (`:rectangle?` on the `:text-drag`).
+    A press on an INLAY row (`panes/ed-pane-inlay-row`) goes to its
+    owner's `model/register-inlay-click` (a code lens runs), else to its line
+src/events/hittest.blsp
+    the mouse side of the view: every hit-test / hover fold that takes
+    a model and returns one (:hover, :diag-hover, :link-hover, a chip
+    click, the context menu's hit) — recomputed from the same widget /
+    segments / layout the view drew, so input never imports the renderer
+```
+
+## spancache — a pane's colours kept across frames, and a lexer mode's line-state cache
+
+```
+src/spancache.blsp
+    what a pane is coloured with, kept across frames: fontified a window at a
+    time, a band from a held tree or a line cache, a long line clipped to
+    what is shown; the gutter's cells likewise; `ed-refresh-spans` once per
+    event. `ed-visible-windows`, the char ranges a per-window highlight reads
+src/spancache/linecache.blsp
+    the line-state highlight cache a LEXER mode keeps (brood ADR-471):
+    a mode's `:line-lexer` builder (markdown's fence, org's #+BEGIN_
+    block, the `lex-*` formats stateless), `:line-caches` by pool index,
+    threaded by the span refresh, dropped on kill; an edit re-lexes the
+    lines it touched, exact at any depth — no lead-in, no restart. A
+    mode's `:line-band-pass` then sees the band: what spans lines, as
+    markdown's fences coloured as their language (brood ADR-489)
+```
+
+## charset — the encodings a file may be in besides UTF-8, and the single-byte codings as data
+
+```
+src/charset.blsp
+    the encodings a file may be in besides UTF-8 (Emacs's coding systems):
+    the single-byte ones as DATA (`charset/tables`, one row each, generated
+    from iconv by tools/gen-charset-tables.sh) and UTF-16. `detect` says what a
+    file's bytes are: the charset its `.editorconfig` declares, a UTF-16 mark,
+    UTF-8, a binary (a NUL or a control byte: the hex view), a SCRIPT (Cyrillic,
+    Greek, Hebrew, Arabic: high bytes running together, mostly the row's
+    `:common` letters; KOI8-R told from windows-1251 that way), else init.blsp's
+    `:file-coding`, which is what tells Polish from French. Every byte comes
+    back on a save. No multi-byte legacy coding (Shift-JIS, GBK, Big5). A buffer in one
+    remembers `:coding` beside `:eol` and `:bom` (the registry `:meta` carries
+    it, the mode line shows it); `charset/save` writes it and refuses a
+    character it has no form for, leaving the file (`file-content`, which a
+    root file's save shares). `tool-view` is the text as a program's captured
+    output shows the file, which is what the diff gutter compares with
+src/charset/tables.blsp
+    the single-byte codings as DATA, one row per coding, generated from
+    iconv by tools/gen-charset-tables.sh: what bytes 128-255 mean, the names
+    people call it, the letters a text in it is mostly made of
+    (`charset/detect` reads that)
 ```

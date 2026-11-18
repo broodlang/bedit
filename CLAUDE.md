@@ -99,17 +99,17 @@ another context's detail and any cycle between contexts (none today; keep it tha
 used across the editor (the kernel, a library) stays a top-level file with no folder. A context
 must not take a std module's name (`vcs` shadowed std's: hence `vc`).
 
-| Contexts (folders) | `processes` `shells` `vc` `lsp` `diagnostics` `tramp` `dired` `tutor` `decorations` `collab` `languages` `testrun` `packages` `org` `mail`, and `diffs` (one file) |
+| Contexts (folders) | `processes` `shells` `vc` `lsp` `diagnostics` `tramp` `dired` `tutor` `decorations` `collab` `languages` `testrun` `packages` `org` `mail` `view` `events` `spancache` `charset`, and `diffs` (one file) |
 |---|---|
-| kernel + loop | `main` `startup` `startpage` `model` (the registries every feature plugs into) `sources` `input` `events` `lifeline` `offloop` `interactive` `modes` `pool` `theme` |
+| kernel + loop | `main` `startup` `startpage` `model` (the registries every feature plugs into) `sources` `input` `lifeline` `offloop` `interactive` `modes` `pool` `theme` |
 | text | `textpos` `bufferops` `wrap` `inlinetext` `folds` `codefold` `stringstate` `stringlex` `stringwarm` `conventions` `editorconfig` `dirlocals` `syntaxtree` `tsbrackets` |
-| view | `view` `panes` `panegeometry` `panebody` `panecompose` `display-settings` `spanpaint` `spancache` `linecache` `treewarm` `modeline` `statusbar` `headerline` `echoarea` `hittest` `overlayview` `ui-kit` `themes` `desktopprefs` `appearance` `scrollbar` `scroll` `eolview` `eolnotes` `linkview` `foldview` `gutter` |
-| editing + keys | `commands` `motion` `structural` `indent` `typing` `killing` `editing` `region` `textops` `comment` `fill` `electric` `kmacro` `registers` `window-commands` `search-commands` `isearch` `query-replace` `avy` `embark` `menu` `mouse` `clipboard` `browse-kill-ring` `yankmedia` `keymaps` `vim` `userkeys` `transient` `transient-core` `whichkey` `keyhelp` `keycolumns` `help` |
+| view | `panes` `panegeometry` `display-settings` `spanpaint` `treewarm` `modeline` `statusbar` `headerline` `overlayview` `ui-kit` `themes` `desktopprefs` `appearance` `scrollbar` `scroll` `eolnotes` `linkview` `foldview` `gutter` |
+| editing + keys | `commands` `motion` `structural` `indent` `typing` `killing` `editing` `region` `textops` `comment` `fill` `electric` `kmacro` `registers` `window-commands` `search-commands` `isearch` `query-replace` `avy` `embark` `menu` `clipboard` `browse-kill-ring` `yankmedia` `keymaps` `vim` `userkeys` `transient` `transient-core` `whichkey` `keyhelp` `keycolumns` `help` |
 | minibuffer + completion | `minibuffer` `lossage` `mincomplete` `filename` `completion` `plume` `complete-*` `cape` `snippet` `savehist` `passwd` |
-| files | `file-save` `lifecycle` `autosave` `backup` `sidecar` `autorevert` `recover` `charset` `charset-tables` `filecoding` `hexl` `imageview` `docview` `sshpath` `fileperm` `lastsession` `saveplace` `reopen` `solong` `sibling` `thingatpt` |
+| files | `file-save` `lifecycle` `autosave` `backup` `sidecar` `autorevert` `recover` `filecoding` `hexl` `imageview` `docview` `sshpath` `fileperm` `lastsession` `saveplace` `reopen` `solong` `sibling` `thingatpt` |
 | buffer kinds | `section` `sectionbuf` `formbuf` `aside` |
 | config | `config-paths` `config` `display-rules` `hooks` `ownership` `grammars` `grammarcheck` `about` `bugreport` `slowlog` `turnprofile` |
-| projects + build | `projects` `project-commands` `project-search` `toolchain` `compile` `results` `formatter` `xrefgrep` `projectdiag` `editspans` `searchedit` `apprun` |
+| projects + build | `projects` `project-commands` `project-search` `toolchain` `compile` `results` `formatter` `projectdiag` `editspans` `searchedit` `apprun` |
 | eval + sessions | `eval-command` `eval-commands` `shell-command` `session` `sandbox` `sandbox-events` `elixir-sandbox` `liveeval` `playground-core` `playground` `elixir-playground` `workings` `debugger` `beam` `process-list` `attach` `eldoc` |
 | multi-frame + remote | `hosted` `guest` `frames` `tabbar` `winner` `remote` `web` |
 | tests + tools | `tests/support/testkit.blsp` (shared helpers: `press`, `source-files` …), `tests/guards_test` `tests/strict_ratchet_test` `tests/layout_doc_test`, `tools/drive-*.blsp` (live pty drivers), `tools/screenshot.blsp`, `tools/affected-tests.sh`, `tools/ci/*` |
