@@ -2,9 +2,11 @@
 
 **Status:** design-of-record, partly built. What exists today (2026-11-04):
 
-- **Stage 1, the settings registry** — brood's `std/settings` (ADR-428). `config.blsp`
-  declares every init.blsp key once with `settings/define` (its default, type and doc); the
-  check, the fallback (`config/setting`) and the generated default file come from that
+- **Stage 1, the settings registry** — brood's `std/settings` (ADR-428). Every init.blsp key
+  is declared once with `settings/define` into `config/*settings*` (its default, type and doc):
+  the editor-wide ones in `config.blsp`, a feature's own beside the feature (`killing.blsp`
+  declares `:kill-whole-line`), since the project image carries the row before the module
+  loads. The check, the fallback (`config/setting`) and the generated default file come from that
   declaration, an unknown key warns, and a package declares its own under
   `:bedit/settings`. nest's own user config is its other caller.
 - **Stage 2's keybinding half** — not as a `bind-key` form but as two DATA keys,
