@@ -191,6 +191,10 @@ directly; a test that wants its own file binds the module's dynvar (`*config-bas
   the `writing-brood` skill before writing `.blsp` — Brood is immutable (no
   mutation, no loops; state is a process or a rope handle; iterate with
   tail-recursion / `fold`). Lists for code, vectors for data.
+- **A feature plugs in from its own module.** Its rows (`model/register-*`), its settings
+  (`settings/define config/*settings*`) and its commands live beside it; the project image
+  carries them before the module loads, and a qualified call loads it. Never add a
+  `(:use feature :only [])` to `main` to load one (`tests/guards_test.blsp` refuses it).
 - **Commands are `model -> model`.** Keys dispatch through a `std/keymap.blsp`
   keymap to command *symbols* resolved at dispatch time, so a command redefined
   at runtime hot-swaps live — that late binding is the road to a self-editing
