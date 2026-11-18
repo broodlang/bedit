@@ -4,6 +4,29 @@ An Emacs clone, written in [Brood](../brood). Brood is a small, immutable Lisp
 built to be the language a modern, self-editing, remotely-hostable editor is
 written in — and this repo is that editor.
 
+## Install
+
+One file with its own Brood runtime inside: you do not need Brood. Linux (x86_64 and arm64)
+and macOS (Apple Silicon):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/broodlang/bedit/main/scripts/install.sh | sh
+```
+
+That puts `bedit` in `~/.local/bin` (and, on Linux, adds it to the app menu). Then:
+
+```sh
+bedit              # a scratch buffer
+bedit notes.txt    # that file (C-x C-s saves)
+```
+
+Run the same line again to update. `BEDIT_VERSION=v0.11.0` before `sh` installs a given
+release, and `BEDIT_INSTALL_DIR` puts it elsewhere. Or download the archive for your
+machine from the [latest release](https://github.com/broodlang/bedit/releases/latest),
+unpack it and put the one file on your `PATH` as `bedit`; on macOS, a browser download
+needs `xattr -d com.apple.quarantine bedit` before it opens. There is no Windows or Intel
+Mac build yet.
+
 bedit is **pure Brood glue over the editor toolkit that ships in Brood's
 `std/`** — nothing custom in any kernel. Every layer is a `std/` module:
 
@@ -20,7 +43,7 @@ framework as a single `ui-run` loop. Commands are `(model key) -> model`; keys
 dispatch through a keymap to command *symbols* resolved at dispatch time, so a
 command redefined live (via `C-x C-e`) hot-swaps on the next keystroke.
 
-## Running it
+## Running it from source
 
 bedit consumes the **installed** `nest` (`~/.local/bin/nest`), which must be
 built with the GUI backend. Building that lives in the Brood repo:
