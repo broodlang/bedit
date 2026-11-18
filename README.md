@@ -133,43 +133,6 @@ A command of your own lives in a package under `~/.config/bedit/packages` (see
 [`packages.md`](docs/packages.md)); [`configurability.md`](docs/configurability.md) has what
 the init file can and cannot say.
 
-## Layout
-
-```
-src/main.blsp               entry point — window / daemon startup (--serve/--attach), runs the ui-run loop
-src/model.blsp              the ui-run model: buffer pool, kill ring, minibuffer, *Messages*, scrolling
-src/config.blsp             ~/.config/bedit/init.blsp — the declarative user config (data, not eval'd)
-src/theme.blsp              every colour the editor paints (Catppuccin Mocha), referenced by role
-src/panes.blsp              pane-layout geometry + mouse-event folding (model -> model)
-src/view.blsp               pure view: model -> render frame (editor/display ops)
-src/statusbar.blsp          the mode line as extensible segments (render ops + click/hover zones)
-src/input.blsp              dispatch: fold a key/mouse/tick event into the next model
-src/commands.blsp           the editing commands, each a (model key) -> model
-src/keymaps.blsp            keybinding profiles (emacs / modal vim) as model-scope layers
-src/interactive.blsp        the `defcommand` macro + the M-x command registry
-src/modes.blsp              modes as layers: the keymaps (data) + brood-mode services
-src/complete-at-point.blsp  completion-at-point (the in-buffer Tab popup)
-src/lsp/client.blsp                LSP client — completion, goto-def/references, hover, rename, format, imenu
-src/mincomplete.blsp        minibuffer prompt completion (path / name)
-src/completion.blsp         shared fuzzy ranking + vertical-menu renderer (complete + minibuffer)
-src/fileperm.blsp           the `ls -l` permission string (dired + minibuffer marginalia)
-src/plume.blsp              the minibuffer completion UI — list + marginalia (our Vertico/Marginalia)
-src/isearch.blsp            incremental search + query-replace (C-s/C-r/M-%) modal mini-loops
-src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
-src/compile.blsp            M-x compile: run a build in the project root, C-x ` next-error
-src/projects.blsp           project root + file walk (find-file-in-project)
-src/shells/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e)
-src/vcs*.blsp               the VCS layer, whichever system (Emacs VC): C-x g, C-x M-g, C-c g, C-x v =/l/b, the mode line
-src/git*.blsp               git porcelain (Magit): the status buffer, diff/log/commit
-src/mur*.blsp               mur porcelain (mur.fly.dev): *mur-status*, save/land/update, the forge
-src/decorations/diffhl.blsp             diff-hl change gutter vs git HEAD or mur's last save; C-x v ] / [ walk its changes
-src/web.blsp                live HTTP mirror of the selected buffer (C-x w)
-src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclient model
-src/collab.blsp             shared-buffer collaboration: presence carets, delta merges, follow/mirror
-tests/*_test.blsp           pure model/view tests, one suite per area (no window needed)
-project.blsp                the nest manifest (:name "bedit")
-```
-
 ## Contributing
 
 The prime directive: when the editor needs a core abstraction Brood doesn't yet
@@ -178,7 +141,8 @@ that clean primitive — don't hack the missing capability into bedit as a
 one-off. A self-editing Emacs clone is only possible if its abstractions live in
 a language expressive enough to host them. See [`CLAUDE.md`](CLAUDE.md) for the
 full working guide (conventions, how to write a plan, the prime directive in
-detail). Design notes for where the editor is headed live in [`docs/`](docs/):
+detail), and [`docs/layout.md`](docs/layout.md) for a map of every module. Design notes
+for where the editor is headed live in [`docs/`](docs/):
 [`configurability.md`](docs/configurability.md) (a settings registry + the
 customization surface), [`packages.md`](docs/packages.md) (an extension ecosystem
 — packages as Brood nests), and
