@@ -14,7 +14,8 @@ dispatcher names it, and the session router has no row seeded on its behalf."
   (:use sandbox-events :only []) ; its routes register at load, after sandbox-events is there
   (:use editor/buffer) ; buffer-text / buffer-rope / buffer-name
   (:use model) ; ed-current-buf / ed-mode-service / ed-set-diagnostics / ed-headless? / the registries
-  (:use task)) ; task — run the in-image check off the loop
+  (:use task) ; task — run the in-image check off the loop
+  (:use memo)) ; defmemo — a file's settings claim, remembered
 ;; sandbox, sandbox-events, session and projects are referenced qualified below.
 
 ;; ---- diagnostics cache (async, recomputed only when the text changes) -------
@@ -26,7 +27,14 @@ dispatcher names it, and the session router has no row seeded on its behalf."
 ;; folded back through `ed-update` as a `[:task-done …]` event, so the editor stays live
 ;; while the checker runs. Without a live `:editor` process (tests / headless) it falls
 ;; back to a synchronous check. The check is the buffer mode's `:diagnostics` service
-;; (brood-mode → the in-process type checker); buffers whose mode offers none never pay.
+;; (brood-mode → the in-process type checker), or a declared config file's settings check;
+;; a buffer with neither never pays.
+
+(defmemo claimed? 16 (file)
+  ;; whether a settings group lives in `file` (`settings/file-claim`), remembered per file: the
+  ;; claim canonicalises every declared path, ~43 µs, and the idle check asks on every pause.
+  ;; Groups declare their files as their modules load, before a buffer is checked
+  (not (nil? (settings/file-claim file))))
 
 (defn- config-file-check (buffer)
   ;; a config file a settings group lives in (`settings/declare-file`: bedit's init.blsp,
@@ -34,9 +42,14 @@ dispatcher names it, and the session router has no row seeded on its behalf."
   ;; checked against the group's declarations instead: a typo'd key, a value its setting
   ;; rejects, text that does not read. A small file, so this runs on the loop. nil otherwise.
   (let (file (buffer-file buffer))
-    (if (and (string? file) (settings/file-claim file))
+    (if (and (string? file) (claimed? file))
       (fn (text) (settings/file-diagnostics file text))
       nil)))
+
+(defn- check-of (buffer)
+  ;; the check `buffer` gets: its config file's settings check, else its mode's `:diagnostics`
+  ;; service, else nil
+  (or (config-file-check buffer) (ed-mode-service buffer :diagnostics)))
 
 (defn ed-refresh-diagnostics (m)
   "The model with `:diagnostics` (a list of `{:line :col :message}`) + `:diag-rope`
@@ -45,7 +58,7 @@ the last check; otherwise `m` unchanged. Synchronous — the core the async path
 tests share. A config file a settings group declares is checked against those settings
 instead (`settings/file-diagnostics`)."
   (let (buffer (ed-current-buf m)
-        check (or (config-file-check buffer) (ed-mode-service buffer :diagnostics))
+        check (check-of buffer)
         rope (buffer-rope buffer))
     (if (or (nil? check) (= rope (:diag-rope m)))
       m
@@ -87,7 +100,7 @@ in its own image; the reply folds back through `sandbox-events` as this module's
 sandbox cannot take the request (no runtime to spawn), the check falls back to the
 in-image task, which sees only the editor's own image."
   (let (buffer (ed-current-buf m)
-        check (ed-mode-service buffer :diagnostics))
+        check (check-of buffer))
     (cond
       (or (nil? check) (not (ed-diag-stale? m))) m
       ;; a declared config file: its settings check is small and runs here
@@ -183,12 +196,13 @@ re-fires iff the buffer moved on while the check ran, so the next idle tick rela
     :diag-checking-buf nil))
 
 (defn ed-diag-stale? (m)
-  "True if the current buffer offers a `:diagnostics` service and its rope differs from
-`:diag-rope` (the rope the cached `:diagnostics` were computed from) — i.e. a recheck is
+  "True if the current buffer has a check (its mode's `:diagnostics` service, or the settings
+check of a declared config file — init.blsp in a mode with no service too) and its rope
+differs from `:diag-rope` (the rope the cached `:diagnostics` were computed from) — i.e. a recheck is
 due. An O(1) rope-handle compare, not a whole-buffer text compare, so movement (which
-keeps the rope) costs nothing. Buffers whose mode offers no service are never stale."
+keeps the rope) costs nothing. A buffer with no check is never stale."
   (let (buffer (ed-current-buf m))
-    (and (ed-mode-service buffer :diagnostics)
+    (and (check-of buffer)
       (not (= (buffer-rope buffer) (:diag-rope m))))))
 
 (defn ed-quit-diag (m)
