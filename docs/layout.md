@@ -874,7 +874,7 @@ src/query-replace.blsp      query-replace (M-%, C-M-%), a modal mini-loop on ise
                             following each key through the minibuffer's `:on-edit` hook
 src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
 src/eval-commands.blsp      the C-x C-e family as commands (eval-last-sexp / -region / -buffer):
-                            off the loop as a std/task, C-g cancels; loaded with the image (main)
+                            off the loop as a std/task, C-g cancels
 src/shell-command.blsp      M-! / M-| (Emacs shell-command): one `sh -c` in the buffer's dir, off
                             the loop, output to the echo area or a side pane; C-u M-| replaces
                             the region; C-g stops the command itself (brood ADR-514). Loaded
@@ -1319,7 +1319,7 @@ src/vc/mur.blsp
     the TOP of the mur porcelain (vc/git.blsp's counterpart): `:use`s every
     mur module, and holds its menus — C-x M-g (and ? in *mur-status*)
     every mur verb, C-c g mur about this file — both reached through
-    `vc/vcscore` rows (`:dispatch`, `:file-menu`), as git's are. main loads it
+    `vc/vcscore` rows (`:dispatch`, `:file-menu`), as git's are. It loads when first reached
 src/vc/murcore.blsp
     the ground the mur porcelain stands on: `mur-mur` (the client, as
     the editor's own seat, MUR_RUNNER=bedit), `mur-json` over its
@@ -1971,9 +1971,9 @@ src/view.blsp
     slot — memoised with the text, scrolling with it — other
     participants' carets) and `register-frame-overlay`
     (`{:rank :run}`: the minibuffer list, avy, which-key, the popup, the
-    transient, the menu, the tooltips). A row's module is `:use`d from
-    `main`: an unloaded row paints nothing (tests/registries_test
-    pins the lists). A `:line-services-off` buffer (so-long) gets no
+    transient, the menu, the tooltips). The project image carries every
+    row, its module loading when the row first runs, so no feature is
+    named in `main` (tests/registries_test pins the lists). A `:line-services-off` buffer (so-long) gets no
     bracket match. The frame names the bottom mode line as its SEAM (`ed-seam-op`, brood
     ADR-610): the window anchors it and the echo area to its bottom edge
     and puts the leftover pixels above it; row 0 is a band (no top
