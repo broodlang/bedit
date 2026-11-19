@@ -1,15 +1,36 @@
 (defmodule popups
   "The `:popup` panel style: floating cards over the text, for those who want them back
-(`:panel-style :popup` in the init file). Completion's candidates are Corfu's card at the
-completion (`complete-card`), a hover's help a tooltip card by the hovered cell. It draws those
-two kinds; a key panel — a transient menu, which-key, the context menu — stays in the echo area,
-drawn by the editor's own `:echo` style (`panel`). Also the shape a package copies to register a
-style of its own."
+(`:panel-style :popup` in the init file). A candidate list is Corfu's card at the cell it is
+about, the selected candidate's documentation in a card beside it (Corfu's `corfu-popupinfo`); a
+hover's help a tooltip card by the hovered cell. It draws those two kinds, each from the panel's
+own data alone, and a panel that names no cell to float at is drawn as the editor's own `:echo`
+style draws it; a key panel — a transient menu, which-key, the context menu — stays in the echo
+area too (`panel`). Also the shape a package copies to register a style of its own."
   (:use panel :only [register-panel-style panel-kind])
-  (:use panes :only [ed-card-stage]) ; what a floating card covers
-  (:use theme) ; the tooltip faces
-  (:use ui-kit :only [ui-tooltip-area]) ; where a tooltip goes, the one floating-card rule
-  (:use editor/display :only [tooltip]))
+  (:use panes :only [ed-card-stage ed-point-screen-cell]) ; what a floating card covers, and where
+  (:use theme) ; the tooltip faces, ui-ctx — the kit's palette
+  (:use ui-kit
+    :only [ui-tooltip-area
+      ui-card-room ui-pad-size ui-pad-amount ui-row-inset ui-place ui-panel ui-list ui-face ui-clip]) ; the one floating-card rule, and the card's widgets
+  (:use completion :only [completion-window-start *completion-max* *completion-card-radius*])
+  (:use editor/display :only [text tooltip]))
+
+;; ---- where a card floats --------------------------------------------------------------------
+
+(defn anchor-cell (panel m columns rows)
+  "The screen cell `[row col]` `panel` floats at: its `:anchor`, else the cell its `:at` (a
+position in the current buffer, on point's row) is shown at — or nil, when it names neither or
+that position is off screen, and the panel is drawn in the echo area instead."
+  (cond
+    (:anchor panel) (:anchor panel)
+    (:at panel) (ed-point-screen-cell m columns rows (:at panel))
+    else nil))
+
+(defn- floats? (panel)
+  ;; whether `panel` names a cell to float at — where it is shown is known only at paint time
+  (or (:anchor panel) (:at panel)))
+
+;; ---- the tooltip card -------------------------------------------------------------------------
 
 (defn tooltip-card-ops (anchor-row anchor-col lines stage columns rows gui?)
   "A tooltip card of `lines` for cell `(anchor-row, anchor-col)`, placed by the one
@@ -27,27 +48,141 @@ under the placed rect, which its own on-screen clamp then leaves where it is."
       gui?
       {:border face-tooltip-border})))
 
-(defn popup-rows (_panel _rows)
-  "The rows of the echo area the `:popup` style takes: none, its cards float over the text."
-  0)
+;; ---- the candidate card (Corfu's) ------------------------------------------------------------
+
+(def card-style
+  ;; a frameless popup card (no :border): a raised surface with the `:popup` padding (no rows
+  ;; above or below, a cell at each side) and a rounded selection pill (GUI) / solid bar
+  ;; (terminal)
+  {:fg :on-surface :bg :surface :pad :popup :radius *completion-card-radius*})
+
+(def- info-style
+  ;; the info card: the card's surface, with a hairline so it reads as a separate card
+  {:fg :on-surface :bg :surface :pad :popup :radius *completion-card-radius* :border true})
+
+(def- info-max-lines 14)
+(def- info-max-width 64)
+
+(defn- info-ops (lines area stage columns rows context)
+  ;; the documentation card beside the candidate card at `area`, kept off the chrome around
+  ;; `stage` as the card is (`ui-place`): right of it when it fits, else left, else none
+  (if (empty? lines)
+    []
+    (let ([card-column card-row card-width _] area
+          [room-column _ room-width room-height] (ui-card-room stage)
+          shown (vec (take lines (math/min info-max-lines (math/max 1 room-height))))
+          width (+ (first (ui-pad-size (:pad info-style)))
+                  (math/min info-max-width
+                    (fold shown 1 (fn (widest line) (math/max widest (string/display-width line))))))
+          right (+ card-column card-width 1)
+          left (- card-column width 1)
+          column (cond
+                   (<= (+ right width) (+ room-column room-width)) right
+                   (>= left room-column) left
+                   else nil))
+      (if (nil? column)
+        []
+        (let (face (ui-face (:theme context) {:fg :on-surface :bg :surface}))
+          (:ops (ui-panel (ui-place [column card-row width (count shown)] stage columns rows)
+                  context
+                  info-style
+                  (fn (inner _context)
+                    (let ([inner-column inner-row inner-width _] inner)
+                      {:ops (map (seq/enumerate shown)
+                              (fn ([index line])
+                                (text (+ inner-row index)
+                                  inner-column
+                                  (ui-clip line inner-width)
+                                  face)))
+                       :zones []})))))))))
+
+(defn list-card (panel cell m columns rows)
+  "A `:list` panel as a floating card at screen `cell`, `{:ops :zones}`: its candidates in a
+frameless card under the cell (above it when there is no room below), `*completion-max*` of them
+scrolled around the selection, their labels lined up under the cell, and the selected one's
+`:info` lines in a card beside it. Both keep `:card-gap` off the chrome of the pane the cell is
+in (`ui-kit/ui-place`); a click on a candidate is the zone `[:panel-entry i]`."
+  (let (items (vec (:items panel))
+        selected (:selected panel)
+        [cell-row cell-column] cell
+        stage (ed-card-stage m columns rows cell)
+        [_ room-top _ room-height] (ui-card-room stage)
+        room-bottom (+ room-top room-height)
+        ;; capped to the room on the roomier side of the cell, so a short pane never paints the
+        ;; card over its mode line or header line
+        visible (math/max 1
+                  (math/min *completion-max*
+                    (count items)
+                    (math/max (- room-bottom cell-row 1) (- cell-row room-top))))
+        ;; nothing selected (an auto popup) scrolls as if the first were
+        start (completion-window-start (count items) (math/max 0 (or selected -1)) visible)
+        window (vec (take (drop items start) visible))
+        text-width (math/min 40
+                     (math/max 8
+                       (fold window
+                         0
+                         (fn (widest item)
+                           (math/max widest (string/display-width (or (:label item) "")))))))
+        [pad-width _] (ui-pad-size (:pad card-style))
+        inset (ui-row-inset card-style)
+        ;; how far the labels sit right of the card's edge: its left pad and the row inset, so
+        ;; they line up under the cell
+        lead (+ (ui-pad-amount (:pad card-style) 3) inset)
+        below? (<= (+ cell-row 1 visible) room-bottom)
+        area (ui-place [(math/max 0 (- cell-column lead))
+                         (if below? (inc cell-row) (- cell-row visible))
+                         (+ text-width pad-width (* 2 inset))
+                         visible]
+               stage columns rows)
+        context (ui-ctx (:gui m))
+        card (ui-panel area
+               context
+               card-style
+               (ui-list {:items window
+                         :selected selected
+                         :base start
+                         :row (fn (item _index _selected?)
+                                {:label (ui-clip (or (:label item) "") text-width) :enabled true})
+                         :tag :panel-entry
+                         :style card-style})))
+    {:ops (append (:ops card) (info-ops (or (:info panel) []) area stage columns rows context))
+     :zones (:zones card)}))
+
+;; ---- the style ---------------------------------------------------------------------------------
+
+(defn popup-rows (panel columns rows)
+  "The rows of the echo area the `:popup` style takes: none for a panel that floats, its cards are
+over the text; what `:echo` takes for one that names no cell."
+  (if (floats? panel) 0 (panel/echo-rows panel columns rows)))
 
 (defn popup-paint (panel m columns rows)
-  "The `:popup` style's drawing of `panel`: the completion card for a `:list`, as `{:ops
-:zones}`; a tooltip card about the hovered cell for a `:text`, kept off the chrome of the pane
-it is in."
-  (case (panel-kind panel)
-    :list (complete-card/complete-popup-widget m columns rows)
-    :text
-      (let ([row column] (:anchor panel))
-        (vec (or (tooltip-card-ops row
-                   column
-                   (:lines panel)
-                   (ed-card-stage m columns rows (or (:stage-cell panel) [row column]))
-                   columns
-                   rows
-                   (:gui m))
-               [])))
-    []))
+  "The `:popup` style's drawing of `panel`, as `{:ops :zones}`: a `:list` as the candidate card
+at its cell ([[list-card]]), a `:text` as a tooltip card by it, kept off the chrome of the pane it
+is in; drawn as `:echo` draws it when it names no cell, and nothing while its cell is off screen."
+  (let (cell (anchor-cell panel m columns rows))
+    (cond
+      (not (floats? panel)) (panel/echo-paint panel m columns rows)
+      (nil? cell) {:ops [] :zones []}
+      (= (panel-kind panel) :list) (list-card panel cell m columns rows)
+      else
+        (let ([row column] cell)
+          {:ops (vec (or (tooltip-card-ops row
+                           column
+                           (:lines panel)
+                           (ed-card-stage m columns rows (or (:stage-cell panel) cell))
+                           columns
+                           rows
+                           (:gui m))
+                       []))
+           :zones []}))))
+
+(defn popup-echo (panel m)
+  "What the `:popup` style says on the echo row: a `:text` panel's help when it names no cell to
+float at, as `:echo` says it; nil otherwise."
+  (when (not (floats? panel)) (panel/echo-text panel m)))
 
 (register-panel-style :popup
-  {:kinds #{:list :text} :rows 'popups/popup-rows :paint 'popups/popup-paint})
+  {:kinds #{:list :text}
+   :rows 'popups/popup-rows
+   :paint 'popups/popup-paint
+   :echo 'popups/popup-echo})

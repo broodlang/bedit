@@ -3,7 +3,7 @@
 is inside — `XB.Probe › run` — as Org's names the headings. A tree-sitter mode reads them off
 the held parse (each `deflanguage` names a `:breadcrumbs` service that calls this): the chain
 of nodes around point, kept to the ones the language declares definitions
-(`editor/treesit/definitions`), each named by the word its parse says fills its name field (on a
+(its MODE's, [[buffer-definitions]]), each named by the word its parse says fills its name field (on a
 runtime whose nodes carry fields, brood ADR-759), else the first word on its line that is not a keyword
 (`def`, `pub fn`, `class`…). A Lisp names the top-level form point is in. With no current parse
 (a large file catching up), no crumbs — never a parse on the frame."
@@ -58,24 +58,41 @@ on its first line that fills its name field — `main` in `public static void ma
 `func (r *Rec) Name()` — read from the parse, the fields `(:name-fields definitions)` (default
 `#{:name}`) leading down to it; else, on a runtime whose nodes carry no fields, [[definition-name]]."
   (let (line (text/char->line rope (:start node))
-        line-end (if (< (inc line) (text/line-count rope))
-                   (text/after-line->char rope line)
-                   (count rope))
+        line-end (text/after-line->char rope line)
         head (text/slice rope (:start node) line-end)
         words (regex/find-all head "[A-Za-z_*][A-Za-z0-9_.!?*-]*"))
     (or (name-field-word rope lang tree node words (or (:name-fields definitions) #{:name}))
       (definition-name head))))
 
-(defn- definition? (node definitions rope)
-  ;; whether chain `node` is a definition: its kind is one the language declares, or it is a
-  ;; call whose callee is (Elixir's `def`, a call)
-  (or (contains? (or (:kinds definitions) #{}) (:kind node))
-    (and (= (:kind node) :call)
-      (let (callee (first (regex/find-all (text/slice rope
-                                            (:start node)
-                                            (math/min (:end node) (+ (:start node) 32)))
-                            "^[A-Za-z_][A-Za-z0-9_]*")))
-        (and callee (contains? (or (:calls definitions) #{}) (:text callee)))))))
+(defn lang-definitions (lang)
+  "What a definition is in the grammar `lang` when no mode says: the `:definitions` of the spec of
+the mode named after it, else of any registered spec that parses with it (as
+`modes/language-faces` finds a table), else what std declares for it (`editor/treesit/definitions`:
+Ruby's, Elixir's), else `{}`."
+  (let (own (registry/lookup :languages/specs lang)
+        spec-ref (or own
+                   (seq/find (vals (registry/entries :languages/specs))
+                     (fn (candidate) (= (get (reflect/eval candidate) :lang) lang))))
+        declared (when spec-ref (get (reflect/eval spec-ref) :definitions)))
+    (if (map? declared) declared (editor/treesit/definitions lang))))
+
+(defn buffer-definitions (buffer &optional (lang nil))
+  "What `buffer`'s MODE takes a definition to be: its layer's `:ts-definitions` (a
+`deflanguage`'s `:definitions`), else what its grammar — `lang`, or its mode's `:ts-lang` —
+has ([[lang-definitions]]). By mode first, so a second mode over one grammar — a package's —
+never changes the first one's."
+  (or (model/ed-mode-service buffer :ts-definitions)
+    (let (grammar (or lang (model/ed-mode-service buffer :ts-lang)))
+      (if grammar (lang-definitions grammar) {}))))
+
+(defn defun-edge (rope lang definitions point edge &optional (tree nil))
+  "The `edge` (`:start` or `:end`) of the definition around `point` in `rope`'s `lang` parse, as
+`definitions` ([[buffer-definitions]]) say — std's beginning/end-of-defun
+(`editor/treesit/point-defun-start`) given the MODE's definitions rather than the grammar's, so
+a second mode over one grammar moves by its own. `tree` is a held parse of exactly `rope`."
+  (if (= edge :start)
+    (editor/treesit/point-defun-start rope lang point tree definitions)
+    (editor/treesit/point-defun-end rope lang point tree definitions)))
 
 (defn tree-crumbs (lang buffer tree)
   "The definitions point of `buffer` is inside, outermost first, by name — from `tree`, a held
@@ -83,11 +100,12 @@ parse of exactly `buffer`'s text in `lang`; `()` without one."
   (if (nil? tree)
     '()
     (let (rope (buffer-rope buffer)
-          definitions (editor/treesit/definitions lang)
+          definitions (buffer-definitions buffer lang)
           chain (editor/treesit/node-chain rope lang (buffer-point buffer) tree))
       (seq/keep chain
         (fn (node)
-          (when (definition? node definitions rope) (node-name rope lang tree definitions node)))))))
+          (when (editor/treesit/definition-node? rope definitions node)
+            (node-name rope lang tree definitions node)))))))
 
 (defn form-crumbs (buffer &optional (tree nil))
   "A Lisp mode's `:breadcrumbs`: the name of the top-level form point is in (`(defn run …` gives
@@ -99,9 +117,7 @@ parse of exactly `buffer`'s text in `lang`; `()` without one."
     (if (or (> point end) (not (= (text/slice rope start (math/min (inc start) (count rope))) "(")))
       '()
       (let (line (text/char->line rope start)
-            line-end (if (< (inc line) (text/line-count rope))
-                       (text/after-line->char rope line)
-                       (count rope))
+            line-end (text/after-line->char rope line)
             head (text/slice rope (inc start) line-end)
             name (definition-name head))
         (if name (list name) '())))))
@@ -114,7 +130,7 @@ names (`Cart.total`, as `M-g i` lists a server's symbols), `offset` where it sta
 `tree`, a held parse of `buffer`'s text in `lang`: each line's chain at its first ink names the
 definitions starting on that line and the ones around them."
   (let (rope (buffer-rope buffer)
-        definitions (editor/treesit/definitions lang)
+        definitions (buffer-definitions buffer lang)
         name-at (fn (node) (node-name rope lang tree definitions node)))
     (seq/keep (range 0 (text/line-count rope))
       (fn (line)
@@ -122,7 +138,7 @@ definitions starting on that line and the ones around them."
               first-ink (text/skip-forward rope line-start " \t" true))
           (when (< first-ink (count rope))
             (let (chain (seq/filter (editor/treesit/node-chain rope lang first-ink tree)
-                          (fn (node) (definition? node definitions rope)))
+                          (fn (node) (editor/treesit/definition-node? rope definitions node)))
                   here (seq/find chain (fn (node) (= (text/char->line rope (:start node)) line))))
               (when here
                 (let (path (seq/keep (seq/take-while chain (fn (node) (not (= node here)))) name-at)
@@ -137,9 +153,7 @@ lists `total` — top to bottom."
       (fn (line)
         (let (start (text/line->char rope line))
           (when (= (text/slice rope start (math/min (inc start) (count rope))) "(")
-            (let (line-end (if (< (inc line) (text/line-count rope))
-                             (text/after-line->char rope line)
-                             (count rope))
+            (let (line-end (text/after-line->char rope line)
                   head (text/slice rope (inc start) line-end)
                   words (regex/find-all head "[^\\s()\\[\\]{}\"]+"))
               ;; only a form whose head defines (`def…`): a bare call at the top names nothing

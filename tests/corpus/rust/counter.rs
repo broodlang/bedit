@@ -23,7 +23,7 @@ impl<'a> Counter<'a> {
     }
 
     /// Count each word.
-    // ^^^^^^^^^^^^^^^^^ comment
+    // ^^^^^^^^^^^^^^^^^ doc
     pub fn add(&mut self, words: &[&str]) -> usize {
         let mut total = 0;
         //              ^ number

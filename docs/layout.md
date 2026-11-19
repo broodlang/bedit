@@ -126,14 +126,21 @@ src/panel.blsp              the PANEL — what you can choose or learn here, as 
                             chosen by the `:panel-style` setting — the editor's own `:echo` is
                             Emacs's, everything in the echo area: keys and candidates as a flat
                             strip below the mode line, help on the echo row (help-echo with
-                            `tooltip-mode` off). A style names the kinds it draws (`:kinds`), the
-                            rest fall back to `:echo`. The echo area's height asks it
-                            (`minibuffer/ed-echo-rows`); a source names its `:deps`, and the
-                            panel is built once per change of them
-src/popups.blsp             the `:popup` panel style: completion's candidates as Corfu's card
-                            (`complete-card`) and a hover's help as a tooltip card
-                            (`tooltip-card-ops`); key panels stay in the echo area. The shape a
-                            package copies to register a style of its own
+                            `tooltip-mode` off) until a newer message. A key panel is laid out
+                            for the frame (`panel-layout`): Magit's columns of whole groups,
+                            wrapped into rows of columns, paged only when even that does not fit;
+                            which-key's run down then across, paged, its page on the echo row. A
+                            style names the kinds it draws (`:kinds`), the rest fall back to
+                            `:echo`. The echo area's height asks it (`minibuffer/ed-echo-rows`,
+                            clamped by `echo-room`, the cap `list-rows` the minibuffer's list
+                            shares); a source names its `:deps`, the panel is built once per
+                            change of them, and `:echo`'s paint is remembered on what it reads
+src/popups.blsp             the `:popup` panel style: a `:list` as Corfu's card at the panel's
+                            `:anchor` or `:at` (the selected candidate's `:info` in a card beside
+                            it) and a hover's help as a tooltip card (`tooltip-card-ops`), from
+                            the panel's data alone; a panel naming no cell, and key panels, are
+                            drawn as `:echo` draws them. The shape a package copies to register a
+                            style of its own
 src/scroll.blsp             keeping point on screen: the scroll-margin clamp, horizontal scroll,
                             `ed-max-top`, and the snap that ends a glide on a line; in a
                             row-wise (wrapped) buffer the pane starts on a screen ROW of its top
@@ -603,9 +610,10 @@ src/file-save.blsp          writing a pool buffer to its file: `ed-save-buf-at` 
                             visits the new path only once the write lands, and keeps its old one
                             when it fails. Headless, inline; tests bind `*write-off-loop*` / `*write-file*`
 src/menu.blsp               the right-click context menu (and M-x context-menu-open, on the menu key
-                            and S-F10): a key panel source, each action under the last key of its
-                            binding (Copy M-w is `w`), a click on an entry runs it; an item names
-                            its command by SYMBOL, resolved when it runs
+                            and S-F10): a key panel source, each action under a letter of its own
+                            (Copy M-w is `w`, but Cut C-w is `k`), a click on an entry runs it, a
+                            key on one that does not apply says why; an item names its command by
+                            SYMBOL, resolved when it runs
 src/keymaps.blsp            keybinding profiles (emacs / modal vim) as model-scope layers, and the
                             which-key name and groups of each prefix map, in the keymap itself
                             (`keymap-describe`, a heading on each `keymap-bind`; brood ADR-745)
@@ -733,9 +741,9 @@ src/formatter.blsp          M-x format-buffer + format-on-save: the language's o
 src/complete-words.blsp     what completion knows of a buffer's words: the word boundary, the rope
                             scan, the `:word-index` built off the loop, the always-on source
 src/complete-card.blsp      the completion as shown: its `:list` panel (the echo area's list, the
-                            selected candidate's first doc line beside it), the documentation it
-                            loads, and the Corfu card the `:popup` style draws, anchored where the
-                            completion STARTS, with the info card beside it
+                            selected candidate's first doc line beside it; `:at` where the
+                            completion STARTS and `:info` its documentation, for the `:popup`
+                            style's card) and the documentation it loads
 src/complete-at-point.blsp  completion-at-point (the in-buffer Tab popup) — multi-source merge
                             (named to dodge std's `tool/complete`, which shadows a bare `complete`).
                             The auto popup is per

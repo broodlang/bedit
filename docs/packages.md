@@ -421,7 +421,9 @@ back with the rest of its rows.
 **One template.** bedit's own languages (`src/languages/<lang>.blsp`) and a language package
 (`bedit-lang-<lang>`) are written the same way, against the same public module, and tested by
 the same harness. The built-in ones stay in bedit; a new one can be either, and moving one from
-bedit to a package (or back) is a rename of its module and nothing else. The sample package
+bedit to a package (or back) is a rename of its module and nothing else: its samples, golden
+listings (whose header names `corpus/write-golden`, the same in either place) and known gaps move
+as they are. The sample package
 is `bedit-lang-zig` (Zig over tree-sitter-zig), kept beside bedit as `../bedit-lang-zig`.
 
 ### The layout
@@ -479,10 +481,14 @@ dialect) — the face-table helpers (`call-faces`, `method-call-faces`, `field-f
 `token-faces`), the Lisp helpers (`head-set`, `lisp-indent-with`) and the tables several
 languages share (`*quote-pairs*`, `*backtick-pairs*`, `*hash-strings*`, `*c-strings*`,
 `*block-comment-opaque*`, `*triple-quote-opaque*`, `*backtick-opaque*`,
-`*triple-quote-heredocs*`, `*prettier*`, `*case-label-electric*`). Nothing under `languages/` is
-named by a language: that is the context's detail. A table one language uses is that language's
-own. The macro names what it generates by the module it expands in (`zig-spec`, `zig-fontify`,
-…), and every
+`*triple-quote-heredocs*`, `*prettier*`, `*case-label-electric*`). A language names nothing of the
+context's machinery — `languages/core` and the rest are its detail. It names another language
+module only to build on it, and only inside bedit: C++'s spec merges C's, TypeScript's and TSX's
+JavaScript's, a `deflexer` names its lexer module's stem (`'languages/lex-configs/yaml`). A
+package builds on bedit's languages through their registered specs, never their modules. A table
+one language uses is that language's own. The macro names what it generates by the module it
+expands in (`zig-spec`, `zig-fontify`, …), and refuses to replace a definition of that name it
+did not generate (a hand-written `zig-indent` raises at load). Every
 table it writes is claimed for the file that loads it, so a package's language goes back with
 the package. One spec carries everything the editor knows of the language, and a key it does not
 take (`:interpeters`) fails the load, naming the one meant:
@@ -494,9 +500,12 @@ take (`:interpeters`) fails the load, naming the one meant:
 | `:grammar {:url :revision :fingerprint}` | where its tree-sitter grammar lives, pinned |
 | `:faces`, `:injections` | colours, and the code embedded in it |
 | `:indent`, `:restart`, `:definitions`, `:folds` | RET/TAB, the windowed fontify, C-M-a, folding |
-| `:format` | the formatter M-x format-buffer and format-on-save run |
+| `:resume [{:open :close}]` | the outer construct a window far down the file may begin inside (PHP's `<?php … ?>`): the last marker above it decides, an opener being re-read first |
+| `:count-above true` on a `:restart` `:opaque` pair | a symmetric multi-line string (`"""`) is counted over the whole text above a window too, so a window in or below a docstring longer than the lead-in knows it (`:heredocs` markers always are) |
+| `:format` | the formatter M-x format-buffer and format-on-save run: a command, alternatives, or a function of the buffer's layout (`formatter/buffer-layout`) answering either |
 | `:lsp {:id :ids :servers}` | its language servers, reached by every buffer in the mode however it got there (name, `#!`, M-x), and its LSP `languageId` — `:ids` only for an extension LSP names apart (`jsx`) (`model/register-lsp`) |
 | `:snippets` | its built-in snippet templates |
+| `:embedded-languages` | a function of the text answering the languages it embeds that only the text names (Markdown's fence info strings): the corpus's golden check runs only once their grammars are loaded too |
 | `:pairs`, `:strings` | electric pairs, and its strings and comments without a parse (`stringstate`) |
 | `:fallback` | a line lexer to colour by while the grammar is missing |
 
@@ -577,16 +586,29 @@ their own:
    Lines of verbatim content (a heredoc's body) are found from the spec's `:indent :verbatim`
    kinds and kept as written.
 5. **restart** — fontifying from the spec's `:restart` answer paints what the whole text paints,
-   at every line: the windowed fontify's one assumption, proven per sample.
+   at every line: the windowed fontify's one assumption, proven per sample — and again from a
+   short lead-in, read after what is open above it (a `<?php`, a docstring), wherever the restart
+   finds a point in it.
 6. **robustness** — seeded random one-character edits: fontify, indent, restart, fold extent and
    breadcrumbs raise nothing and the spans stay in bounds and in order.
 
 And the project's languages are checked against every registered one — bedit's own included, which
-a package's run loads first (`corpus/load-languages`): no shared `:names` word or `#!` program, no
-corpus file claimed by two patterns, every spec passes its macro's key check, every server row
-says `:name :commands :root-markers`, every language the project registers has a sample. A gap the
+a package's run loads first (`corpus/load-languages`). A conflict is the project's when one of
+its OWN languages is in it, so a package's run never fails for a pair of bedit's: none of its
+languages shares a `:names` word or `#!` program with another, no corpus file is claimed by two
+patterns, each of its specs passes its kind's check (its keys, its `:lsp` and every server row's
+`:name :commands :root-markers` — the same check that fails the load), every entry of the known
+gaps names a sample and a check, and every language it registers has a sample. A gap the
 language cannot close yet — a line its indenter misplaces — goes in `tests/corpus/known-gaps.blsp`
 with why, which only shrinks: a listed line that starts passing fails the test until it is removed.
+
+The languages a run answers for are the ones the project's `:source-paths` register
+(`corpus/own-languages`) — never the bedit a `:git` dev dependency fetches into `_deps/`. A sample
+is judged at its LANGUAGE's conventions: no `.editorconfig` is read for it (`corpus/file-model`),
+and the three indent checks all indent through TAB's own path (`indent/ed-indent-target`) at the
+buffer's indent and tab widths. Markdown and Brood, whose modes are written by hand, register a
+spec of the registration facts through the same path (`languages/core/hand-written-*-kind`), so
+they take part in every check across languages too.
 
 ## A plugin's library dependencies (built)
 

@@ -16,7 +16,7 @@
 (defun count-words (text)
   ;; ^ special
   "A hash table of each word in TEXT to how often it occurs."
-  ;; ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ string
+  ;; ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ doc
   (let ((table (make-hash-table :test #'equal)))
     (loop for word in (split text)
           unless (string= word "")

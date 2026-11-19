@@ -30,7 +30,7 @@ forgotten, and a forgotten service is invisible until someone presses the key.
 
 `:pattern` is the file-name regex that selects the mode, or `{:match re :except re}` for one
 with an exception the regex engine (no lookahead) cannot spell — HCL's `.hcl` except
-Terraform's `.tftest.hcl` (`modes/file-pattern-matches?`), so which mode wins never rests on
+Terraform's `.tftest.hcl` (`modes/pattern-matches?`), so which mode wins never rests on
 registration order.
 
 The services are generated as named globals rather than closures because
@@ -41,13 +41,18 @@ closure in the layer would be resolved once and frozen.
 `:format` is the language's formatter as a command vector — `[\"mix\" \"format\"]`, to which
 the file path is appended — or a vector of them, `[[\"terraform\" \"fmt\"] [\"tofu\" \"fmt\"]]`,
 when several programs format the language: the first installed one runs
-(`formatter/format-command-choice`). It becomes the `:format-command` service that `M-x
+(`formatter/format-command-choice`) — or a function symbol, called at format time with the
+buffer's layout (`formatter/buffer-layout`: its indent width, tabs, tab width and fill column)
+and answering either, for a formatter whose flags must say what the buffer is indented with
+(`languages/shell/shfmt-command`). It becomes the `:format-command` service that `M-x
 format-buffer` and format-on-save consult, so neither names a language.
 
 `:definitions` says which nodes C-M-a / C-M-e / C-M-h treat as a definition —
-`{:kinds #{:function_item …}}`, or `:calls` for a language that defines with a call
-(`editor/treesit/register-definitions`). Ruby and Elixir are declared by std, whose
-grammars they are; a language that declares nothing moves by top-level form.
+`{:kinds #{:function_item …}}`, or `:calls` for a language that defines with a call — its
+MODE's, carried on the layer (`:ts-definitions`, read by `languages/crumbs/buffer-definitions`),
+so a second mode over the same grammar (a package's) never changes the first one's C-M-a. A
+spec without one takes what std declares for its grammar (`editor/treesit/definitions`: Ruby's
+and Elixir's); a language that declares nothing moves by top-level form.
 
 `:folds` is the node kinds a fold (`C-c @`, `codefold`) covers, when they are not the indent
 spec's: `#{:block_mapping_pair}` folds each such node from its own first line, and
@@ -103,7 +108,8 @@ embedded language's faces are its own `deflanguage`'s, found when a frame asks
 registration like the face table.
 
 `:indent` is `editor/treesit/indent-column`'s spec — `{:width :brackets :blocks :dedent :opens
-:verbatim …}`, where a missing `:blocks` or `:dedent` is none — or `:content`.
+:verbatim :pairs :clauses :modifiers …}`, where a missing `:blocks` or `:dedent` is none — or
+`:content`.
 
 `:interpreters` lists the `#!` program names that select the mode for a file with no telling
 name, as `deflexer`'s does.
@@ -140,17 +146,31 @@ and `:ids` only the extensions LSP names otherwise (`model/register-lsp`, `lsp/c
 
 `:fontify-restart` says where a windowed fontify may cut its lead-in, and comes from one of
 three declarations. `:heredocs` (paired markers, Elixir's `\"\"\"`) restarts at a column-0 line
-outside them (`editor/treesit/column0-restart`). `:restart {:item-start :opaque}` is the
+outside them (`editor/treesit/column0-restart`). `:restart {:item-start :opaque :keep}` is the
 brace languages' rule (`column0-item-restart`): the column-0 line that LOOKS like an item
 start, unless something whose contents can be anything (a block comment, a raw string)
-opens above it. `:restart 'sym` names a hand-written one when the rule is neither — Ruby
-must also notice `=begin`. A language with none declines to restart, which is a fact about
-the language — `editor/treesit/language-contract` says which services are required and
-which are optional.
+opens above it, and never past a `:keep` line (PHP's `<?php`). `:restart 'sym` names a
+hand-written one when the rule is neither — Ruby must also notice `=begin`. A language with
+none declines to restart, which is a fact about the language —
+`editor/treesit/language-contract` says which services are required and which are optional.
+
+A restart only TRIMS the lead-in, so a window can never learn what the text above its lead-in
+left open. The `:fontify-around` service ([[spec-window-around]]) says what can be, as the text a
+window is read between: what comes before is read by the restart, and by the parse when the
+restart cuts nothing. Two declarations feed it. `:resume [{:open re :close re :skip re :heredoc
+re}]` is an outer construct the grammar reads the rest of the file inside of, as PHP reads
+`<?php … ?>`: whichever of those markers comes last above the lead-in decides, an opener being
+re-read and a closer inside the construct's own strings passed over ([[resume-prefix]]). And a
+multi-line string — a `:heredocs` marker, or an `:opaque` pair marked `:count-above` — still
+open at an edge of the window, as the spec's `:strings` read the text above, is re-opened
+before it or closed after it ([[open-string-around]]), so a docstring longer than the lead-in
+neither turns the restart's count inside out nor reaches the parse unterminated.
 
 The generated restart is `<name>-restart`, not `<name>-fontify-restart`: the obvious name is
 the one a language with a CUSTOM restart uses (Ruby's), and generating it would silently
-replace that one. A generated definition must not be able to take a hand-written name.
+replace that one. A generated definition must not be able to take a hand-written name: every
+name it generates (`*generated-suffixes*`) that is already bound to something no `deflanguage`
+generated raises at load ([[claim-generated]]).
 
 The spec is evaluated ONCE, into `<name>-spec`, so a spec built from a shared base
 (`(merge js-spec {…})`) is one value every generated service reads."
@@ -160,6 +180,7 @@ The spec is evaluated ONCE, into `<name>-spec`, so a spec built from a shared ba
         spec-name (generated "-spec")
         spec-ref (qualified "-spec"))
     `(do
+       (languages/core/claim-generated '~name '~(vec (map *generated-suffixes* qualified)))
        (def ~spec-name ~spec)
        (languages/core/check-spec languages/core/deflanguage-kind '~name ~spec-ref)
        (defn ~(generated "-fontify") (text) (languages/core/spec-fontify ~spec-ref text))
@@ -173,6 +194,9 @@ The spec is evaluated ONCE, into `<name>-spec`, so a spec built from a shared ba
          (languages/core/spec-indent-column ~spec-ref text line-start tree))
        (defn ~(generated "-restart") (source position)
          (languages/core/spec-restart ~spec-ref source position))
+       ;; what a window re-reads first and closes after; `known` resumes the scan of the text above
+       (defn ~(generated "-window-around") (rope start end &optional (known nil))
+         (languages/core/spec-window-around ~spec-ref rope start end known))
        ;; show-paren over the parse: the view's window of text, or the held tree
        ;; (`:bracket-match-tree`, `tsbrackets/match-tree`) when the buffer keeps one
        (defn ~(generated "-bracket-match") (text position)
@@ -196,6 +220,7 @@ The spec is evaluated ONCE, into `<name>-spec`, so a spec built from a shared ba
            {:fontify '~(qualified "-fontify")
             :indent '~(qualified "-indent")
             :restart '~(qualified "-restart")
+            :window-around '~(qualified "-window-around")
             :faces '~(qualified "-ts-faces")
             :injections '~(qualified "-ts-injections")
             :bracket-match '~(qualified "-bracket-match")
@@ -208,6 +233,31 @@ The spec is evaluated ONCE, into `<name>-spec`, so a spec built from a shared ba
        (languages/core/register-language languages/core/deflanguage-kind
          '~name '~spec-ref '~(qualified "-mode-layer")))))
 
+(def *generated-suffixes*
+  ;; every global `deflanguage <name>` defines, as the suffix after the name
+  ["-spec"
+    "-fontify" "-ts-injections" "-indent" "-restart" "-window-around" "-bracket-match"
+    "-fold-extent" "-breadcrumbs" "-ts-faces" "-mode-layer" "-fallback-layer"])
+
+(defn claim-generated (name names)
+  "Raise when one of `names` — the qualified globals `deflanguage name` is about to define — is
+already bound to something no `deflanguage` generated: a hand-written `zig-indent` beside
+`(deflanguage zig …)` would otherwise be replaced without a word. Records each as generated
+(claimed, so a package's go back with it); a `deflanguage` evaluated again finds its own. Answers
+`names`."
+  (let (taken (seq/find names
+                (fn (global)
+                  (and (bound? global) (nil? (registry/lookup :languages/generated global))))))
+    (when taken
+      (error "deflanguage "
+        name
+        ": "
+        (pr-str taken)
+        " is already defined, and not by a deflanguage — a generated definition would replace it;"
+        " rename the hand-written one"))
+    (doseq (global names) (ownership/claim! :languages/generated global true))
+    names))
+
 ;; ---- the facts every language macro registers, through ONE path ------------------------
 ;; `deflanguage`, `deflexer` and `languages/lisps/deflisp` generate different services, but what a
 ;; language IS to the rest of the editor — its mode type, the `#!` programs and words that name
@@ -217,7 +267,7 @@ The spec is evaluated ONCE, into `<name>-spec`, so a spec built from a shared ba
 
 (def *registration-keys*
   ;; the facts `register-language` reads, which every kind takes
-  #{:type :pattern :comment :interpreters :names :lsp :snippets})
+  #{:type :pattern :comment :interpreters :names :lsp :snippets :embedded-languages})
 
 (def *convention-keys*
   ;; a language's conventions and string syntax (`spec-conventions`), as both spec kinds take them
@@ -228,8 +278,8 @@ The spec is evaluated ONCE, into `<name>-spec`, so a spec built from a shared ba
    :stack :prog
    :keys (into (set/union *registration-keys* *convention-keys*)
            #{:lang
-             :faces :indent :heredocs :restart :comment-block :format :definitions :folds
-             :grammar :fallback :fallback-above :injections :electric-indent})})
+             :faces :indent :heredocs :restart :resume :comment-block :format :definitions
+             :folds :grammar :fallback :fallback-above :injections :electric-indent})})
 
 (def deflexer-kind
   {:macro 'deflexer
@@ -237,9 +287,30 @@ The spec is evaluated ONCE, into `<name>-spec`, so a spec built from a shared ba
    :keys (into (set/union *registration-keys* *convention-keys*)
            #{:lexer :completion-auto :restart})})
 
+;; A mode written BY HAND — its layer a map of its own, Markdown's, Brood's — has no macro to
+;; generate it, but is still a language to the rest of the editor: its spec says the
+;; registration facts alone, checked and registered by the one path, so its pattern, names and
+;; `#!` programs take part in every check across languages (`corpus`).
+(def hand-written-text-kind
+  {:macro 'register-language :stack :text :keys *registration-keys*})
+
+(def hand-written-prog-kind
+  {:macro 'register-language :stack :prog :keys *registration-keys*})
+
 (def *lsp-keys*
   ;; what a spec's `:lsp` says (`model/register-lsp`)
   #{:id :ids :servers})
+
+(def *server-row-shape*
+  ;; a server row of a spec's `:lsp :servers`, as `model/register-lsp-server` and `lsp/client`
+  ;; read it — the `:owner` is stamped by registration, never written
+  {:required #{:name :commands :root-markers}
+   :optional #{:shared :add-on :rank :extensions}
+   :check {:name string?
+           :commands (fn (commands) (and (vector? commands) (not (empty? commands))))
+           :root-markers vector?
+           :rank int?
+           :extensions vector?}})
 
 (defn- unknown-key-problem (macro name what keys allowed)
   ;; the error for the first of `keys` that `allowed` does not take (`map/shape-problems`), with
@@ -257,16 +328,55 @@ The spec is evaluated ONCE, into `<name>-spec`, so a spec built from a shared ba
         " — it takes "
         (string/join (sort (map allowed pr-str)) " ")))))
 
+(defn- server-row-problem (macro name index row)
+  ;; why the `index`th server row of a spec's `:lsp` does not fit `*server-row-shape*`, or nil
+  (let (problem (first (map/shape-problems row *server-row-shape*)))
+    (when problem
+      (str macro
+        " "
+        name
+        ": :lsp server "
+        (if (and (map? row) (string? (:name row))) (pr-str (:name row)) (str "#" (inc index)))
+        ": "
+        (map/shape-problem->string problem)))))
+
+(defn- lsp-problem (macro name lsp)
+  ;; why a spec's `:lsp` is not what `model/register-lsp` reads, or nil: a map of `*lsp-keys*`,
+  ;; `:id` a string, `:ids` a map of extension to id, `:servers` a vector of server rows
+  (cond
+    (nil? lsp) nil
+    (not (map? lsp)) (str macro " " name ": :lsp is a map {:id :ids :servers}, not " (pr-str lsp))
+    else
+      (or (unknown-key-problem macro name ":lsp" lsp *lsp-keys*)
+        (when (and (contains? lsp :id) (not (string? (:id lsp))))
+          (str macro
+            " "
+            name
+            ": :lsp :id is a string (the LSP languageId), not "
+            (pr-str (:id lsp))))
+        (when (and (contains? lsp :ids) (not (map? (:ids lsp))))
+          (str macro
+            " "
+            name
+            ": :lsp :ids is a map of extension to languageId, not "
+            (pr-str (:ids lsp))))
+        (let (servers (get lsp :servers []))
+          (if (not (vector? servers))
+            (str macro " " name ": :lsp :servers is a vector of server rows, not " (pr-str servers))
+            (first (seq/keep (range (count servers))
+                     (fn (index) (server-row-problem macro name index (nth servers index))))))))))
+
 (defn check-spec (kind name spec)
   "Raise when `spec`, declaring the language `name` with the macro `kind` describes, has a key
-the kind does not take — naming the macro, the language, the key and the nearest known one —
-or an `:lsp` with a key `model/register-lsp` does not read. A misspelt key would otherwise be
-ignored, and the fact it carried missed by someone opening a file much later. Answers `spec`.
+the kind does not take — naming the macro, the language, the key and the nearest known one — or
+an `:lsp` that `model/register-lsp` would not read as written: not a map, a key it does not
+take, or a server row missing `:name`, `:commands` or `:root-markers` or carrying a key no
+server code reads (`*server-row-shape*`). A misspelt key would otherwise be ignored, and the
+fact it carried missed by someone opening a file much later. Answers `spec`.
 
     (languages/core/check-spec languages/core/deflexer-kind 'ok {:pattern \"x\" :lexer 'l})   ;=> {:pattern \"x\" :lexer l}"
-  (let (lsp (get spec :lsp)
-        problem (or (unknown-key-problem (:macro kind) name "spec" spec (:keys kind))
-                  (when (map? lsp) (unknown-key-problem (:macro kind) name ":lsp" lsp *lsp-keys*))))
+  (let (problem (or (unknown-key-problem (:macro kind) name "spec" spec (:keys kind))
+                  (lsp-problem (:macro kind) name (get spec :lsp))))
     (if problem (error problem) spec)))
 
 (defn mode-type (name spec)
@@ -281,25 +391,37 @@ the spec's `:type`, else its `:lang` (a `deflanguage`'s grammar), else the macro
   "Register the language `name` that the macro `kind` describes, whose spec is the global
 `spec-ref` and whose mode layer `layer-ref`: under its [[mode-type]], the `#!` programs that
 select it (`:interpreters`), its spec in `:languages/specs` (where its `:names` and faces are
-found: `modes/language-named`), its servers and `languageId`s (`:lsp`, `model/register-lsp`),
+found: `modes/language-named`) and the kind that declared it ([[spec-kind]]), its servers and
+`languageId`s (`:lsp`, `model/register-lsp` — a `:fallback` stand-in's buffers reach them too),
 and its mode — over the `prog` motions for a `:prog` kind, over text-mode for a `:text` one.
 Its snippets and conventions are its LAYER's, which the macro built. Every registration is
 claimed, so a package's language goes back with the package."
   (let (spec (reflect/eval spec-ref)
-        type (mode-type name spec))
+        type (mode-type name spec)
+        stand-in (when (get spec :fallback) (fallback-type spec)))
     (doseq (program (get spec :interpreters [])) (modes/register-interpreter program type))
     (register-spec type spec-ref)
-    (when (map? (get spec :lsp)) (model/register-lsp type (get spec :lsp)))
+    (ownership/claim! :languages/spec-kinds type kind)
+    (when (map? (get spec :lsp))
+      (model/register-lsp type (get spec :lsp))
+      (when stand-in (model/register-lsp-stand-in stand-in type)))
     (if (= (:stack kind) :text)
       (modes/register-language-mode layer-ref type)
       (modes/register-prog-mode layer-ref type))))
 
+(defn spec-kind (type)
+  "The kind (`deflanguage-kind`, `deflexer-kind`, `languages/lisps/deflisp-kind`, a hand-written
+one) the language of the mode `type` was registered with, or nil — recorded at registration, so
+a check of its spec never guesses the macro from the keys.
+
+    (languages/core/spec-kind :no-such-mode)   ;=> nil"
+  (registry/lookup :languages/spec-kinds type))
+
 (defn declare-grammar-facts (spec fallback-ref)
-  "Declare what a `deflanguage` spec says of its GRAMMAR, which no other kind has: its
-definitions (`declare-definitions`), where the grammar lives (`declare-grammar`), the names its
-tables use of it (`expect-grammar-names`) and its line-lexer stand-in, the layer
-`fallback-ref` names (`register-fallback`)."
-  (declare-definitions spec)
+  "Declare what a `deflanguage` spec says of its GRAMMAR, which no other kind has: where the
+grammar lives (`declare-grammar`), the names its tables use of it (`expect-grammar-names`) and
+its line-lexer stand-in, the layer `fallback-ref` names (`register-fallback`). Its
+`:definitions` are its layer's (`:ts-definitions`), never the grammar's."
   (declare-grammar spec)
   (expect-grammar-names spec)
   (register-fallback spec fallback-ref))
@@ -418,16 +540,10 @@ only reached for a language whose layer names no generated restart."
   (let (rule (get spec :restart)
         heredocs (get spec :heredocs))
     (cond
-      (map? rule) (column0-item-restart source position (:item-start rule) (:opaque rule))
+      (map? rule)
+        (column0-item-restart source position (:item-start rule) (:opaque rule) (:keep rule))
       (not (nil? heredocs)) (editor/treesit/column0-restart source position heredocs)
       else position)))
-
-(defn declare-definitions (spec)
-  "Register a `deflanguage` spec's `:definitions` with `editor/treesit`. A spec without one
-leaves std's declaration alone — Ruby's and Elixir's live there."
-  (let (definitions (get spec :definitions))
-    (when (map? definitions)
-      (editor/treesit/register-definitions (get spec :lang) definitions))))
 
 (defn declare-grammar (spec)
   "Record where a `deflanguage` spec's grammar lives (`:grammar` — a git URL, or `{:url
@@ -440,19 +556,24 @@ file of the language opened without one can say how to get it."
 (defn spec-grammar-names (spec)
   "The node kinds and fields of its grammar a `deflanguage` spec's tables name, as
 `{:kinds :fields}` (std's `editor/treesit/language-names`): its face table, injection rules,
-indent spec and definitions, and the kinds its own `:folds` names.
+indent spec and definitions, and the kinds its own `:folds` names — a scoped entry
+(`{:kind :then :parent-not :rescue}`) by its `:kind`.
 
     (languages/core/spec-grammar-names {:faces {:comment :syntax/comment} :indent :content})   ;=> {:kinds #{:comment} :fields #{}}
-    (languages/core/spec-grammar-names {:indent :content :folds #{:pair}})   ;=> {:kinds #{:pair} :fields #{}}"
+    (languages/core/spec-grammar-names {:indent :content :folds #{:pair}})   ;=> {:kinds #{:pair} :fields #{}}
+    (languages/core/spec-grammar-names {:indent :content :folds {:blocks #{{:kind :then :parent-not :rescue}}}})   ;=> {:kinds #{:then} :fields #{}}"
   (let (names (editor/treesit/language-names {:faces (get spec :faces)
                                               :injections (get spec :injections)
                                               :indent (get spec :indent)
                                               :definitions (get spec :definitions)})
-        folds (get spec :folds))
+        folds (get spec :folds)
+        kind-of (fn (entry) (if (map? entry) (:kind entry) entry)))
     (if (nil? folds)
       names
       (let (kinds (spec-fold-kinds spec))
-        (update names :kinds set/union (set/union (:blocks kinds) (:brackets kinds)))))))
+        (update names
+          :kinds set/union
+          (into #{} (map (set/union (:blocks kinds) (:brackets kinds)) kind-of)))))))
 
 (defn expect-grammar-names (spec)
   "Record the names a `deflanguage` spec's tables use of its grammar (`spec-grammar-names`),
@@ -560,7 +681,9 @@ reads."
   "The node kinds a fold in `spec`'s language covers, as `{:blocks :brackets}` (`codefold`): its
 `:folds` when it says (a set is folded from each node's own first line, as `:brackets`; a map is
 taken as given), else its indent spec's, the nodes that open a level — nil for a language whose
-indent reads content (`:indent :content`) and says no `:folds`.
+indent reads content (`:indent :content`) and says no `:folds`. A kind may be a scoped entry
+(`{:kind :then :parent-not :rescue}`, a map), kept as it is: `codefold` reads it as the indenter does
+(`editor/treesit/indent-entry-holds?`), and [[spec-grammar-names]] by its `:kind`.
 
     (languages/core/spec-fold-kinds {:indent {:blocks #{:block} :brackets #{:list}}})   ;=> {:blocks #{:block} :brackets #{:list}}
     (languages/core/spec-fold-kinds {:indent :content :folds #{:pair}})   ;=> {:blocks #{} :brackets #{:pair}}"
@@ -574,8 +697,8 @@ indent reads content (`:indent :content`) and says no `:folds`.
 
 (defn language-layer (name spec refs)
   "The mode layer for a `deflanguage`, checked against `editor/treesit/language-contract`.
-`refs` names the generated services: `{:fontify :indent :restart :faces :injections
-:bracket-match}`.
+`refs` names the generated services: `{:fontify :indent :restart :window-around :faces :injections
+:bracket-match :fold-extent :breadcrumbs}`.
 
 Raises on an incomplete language rather than registering one. A mode missing `:indent`
 would register happily and simply do nothing on RET — a failure that surfaces as a key
@@ -595,6 +718,8 @@ by someone opening a file."
                :ts-injections (when (get spec :injections) (:injections refs))
                :file-pattern (get spec :pattern)
                :fontify (:fontify refs)
+               ;; the text a window is read between: what is still open at its edges
+               :fontify-around (when (spec-window-around? spec) (:window-around refs))
                :indent (:indent refs)
                ;; a hand-written one by name (Ruby's, which must also see `=begin`), the
                ;; generated one for a rule declared as data, or none — a language with no
@@ -613,6 +738,9 @@ by someone opening a file."
                :fold-extent (:fold-extent refs)
                ;; the header line's path of definitions at point
                :breadcrumbs (:breadcrumbs refs)
+               ;; what C-M-a / C-M-e and the breadcrumbs take a definition to be: the MODE's, so
+               ;; two modes over one grammar keep their own (`languages/crumbs/buffer-definitions`)
+               :ts-definitions (get spec :definitions)
                :bracket-match-tree 'tsbrackets/match-tree
                ;; The language's own formatter, as `[prog arg …]` with the file appended
                ;; — `mix format <file>`. A service like any other, so `M-x format-buffer`
@@ -622,7 +750,7 @@ by someone opening a file."
                :format-command (get spec :format)
                ;; the words that end a block, as a regexp over what precedes point on its line
                ;; (`indent/ed-electric-reindent`): typing one reindents the line
-               :electric-indent (get spec :electric-indent)
+               :electric-indent (spec-electric-indent spec)
                ;; the line-lexer type a buffer stands in with while the grammar is missing,
                ;; or past `:fallback-above` characters (`model/ed-grammar-fallback`)
                :grammar-fallback (when (fallback-type spec)
@@ -636,11 +764,17 @@ by someone opening a file."
                 {:indent-tabs (= true (get spec :indent-tabs))})
         gaps (editor/treesit/missing-services layer)
         face-problems (editor/treesit/face-table-problems (get spec :faces))
+        ;; a misspelt indent key, or an entry the indenter can never match, is refused here
+        ;; rather than found as a wrong indent (brood ADR-766)
+        indent-problems (let (indent (get spec :indent))
+                          (if (map? indent) (editor/treesit/indent-problems indent) ()))
         injection-problems (injection-rule-problems (get spec :injections [])))
     (when (not (empty? gaps))
       (error "deflanguage " name ": missing required service(s) " (->string gaps)))
     (when (not (empty? face-problems))
       (error "deflanguage " name ": malformed face table: " (string/join face-problems "; ")))
+    (when (not (empty? indent-problems))
+      (error "deflanguage " name ": malformed indent spec: " (string/join indent-problems "; ")))
     (when (not (empty? injection-problems))
       (error "deflanguage "
         name
@@ -792,9 +926,36 @@ JavaScript's calls are this shape.
 (def *prettier* ["prettier" "--write" "--log-level" "warn"])
 
 ;; ---- the electric words more than one language shares ---------------------------------------
-;; A spec's `:electric-indent`. A brace language's `case` / `default` label backs out of the
+;; A spec's `:electric-indent` ([[spec-electric-indent]]). A brace language's `case` / `default` label backs out of the
 ;; statements above it, so typing one reindents its line when its `:` (or Java's `->`) closes it.
 (def *case-label-electric* "^(case\\b.*|default\\s*)(:|->)$")
+
+(defn spec-electric-indent (spec)
+  "The `:electric-indent` a `deflanguage` spec declares, as the one regexp over what precedes
+point on its line that `indent/ed-electric-reindent` reads: a regexp, or a vector of them, where
+`:dedent` stands for the indent spec's `:dedent` words, each a whole line — so a language whose
+block-ending words are its dedent words says so once (`:electric-indent :dedent`), and one that
+adds a pattern beside a shared one lists both (`[*case-label-electric* \"^</\"]`). nil for none.
+
+    (languages/core/spec-electric-indent {:indent {:dedent #{\"fi\" \"done\"}} :electric-indent :dedent})   ;=> \"^(?:done|fi)$\"
+    (languages/core/spec-electric-indent {:electric-indent [\"^a$\" \"^</\"]})   ;=> \"(?:^a$)|(?:^</)\""
+  (let (declared (get spec :electric-indent)
+        dedent (fn ()
+                 (let (words (map/get-in spec [:indent :dedent])
+                       listed (cond
+                                (map? words) (sort (vec (keys words)))
+                                (set? words) (sort (vec words))
+                                else []))
+                   (when (not (empty? listed))
+                     (str "^(?:" (string/join (map listed regex/escape) "|") ")$"))))
+        resolve (fn (entry) (if (= entry :dedent) (dedent) entry)))
+    (cond
+      (nil? declared) nil
+      (vector? declared)
+        (let (patterns (seq/keep declared resolve))
+          (when (not (empty? patterns))
+            (string/join (map patterns (fn (pattern) (str "(?:" pattern ")"))) "|")))
+      else (resolve declared))))
 
 ;; ---- the restarts more than one language shares ---------------------------------------------
 
@@ -811,16 +972,18 @@ JavaScript's calls are this shape.
                    (if (< newline 0) (count source) newline)))
     (cond
       (= candidate 0) 0
-      (modes/file-pattern-matches? (string/substring source candidate line-end) item-start)
-        candidate
+      (modes/pattern-matches? (string/substring source candidate line-end) item-start) candidate
       else (item-line-before source (dec candidate) item-start))))
 
 ;; What a `:restart` rule's `:opaque` names: the constructs whose contents can be anything, so a
 ;; column-0 line inside one is not code. Each is a pair — `{:open re :close re}`, or `:symmetric`
 ;; when the same marker closes it (counted for parity) — or `{:open re}` alone when the closer is
 ;; text the opener chose (a heredoc's word), which is then taken as still open.
+;; `:count-above` also counts a symmetric marker over the whole text above a window
+;; (`open-string-around`), so a lead-in that begins inside a long docstring knows it does. Not a
+;; backtick: one stray in a comment would turn every window below it into a string.
 (def *block-comment-opaque* {:open "/\\*" :close "\\*/"})
-(def *triple-quote-opaque* {:open "\"\"\"" :symmetric true})
+(def *triple-quote-opaque* {:open "\"\"\"" :symmetric true :count-above true})
 (def *backtick-opaque* {:open "`" :symmetric true})
 
 (defn- opaque-pairs (opaque)
@@ -844,16 +1007,8 @@ JavaScript's calls are this shape.
                   (nil? (regex/find (string/substring lead (:end opener) (count lead)) close)))
             (:start opener))))))
 
-(defn column0-item-restart (source position item-start opaque)
-  "The fontify restart every brace language shares: the previous column-0 line that LOOKS like
-the start of an item (`item-start`, a regex over the line, or `{:match re :except re}`) — unless
-it sits inside something whose contents can be anything, an `opaque` construct (a block comment,
-a raw or template string, a heredoc: pairs, see `*block-comment-opaque*`) still open there,
-when the item line before THAT construct is tried. A construct that opened and closed above the
-line does not count: a closed `/** doc */` above every function is the ordinary case, and
-declining on it re-parsed the whole lead-in on every key. A language with nothing opaque passes nil.
-
-    (languages/core/column0-item-restart \"/* a */\\nfn f\\n  x\" 13 \"^fn\" languages/core/*block-comment-opaque*)   ;=> 8"
+(defn- item-restart (source position item-start opaque)
+  ;; the item line before `position` outside every `opaque` construct, or 0 ([[column0-item-restart]])
   (let (candidate (item-line-before source position item-start))
     (if (= candidate 0)
       0
@@ -863,4 +1018,170 @@ declining on it re-parsed the whole lead-in on every key. A language with nothin
                       (fn (earliest pair)
                         (let (start (unclosed-opener lead pair))
                           (if (and start (or (nil? earliest) (< start earliest))) start earliest)))))
-        (if (nil? open-at) candidate (column0-item-restart source open-at item-start opaque))))))
+        (if (nil? open-at) candidate (item-restart source open-at item-start opaque))))))
+
+(defn column0-item-restart (source position item-start opaque &optional (keep nil))
+  "The fontify restart every brace language shares: the previous column-0 line that LOOKS like
+the start of an item (`item-start`, a regex over the line, or `{:match re :except re}`,
+`modes/pattern-matches?`) — unless it sits inside something whose contents can be anything, an
+`opaque` construct (a block comment, a raw or template string, a heredoc: pairs, see
+`*block-comment-opaque*`) still open there, when the item line before THAT construct is tried. A
+construct that opened and closed above the line does not count: a closed `/** doc */` above every
+function is the ordinary case, and declining on it re-parsed the whole lead-in on every key. A
+language with nothing opaque passes nil.
+
+`keep` (a rule's `:keep`) is a line the cut never moves past: when one stands above the item line,
+outside every opaque construct, the cut is there instead — PHP's `<?php`, which the grammar reads
+the rest of the file inside of. One at the very start of `source` keeps nothing: it is where the
+cut would land anyway, or the re-read text above the lead-in (`:resume`), which a cut past it asks
+for again.
+
+    (languages/core/column0-item-restart \"/* a */\\nfn f\\n  x\" 13 \"^fn\" languages/core/*block-comment-opaque*)   ;=> 8
+    (languages/core/column0-item-restart \"<p>\\n<?php\\nfn f\\n  x\" 15 \"^(fn|<\\\\?php)\" nil \"^<\\\\?php\")   ;=> 4"
+  (let (cut (item-restart source position item-start opaque)
+        kept (if (nil? keep) 0 (item-restart source position keep opaque)))
+    (if (and (> kept 0) (< kept cut)) kept cut)))
+
+;; ---- resuming an outer construct above a window --------------------------------------------
+;; A restart sees only the lead-in, so the one fact it cannot recover is what the text ABOVE the
+;; lead-in left open — PHP's `<?php`, which the grammar reads the rest of the file inside of. One
+;; backward search finds the last marker; nothing above it is read, unless that marker is a closer
+;; that may sit inside the construct's own strings (`:skip`), when the text from its opener on is.
+
+(defn- marker-pattern (patterns)
+  ;; one alternation of `patterns`
+  (string/join (map patterns (fn (pattern) (str "(?:" pattern ")"))) "|"))
+
+(defn- whole-match? (text pattern)
+  (regex/match? text (str "^(?:" pattern ")$")))
+
+(defn- heredoc-end (rope found)
+  ;; where the heredoc a `:heredoc` match opened ends: past the line that starts with the word its
+  ;; first group named, or the text's end
+  (let (word (:text (first (:groups found)))
+        closer (regex/rope-find rope (str "^[ \\t]*" (regex/escape word) "\\b") (:end found)))
+    (if closer (:end closer) (count rope))))
+
+(defn- skipped-close (pair rope at)
+  ;; where the string, comment or heredoc that holds the closer at char `at` starts — `pair`'s
+  ;; `:skip` tokens and `:heredoc`s, read from the opener above it on — so the search goes on above
+  ;; that; nil when the closer is real, or follows a real one (the text after that is outside)
+  (let (skip (:skip pair)
+        heredoc (:heredoc pair)
+        opener (when (or skip heredoc) (regex/rope-find-backward rope (:open pair) at)))
+    (when opener
+      (let (scan (marker-pattern (seq/keep [heredoc skip (:close pair)] identity)))
+        (letrec (walk (fn (from)
+                        (let (found (regex/rope-find rope scan from))
+                          (cond
+                            (or (nil? found) (>= (:start found) at)) nil
+                            (whole-match? (:text found) (:close pair)) nil
+                            else
+                              (let (end (if (and heredoc (first (:groups found)))
+                                          (heredoc-end rope found)
+                                          (:end found)))
+                                (if (> end at) (:start found) (walk end)))))))
+          (walk (:end opener)))))))
+
+(defn resume-prefix (pairs rope offset)
+  "The text a window starting at char `offset` of `rope` re-reads first, so its parse begins
+inside the outer construct the text above leaves open — or nil when none is. `pairs` is a
+`:resume` spec, `[{:open re :close re :prefix s :skip re :heredoc re}]`: the marker that comes last
+above `offset` decides, an opener answering its `:prefix` (by default the opener's own text and a
+newline), a closer nil. One backward search over the rope, whose cost is the distance to that
+marker — except that a closer inside the construct's own strings closes nothing: `:skip` matches
+them whole (`stringlex/text-pattern`), `:heredoc` opens one whose first group is the word that
+closes it at a line's start, and a closer inside either is passed over, PHP's `echo '?>';`.
+
+    (languages/core/resume-prefix [{:open \"<\\\\?php\" :close \"\\\\?>\"}] (text/string-> \"<p>\\n<?php\\n$x;\\n\") 10)   ;=> \"<?php\\n\"
+    (languages/core/resume-prefix [{:open \"<\\\\?php\" :close \"\\\\?>\" :skip \"'[^']*'\"}] (text/string-> \"<?php\\n'?>'\\n$x;\\n\") 11)   ;=> \"<?php\\n\""
+  (when (and pairs (> offset 0))
+    (let (pattern (marker-pattern (mapcat pairs (fn (pair) [(:open pair) (:close pair)]))))
+      (letrec (search (fn (before)
+                        (let (found (regex/rope-find-backward rope pattern before))
+                          (when found
+                            (let (text (:text found)
+                                  opener (seq/find pairs
+                                           (fn (pair) (whole-match? text (:open pair)))))
+                              (if opener
+                                (get opener :prefix (str text "\n"))
+                                (let (pair (seq/find pairs
+                                             (fn (pair) (whole-match? text (:close pair))))
+                                      skipped (skipped-close pair rope (:start found)))
+                                  (when skipped (search skipped)))))))))
+        (search offset)))))
+
+;; ---- a multi-line string open at a window's edges ------------------------------------------
+;; A restart counts a paired marker's occurrences in the lead-in to tell a column-0 line inside a
+;; docstring from code — which is only right when the lead-in begins OUTSIDE one. A docstring
+;; longer than the lead-in begins it inside, the count is one off, and the restart cuts in the
+;; prose (a Julia `# Examples`) or at the closing `"""`. And a window that ENDS inside one parses
+;; an unterminated string, which tree-sitter recovers from as code. Which string is open at each
+;; edge is read from the top of the file by the spec's string syntax (`stringlex/text-state`), so a
+;; marker inside another string or a comment opens nothing: once per slice, never on the common frame.
+
+(defn- counted-markers (spec)
+  ;; the paired markers whose string open above a window is re-read: the `:restart` rule's
+  ;; `:opaque` pairs marked `:count-above`, and every `:heredocs` marker (literal text, so escaped)
+  (let (rule (get spec :restart))
+    (into []
+      (append (if (map? rule)
+                (map (seq/filter (opaque-pairs (:opaque rule)) :count-above) :open)
+                [])
+        (map (get spec :heredocs []) regex/escape)))))
+
+(defn- window-strings (spec)
+  ;; `[syntax opens]`: the string syntax a window's edges are read by — the spec's `:strings`,
+  ;; with a multi-line string for each counted marker it does not name — and the set of openers
+  ;; whose string, open at an edge, is re-opened or closed
+  (let (markers (counted-markers spec)
+        syntax (or (get spec :strings) {})
+        entries (or (:strings syntax) [])
+        named (fn (marker) (seq/find entries (fn (entry) (regex/matches? (:open entry) marker))))
+        missing (into []
+                  (map (seq/reject markers named)
+                    (fn (marker) {:open (regex/replace marker "\\\\(.)" "$1") :multiline true})))
+        all (into entries missing))
+    [(assoc syntax :strings all)
+      (into #{}
+        (map (seq/filter all
+               (fn (entry) (any? markers (fn (marker) (regex/matches? (:open entry) marker)))))
+          :open))]))
+
+(defn open-string-around (syntax opens rope start end &optional (known nil))
+  "`[before after state]`: what a window over chars `[start, end)` of `rope` is read inside of when
+a multi-line string whose opener is one of `opens` is still open at its edges, as `syntax` (a
+string syntax, `stringstate`) reads the text above — so a `'''` inside a `\"\"\"` docstring, or a
+`\"\"\"` in a comment, opens nothing. `before` re-opens the string open at `start` (its opener and a
+newline), `after` closes the one open at `end`; each is \"\" when none is. `state` is the scan's
+state at `start` (`stringlex/text-state`), which a later call for a window starting further down
+passes as `known` to read on from there rather than from the top. One native pass over the text
+above `end`, paid once per slice.
+
+    (languages/core/open-string-around {:strings [{:open \"\\\"\\\"\\\"\" :multiline true}]} #{\"\\\"\\\"\\\"\"} (text/string-> \"\\\"\\\"\\\"\\ndoc\\nmore\\n\") 4 8)   ;=> [\"\\\"\\\"\\\"\\n\" \"\\n\\\"\\\"\\\"\" [4 13]]"
+  (if (or (empty? opens) (<= end 0))
+    ["" "" nil]
+    (let (pattern (stringlex/text-pattern syntax)
+          at-start (stringlex/text-state pattern rope start known)
+          at-end (stringlex/text-state pattern rope end at-start)
+          opened (fn (state)
+                   (let (found (stringlex/open-string syntax pattern rope state))
+                     (when (and found (contains? opens (first found))) found)))
+          before (opened at-start)
+          after (opened at-end))
+      [(if before (str (first before) "\n") "") (if after (str "\n" (second after)) "") at-start])))
+
+(defn spec-window-around (spec rope start end &optional (known nil))
+  "The `:fontify-around` a `deflanguage` spec declares as data: `[before after state]`, the text a
+window over chars `[start, end)` of `rope` is read between — the outer construct still open at
+`start` (`:resume`, [[resume-prefix]]) or the multi-line string still open there, and the one still
+open at `end` ([[open-string-around]]) — each \"\" when nothing is. `state` is what the scan of the
+text above knew at `start`: passed back as `known` for a window cut further down
+(`spancache/ed-restart-window`), it reads on from there instead of from the top."
+  (let ([syntax opens] (window-strings spec)
+        [before after state] (open-string-around syntax opens rope start end known))
+    [(or (resume-prefix (get spec :resume) rope start) before) after state]))
+
+(defn spec-window-around? (spec)
+  "Whether a `deflanguage` spec has anything for [[spec-window-around]] to read a window inside of."
+  (or (not (nil? (get spec :resume))) (not (empty? (counted-markers spec)))))

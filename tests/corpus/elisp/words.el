@@ -24,7 +24,7 @@
 (defun words-count (text)
   ;; ^ special
   "Count the words in TEXT."
-  ;; ^^^^^^^^^^^^^^^^^^^^^^^ string
+  ;; ^^^^^^^^^^^^^^^^^^^^^^^ doc
   (let ((table (make-hash-table :test #'equal)))
     ;;                          ^^^^^ symbol
     (dolist (word (split-string text))
