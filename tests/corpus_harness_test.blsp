@@ -1,0 +1,234 @@
+;; The corpus harness itself (src/corpus.blsp), as a language package meets it: which languages
+;; a run answers for, the conventions a sample is judged at, the known gaps file, a project with
+;; no corpus, and the spec checks the cross-language tests lean on. The samples' own checks are
+;; tests/language_corpus_test.blsp's.
+(defmodule corpus-harness-test
+  (:use test)
+  (:use model) ; ed-current-buf
+  (:use testkit :only [file-model])
+  (:use conventions :only [*user-settings*]))
+
+(purge-stale-temp "bedit-corpus-harness-")
+
+(defn- write-tree (base files)
+  ;; each `[relative-path text]` of `files` written under `base`, its directories made
+  (doseq ([relative text] files)
+    (let (path (path/join base relative))
+      (file/mkdir (path/dirname path))
+      (file/spit path text)))
+  base)
+
+;; ---- which languages a run answers for -------------------------------------------------
+
+(describe "the languages a project answers for"
+  :isolated (test "are the ones its :source-paths register, never a dependency's under _deps/"
+    (let (root "/tests/corpus-harness-own")
+      ;; a package's own language, and the bedit a `:git` dev dependency fetches into _deps/
+      (ownership/with-claimant (path/join root "src" "bedit-lang-zzown.blsp")
+        (fn () (ownership/claim! :languages/specs :zzown 'zzown-spec)))
+      (ownership/with-claimant (path/join root "_deps" "bedit" "src" "languages" "zzdep.blsp")
+        (fn () (ownership/claim! :languages/specs :zzdep 'zzdep-spec)))
+      (assert= (corpus/own-languages root ["src"]) ["zzown"])
+      (assert= (corpus/own-languages root ["src" "_deps/bedit/src"]) ["zzdep" "zzown"])
+      (ownership/release-under! root)
+      (assert= (corpus/own-languages root ["src"]) [])))
+  (test "bedit's tree answers for bedit's own, Markdown and Brood among them"
+    (let (own (corpus/own-languages))
+      (is (includes? own "rust"))
+      (is (includes? own "markdown"))
+      (is (includes? own "brood")))))
+
+;; ---- a sample is judged at its language's conventions ----------------------------------
+
+(def- *rust-sample* "tests/corpus/rust/counter.rs")
+
+(describe "a sample's indentation"
+  (test "is judged at its language's width, whatever .editorconfig the project has"
+    :skip-unless (corpus/load-test-grammar :rust)
+    "no rust grammar"
+    (let (base (temp-dir "bedit-corpus-harness-")
+          path (path/join base "rust" "counter.rs")
+          _ (write-tree base
+              [[".editorconfig" "root = true\n\n[*]\nindent_size = 2\n"]
+                ["rust/counter.rs" (file/slurp *rust-sample*)]])
+          sample (corpus/sample {:language "rust" :name "counter.rs" :path path}))
+      ;; the visit a user makes reads it — but not the harness
+      (assert= (conventions/indent-width (ed-current-buf (ed-init (editor/buffer/make-buffer ""
+                                                                    path path))))
+        2)
+      (assert= (conventions/indent-width (:buffer sample)) 4)
+      (assert= (corpus/indent-problems sample) [])
+      (assert= (corpus/reindent-problems sample) [])
+      (assert= (corpus/typing-problems sample) [])))
+  (test "counts a tab at the buffer's tab width, as TAB indents"
+    :skip-unless (corpus/load-test-grammar :go)
+    "no go grammar"
+    (binding (*user-settings* {:tab-width 4})
+      (let (rows (corpus/indent-rows "package main\n\nfunc f() {\n\tx := 1\n}\n" "/p/f.go")
+            body (seq/find rows (fn (row) (= (:line row) 3))))
+        (assert= (:want body) 4)
+        (assert= (:got body) 4))))
+  (test "testkit's file model is the harness's: no .editorconfig read"
+    (assert= (:editorconfig (ed-current-buf (file-model "" "/p/a.py"))) {})))
+
+;; ---- the corpus, and a project without one ----------------------------------------------
+
+(describe "a corpus that is not there"
+  (test "has no samples, so every language the project registers is uncovered"
+    (let (empty (temp-dir "bedit-corpus-harness-"))
+      (binding (corpus/*corpus-root* (path/join empty "tests" "corpus"))
+        (assert= (corpus/corpus-files) [])
+        (assert= (corpus/uncovered-languages) (vec (corpus/own-languages))))))
+  (test "a language with no directory has no samples, and write-golden says so"
+    (assert= (corpus/corpus-files "no-such-language") [])
+    (assert= (corpus/write-golden ["no-such-language"])
+      ["no samples no-such-language — nothing under tests/corpus/no-such-language"])))
+
+(describe "a sample's visit name"
+  (test "a dotfile is visited as itself, and a bare `dot.` keeps its name"
+    (assert= (corpus/visit-path "tests/corpus/env/dot.env") "tests/corpus/env/.env")
+    (assert= (corpus/visit-path "tests/corpus/x/dot.") "tests/corpus/x/dot.")))
+
+(describe "the golden header"
+  (test "names the same rewrite in bedit's tree and in a package's"
+    (assert= (corpus/golden-header {:id "zig/stack.zig" :language "zig"})
+      ";; zig/stack.zig — the faces its mode paints. Rewrite with (corpus/write-golden [\"zig\"]) and review the diff.")))
+
+(describe "preparing a run"
+  (test "loads bedit's languages without evaluating a loaded one again"
+    (let (before languages/rust/rust-indent)
+      (corpus/prepare)
+      (is (= before languages/rust/rust-indent))
+      (assert= (modes/language-named "zig") nil))))
+
+;; ---- the known gaps ------------------------------------------------------------------------
+
+(describe "the known gaps file"
+  (test "an id that names no sample, or a key that is no check, is a problem"
+    (let (base (temp-dir "bedit-corpus-harness-")
+          gaps (path/join base "known-gaps.blsp"))
+      (file/mkdir base)
+      (file/spit gaps
+        (str "{\"rust/counter.rs\" {:indnet {:why \"x\" :lines [1]}}\n"
+          " \"rust/nothing.rs\" {:typing {:why \"x\" :lines [1]}}\n"
+          " \"go/server.go\" {:typing {:lines [1]}}}\n"))
+      (binding (corpus/*gaps-path* gaps)
+        (assert= (corpus/gap-problems)
+          ["\"rust/nothing.rs\" names no sample under tests/corpus"
+            "\"go/server.go\" lists :typing, which says neither {:lines [n …] :why \"…\"} nor {:off \"why\"}"
+            "\"rust/counter.rs\" lists :indnet, which is no check — the checks are :indent :reindent :restart :typing"]))))
+  (test "bedit's own is well formed"
+    (assert= (corpus/gap-problems) []))
+  (test "a listed restart gap off the restart check's stride is asked about, not read as passing"
+    ;; notes.md's line 28 is a restart gap (a lead-in cut inside a fence); 60 lines of prose above
+    ;; it make the sample long enough that the check asks every 2nd line, and put it off that stride
+    (let (base (temp-dir "bedit-corpus-harness-")
+          notes (file/slurp "tests/corpus/markdown/notes.md")
+          text (str (string/join (map (range 60) (fn (index) (str "Line " index " of prose.")))
+                      "\n")
+                 "\n" notes)
+          gap-line (+ 60 28)
+          _ (write-tree base
+              [["markdown/long.md" text]
+                ["known-gaps.blsp"
+                  (str "{\"markdown/long.md\" {:restart {:why \"fence\" :lines [" gap-line "]}}}")]])
+          sample (corpus/sample {:language "markdown"
+                                 :name "long.md"
+                                 :path (path/join base "markdown" "long.md")}))
+      (is (> (count (:lines sample)) 80))
+      ;; off a stride of 2, which asks the even 0-based lines
+      (is (math/odd? (dec gap-line)))
+      (binding (corpus/*gaps-path* (path/join base "known-gaps.blsp"))
+        (assert= (corpus/restart-problems sample) [])))))
+
+;; ---- the spec checks the cross-language tests lean on -------------------------------------
+
+(def- *lexer-kind* languages/core/deflexer-kind)
+
+(defn- spec-error (spec)
+  ;; what `check-spec` raises for `spec` as a `deflexer`'s, or nil
+  (check-allow :discarded-catch
+    (try
+      (do (languages/core/check-spec *lexer-kind* 'zzspec spec) nil)
+      (catch e (if (map? e) (:message e) (pr-str e))))))
+
+(def- *good-server* {:name "zz-ls" :commands [["zz-ls" []]] :root-markers ["zz.toml"]})
+
+(describe "a spec's :lsp"
+  (test "must be a map, with servers that say their name, commands and root markers"
+    (assert= (spec-error {:pattern "x" :lexer 'l :lsp {:id "zz" :servers [*good-server*]}}) nil)
+    (is (includes? (spec-error {:pattern "x" :lexer 'l :lsp [*good-server*]}) ":lsp is a map"))
+    (is (includes? (spec-error {:pattern "x"
+                                :lexer 'l
+                                :lsp {:servers [(dissoc *good-server* :commands)]}})
+          "server \"zz-ls\": missing required key :commands"))
+    (is (includes? (spec-error {:pattern "x"
+                                :lexer 'l
+                                :lsp {:servers [(assoc *good-server* :add-no true)]}})
+          "did you mean :add-on"))
+    (is (includes? (spec-error {:pattern "x" :lexer 'l :lsp {:servers *good-server*}})
+          ":servers is a vector"))
+    (is (includes? (spec-error {:pattern "x" :lexer 'l :lsp {:id :zz}}) ":id is a string")))
+  (test "every server row bedit registers fits the shape"
+    (assert= (corpus/spec-problems) [])))
+
+(describe "a registered spec's check"
+  (test "uses the kind it was registered with, never one guessed from its keys"
+    (corpus/prepare)
+    (assert= (languages/core/spec-kind :rust) languages/core/deflanguage-kind)
+    (assert= (languages/core/spec-kind :markdown) languages/core/hand-written-text-kind)
+    ;; a deflanguage spec without its `:lang` is still checked as a deflanguage's
+    (assert= (languages/spec-problem :rust (dissoc languages/rust/rust-spec :lang)) nil)
+    (is (includes? (languages/spec-problem :rust (assoc languages/rust/rust-spec :lexer 'x))
+          "deflanguage :rust: unknown spec key :lexer"))))
+
+(defn zzclash-indent (text) text)
+
+(describe "a deflanguage's generated names"
+  :isolated (test "may not replace a definition no deflanguage generated"
+    (let (taken 'corpus-harness-test/zzclash-indent
+          fresh 'corpus-harness-test/zzclash-fontify)
+      (is (includes? (check-allow :discarded-catch
+                       (try
+                         (do (languages/core/claim-generated 'zzclash [fresh taken]) "")
+                         (catch e (if (map? e) (:message e) (pr-str e)))))
+            "is already defined, and not by a deflanguage"))
+      ;; a name it generated is its own to define again
+      (assert= (languages/core/claim-generated 'zzclash [fresh]) [fresh])
+      (assert= (languages/core/claim-generated 'zzclash [fresh]) [fresh]))))
+
+;; ---- Markdown and Brood are languages like the rest ------------------------------------
+
+(describe "the hand-written modes"
+  (test "are named, patterned and served from a registered spec"
+    (assert= (modes/language-named "markdown") :markdown)
+    (assert= (modes/language-named "md") :markdown)
+    (assert= (modes/language-named "blsp") :brood)
+    (is (not (nil? (registry/lookup :languages/specs :brood))))
+    (assert= (vec (map (lsp/client/lsp-specs-for "/p/app.blsp") :name)) ["brood-lsp"])
+    (assert= (:type (ed-current-buf (file-model "# x\n" "/p/notes.md"))) :markdown)))
+
+;; ---- a line-lexer stand-in reaches its language's servers --------------------------------
+
+(def zzfall-spec
+  {:lang :zzfall
+   :pattern "\\.zzfall$"
+   :fallback 'languages/lex-shell/shell
+   :lsp {:id "zzfall"
+         :servers [{:name "zzfall-ls" :commands [["zzfall-ls" []]] :root-markers ["zz.toml"]}]}})
+
+(def zzfall-layer {:name (quote zzfall) :file-pattern "\\.zzfall$"})
+
+(describe "a buffer typed as its language's stand-in"
+  :isolated (test "reaches the servers and languageId of the mode it stands in for"
+    (let (claimant "/tests/corpus-harness-fallback/src/zzfall.blsp")
+      (ownership/with-claimant claimant
+        (fn ()
+          (languages/core/register-language languages/core/deflanguage-kind
+            'zzfall 'corpus-harness-test/zzfall-spec 'corpus-harness-test/zzfall-layer)))
+      (assert= (model/lsp-mode-of :zzfall-lexer) :zzfall)
+      (assert= (vec (map (lsp/client/lsp-specs-for "/p/run.zzfall" :zzfall-lexer) :name))
+        ["zzfall-ls"])
+      (assert= (lsp/client/lsp-language-id "/p/run.zzfall" :zzfall-lexer) "zzfall")
+      (ownership/release-under! "/tests/corpus-harness-fallback")
+      (assert= (vec (lsp/client/lsp-specs-for "/p/run.zzfall" :zzfall-lexer)) []))))
