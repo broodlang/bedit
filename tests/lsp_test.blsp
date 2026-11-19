@@ -2326,3 +2326,85 @@ answer `[result elapsed-ms]`."
   (test "the client says it understands inlay hints"
     (is (map? (map/get-in (lsp/client/lsp-init-params "file:///tmp")
                 [:capabilities :textDocument :inlayHint])))))
+
+;; ---- what a server pushes goes to the loop that connected it --------------------------------
+
+(defn- lspk-framed (body)
+  ;; `body` framed as a server writes it, as a `printf` argument for a stand-in server's script
+  (str "printf 'Content-Length: " (count body) "\\r\\n\\r\\n" body "'"))
+
+(def lspk-init-reply
+  "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"capabilities\":{\"hoverProvider\":true}}}")
+
+(describe "a server's pushes reach the loop that started it"
+  :isolated (test "its capabilities go to that loop, not to the :editor name"
+    (if (= (os/type) :windows)
+      (io/puts "  (skipped: no sh)")
+      (let (elsewhere (spawn (receive (_ :done) (after 30000 :done)))
+            previous (proc/whereis :editor)
+            _ (proc/register :editor elsewhere)
+            conn (binding (editor/ui/*loop* (self))
+                   (lsp/client/lsp-connect "sh"
+                     ["-c" (str (lspk-framed lspk-init-reply) "; cat > /dev/null")]
+                     "file:///tmp"))
+            caps (receive ([:lsp-capabilities caps ^conn] caps) (after 10000 :timeout)))
+        (if previous (proc/register :editor previous) (proc/unregister :editor))
+        (exit elsewhere :kill)
+        (exit conn :kill)
+        (assert= caps {:hoverProvider true})))))
+
+;; ---- a malformed message is survived, not fatal --------------------------------------------
+
+(defn- lspj-state (pending)
+  {:proc :fake :buf "" :next-id 8 :pending pending :opened {} :version 1})
+
+(defn- lspj-frame (message) (jsonrpc/frame (json/encode message)))
+
+(describe "a server's malformed message"
+  (test "a reply of the wrong shape answers its waiter with an empty result, and is logged"
+    (let ([state replies] (lsp/protocol/lsp-ingest (lspj-state {7 [:my-pid :corr-1 (lsp-completion)]})
+                            (lspj-frame {:jsonrpc "2.0" :id 7 :result {:items "not a list"}})))
+      (assert= replies (list [:my-pid [:lsp-completion :corr-1 {:entries nil :incomplete false}]]))
+      (is (nil? (get (:pending state) 7)))
+      (is (any? (:notices state) (fn (notice) (includes? (:text notice) "could not be handled"))))))
+  (test "a message that is not an object is logged and passed over; the next one still routes"
+    (let (junk (lspj-frame [1 2 3])
+          good (lspj-frame {:jsonrpc "2.0" :id 7 :result {:items [{:label "foo"}]}})
+          [state replies] (lsp/protocol/lsp-ingest (lspj-state {7 [:my-pid :corr-1 (lsp-completion)]})
+                            (str junk good)))
+      (assert= (count replies) 1)
+      (is (any? (:notices state) (fn (notice) (includes? (:text notice) "could not be handled"))))))
+  (test "a server request that cannot be handled is answered with an error, not left waiting"
+    (let ([state _] (lsp/protocol/lsp-ingest (lspj-state {})
+                      (lspj-frame {:jsonrpc "2.0"
+                                   :id 3
+                                   :method "workspace/applyEdit"
+                                   :params {:edit {:changes "bogus"}}})))
+      (is (any? (:outbox state)
+            (fn (frame) (and (includes? frame "\"id\":3") (includes? frame "error")))))))
+  (test "documentChanges: a resource operation is passed over, the text edits beside it kept"
+    (let (edit (lsp/protocol/lsp-workspace-edit {:documentChanges [{:kind "create"
+                                                                    :uri "file:///tmp/new.ex"}
+                                                                    {:textDocument {:uri "file:///tmp/a.ex"
+                                                                                    :version nil}
+                                                                     :edits [{:range {:start {:line 0
+                                                                                              :character 0}
+                                                                                      :end {:line 0
+                                                                                            :character 0}}
+                                                                              :newText "x"}]}]}))
+      (assert= (keys edit) (list "/tmp/a.ex")))))
+
+(describe "a server stopped before it answers initialize"
+  :isolated (test "is stopped as the protocol asks, not left waiting out the handshake"
+    (if (= (os/type) :windows)
+      (io/puts "  (skipped: no bash)")
+      (let (file (hearing-file)
+            script (str "while IFS= read -r -d '}' chunk; do printf '%s}' \"$chunk\" >> "
+                     file "; case \"$chunk\" in *exit*) exit 0;; esac; done")
+            conn (binding (editor/ui/*loop* (self))
+                   (lsp/client/lsp-connect "bash" ["-c" script] "file:///tmp"))
+            mref (monitor conn))
+        (lsp/client/lsp-shutdown conn)
+        (assert= (receive ([:down ^mref _ _] :down) (after 10000 :timeout)) :down)
+        (is (includes? (heard file) "\"shutdown\""))
+        (is (includes? (heard file) "\"exit\""))))))

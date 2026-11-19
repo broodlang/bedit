@@ -93,6 +93,11 @@ A folder that cannot be listed holds nothing.
 
 ;; ---- the connection process (the thin IO shell) -----------------------------
 
+(defn- lsp-sink (state)
+  ;; where everything this connection pushes goes: the loop that started it (`lsp-connect`
+  ;; captures `ed-loop-address`), so a served session or a second frame hears its server
+  (or (:sink state) :editor))
+
 (defn- lsp-send-all (proc frames)
   (doseq (frame frames) (os/write proc frame)))
 
@@ -116,13 +121,13 @@ froze the editor while Expert indexed."
   (lsp-send-all (:proc state) (or (:outbox state) []))
   ;; …with the connection it came from and the tokens of what it was computed against
   (doseq (queued (or (:edits state) []))
-    (send :editor [:lsp-apply-edit (:edit queued) (self) (:tokens queued)]))
+    (send (lsp-sink state) [:lsp-apply-edit (:edit queued) (self) (:tokens queued)]))
   ;; …and any document whose incremental sync it had to refuse: the editor sends the whole
   ;; text next time ([[lsp-sync-document]])
-  (doseq (uri (or (:resyncs state) [])) (send :editor [:lsp-resync uri (self)]))
+  (doseq (uri (or (:resyncs state) [])) (send (lsp-sink state) [:lsp-resync uri (self)]))
   ;; …and every refresh it asked for (`lsp/protocol/*lsp-refresh-requests*`): the editor asks
   ;; this connection again for what it shows
-  (doseq (refresh (or (:refreshes state) [])) (send :editor [refresh (self)]))
+  (doseq (refresh (or (:refreshes state) [])) (send (lsp-sink state) [refresh (self)]))
   (lsp-flush-when-due (dissoc state :outbox :edits :resyncs :refreshes)))
 
 (defn- lsp-said? (state)
@@ -135,13 +140,13 @@ event and one `[:lsp-diagnostics …]` per file ([[lsp-publish]] already kept on
 newest per open file), and note when. The editor's loop pays a turn per event, so a burst
 of a thousand log lines costs it one."
   (let (notices (or (:notices state) []))
-    (when (not (empty? notices)) (send :editor [:lsp-notices notices]))
+    (when (not (empty? notices)) (send (lsp-sink state) [:lsp-notices notices]))
     ;; a file's diagnostics only matter at their newest: one this server published that
     ;; the editor has not folded yet is REPLACED rather than queued behind (brood ADR-490).
     ;; The log above is not state — every line of it counts — so it is a plain send.
     (doseq (published (or (:diags state) []))
       (let ([path items raw] published)
-        (proc/send-latest :editor
+        (proc/send-latest (lsp-sink state)
           [:lsp-diagnostics (pr-str (self)) path]
           [:lsp-diagnostics path items raw (self)])))
     (assoc (dissoc state :notices :diags) :flushed-at (os/now))))
@@ -169,7 +174,8 @@ late first completion rather than a frozen editor."
     ([:proc _p chunk]
       (let (received (str (:buf state) chunk)
             [messages remaining] (jsonrpc/decode received)
-            hit (seq/find messages (fn (msg) (and (= (:id msg) id) (nil? (:method msg)))))
+            hit (seq/find messages
+                  (fn (msg) (and (map? msg) (= (:id msg) id) (nil? (:method msg)))))
             ;; everything else that arrived meanwhile is handled as the loop
             ;; would: a server that asks for its configuration or registers a
             ;; capability BEFORE answering initialize is waiting on us, and
@@ -182,10 +188,14 @@ late first completion rather than a frozen editor."
           ;; …keeping what it says it can do. A server that does not offer
           ;; signature help should not be asked for it on every keystroke,
           ;; and the only honest source for that is its own answer here.
-          (assoc drained :caps (or (map/get-in hit [:result :capabilities]) {}))
+          (let (caps (map/get-in hit [:result :capabilities]))
+            (assoc drained :caps (if (map? caps) caps {})))
           (lsp-await-init drained id))))
     ([:proc-err _p _chunk] (lsp-await-init state id))
     ([:proc-closed _p _code] state)
+    ;; the editor stopped this server before it answered (its buffer closed, C-x C-c, a
+    ;; restart): the handshake is abandoned, and the server stopped as the protocol asks
+    ([:shutdown] (assoc state :stopping true))
     (after *lsp-init-timeout-ms* state)))
 
 (defn- lsp-folder (root)
@@ -250,7 +260,8 @@ the connection is going."
     (receive
       ([:proc _p chunk]
         (let ([messages remaining] (jsonrpc/decode (str (:buf state) chunk)))
-          (if (any? messages (fn (message) (and (= (:id message) id) (nil? (:method message)))))
+          (if (any? messages
+                (fn (message) (and (map? message) (= (:id message) id) (nil? (:method message)))))
             :answered (lsp-await-stop (assoc state :buf remaining) id deadline))))
       ([:proc-err _p _chunk] (lsp-await-stop state id deadline))
       ([:proc-closed _p _code] :closed)
@@ -284,7 +295,7 @@ client claims — each one a promise a server acts on (rust-analyzer sends no le
    ;; a server written against the current spec may read only this one — which looks from
    ;; the outside exactly like a server that initialises cleanly and then answers nothing,
    ;; because it has no workspace to answer about.
-   :workspaceFolders [{:uri root-uri :name (path/basename (lsp-uri->path root-uri))}]
+   :workspaceFolders [{:uri root-uri :name (path/basename (or (lsp-uri->path root-uri) root-uri))}]
    :clientInfo {:name "bedit"}
    ;; `window.workDoneProgress`: a server that may report progress says what it is doing
    ;; in `$/progress` — the channel meant for the reader — rather than only in its log.
@@ -316,7 +327,7 @@ client claims — each one a promise a server acts on (rust-analyzer sends no le
                                  :semanticTokens lsp/semantic/client-capabilities
                                  :codeLens {:dynamicRegistration false}}}})
 
-(defn- lsp-run (cmd cmd-args root-uri)
+(defn- lsp-run (cmd cmd-args root-uri sink)
   "The connection process body: spawn the server, do the `initialize`/`initialized`
 handshake, then loop. Must call `proc-spawn` itself so it owns the handle (is the
 subscriber for the server's `[:proc …]` output).
@@ -339,24 +350,27 @@ model drops a connection whose process is gone (`ed-lsp-live`)."
                      (do
                        (log/warn (str "lsp: could not start " cmd ": " (error-message spawn-error)))
                        nil)))))
-    (when server (lsp-run-connected server root-uri))))
+    (when server (lsp-run-connected server root-uri sink))))
 
-(defn- lsp-run-connected (server root-uri)
-  "The handshake and loop, given a live server handle."
+(defn- lsp-run-connected (server root-uri sink)
+  "The handshake and loop, given a live server handle; what the server pushes goes to `sink`."
   ;; A server can be gone before the first write: a rustup `rust-analyzer` stub for a
   ;; component that is not installed passes `os/which`, starts, and exits at once. The write
   ;; then raises; this process ends quietly instead — the
   ;; editor sees the dead connection and says so once (`ed-lsp-autostart`).
-  (let (state {:proc server :buf "" :next-id 1 :pending {} :opened {} :version 2})
+  (let (state {:proc server :buf "" :next-id 1 :pending {} :opened {} :version 2 :sink sink})
     (if (not (lsp-write-handshake server
                (jsonrpc/request 0 "initialize" (lsp-init-params root-uri))))
       :lsp-stopped (let (initialized (lsp-await-init state 0))
-        (if (not (lsp-write-handshake server (jsonrpc/notification "initialized" {})))
-          :lsp-stopped (do
-            ;; tell the editor what this server can do, so a command can say "this server
-            ;; does not do that" instead of showing nothing and reading as broken
-            (send :editor [:lsp-capabilities (or (:caps initialized) {}) (self)])
-            (lsp-loop initialized)))))))
+        (cond
+          (:stopping initialized) (lsp-stop initialized)
+          (not (lsp-write-handshake server (jsonrpc/notification "initialized" {}))) :lsp-stopped
+          else
+            (do
+              ;; tell the editor what this server can do, so a command can say "this server
+              ;; does not do that" instead of showing nothing and reading as broken
+              (send (lsp-sink initialized) [:lsp-capabilities (or (:caps initialized) {}) (self)])
+              (lsp-loop initialized)))))))
 
 (defn- lsp-write-handshake (server frame)
   ;; write one handshake frame; false when the server is already gone (the first write can
@@ -366,8 +380,10 @@ model drops a connection whose process is gone (`ed-lsp-live`)."
 (defn lsp-connect (cmd cmd-args root-uri)
   "Spawn language server `cmd` (with `cmd-args`, a list/vector of strings) for project
 `root-uri` and return the connection process pid. The editor files it under
-`:lsp-servers` (`lsp/servers/ed-lsp-attach`), which is what `lsp-server-entry` finds. `(lsp-shutdown conn)` stops it."
-  (spawn (lsp-run cmd cmd-args root-uri)))
+`:lsp-servers` (`lsp/servers/ed-lsp-attach`), which is what `lsp-server-entry` finds. `(lsp-shutdown conn)` stops it.
+What the server pushes — its capabilities, diagnostics, edits to apply — goes to the loop that
+connected it (`ed-loop-address`), not to whichever loop holds the `:editor` name."
+  (let (sink (ed-loop-address)) (spawn (lsp-run cmd cmd-args root-uri sink))))
 
 (defn lsp-capable? (caps feature)
   "Whether a server's advertised `caps` include `feature` (`:signatureHelpProvider`,

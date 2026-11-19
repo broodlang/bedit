@@ -560,13 +560,17 @@ both the `:changes` map and the `:documentChanges` array shapes; `{}` when nil."
             {}
             (fn (by-path uri)
               (assoc by-path (lsp-edit-key uri) (map (get changes uri) lsp-text-edit))))
+        ;; an entry with no `:textDocument` is a resource operation (create, rename, delete a
+        ;; file), which this client does not claim (`workspace.workspaceEdit.resourceOperations`)
+        ;; and does not carry out: it is passed over, and the text edits beside it applied
         document-changes
           (reduce document-changes
             {}
             (fn (by-path change)
-              (assoc by-path
-                (lsp-edit-key (map/get-in change [:textDocument :uri]))
-                  (map (or (:edits change) []) lsp-text-edit))))
+              (let (uri (when (map? change) (map/get-in change [:textDocument :uri])))
+                (if (nil? uri)
+                  by-path
+                  (assoc by-path (lsp-edit-key uri) (map (or (:edits change) []) lsp-text-edit))))))
         else {}))))
 
 (defn lsp-workspace-edit-versions (result)
@@ -579,7 +583,7 @@ is on disk). What `workspace/applyEdit` checks against the versions this client 
   (reduce (or (:documentChanges (or result {})) [])
     {}
     (fn (versions change)
-      (let (document (or (:textDocument change) {})
+      (let (document (or (when (map? change) (:textDocument change)) {})
             path (lsp-uri->path (:uri document)))
         (if (and path (int? (:version document)))
           (assoc versions path (:version document))
@@ -1159,6 +1163,43 @@ itself (`*lsp-retried-methods*`). A lookup the reader asked for gets its empty a
     (contains? *lsp-retried-methods* (lsp-request-method kind))))
 
 (defn lsp-dispatch (folded message)
+  "Fold step: route one decoded `message` ([[lsp-dispatch-message]]) — and survive it. A
+message whose shape the routing did not expect (a server's bug, a field of the wrong type)
+raised here, which took down the connection process and the server with it, and autostart
+would not start another. Now the raise is caught: the request's waiter, if it had one, is
+answered with the kind's empty result, a server's request is answered with an error (it is
+waiting on one), and the reason goes to the log."
+  (try
+    (lsp-dispatch-message folded message)
+    (catch failure (lsp-dispatch-failed folded message failure))))
+
+(defn- lsp-dispatch-failed (folded message failure)
+  ;; the fold after `message` raised `failure` in [[lsp-dispatch-message]]: what it owed, paid
+  (let ([state replies] folded
+        id (when (map? message) (:id message))
+        method (when (map? message) (:method message))
+        entry (when (and id (not method)) (map/get-in state [:pending id]))
+        text (str "lsp: a message from the server could not be handled ("
+               (or method (when id (str "reply " id)) "no id")
+               "): "
+               (error-message failure))
+        noted (lsp-queue-notice state
+                {:channel :log :level "error" :text text :line (lsp-notice-line text)}))
+    (cond
+      (and id method)
+        [(assoc noted
+           :outbox
+             (append (or (:outbox noted) [])
+               [(jsonrpc/error-response id (:internal-error jsonrpc/*error-codes*) text)]))
+          replies]
+      entry
+        (let ([reply-to correlation kind] entry
+              [tag empty] (lsp-shape kind nil))
+          [(assoc noted :pending (dissoc (:pending noted) id))
+            (cons [reply-to [tag correlation empty]] replies)])
+      else [noted replies])))
+
+(defn- lsp-dispatch-message (folded message)
   ;; Fold step: route one decoded message. Three kinds arrive on this stream and they are
   ;; told apart by which fields they carry:
   ;;
