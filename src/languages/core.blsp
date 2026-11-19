@@ -143,24 +143,25 @@ and `:ids` only the extensions LSP names otherwise (`model/register-lsp`, `lsp/c
 
 `:fontify-restart` says where a windowed fontify may cut its lead-in, and comes from one of
 three declarations. `:heredocs` (paired markers, Elixir's `\"\"\"`) restarts at a column-0 line
-outside them (`editor/treesit/column0-restart`). `:restart {:item-start :opaque}` is the
+outside them (`editor/treesit/column0-restart`). `:restart {:item-start :opaque :keep}` is the
 brace languages' rule (`column0-item-restart`): the column-0 line that LOOKS like an item
 start, unless something whose contents can be anything (a block comment, a raw string)
-opens above it. `:restart 'sym` names a hand-written one when the rule is neither — Ruby
-must also notice `=begin`. A language with none declines to restart, which is a fact about
-the language — `editor/treesit/language-contract` says which services are required and
-which are optional.
+opens above it, and never past a `:keep` line (PHP's `<?php`). `:restart 'sym` names a
+hand-written one when the rule is neither — Ruby must also notice `=begin`. A language with
+none declines to restart, which is a fact about the language —
+`editor/treesit/language-contract` says which services are required and which are optional.
 
 A restart only TRIMS the lead-in, so a window can never learn what the text above its lead-in
 left open. The `:fontify-around` service ([[spec-window-around]]) says what can be, as the text a
 window is read between: what comes before is read by the restart, and by the parse when the
-restart cuts nothing. Two declarations feed it. `:resume [{:open re :close re}]` is an outer
-construct the grammar reads the rest of the file inside of, as PHP reads `<?php … ?>`: whichever
-of those markers comes last above the lead-in decides, an opener being re-read
-([[resume-prefix]]). And a multi-line string — a `:heredocs` marker, or an `:opaque` pair marked
-`:count-above` — opened an odd number of times above an edge of the window is re-opened before
-it or closed after it ([[open-string-around]]), so a docstring longer than the lead-in neither
-turns the restart's count inside out nor reaches the parse unterminated.
+restart cuts nothing. Two declarations feed it. `:resume [{:open re :close re :skip re :heredoc
+re}]` is an outer construct the grammar reads the rest of the file inside of, as PHP reads
+`<?php … ?>`: whichever of those markers comes last above the lead-in decides, an opener being
+re-read and a closer inside the construct's own strings passed over ([[resume-prefix]]). And a
+multi-line string — a `:heredocs` marker, or an `:opaque` pair marked `:count-above` — still
+open at an edge of the window, as the spec's `:strings` read the text above, is re-opened
+before it or closed after it ([[open-string-around]]), so a docstring longer than the lead-in
+neither turns the restart's count inside out nor reaches the parse unterminated.
 
 The generated restart is `<name>-restart`, not `<name>-fontify-restart`: the obvious name is
 the one a language with a CUSTOM restart uses (Ruby's), and generating it would silently
@@ -190,9 +191,9 @@ The spec is evaluated ONCE, into `<name>-spec`, so a spec built from a shared ba
          (languages/core/spec-indent-column ~spec-ref text line-start tree))
        (defn ~(generated "-restart") (source position)
          (languages/core/spec-restart ~spec-ref source position))
-       ;; what a window at `offset` re-reads first, so it starts inside what is open above it
-       (defn ~(generated "-window-around") (rope start end)
-         (languages/core/spec-window-around ~spec-ref rope start end))
+       ;; what a window re-reads first and closes after; `known` resumes the scan of the text above
+       (defn ~(generated "-window-around") (rope start end &optional (known nil))
+         (languages/core/spec-window-around ~spec-ref rope start end known))
        ;; show-paren over the parse: the view's window of text, or the held tree
        ;; (`:bracket-match-tree`, `tsbrackets/match-tree`) when the buffer keeps one
        (defn ~(generated "-bracket-match") (text position)
@@ -536,7 +537,8 @@ only reached for a language whose layer names no generated restart."
   (let (rule (get spec :restart)
         heredocs (get spec :heredocs))
     (cond
-      (map? rule) (column0-item-restart source position (:item-start rule) (:opaque rule))
+      (map? rule)
+        (column0-item-restart source position (:item-start rule) (:opaque rule) (:keep rule))
       (not (nil? heredocs)) (editor/treesit/column0-restart source position heredocs)
       else position)))
 
@@ -927,8 +929,7 @@ JavaScript's calls are this shape.
                    (if (< newline 0) (count source) newline)))
     (cond
       (= candidate 0) 0
-      (modes/pattern-matches? (string/substring source candidate line-end) item-start)
-        candidate
+      (modes/pattern-matches? (string/substring source candidate line-end) item-start) candidate
       else (item-line-before source (dec candidate) item-start))))
 
 ;; What a `:restart` rule's `:opaque` names: the constructs whose contents can be anything, so a
@@ -963,16 +964,8 @@ JavaScript's calls are this shape.
                   (nil? (regex/find (string/substring lead (:end opener) (count lead)) close)))
             (:start opener))))))
 
-(defn column0-item-restart (source position item-start opaque)
-  "The fontify restart every brace language shares: the previous column-0 line that LOOKS like
-the start of an item (`item-start`, a regex over the line, or `{:match re :except re}`) — unless
-it sits inside something whose contents can be anything, an `opaque` construct (a block comment,
-a raw or template string, a heredoc: pairs, see `*block-comment-opaque*`) still open there,
-when the item line before THAT construct is tried. A construct that opened and closed above the
-line does not count: a closed `/** doc */` above every function is the ordinary case, and
-declining on it re-parsed the whole lead-in on every key. A language with nothing opaque passes nil.
-
-    (languages/core/column0-item-restart \"/* a */\\nfn f\\n  x\" 13 \"^fn\" languages/core/*block-comment-opaque*)   ;=> 8"
+(defn- item-restart (source position item-start opaque)
+  ;; the item line before `position` outside every `opaque` construct, or 0 ([[column0-item-restart]])
   (let (candidate (item-line-before source position item-start))
     (if (= candidate 0)
       0
@@ -982,43 +975,111 @@ declining on it re-parsed the whole lead-in on every key. A language with nothin
                       (fn (earliest pair)
                         (let (start (unclosed-opener lead pair))
                           (if (and start (or (nil? earliest) (< start earliest))) start earliest)))))
-        (if (nil? open-at) candidate (column0-item-restart source open-at item-start opaque))))))
+        (if (nil? open-at) candidate (item-restart source open-at item-start opaque))))))
+
+(defn column0-item-restart (source position item-start opaque &optional (keep nil))
+  "The fontify restart every brace language shares: the previous column-0 line that LOOKS like
+the start of an item (`item-start`, a regex over the line, or `{:match re :except re}`,
+`modes/pattern-matches?`) — unless it sits inside something whose contents can be anything, an
+`opaque` construct (a block comment, a raw or template string, a heredoc: pairs, see
+`*block-comment-opaque*`) still open there, when the item line before THAT construct is tried. A
+construct that opened and closed above the line does not count: a closed `/** doc */` above every
+function is the ordinary case, and declining on it re-parsed the whole lead-in on every key. A
+language with nothing opaque passes nil.
+
+`keep` (a rule's `:keep`) is a line the cut never moves past: when one stands above the item line,
+outside every opaque construct, the cut is there instead — PHP's `<?php`, which the grammar reads
+the rest of the file inside of. One at the very start of `source` keeps nothing: it is where the
+cut would land anyway, or the re-read text above the lead-in (`:resume`), which a cut past it asks
+for again.
+
+    (languages/core/column0-item-restart \"/* a */\\nfn f\\n  x\" 13 \"^fn\" languages/core/*block-comment-opaque*)   ;=> 8
+    (languages/core/column0-item-restart \"<p>\\n<?php\\nfn f\\n  x\" 15 \"^(fn|<\\\\?php)\" nil \"^<\\\\?php\")   ;=> 4"
+  (let (cut (item-restart source position item-start opaque)
+        kept (if (nil? keep) 0 (item-restart source position keep opaque)))
+    (if (and (> kept 0) (< kept cut)) kept cut)))
 
 ;; ---- resuming an outer construct above a window --------------------------------------------
 ;; A restart sees only the lead-in, so the one fact it cannot recover is what the text ABOVE the
 ;; lead-in left open — PHP's `<?php`, which the grammar reads the rest of the file inside of. One
-;; backward search finds the last marker; nothing above it is read.
+;; backward search finds the last marker; nothing above it is read, unless that marker is a closer
+;; that may sit inside the construct's own strings (`:skip`), when the text from its opener on is.
+
+(defn- marker-pattern (patterns)
+  ;; one alternation of `patterns`
+  (string/join (map patterns (fn (pattern) (str "(?:" pattern ")"))) "|"))
+
+(defn- whole-match? (text pattern)
+  (regex/match? text (str "^(?:" pattern ")$")))
+
+(defn- heredoc-end (rope found)
+  ;; where the heredoc a `:heredoc` match opened ends: past the line that starts with the word its
+  ;; first group named, or the text's end
+  (let (word (:text (first (:groups found)))
+        closer (regex/rope-find rope (str "^[ \\t]*" (regex/escape word) "\\b") (:end found)))
+    (if closer (:end closer) (count rope))))
+
+(defn- skipped-close (pair rope at)
+  ;; where the string, comment or heredoc that holds the closer at char `at` starts — `pair`'s
+  ;; `:skip` tokens and `:heredoc`s, read from the opener above it on — so the search goes on above
+  ;; that; nil when the closer is real, or follows a real one (the text after that is outside)
+  (let (skip (:skip pair)
+        heredoc (:heredoc pair)
+        opener (when (or skip heredoc) (regex/rope-find-backward rope (:open pair) at)))
+    (when opener
+      (let (scan (marker-pattern (seq/keep [heredoc skip (:close pair)] identity)))
+        (letrec (walk (fn (from)
+                        (let (found (regex/rope-find rope scan from))
+                          (cond
+                            (or (nil? found) (>= (:start found) at)) nil
+                            (whole-match? (:text found) (:close pair)) nil
+                            else
+                              (let (end (if (and heredoc (first (:groups found)))
+                                          (heredoc-end rope found)
+                                          (:end found)))
+                                (if (> end at) (:start found) (walk end)))))))
+          (walk (:end opener)))))))
 
 (defn resume-prefix (pairs rope offset)
   "The text a window starting at char `offset` of `rope` re-reads first, so its parse begins
 inside the outer construct the text above leaves open — or nil when none is. `pairs` is a
-`:resume` spec, `[{:open re :close re :prefix s}]`: the marker that comes last above `offset`
-decides, an opener answering its `:prefix` (by default the opener's own text and a newline), a
-closer nil. One backward search over the rope, whose cost is the distance to that marker.
+`:resume` spec, `[{:open re :close re :prefix s :skip re :heredoc re}]`: the marker that comes last
+above `offset` decides, an opener answering its `:prefix` (by default the opener's own text and a
+newline), a closer nil. One backward search over the rope, whose cost is the distance to that
+marker — except that a closer inside the construct's own strings closes nothing: `:skip` matches
+them whole (`stringlex/text-pattern`), `:heredoc` opens one whose first group is the word that
+closes it at a line's start, and a closer inside either is passed over, PHP's `echo '?>';`.
 
-    (languages/core/resume-prefix [{:open \"<\\\\?php\" :close \"\\\\?>\"}] (text/string-> \"<p>\\n<?php\\n$x;\\n\") 10)   ;=> \"<?php\\n\""
+    (languages/core/resume-prefix [{:open \"<\\\\?php\" :close \"\\\\?>\"}] (text/string-> \"<p>\\n<?php\\n$x;\\n\") 10)   ;=> \"<?php\\n\"
+    (languages/core/resume-prefix [{:open \"<\\\\?php\" :close \"\\\\?>\" :skip \"'[^']*'\"}] (text/string-> \"<?php\\n'?>'\\n$x;\\n\") 11)   ;=> \"<?php\\n\""
   (when (and pairs (> offset 0))
-    (let (markers (mapcat pairs (fn (pair) [(:open pair) (:close pair)]))
-          found (regex/rope-find-backward rope
-                  (string/join (map markers (fn (marker) (str "(?:" marker ")"))) "|")
-                  offset))
-      (when found
-        (let (text (:text found)
-              opener (seq/find pairs
-                       (fn (pair) (regex/match? text (str "^(?:" (:open pair) ")$")))))
-          (when opener (get opener :prefix (str text "\n"))))))))
+    (let (pattern (marker-pattern (mapcat pairs (fn (pair) [(:open pair) (:close pair)]))))
+      (letrec (search (fn (before)
+                        (let (found (regex/rope-find-backward rope pattern before))
+                          (when found
+                            (let (text (:text found)
+                                  opener (seq/find pairs
+                                           (fn (pair) (whole-match? text (:open pair)))))
+                              (if opener
+                                (get opener :prefix (str text "\n"))
+                                (let (pair (seq/find pairs
+                                             (fn (pair) (whole-match? text (:close pair))))
+                                      skipped (skipped-close pair rope (:start found)))
+                                  (when skipped (search skipped)))))))))
+        (search offset)))))
 
 ;; ---- a multi-line string open at a window's edges ------------------------------------------
 ;; A restart counts a paired marker's occurrences in the lead-in to tell a column-0 line inside a
 ;; docstring from code — which is only right when the lead-in begins OUTSIDE one. A docstring
 ;; longer than the lead-in begins it inside, the count is one off, and the restart cuts in the
 ;; prose (a Julia `# Examples`) or at the closing `"""`. And a window that ENDS inside one parses
-;; an unterminated string, which tree-sitter recovers from as code. The marker's parity from the
-;; top of the file says both: counted once per slice, never on the common frame.
+;; an unterminated string, which tree-sitter recovers from as code. Which string is open at each
+;; edge is read from the top of the file by the spec's string syntax (`stringlex/text-state`), so a
+;; marker inside another string or a comment opens nothing: once per slice, never on the common frame.
 
 (defn- counted-markers (spec)
-  ;; the paired markers whose parity above a window is counted: the `:restart` rule's `:opaque`
-  ;; pairs marked `:count-above`, and every `:heredocs` marker (literal text, so escaped)
+  ;; the paired markers whose string open above a window is re-read: the `:restart` rule's
+  ;; `:opaque` pairs marked `:count-above`, and every `:heredocs` marker (literal text, so escaped)
   (let (rule (get spec :restart))
     (into []
       (append (if (map? rule)
@@ -1026,50 +1087,57 @@ closer nil. One backward search over the rope, whose cost is the distance to tha
                 [])
         (map (get spec :heredocs []) regex/escape)))))
 
-(defn- latest-marker (markers rope at)
-  ;; the text of whichever of `markers` occurs last before char `at` of `rope`, or nil
-  (let (latest (fold markers
-                 nil
-                 (fn (best marker)
-                   (let (found (regex/rope-find-backward rope marker at))
-                     (if (and found (or (nil? best) (> (:start found) (:start best)))) found best)))))
-    (when latest (:text latest))))
+(defn- window-strings (spec)
+  ;; `[syntax opens]`: the string syntax a window's edges are read by — the spec's `:strings`,
+  ;; with a multi-line string for each counted marker it does not name — and the set of openers
+  ;; whose string, open at an edge, is re-opened or closed
+  (let (markers (counted-markers spec)
+        syntax (or (get spec :strings) {})
+        entries (or (:strings syntax) [])
+        named (fn (marker) (seq/find entries (fn (entry) (regex/matches? (:open entry) marker))))
+        missing (into []
+                  (map (seq/reject markers named)
+                    (fn (marker) {:open (regex/replace marker "\\\\(.)" "$1") :multiline true})))
+        all (into entries missing))
+    [(assoc syntax :strings all)
+      (into #{}
+        (map (seq/filter all
+               (fn (entry) (any? markers (fn (marker) (regex/matches? (:open entry) marker)))))
+          :open))]))
 
-(check-allow :trusted
-  (sig marker-count (any string int int -> int))
-  (defn- marker-count (rope marker from to)
-    ;; how many matches of `marker` start in chars `[from, to)` of `rope`
-    (first (regex/rope-count rope marker from to))))
+(defn open-string-around (syntax opens rope start end &optional (known nil))
+  "`[before after state]`: what a window over chars `[start, end)` of `rope` is read inside of when
+a multi-line string whose opener is one of `opens` is still open at its edges, as `syntax` (a
+string syntax, `stringstate`) reads the text above — so a `'''` inside a `\"\"\"` docstring, or a
+`\"\"\"` in a comment, opens nothing. `before` re-opens the string open at `start` (its opener and a
+newline), `after` closes the one open at `end`; each is \"\" when none is. `state` is the scan's
+state at `start` (`stringlex/text-state`), which a later call for a window starting further down
+passes as `known` to read on from there rather than from the top. One native pass over the text
+above `end`, paid once per slice.
 
-(defn open-string-around (markers rope start end)
-  "`[before after]`: what a window over chars `[start, end)` of `rope` is read inside of when a
-multi-line string opened by one of `markers` (regexes for paired, symmetric markers: `\"\"\"`) is
-still open at its edges — the marker occurs an odd number of times above the edge. `before`
-re-opens the string open at `start` (its marker and a newline), `after` closes the one open at
-`end`; each is \"\" when none is. Two counts per marker, over the text above the window and
-over the window: their cost is `end`, paid once per slice.
+    (languages/core/open-string-around {:strings [{:open \"\\\"\\\"\\\"\" :multiline true}]} #{\"\\\"\\\"\\\"\"} (text/string-> \"\\\"\\\"\\\"\\ndoc\\nmore\\n\") 4 8)   ;=> [\"\\\"\\\"\\\"\\n\" \"\\n\\\"\\\"\\\"\" [4 17]]"
+  (if (or (empty? opens) (<= end 0))
+    ["" "" nil]
+    (let (pattern (stringlex/text-pattern syntax)
+          at-start (stringlex/text-state pattern rope start known)
+          at-end (stringlex/text-state pattern rope end at-start)
+          opened (fn (state)
+                   (let (found (stringlex/open-string syntax pattern rope state))
+                     (when (and found (contains? opens (first found))) found)))
+          before (opened at-start)
+          after (opened at-end))
+      [(if before (str (first before) "\n") "") (if after (str "\n" (second after)) "") at-start])))
 
-    (languages/core/open-string-around [\"\\\"\\\"\\\"\"] (text/string-> \"\\\"\\\"\\\"\\ndoc\\nmore\\n\") 4 8)   ;=> [\"\\\"\\\"\\\"\\n\" \"\\n\\\"\\\"\\\"\"]"
-  (if (or (empty? markers) (<= end 0))
-    ["" ""]
-    (let (parities (map markers
-                     (fn (marker)
-                       (let (above (marker-count rope marker 0 start)
-                             within (marker-count rope marker start end))
-                         [marker (math/odd? above) (math/odd? (+ above within))])))
-          open-at-start (seq/keep parities (fn ([marker open? _]) (when open? marker)))
-          open-at-end (seq/keep parities (fn ([marker _ open?]) (when open? marker)))
-          before (latest-marker open-at-start rope start)
-          after (latest-marker open-at-end rope end))
-      [(if before (str before "\n") "") (if after (str "\n" after) "")])))
-
-(defn spec-window-around (spec rope start end)
-  "The `:fontify-around` a `deflanguage` spec declares as data: `[before after]`, the text a window
-over chars `[start, end)` of `rope` is read between — the outer construct still open at `start`
-(`:resume`, [[resume-prefix]]) or the multi-line string still open there, and the one still open
-at `end` ([[open-string-around]]) — each \"\" when nothing is."
-  (let ([before after] (open-string-around (counted-markers spec) rope start end))
-    [(or (resume-prefix (get spec :resume) rope start) before) after]))
+(defn spec-window-around (spec rope start end &optional (known nil))
+  "The `:fontify-around` a `deflanguage` spec declares as data: `[before after state]`, the text a
+window over chars `[start, end)` of `rope` is read between — the outer construct still open at
+`start` (`:resume`, [[resume-prefix]]) or the multi-line string still open there, and the one still
+open at `end` ([[open-string-around]]) — each \"\" when nothing is. `state` is what the scan of the
+text above knew at `start`: passed back as `known` for a window cut further down
+(`spancache/ed-restart-window`), it reads on from there instead of from the top."
+  (let ([syntax opens] (window-strings spec)
+        [before after state] (open-string-around syntax opens rope start end known))
+    [(or (resume-prefix (get spec :resume) rope start) before) after state]))
 
 (defn spec-window-around? (spec)
   "Whether a `deflanguage` spec has anything for [[spec-window-around]] to read a window inside of."
