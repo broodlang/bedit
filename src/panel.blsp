@@ -1,0 +1,378 @@
+(defmodule panel
+  "The PANEL: what you can choose or learn here, shown while it matters — the keys a transient
+menu (git's push, embark's actions), which-key's pending prefix and the right-click menu offer,
+the candidates completion-at-point found, the help a hovered thing gives. One shape of data per
+kind, one place that decides how all of them look.
+
+A panel is data of one of three KINDS (`:kind`, [[panel-kind]]):
+- `:keys`, the default: `{:title :groups :layout :page :page-hint}`, its groups `keycolumns`
+  groups (`{:title :rows}`, each row an entry `{:key :text}`, `:enabled false` dimmed and not
+  clickable); `:layout` is `:balanced` (whole groups packed side by side, Magit's transient) or
+  `:flow` (one run of lines read down then across, which-key's); `:page` turns a panel wider
+  than the frame, `:page-hint` says which keys turn it.
+- `:list`: `{:items :selected}`, candidates as `ui-list` rows (`{:label :key}`, the `:key` slot
+  an annotation), `:selected` an index or nil.
+- `:text`: `{:lines :anchor :stage-cell}`, help about screen cell `:anchor` `[row col]`.
+Any panel may carry `:anchor`, the cell it is about, for a style that floats a card there.
+
+A feature that has a panel to show registers a SOURCE ([[register-panel-source]]); the first
+source with an answer is shown. A source with a `:click` makes its entries clickable.
+
+How a panel looks is a STYLE ([[register-panel-style]]), chosen by the `:panel-style` setting.
+The editor's own, `:echo`, is Emacs's: everything in the echo area, nothing over the text — a
+key panel or a candidate list as a flat strip the width of the frame below the mode line (where
+which-key's side window, Magit's transient buffer and Vertico's list sit), a hover's help on the
+echo row (help-echo with `tooltip-mode` off). `:popup` (`popups`) floats the candidates and the
+help as cards. A package registers another; a style names the kinds it draws (`:kinds`) and the
+rest are drawn by `:echo`. The sources never know which style draws them."
+  (:use model :only [register-frame-overlay register-echo-source])
+  (:use sources :only []) ; loaded first: the tables' `sources/define-table` run at load
+  (:use theme) ; ui-ctx — the palette as the kit's roles
+  (:use ui-kit :only [ui-face ui-clip ui-space-cells])
+  (:use completion :only [completion-list]) ; the echo list, the minibuffer's
+  (:use editor/display :only [text zone zone-at])
+  (:use memo :only [defmemo])) ; the panel, built once per change of what it reads
+
+;; ---- the registries --------------------------------------------------------------------------
+
+(sources/define-table :panel/sources {:required #{:rank :deps :run} :optional #{:when :click}})
+
+(defn register-panel-source (name row)
+  "Add the panel source `name`: `{:rank n :when key :deps 'deps-fn :run 'panel-fn :click
+'click-fn}`. `(deps-fn m)` answers what the panel is made from — everything `panel-fn` reads,
+kept small — and `(panel-fn deps rows)` the panel to show, or nil, `rows` the most lines a column
+may take. A panel is built once for each change of its deps, not on every read (the layout and
+the frame both ask for it). `:when` names a model key that must be set before the source is
+asked, so a feature that is not in use is never loaded to say so (the transient's `:transient`,
+which-key's `:which-key`). `(click-fn m target)` is a press on an entry: `target` the entry of a
+`:keys` panel, the index of a `:list` one; without `:click` nothing in the panel is clickable.
+Lowest `:rank` first."
+  (sources/register :panel/sources name row))
+
+(sources/define-table :panel/styles {:required #{:rows :paint} :optional #{:kinds :echo}})
+
+(defn register-panel-style (name row)
+  "Add the panel style `name`: `{:rows 'rows-fn :paint 'paint-fn :echo 'echo-fn :kinds #{…}}`.
+`(rows-fn panel rows)` is how many rows of the echo area, below its message row, the style takes
+for `panel` in a frame `rows` tall (0 for one it draws over the text, or on the echo row);
+`(paint-fn panel m columns rows)` its render ops, or `{:ops :zones}` with click zones whose id is
+`[:panel-entry target]` (see [[register-panel-source]]); `(echo-fn panel m)`, optional, what the
+echo row says for it, or nil. `:kinds` names the panel kinds it draws (every kind when absent); a
+panel of another kind is drawn by `:echo`. The `:panel-style` setting names the style in use."
+  (sources/register :panel/styles name row))
+
+(defn style-name? (name)
+  "Whether `name` is a registered panel style ([[register-panel-style]]): what the `:panel-style`
+setting accepts. The init file is checked after the installed packages load, so a package's style
+registered as it loads is known; one registered later still draws once it exists, but the init
+check has already said it was unknown.
+
+    (panel/style-name? :echo)   ;=> true
+    (panel/style-name? :no-such-style)   ;=> false"
+  (contains? (registry/entries :panel/styles) name))
+
+(settings/define config/*settings*
+  :panel-style {:default :echo
+   :type 'keyword
+   :valid? 'panel/style-name?
+   :want "a registered panel style: :echo, :popup, or one a package adds (panel/register-panel-style)"
+   :model-key :panel-style
+   :commented? true
+   :doc (str "how a panel is shown — a transient menu, which-key, the context menu, completion's\n"
+          "candidates, a hover's help: :echo, in the echo area as Emacs shows them; :popup, the\n"
+          "candidates and the help as cards over the text; or a style a package registers")})
+
+;; ---- which panel, drawn how ------------------------------------------------------------------
+
+(def panel-max-rows
+  ;; the most lines a panel's column takes, as the minibuffer's list (Emacs vertico-count)
+  10)
+
+(sig column-limit (int -> int))
+(defn- column-limit (rows)
+  ;; the lines a column may take in a frame `rows` tall: the cap, leaving a pane room above
+  (math/max 1 (math/min panel-max-rows (- rows 6))))
+
+(defn panel-kind (panel)
+  "`panel`'s kind: `:keys`, `:list` or `:text` — `:keys` when it does not say.
+
+    (panel/panel-kind {:kind :list})   ;=> :list
+    (panel/panel-kind {:groups []})   ;=> :keys"
+  (or (:kind panel) :keys))
+
+(defmemo built-panel 4 (panel-fn deps rows)
+  ;; the panel `panel-fn` (the function itself, so a redefinition is a new key) makes of `deps`
+  ;; for columns of `rows` lines: built once per change, though the echo area's height alone is
+  ;; asked several times a frame
+  (panel-fn deps rows))
+
+(defn- source-panel (m rows row)
+  ;; the panel the source `row` has for `m`, carrying the source's `:click`, or nil: none asked
+  ;; while its `:when` key is unset, nor while its module has not loaded
+  (when (or (nil? (:when row)) (get m (:when row)))
+    (let (panel-fn (reflect/bound-value (:run row) nil))
+      (when (fn? panel-fn)
+        (let (panel (built-panel panel-fn (reflect/call-if-bound (:deps row) nil m) rows))
+          (if (and panel (:click row)) (assoc panel :click (:click row)) panel))))))
+
+(defn ed-panel (m rows)
+  "The panel to show for `m` in a frame `rows` tall, or nil: the first source with one, none
+while a prompt lists candidates (its list owns the echo area)."
+  (let (minibuffer (:minibuffer m))
+    (when (not (and minibuffer (:accept-selection minibuffer)))
+      (first (sources/first-answer :panel/sources
+               (fn (row) (source-panel m (column-limit rows) row)))))))
+
+(defn- style-for (m panel)
+  ;; the style row that draws `panel`: the one the `:panel-style` setting names when it draws
+  ;; that kind, the editor's own otherwise (or when the named style's package went away)
+  (let (echo (registry/lookup :panel/styles :echo)
+        named (registry/lookup :panel/styles (get m :panel-style :echo)))
+    (if (and named (or (nil? (:kinds named)) (contains? (:kinds named) (panel-kind panel))))
+      named
+      echo)))
+
+(sig panel-rows (map int -> int))
+(defn panel-rows (m rows)
+  "How many rows of the echo area, below its message row, the panel takes in a frame `rows`
+tall — 0 when there is none, or its style draws it elsewhere."
+  (let (panel (ed-panel m rows))
+    (if (nil? panel)
+      0
+      (math/max 0
+        (let (wanted (reflect/call-if-bound (:rows (style-for m panel)) 0 panel rows))
+          (math/min (- rows 4) (if (int? wanted) wanted 0)))))))
+
+(defn- painted (panel m columns rows)
+  ;; what the style draws for `panel`, as `{:ops :zones}` whichever of the two it answered
+  (let (drawn (reflect/call-if-bound (:paint (style-for m panel)) [] panel m columns rows))
+    (cond
+      (map? drawn) {:ops (or (:ops drawn) []) :zones (or (:zones drawn) [])}
+      (nil? drawn) {:ops [] :zones []}
+      else {:ops drawn :zones []})))
+
+(defn ed-panel-ops (m columns rows)
+  "The panel's render ops, drawn by the style in use; `[]` when there is none."
+  (let (panel (ed-panel m rows)) (if (nil? panel) [] (:ops (painted panel m columns rows)))))
+
+(defn ed-panel-click (m columns rows column row)
+  "A press at screen cell `[column row]` on an entry of the panel — run through its source's
+`:click` — or nil: no panel, a panel with nothing to click, or the press not on an entry. The
+zones come from the same paint the frame drew, so a click lands on the entry under it."
+  (let (panel (ed-panel m rows))
+    (when (and panel (:click panel))
+      (let (hit (zone-at (:zones (painted panel m columns rows)) column row))
+        (when (and hit (vector? (:id hit)) (= (first (:id hit)) :panel-entry))
+          (reflect/call-if-bound (:click panel) nil m (second (:id hit))))))))
+
+(def- echo-frame-rows
+  ;; the frame height the echo row asks the panel at: what it says is a `:text` panel's lines,
+  ;; which no frame height changes, and a frame this tall gives a column the full cap
+  (+ panel-max-rows 6))
+
+(defn panel-echo (m _buf)
+  "The echo source of the panel: what its style says on the echo row for it (a hover's help, as
+the `:echo` style shows it), or nil."
+  (let (panel (ed-panel m echo-frame-rows))
+    (when panel
+      (let (said (reflect/call-if-bound (:echo (style-for m panel)) nil panel m))
+        (when (and (string? said) (not (string/blank? said))) said)))))
+
+;; ---- the layout of a key panel, every style may share ----------------------------------------
+;; A panel's height never depends on the frame's width: the echo area is reserved before the
+;; columns are known. So the lines are packed into columns of a fixed height and a panel wider
+;; than the frame is paged, as which-key pages.
+
+(defn- with-key-widths (groups)
+  ;; each entry carrying its group's key column width, so a column of several groups aligns each
+  ;; group's descriptions on its own keys
+  (map groups
+    (fn (group)
+      (let (width (keycolumns/key-width (:rows group)))
+        (assoc group :rows (map (:rows group) (fn (entry) (assoc entry :key-width width))))))))
+
+(sig panel-height (map int -> int))
+(defn panel-height (panel rows)
+  "The lines a column of `panel` takes in a frame `rows` tall: the tallest group (`:balanced`),
+every line (`:flow`) or every candidate (a `:list`), capped."
+  (let (groups (:groups panel)
+        wanted (cond
+                 (= (panel-kind panel) :list) (count (:items panel))
+                 (= (:layout panel) :flow) (count (keycolumns/flow-lines groups 1000000))
+                 else
+                   (fold groups
+                     0
+                     (fn (most group) (math/max most (count (keycolumns/group-lines group)))))))
+    (math/max 1 (math/min (column-limit rows) wanted))))
+
+(defn panel-columns (panel height)
+  "`panel`'s lines as columns of at most `height` lines, each a vector of `keycolumns` lines:
+whole groups packed in order (`:balanced`), or one run read down then across (`:flow`)."
+  (let (groups (vec (with-key-widths (:groups panel))))
+    (if (= (:layout panel) :flow)
+      (map (seq/chunk-every (keycolumns/flow-lines groups height) height) vec)
+      (map (keycolumns/balanced-columns groups (count groups)) keycolumns/column-lines))))
+
+(defn- line-width (line)
+  (case (first line)
+    :heading (string/display-width (second line))
+    :row
+      (let (entry (second line))
+        (+ (:key-width entry) keycolumns/key-gap (string/display-width (:text entry))))
+    0))
+
+(defn- column-width (lines) (fold lines 0 (fn (widest line) (math/max widest (line-width line)))))
+
+(defn panel-pages (columns available)
+  "`columns` split into pages of the columns that fit side by side in `available` cells,
+[[keycolumns/column-gap]] apart; a column wider than that is a page of its own."
+  (fold columns
+    []
+    (fn (pages lines)
+      (let (width (column-width lines)
+            page (last pages)
+            used (if (nil? page)
+                   0
+                   (+ (fold page 0 (fn (sum column) (+ sum (column-width column))))
+                     (* keycolumns/column-gap (count page)))))
+        (if (and (not (nil? page)) (<= (+ used width) available))
+          (assoc pages (dec (count pages)) (conj page lines))
+          (conj pages [lines]))))))
+
+;; ---- :echo — the editor's own: everything in the echo area ------------------------------------
+
+(defn- titled? (panel) (not (string/blank? (or (:title panel) ""))))
+
+(defn echo-rows (panel rows)
+  "The rows the `:echo` style takes for `panel`: none for a `:text` panel (its help is on the echo
+row), a column's height for the others, plus a title row when a key panel has a title. (A key
+panel that pages in a narrow frame shows its count on that row; one with no title then takes its
+first line's row.)"
+  (case (panel-kind panel)
+    :text 0
+    :list (panel-height panel rows)
+    (+ (panel-height panel rows) (if (titled? panel) 1 0))))
+
+(defn echo-faces (gui?)
+  "The `:echo` style's faces, by role: Magit's transient — a key in the accent colour, bold, a
+heading bold and muted, a title bold, an entry that does not apply now faint."
+  (let (theme (:theme (ui-ctx gui?)))
+    {:title (ui-face theme {:fg :on-surface :bold true})
+     :heading (ui-face theme {:fg :muted :bold true})
+     :key (ui-face theme {:fg :accent :bold true})
+     :text (ui-face theme {:fg :on-surface})
+     :hint (ui-face theme {:fg :faint})}))
+
+(defn- enabled? (entry) (not (= false (:enabled entry))))
+
+;; check-allow: the positions are cell counts — a column's widths summed from its entries' key
+;; widths, which ride on the entries as data — that the checker reads back as `number`
+(check-allow :type-mismatch
+  (defn- line-ops (line row x room faces)
+    ;; one line of a column at `row`, column `x`, in `room` cells
+    (case (first line)
+      :heading [(text row x (ui-clip (second line) room) (:heading faces))]
+      :row
+        (let (entry (second line)
+              after (+ (:key-width entry) keycolumns/key-gap)
+              shown? (enabled? entry))
+          [(text row x (ui-clip (:key entry) room) (if shown? (:key faces) (:hint faces)))
+            (text row
+              (+ x after)
+              (ui-clip (:text entry) (math/max 0 (- room after)))
+              (if shown? (:text faces) (:hint faces)))])
+      [])))
+
+(check-allow :type-mismatch
+  (defn- line-zones (line row x room)
+    ;; the click zone of an entry line that applies now: its key and its text, as far as drawn
+    (if (and (= (first line) :row) (enabled? (second line)) (> room 0))
+      [(zone [x row (math/min room (line-width line)) 1] [:panel-entry (second line)])]
+      [])))
+
+(defn- echo-keys (panel m columns rows)
+  ;; a key panel as a flat strip across the bottom of the frame, below the echo area's message
+  ;; row — its title (and its page count, right-aligned) on the first row, then its columns side
+  ;; by side, each entry a click zone
+  (let (faces (echo-faces (:gui m))
+        height (panel-height panel rows)
+        pages (panel-pages (panel-columns panel height) columns)
+        ;; a panel with no groups has no pages: nothing to lay out, and no page to turn to
+        index (math/mod (or (:page panel) 0) (math/max 1 (count pages)))
+        page (nth pages index [])
+        titled (titled? panel)
+        top (- rows height (if titled 1 0))
+        hint (when (> (count pages) 1)
+               (str "page "
+                 (inc index)
+                 "/"
+                 (count pages)
+                 (if (:page-hint panel) (str " · " (:page-hint panel)) "")))
+        title-ops (append (if titled
+                            [(text top 0 (ui-clip (:title panel) columns) (:title faces))]
+                            [])
+                    (if hint
+                      [(text top
+                         (math/max 0 (- columns (string/display-width hint)))
+                         hint
+                         (:hint faces))]
+                      []))
+        first-row (if titled (inc top) top)
+        ;; every line of the page with where it goes: `[line row x room]`
+        [_ placed] (fold page
+                     [0 []]
+                     (fn ([x placed] lines)
+                       [(+ x (column-width lines) keycolumns/column-gap)
+                         (into placed
+                           (map (seq/enumerate lines)
+                             (fn ([index line])
+                               [line (+ first-row index) x (math/max 0 (- columns x))])))])))
+    {:ops (into (vec title-ops)
+            (mapcat placed (fn ([line row x room]) (line-ops line row x room faces))))
+     :zones (vec (mapcat placed (fn ([line row x room]) (line-zones line row x room))))}))
+
+(def- list-inset
+  ;; how far in a candidate list sits, as the minibuffer's (`plume/*plume-inset*`)
+  (ui-space-cells :flush))
+
+(defn- echo-list (panel m columns rows)
+  ;; a candidate list as the minibuffer's: the bottom rows, the selection a full-width bar, each
+  ;; row's annotation right-aligned (clipped to half the width) and its label clipped before it
+  (let (height (panel-height panel rows)
+        items (vec (:items panel))
+        selected (:selected panel)
+        start (completion/completion-window-start (count items) (or selected 0) height)
+        width (math/max 1 (- columns (* 2 list-inset)))
+        window (map (take (drop items start) height)
+                 (fn (item)
+                   (let (annotation (when (:key item) (ui-clip (:key item) (math/quot width 2)))
+                         room (- width (if annotation (+ (string/display-width annotation) 2) 0)))
+                     (assoc item
+                       :label (ui-clip (or (:label item) "") (math/max 1 room))
+                       :key annotation
+                       :enabled true)))))
+    (completion-list {:window (vec window) :selected selected :start start :tag :panel-entry}
+      [list-inset (- rows height) width height]
+      (:gui m))))
+
+(defn echo-paint (panel m columns rows)
+  "The `:echo` style: a key panel or a candidate list as a flat strip across the bottom of the
+frame, below the echo area's message row, as `{:ops :zones}`; nothing for a `:text` panel, which
+it says on the echo row ([[echo-text]])."
+  (case (panel-kind panel)
+    :keys (echo-keys panel m columns rows)
+    :list (echo-list panel m columns rows)
+    {:ops [] :zones []}))
+
+(defn echo-text (panel _m)
+  "What the `:echo` style says on the echo row: a `:text` panel's lines, run together — Emacs's
+help-echo in the echo area while `tooltip-mode` is off; nil for the other kinds.
+
+    (panel/echo-text {:kind :text :lines [\"main\" \"2 ahead\"]} {})   ;=> \"main · 2 ahead\""
+  (when (= (panel-kind panel) :text)
+    (string/join (seq/reject (map (:lines panel) string/trim) string/blank?) " · ")))
+
+(register-panel-style :echo {:rows 'panel/echo-rows :paint 'panel/echo-paint :echo 'panel/echo-text})
+(register-frame-overlay :panel {:rank 40 :run 'panel/ed-panel-ops})
+;; the help a hover gives beats the latest message, as help-echo does in Emacs's echo area
+(register-echo-source :panel {:rank 5 :run 'panel/panel-echo})

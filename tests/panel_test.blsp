@@ -1,0 +1,203 @@
+;; The panel (src/panel.blsp): a transient menu, which-key, the context menu, completion's
+;; candidates and a hover's help as data of three kinds, drawn by the style the `:panel-style`
+;; setting names — the editor's own `:echo`, everything in the echo area, the `:popup` cards, or
+;; one a package registers.
+(defmodule panel-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer :only [make-buffer goto-char])
+  (:use testkit :only [m-of press]))
+
+(def- test-menu
+  {:name 'panel-menu
+   :title "Push"
+   :groups [{:title "Arguments"
+             :suffixes [{:key "-f" :kind :switch :arg "--force-with-lease" :label "force"}]}
+             {:title "Push to"
+              :suffixes [{:key "p" :kind :command :command 'motion/cmd-forward-char :label "origin"}]}]})
+
+(defn- menu-model () (transient/ed-transient-open (m-of "abc\ndef") test-menu))
+
+(defn- texts (ops) (seq/filter ops (fn (op) (= (first op) :text))))
+
+(defn- modeline-row (m rows) (dec (- rows (minibuffer/ed-echo-rows m rows))))
+
+(describe "which panel is shown"
+  (test "none with no menu open and no prefix pending"
+    (is (nil? (panel/ed-panel (m-of "x") 30)))
+    (assert= (panel/panel-rows (m-of "x") 30) 0))
+  (test "an open menu's panel, before a pending prefix's"
+    (assert= (:title (panel/ed-panel (menu-model) 30)) "Push"))
+  (test "none while a prompt lists candidates: its list owns the echo area"
+    (let (m (assoc (menu-model) :minibuffer {:accept-selection true}))
+      (is (nil? (panel/ed-panel m 30))))))
+
+(describe "the :echo style, a strip below the mode line"
+  (test "the echo area grows by the panel's rows, and every line is painted below the mode line"
+    (let (m (menu-model)
+          ops (texts (panel/ed-panel-ops m 100 30)))
+      ;; the message row, the title, and the tallest group's heading and row
+      (assert= (minibuffer/ed-echo-rows m 30) 4)
+      (is (not (empty? ops)))
+      (is (every? ops (fn (op) (> (nth op 1) (modeline-row m 30)))))))
+  (test "the groups sit side by side, each key before its description"
+    (let (ops (texts (panel/ed-panel-ops (menu-model) 100 30))
+          at (fn (label) (seq/find ops (fn (op) (= (nth op 3) label)))))
+      (assert= (nth (at "Arguments") 1) (nth (at "Push to") 1))
+      (is (< (nth (at "Arguments") 2) (nth (at "Push to") 2)))
+      (assert= (nth (at "p") 1) (nth (at "-f") 1))))
+  (test "a column starts at the same screen column on every row, wide glyphs before it"
+    ;; columns are measured in display cells: a CJK label is two cells a character
+    (let (panel {:groups [{:title nil
+                           :rows [{:key "a" :text "日本 x"}
+                                   {:key "b" :text "ab"}
+                                   {:key "c" :text "c"}
+                                   {:key "d" :text "d"}]}]
+                 :layout :flow}
+          ops (texts (:ops (panel/echo-paint panel (m-of "x") 80 4)))
+          column-of (fn (label) (nth (seq/find ops (fn (op) (= (nth op 3) label))) 2)))
+      ;; four rows in a frame four tall cap a column at one line: each entry its own column
+      (assert= (column-of "日本 x") 3)
+      (assert= (- (column-of "b") (column-of "a")) (+ 3 6 3))))
+  (test "a panel wider than the frame is paged, its first row saying which page and how to turn"
+    (let (rows (map (range 30) (fn (n) {:key (str "k" n) :text "a command of some length"}))
+          panel {:groups [{:title nil :rows rows}] :layout :flow :page 1 :page-hint "C-h n/p"}
+          labels (map (texts (:ops (panel/echo-paint panel (m-of "x") 80 30))) (fn (op) (nth op 3))))
+      (is (includes? labels "page 2/2 · C-h n/p"))
+      (is (not (includes? labels "k0"))))))
+
+;; a package's style, registered as a package would register one
+(defn plain-rows (_panel _rows) 1)
+(defn plain-paint (panel _m _columns rows) [[:text (dec rows) 0 (str "plain: " (:title panel)) {}]])
+
+(describe "a package changes how the panel looks"
+  (test "the setting names a registered style, and that style draws every panel"
+    (panel/register-panel-style :panel-test-plain
+      {:rows 'panel-test/plain-rows :paint 'panel-test/plain-paint})
+    (let (m (assoc (menu-model) :panel-style :panel-test-plain))
+      (assert= (panel/ed-panel-ops m 100 30) [[:text 29 0 "plain: Push" {}]])
+      (assert= (minibuffer/ed-echo-rows m 30) 2)))
+  (test "a setting naming no registered style falls back to the editor's own"
+    (let (m (assoc (menu-model) :panel-style :nonexistent))
+      (is (any? (texts (panel/ed-panel-ops m 100 30)) (fn (op) (= (nth op 3) "Push")))))))
+
+(describe "which-key is a key panel"
+  (test "a prefix pending past the delay shows its keys in the strip"
+    (let (m (press (m-of "x") [:ctrl-x [:timer :which-key]])
+          labels (map (texts (panel/ed-panel-ops m 200 30)) (fn (op) (nth op 3))))
+      (is (includes? labels "find-file"))
+      (is (includes? labels "C-f")))))
+
+;; a source that says each time it builds its panel: `:panel-test-count` is `{:to pid :version
+;; n}`, set by no other test, so registering it once at load disturbs no other panel
+(defn counted-deps (m) (:panel-test-count m))
+(defn counted-panel (deps _rows)
+  (send (:to deps) :built)
+  {:title (str "Counted " (:version deps))
+   :groups [{:title nil :rows [{:key "c" :text "count"}]}]
+   :layout :balanced})
+(panel/register-panel-source :panel-test-counted
+  {:rank 90
+   :when :panel-test-count
+   :deps 'panel-test/counted-deps
+   :run 'panel-test/counted-panel})
+
+(defn- builds-since (n)
+  "How many `:built` messages are waiting, each taken."
+  (receive (:built (builds-since (inc n))) (after 0 n)))
+
+(describe "a panel is built once for what it reads"
+  (test "the layout and the frame asking again build nothing new; a change builds once"
+    (builds-since 0)
+    (let (m (assoc (m-of "x") :panel-test-count {:to (self) :version 1}))
+      (minibuffer/ed-echo-rows m 30)
+      (minibuffer/ed-echo-rows m 30)
+      (panel/ed-panel-ops m 100 30)
+      (assert= (builds-since 0) 1)
+      (assert= (:title (panel/ed-panel (assoc m :point-moved true) 30)) "Counted 1")
+      (assert= (builds-since 0) 0)
+      (assert= (:title (panel/ed-panel (assoc m :panel-test-count {:to (self) :version 2})
+                         30))
+        "Counted 2")
+      (assert= (builds-since 0) 1)))
+  (test "a source whose :when key is unset is not asked"
+    (builds-since 0)
+    (is (nil? (panel/ed-panel (m-of "x") 30)))
+    (assert= (builds-since 0) 0)))
+
+(describe "the :panel-style setting"
+  (test "names a registered style"
+    (is (empty? (config/config-warnings {:panel-style :echo})))
+    (is (panel/style-name? :echo)))
+  (test "an unknown style is a warning for *Messages*, and the editor's own style is used"
+    (is (any? (config/config-warnings {:panel-style :no-such-style})
+          (fn (warning) (includes? warning ":panel-style is :no-such-style"))))
+    (assert= (settings/value-of config/*settings* {:panel-style :no-such-style} :panel-style) :echo)))
+
+(describe "an empty panel"
+  (test "a panel with no groups paints nothing rather than dividing by its zero pages"
+    (assert= (panel/echo-paint {:groups [] :layout :balanced} (m-of "x") 80 24) {:ops [] :zones []})))
+
+;; ---- the three kinds ------------------------------------------------------------------------
+
+(defn- completing-model ()
+  ;; "alpha alps al", point after "al": the first Tab takes the common "alp", the second lists
+  ;; the two candidates
+  (let (m (ed-set-buf (m-of "") (goto-char (make-buffer "alpha alps al") 13)))
+    (complete-at-point/cmd-complete (complete-at-point/cmd-complete m nil) nil)))
+
+(defn- text-at (ops label) (seq/find (texts ops) (fn (op) (= (nth op 3) label))))
+
+(describe "completion's candidates are a :list panel"
+  (test "listed in the echo area below the mode line, as the minibuffer lists them"
+    (let (m (completing-model)
+          ops (panel/ed-panel-ops m 80 24))
+      (assert= (panel/panel-kind (panel/ed-panel m 24)) :list)
+      (assert= (minibuffer/ed-echo-rows m 24) 3)
+      (is (> (nth (text-at ops "alpha") 1) (modeline-row m 24)))
+      (assert= (inc (nth (text-at ops "alpha") 1)) (nth (text-at ops "alps") 1))))
+  (test "a click on a candidate takes it"
+    (let (m (completing-model)
+          op (text-at (panel/ed-panel-ops m 80 24) "alps")
+          taken (input/ed-update m [:mouse :press :left (nth op 1) (nth op 2) []] 80 24))
+      (assert= (editor/buffer/buffer-text (ed-current-buf taken)) "alpha alps alps")
+      (is (nil? (:completion taken)))))
+  (test "under the :popup style they are the card at point, over the text"
+    (let (m (assoc (completing-model) :panel-style :popup)
+          ops (panel/ed-panel-ops m 80 24))
+      (assert= (minibuffer/ed-echo-rows m 24) 1)
+      (is (< (nth (text-at ops "alpha") 1) (modeline-row m 24))))))
+
+(describe "a hover's help is a :text panel"
+  (test "the :echo style says it on the echo row, run together, and takes no rows below it"
+    (let (panel {:kind :text :lines ["main" "  2 ahead"] :anchor [3 4]})
+      (assert= (panel/echo-text panel {}) "main · 2 ahead")
+      (assert= (panel/echo-rows panel 30) 0)
+      (assert= (panel/echo-paint panel (m-of "x") 80 30) {:ops [] :zones []})))
+  (test "the hover's help beats the latest message on the echo row"
+    (let (m (assoc (model/message (m-of "x") "saved") :hover {:id :b :col 3 :row 20 :lines ["hi"]}))
+      (assert= (ed-echo-text m) "hi"))))
+
+(describe "a style draws only the kinds it names"
+  (test "under :popup a key panel stays in the echo area, drawn by :echo"
+    (let (m (assoc (menu-model) :panel-style :popup)
+          ops (panel/ed-panel-ops m 100 30))
+      (is (> (nth (text-at ops "Push") 1) (modeline-row m 30)))
+      (assert= (minibuffer/ed-echo-rows m 30) 4))))
+
+(describe "the context menu is a key panel"
+  (test "its items under their keys, grouped, each saying its binding"
+    (let (panel (panel/ed-panel (menu/ed-open-menu (m-of "abc") 3 4) 30))
+      (assert= (:title panel) "Context menu")
+      (assert= (map (:groups panel) :title) '("Edit" "Select"))
+      (assert= (map (:rows (first (:groups panel))) :key) '("w" "k" "y"))
+      (assert= (:text (first (:rows (second (:groups panel))))) "Select All  C-x h")
+      (assert= (:anchor panel) [3 4])))
+  (test "an item that does not apply is dimmed and has no click zone"
+    (let (m (menu/ed-open-menu (m-of "abc") 3 4) ; no region: Copy and Cut do not apply
+          ops (panel/ed-panel-ops m 100 30)
+          copy (text-at ops "Copy  M-w")
+          select (text-at ops "Select All  C-x h"))
+      (is (not (= (nth copy 4) (nth select 4))))
+      (is (nil? (panel/ed-panel-click m 100 30 (nth copy 2) (nth copy 1))))
+      (is (not (nil? (panel/ed-panel-click m 100 30 (nth select 2) (nth select 1))))))))
