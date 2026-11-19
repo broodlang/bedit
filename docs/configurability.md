@@ -81,7 +81,7 @@ The editor is already far more layered than its surface suggests. The strong sea
   `:comment-syntax`. A new language is pure data registration.
 - **Data registries everywhere** — transient overlays (`input/ed--transient-handlers`),
   async events (`input/ed--event-handlers`), profiles (`keymaps/*profiles*`), buffer
-  file-types (`layers/*auto-type-by-file*`), log routes (`model/*log-routes*`), and
+  file-types (`layers/*auto-type-by-file*`), and
   *two* per-command property registries (`interactive/*prefix-consuming*`,
   `interactive/*command-inverse*`).
 

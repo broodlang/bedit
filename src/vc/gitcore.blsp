@@ -58,12 +58,22 @@ reaches `vc/gitstatus` by name, because `vc/gitstatus` stands on this module."
   ;; failed command, reported like any other.
   {"GIT_TERMINAL_PROMPT" "0"})
 
-(def *git-background-env*
-  ;; A git nobody asked for (the background fetch) must not ask anything at all: no askpass
-  ;; dialog popping up every three minutes, no ssh passphrase prompt. `true` as the askpass
-  ;; program answers every question with nothing, so the fetch fails quietly instead.
-  (merge *git-env*
-    {"GIT_ASKPASS" "true" "SSH_ASKPASS" "true" "GIT_SSH_COMMAND" "ssh -o BatchMode=yes"}))
+(defn git-background-env (root)
+  "The environment of a git nobody asked for (the background fetch) in repo `root`: it must not
+ask anything at all — no askpass dialog popping up every three minutes, no ssh passphrase
+prompt. `true` as the askpass program answers every question with nothing, so the fetch fails
+quietly instead; and ssh runs in batch mode. The ssh is the one the reader set up —
+`$GIT_SSH_COMMAND`, else the repo's `core.sshCommand`, else `ssh` — with `-o BatchMode=yes`
+added to it: replacing it lost a key, a port or a jump host the fetch needs."
+  (let (configured (os/env "GIT_SSH_COMMAND")
+        from-config (when (or (nil? configured) (string/blank? configured))
+                      (string/trim (:stdout (git-git root ["config" "--get" "core.sshCommand"]) "")))
+        ssh (cond
+              (and configured (not (string/blank? configured))) configured
+              (and from-config (not (string/blank? from-config))) from-config
+              else "ssh"))
+    (merge *git-env*
+      {"GIT_ASKPASS" "true" "SSH_ASKPASS" "true" "GIT_SSH_COMMAND" (str ssh " -o BatchMode=yes")})))
 
 (defn git-git (root args &optional (opts {}))
   "Run git in `root` with `args` (a vector); `{:exit :stdout :stderr}`. `core.quotePath=false`
@@ -315,6 +325,28 @@ it must take its turn against the working-tree commands (a pull racing a discard
     (vc/gitcore/git-writes-checkout? [\"pull\" \"--ff-only\"])   ;=> true"
   (not (contains? git-remote-only-subcommands (git-subcommand args))))
 
+(def- git-hook-subcommands
+  ;; what runs the repository's hooks, or a sequence of steps that must not be cut short:
+  ;; a commit's pre-commit, a push's pre-push, a merge or pull's post-merge, a rebase
+  #{"commit" "merge" "rebase" "am" "cherry-pick" "revert" "pull" "push"})
+
+(def- git-network-reads
+  ;; what only asks the other side, and leaves this checkout as it was
+  #{"fetch" "ls-remote"})
+
+(defn git-op-class (args)
+  "The class of `git args` (`vc/vcsproc/vcs-op-timeout`): `:network-read` for a fetch, which
+a deadline may stop; `:hooks` for what runs the repository's hooks or a sequence of steps (a
+commit, a rebase, a pull, a push); `:writes` for the rest.
+
+    (vc/gitcore/git-op-class [\"fetch\" \"origin\"])   ;=> :network-read
+    (vc/gitcore/git-op-class [\"-c\" \"core.editor=true\" \"rebase\" \"-i\"])   ;=> :hooks"
+  (let (subcommand (git-subcommand args))
+    (cond
+      (contains? git-network-reads subcommand) :network-read
+      (contains? git-hook-subcommands subcommand) :hooks
+      else :writes)))
+
 ;; check-allow: `then` is an opaque caller-supplied `(model result) -> model`; the
 ;; declaration is the contract (ADR-341's `:trusted`).
 (check-allow :trusted
@@ -337,7 +369,8 @@ a pull, a commit, a submodule update wait their turn; a push or a fetch runs bes
         args
         (fn (dir arguments) (git-git dir arguments))
         then
-        (git-writes-checkout? args))))
+        (git-writes-checkout? args)
+        (git-op-class args))))
 
   (sig git-launch-op (model string seqable &optional any -> model))
   (defn git-launch-op (m verb args &optional (then git-refresh-if-open))
@@ -367,7 +400,7 @@ it."
 (defcommand cmd-git-quit
   (m key)
   "Bury the git buffer (q)."
-  (cmd-kill-buffer m key))
+  (cmd-kill-current-buffer m key))
 
 ;; ---- running a git command, journalled -----------------------------------------
 ;; Through `vc/vcsproc/vcs-run`, so a git command cannot be run without being recorded in the
@@ -445,16 +478,25 @@ has never opened a status. Outside a repo it says so rather than running git in 
 
 The command runs OFF the loop, queued behind any still running (`vc/vcsproc/vcs-run-queued`):
 `s s s` down a list of files is three commands in order, and a large repository or a held
-index lock never freezes the window."
+index lock never freezes the window. One that runs hooks or a sequence of steps (a rebase, a
+merge, a revert: [[git-op-class]]) is an operation instead ([[git-launch-op-in]]), in its
+turn all the same: it runs as long as it takes, and C-g stops it."
   (let (root (git-resolve-root m))
-    (if (nil? root)
-      (message m "not in a git repository")
-      (vcs-run-queued (assoc m :git-root root)
-        "git"
-        root
-        args
-        (fn (dir arguments) (git-git dir arguments))
-        (fn (m1 r) (git-refreshed m1 verb r))))))
+    (cond
+      (nil? root) (message m "not in a git repository")
+      (= (git-op-class args) :hooks)
+        (git-launch-op-in m
+          root
+          verb
+          args
+          (fn (m1 r) (if (= (:exit r) 0) (git-refresh-status (git-reload-view m1)) m1)))
+      else
+        (vcs-run-queued (assoc m :git-root root)
+          "git"
+          root
+          args
+          (fn (dir arguments) (git-git dir arguments))
+          (fn (m1 r) (git-refreshed m1 verb r))))))
 
 (defn git-do-hunk (m verb patch cached? reverse?)
   "[[git-do]] for a hunk: `git apply` over stdin, queued off the loop, then the same refresh."

@@ -27,27 +27,35 @@ a command's negative-direction inverse, and its declared traits.
     ((str "cmd-" name) name)
     (_ s)))
 
+(defn- qualified-command-symbol (sym)
+  ;; `sym` qualified to the module registering it, unless it already names its module
+  (let (ns (reflect/current-ns))
+    (if (or (nil? ns) (includes? (->string sym) "/")) sym (symbol (str ns "/" (->string sym))))))
+
+(defn- claim-command (sym entry)
+  ;; claimed (`ownership`), so a package's commands leave M-x when it is removed or updated
+  ;; past them — and a core command it replaced comes back
+  (let (name (command-friendly-name (->string sym))
+        qualified (qualified-command-symbol sym))
+    (ownership/claim! :interactive/command-syms name qualified)
+    (ownership/claim! :interactive/commands name (if (= entry :symbol) qualified entry))))
+
 (defn register-command (sym command)
   "Register `command` as the interactive command named after `sym` (minus `cmd-`), keeping the
 symbol too — QUALIFIED to the module registering it (`bedit/commands/cmd-find-file`), so
 `describe-function`'s docstring, the M-x marginalia's declared contract and the key lookup
-all find it whatever module defined the command. Re-registering replaces the entry."
-  (let (nm (command-friendly-name (->string sym))
-        ns (reflect/current-ns)
-        qualified (if (or (nil? ns) (includes? (->string sym) "/"))
-                    sym
-                    (symbol (str ns "/" (->string sym)))))
-    ;; claimed (`ownership`), so a package's commands leave M-x when it is removed or
-    ;; updated past them — and a core command it replaced comes back
-    (ownership/claim! :interactive/command-syms nm qualified)
-    ;; By SYMBOL when the symbol is bound to this very command — every `defcommand` — as a
-    ;; keymap names it: late-bound, so a redefinition is what runs next, and the registry
-    ;; is names rather than 781 closures. Those rode the startup image's always-loaded
-    ;; section whole, each beside the copy its module's own section holds. A function
-    ;; registered on its own (no global of its name) is kept as the function.
-    (ownership/claim! :interactive/commands
-      nm
-      (if (= (reflect/bound-value qualified nil) command) qualified command))))
+all find it whatever module defined the command. It is kept by symbol when that symbol is
+bound to `command` right now, and as the function otherwise (one registered on its own, with
+no global of its name). Re-registering replaces the entry."
+  (claim-command sym
+    (if (= (reflect/bound-value (qualified-command-symbol sym) nil) command) :symbol command)))
+
+(defn register-defined-command (sym)
+  "Register the global command `sym` names (what `defcommand` defined) as interactive BY
+SYMBOL, as a keymap names it: late-bound, so a redefinition is what runs next, and the
+registry holds names rather than closures. The symbol is passed rather than read back from
+the global, which a concurrent reload of the module may have rebound."
+  (claim-command sym :symbol))
 
 (defn- command-fn (entry)
   ;; a `:interactive/commands` entry as the function to call: a symbol resolved now,
@@ -84,10 +92,30 @@ may not have loaded.
       (ownership/claim! :interactive/deferred nm sym))
     nm))
 
+;; ---- aliases: Emacs's names for commands bedit names otherwise -------------------------
+;; A command bedit names its own way (`save`, `delete-pane`) is reached under Emacs's name too
+;; (`save-buffer`, `delete-window`): an alias is a NAME, offered by M-x and C-h f and run as the
+;; command it stands for. A command registered under the same name wins over an alias.
+;;
+;; :interactive/aliases  name (string) -> the M-x name of the command it stands for
+
+(defn declare-aliases (aliases)
+  "Make each `{alias target}` of `aliases` a name M-x offers and runs as the command `target`
+names — Emacs's `defalias` of a command."
+  (doseq (entry aliases)
+    (let ([alias target] entry) (ownership/claim! :interactive/aliases alias target))))
+
+(defn command-alias (nm)
+  "The M-x name the alias `nm` stands for ([[declare-aliases]]), or nil."
+  (registry/lookup :interactive/aliases nm))
+
 (defn command-sym (nm)
   "The fully-qualified symbol of the interactive command named `nm`, or nil — including one
-that is only declared (its module unloaded), so `describe-function` can find its docstring."
-  (or (registry/lookup :interactive/command-syms nm) (registry/lookup :interactive/deferred nm)))
+that is only declared (its module unloaded), so `describe-function` can find its docstring — and,
+for an alias ([[declare-aliases]]), the command it stands for's."
+  (or (registry/lookup :interactive/command-syms nm)
+    (registry/lookup :interactive/deferred nm)
+    (let (target (command-alias nm)) (when (and target (not (= target nm))) (command-sym target)))))
 
 ;; Memoised on the two registries' CONTENTS (`defmemo` compares with `=`, which is immediate
 ;; for the same map). M-x asks for this on every open, and merging, deduplicating and
@@ -96,14 +124,15 @@ that is only declared (its module unloaded), so `describe-function` can find its
 ;; is always the registries' current one.
 (memo/defmemo sorted-command-names
   1
-  (registered deferred)
-  "The sorted, distinct names of the `registered` and `deferred` command registries."
-  (sort (seq/distinct (append (keys registered) (keys deferred)))))
+  (registered deferred aliases)
+  "The sorted, distinct names of the `registered`, `deferred` and `aliases` command registries."
+  (sort (seq/distinct (append (keys registered) (keys deferred) (keys aliases)))))
 
 (defn command-names ()
-  "All interactive command names, sorted — registered and declared-but-unloaded alike."
+  "All interactive command names, sorted — registered, declared-but-unloaded and aliases alike."
   (sorted-command-names (registry/entries :interactive/commands)
-    (registry/entries :interactive/deferred)))
+    (registry/entries :interactive/deferred)
+    (or (registry/entries :interactive/aliases) {})))
 
 ;; ---- the prefix argument (C-u N) -------------------------------------------
 ;; The numeric prefix a `C-u`/digit sequence builds lives on the model as
@@ -199,17 +228,21 @@ call, without every such module being loaded at startup to make `M-x` honest."
       ;; a deferred one: its module — everything before the symbol's last segment — loaded
       ;; first
         (let (sym (registry/lookup :interactive/deferred nm)
-              module (when sym (command-module sym)))
-          (if (nil? module)
-            (fallback m nm)
-            (let (_ (try
-                      (require-one (symbol module))
-                      (catch e
-                        (log/warn (str "could not load " module " for " nm ": " (error-message e)))))
-                  loaded (command-fn (registry/lookup :interactive/commands nm)))
-              (if loaded
-                (ownership/with-symbol-claimant sym (fn () (loaded m nil)))
-                (fallback m nm))))))))
+              module (when sym (command-module sym))
+              target (command-alias nm))
+          (cond
+            ;; an alias runs the command it stands for, by that command's own name
+            (and (nil? module) target (not (= target nm))) (run-command m target fallback)
+            (nil? module) (fallback m nm)
+            else
+              (let (_ (try
+                        (require-one (symbol module))
+                        (catch e
+                          (log/warn (str "could not load " module " for " nm ": " (error-message e)))))
+                    loaded (command-fn (registry/lookup :interactive/commands nm)))
+                (if loaded
+                  (ownership/with-symbol-claimant sym (fn () (loaded m nil)))
+                  (fallback m nm))))))))
 
 (defmacro defcommand (cmd params & body)
   "Like `defn` for an editor command `(model key) -> model`, but also registers it
@@ -222,4 +255,4 @@ leading `cmd-`."
   `(do
      (sig ~cmd (model any -> model))
      (defn ~cmd ~params ~@body)
-     (interactive/register-command '~cmd ~cmd)))
+     (interactive/register-defined-command '~cmd)))

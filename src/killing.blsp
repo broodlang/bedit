@@ -19,18 +19,22 @@ PRIMARY selection, read off the loop. The ring itself is `clipboard`'s."
 ;; coalescing rule and `ed-drag-select` — lives in `clipboard`, beside what it shares text with.
 
 (defn ed-kill-span (m move)
-  "Kill from point to where `move` (a `buffer -> buffer` point move) lands: push
-the spanned text onto the kill ring (coalescing with an adjacent kill) and delete
-it. An empty span is a no-op. A buffer that refuses the delete (read-only) says so and
-the kill ring is left alone — nothing was killed."
+  "Kill from point to where `move` (a `buffer -> buffer` point move) lands, stopping at the
+edge of the selected pane's narrowing: push the spanned text onto the kill ring (coalescing
+with an adjacent kill) and delete it. An empty span is a no-op. A buffer that refuses the
+delete (read-only) says so and the kill ring is left alone — nothing was killed. The undo record
+keeps point where it was, so undoing a forward kill leaves point at its start, as Emacs does."
   (let (b (ed-current-buf m)
         start (buffer-point b)
-        moved (move (set-mark b)) ; mark = point; point moves
-        text (buffer-region moved))
-    (if (or (nil? text) (= text ""))
+        end (ed-clamp-to-accessible m (buffer-point (move b)))
+        lo (math/min start end)
+        hi (math/max start end)
+        text (buffer-region (assoc b :point lo :mark hi)))
+    (if (= lo hi)
       m
-      (let ([m2 killed?] (ed-try-edit m (fn (_) (clear-mark (delete-region moved)))))
-        (if killed? (ed-push-kill m2 text (> (buffer-point moved) start)) m2)))))
+      (let ([m2 killed?] (ed-try-edit m
+                           (fn (bb) (clear-mark (delete-region (assoc bb :point start :mark end))))))
+        (if killed? (ed-push-kill m2 text (> end start)) m2)))))
 
 (defn- ed-line-start-move (count)
   "A point move to the start of the line `count` lines from point's (0 is its own line's
@@ -44,13 +48,19 @@ start), clamped to the buffer: the end of the buffer past its last line."
           (>= target (text/line-count rope)) (buffer-length buffer)
           else (text/line->char rope target))))))
 
+(defn- rest-of-line-blank? (buffer)
+  ;; whether only spaces and tabs lie between point and the end of its line
+  (let (rest (buffer-region (end-of-line (set-mark buffer))))
+    (= "" (string/trim (or rest "")))))
+
 (defcommand cmd-kill-line
   (m key)
-  "Kill from point to end of line (C-k); at end of line, kill the newline. With the init
-file's `:kill-whole-line` (Emacs's `kill-whole-line`), at the START of a line kill the line
-and its newline, so no empty line is left behind. With a prefix argument N (Emacs's), kill
-through N line starts — N whole lines from point, newlines included; 0 kills back to the
-line's start, and a negative N back N lines."
+  "Kill from point to end of line (C-k); at end of line, or with only whitespace after point,
+kill through the newline, as Emacs's. With the init file's `:kill-whole-line` (Emacs's
+`kill-whole-line`), at the START of a line kill the line and its newline, so no empty line is
+left behind. With a prefix argument N (Emacs's), kill through N line starts — N whole lines
+from point, newlines included; 0 kills back to the line's start, and a negative N back N
+lines."
   (let (b (ed-current-buf m)
         count (current-prefix-arg m))
     (if (and (not (int? count)) (= (buffer-point b) (buffer-length b)))
@@ -60,8 +70,7 @@ line's start, and a negative N back N lines."
       (ed-kill-span m
         (cond
           (int? count) (ed-line-start-move count)
-          (= (buffer-char-after b) "\n") forward-char
-          (and (= true (:kill-whole-line m)) (= (buffer-column b) 0))
+          (or (rest-of-line-blank? b) (and (= true (:kill-whole-line m)) (= (buffer-column b) 0)))
             (fn (bb) (forward-char (end-of-line bb)))
           else end-of-line)))))
 
@@ -133,23 +142,29 @@ enclosing list's close delimiter, so it can't break the parens. Reuses the kill 
             (ed-ding (message mm (str "not found: " ch)))
             (ed-kill-span mm (fn (b) (goto-char b (inc found)))))))))) ; kill [point, found] to ring
 
-(defn- ed-rectangle-kill (m delete?)
-  "C-w (`delete?`) or M-w over a rectangle region (C-x SPC, a C-M-drag): its rows saved as
-the rectangle kill (`:rectangle-kill`, what C-x r y yanks) and, joined by newlines, as a kill
-ring entry of their own — so another program pastes the text, and the next C-y, finding that
-entry newest ([[ed-rectangle-yank?]]), yanks the block. The mark goes, and the mode with it."
+(defn- ed-rectangle-kill (m delete? to-ring?)
+  "Kill (`delete?`) or copy the rectangle between point and mark, the one helper every
+rectangle kill and copy shares: its rows saved as the rectangle kill (`:rectangle-kill`, what
+C-x r y yanks) and, with `to-ring?` (C-w / M-w over a C-x SPC region), joined by newlines as a
+kill ring entry of their own — so another program pastes the text, and the next C-y, finding
+that entry newest ([[ed-rectangle-yank?]]), yanks the block. The mark goes, and the mode with
+it. A buffer that refuses the delete (read-only) says so, and nothing is saved: it says
+\"killed\" only when it edited."
   (let (rows (extract-rectangle (ed-current-buf m))
         text (string/join rows "\n")
-        ;; its own entry: never appended to a kill before it
-        pushed (assoc (ed-push-kill (dissoc m :last-command) text true)
-                 :last-command (:last-command m)
-                 :rectangle-kill rows
-                 :rectangle-kill-text text)
-        done (fn (b) (clear-mark (dissoc b :rectangle-mark))))
+        done (fn (b) (clear-mark (dissoc b :rectangle-mark)))
+        save (fn (mm)
+               (if to-ring?
+                 ;; its own entry: never appended to a kill before it
+                 (assoc (ed-push-kill (dissoc mm :last-command) text true)
+                   :last-command (:last-command mm)
+                   :rectangle-kill rows
+                   :rectangle-kill-text text)
+                 (assoc mm :rectangle-kill rows))))
     (if delete?
-      (message (ed-edit pushed (fn (b) (done (delete-rectangle b))))
-        (str "killed a " (count rows) "-row rectangle"))
-      (message (ed-apply pushed done) (str "copied a " (count rows) "-row rectangle")))))
+      (let ([edited killed?] (ed-try-edit m (fn (b) (done (delete-rectangle b)))))
+        (if killed? (message (save edited) (str "killed a " (count rows) "-row rectangle")) edited))
+      (message (ed-apply (save m) done) (str "copied a " (count rows) "-row rectangle")))))
 
 (defn- ed-rectangle-yank? (m)
   "Whether C-y yanks a rectangle: the newest kill is the text of the last rectangle C-w / M-w
@@ -162,7 +177,7 @@ saved ([[ed-rectangle-kill]]), so nothing has been killed or copied since."
   "Delete the region and push its text onto the kill ring (C-w). A rectangle region
 (C-x SPC) is killed as a rectangle."
   (if (rectangle-mark-active? (ed-current-buf m))
-    (ed-rectangle-kill m true)
+    (ed-rectangle-kill m true true)
     (region/ed-with-region m
       (buffer-region (ed-current-buf m))
       (fn (text) (ed-edit (ed-push-kill m text true) delete-region)))))
@@ -179,7 +194,7 @@ on a results buffer's link line it copies the whole link — the link's absolute
 rectangle region (C-x SPC) is copied as a rectangle."
   (let (text (buffer-region (ed-current-buf m)))
     (cond
-      (rectangle-mark-active? (ed-current-buf m)) (ed-rectangle-kill m false)
+      (rectangle-mark-active? (ed-current-buf m)) (ed-rectangle-kill m false true)
       (not (nil? text)) (message (ed-apply (ed-push-kill m text true) clear-mark) "region copied")
       else
         (let (location (ed-link-at-point m))
@@ -408,19 +423,14 @@ region when no mark is set — every rectangle op needs two corners."
 block, closing the gap. Yank it back with C-x r y."
   (region/ed-with-region m
     (buffer-mark (ed-current-buf m))
-    (fn (_)
-      (let (rows (extract-rectangle (ed-current-buf m)))
-        (message (ed-edit (assoc m :rectangle-kill rows) delete-rectangle)
-          (str "killed a " (count rows) "-row rectangle"))))))
+    (fn (_) (ed-rectangle-kill m true false))))
 
 (defcommand cmd-copy-rectangle-as-kill
   (m key)
   "Copy the rectangle to the rectangle kill ring without deleting it (C-x r M-w)."
   (region/ed-with-region m
     (buffer-mark (ed-current-buf m))
-    (fn (_)
-      (let (rows (extract-rectangle (ed-current-buf m)))
-        (message (assoc m :rectangle-kill rows) (str "copied a " (count rows) "-row rectangle"))))))
+    (fn (_) (ed-rectangle-kill m false false))))
 
 (defcommand cmd-delete-rectangle
   (m key)

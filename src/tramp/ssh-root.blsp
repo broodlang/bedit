@@ -205,48 +205,54 @@ child said before the root shell opened (on a terminal its prompts come with its
   "`[state answer]` once the root shell `state` is starting answers: `true` when it is open, else
 `{:failed …}` — the method wanting a password not given (`:become-password`), refusing the one
 given (`:auth`, `:become`), ssh failing. `password` is written once, at the method's first
-prompt."
-  (letrec (wait (fn (state sent?)
-                  (let (prompts (prompts-in (:become state) (said-before-ready state)))
-                    (cond
-                      (includes? (:stdout state) ready-marker)
-                        (let (after (index-of (:stdout state)
-                                      "\n"
-                                      (index-of (:stdout state) ready-marker)))
-                          [(assoc state
-                             :stdout
-                               (if (< after 0)
-                                 ""
-                                 (string/substring (:stdout state)
-                                   (inc after)
-                                   (count (:stdout state))))
-                             :stderr "")
-                            true])
-                      (and sent? (> prompts 1))
-                        [(close-child state)
-                          {:failed {:error :auth
-                                    :become true
-                                    :reason (str (who (:become state) (:parts state))
-                                              " refused the password")}}]
-                      (and (not sent?) (> prompts 0))
-                        (if (nil? password)
-                          [(close-child state) {:failed {:error :become-password}}]
-                          (do (os/write (:proc state) (str password "\n")) (wait state true)))
-                      else
-                        (let (proc (:proc state))
-                          (receive
-                            ([:proc ^proc data] (wait (update state :stdout str data) sent?))
-                            ([:proc-err ^proc data] (wait (update state :stderr str data) sent?))
-                            ([:proc-exit ^proc code]
-                              [(close-child state) {:failed (start-failure state code sent?)}])
-                            ([:proc-closed ^proc code]
-                              [(close-child state) {:failed (start-failure state code sent?)}])
-                            (after (:timeout-ms state)
-                              [(close-child state)
-                                {:failed {:error :timeout
-                                          :reason (str (who (:become state) (:parts state))
-                                                    " did not answer in time")}}])))))))
-    (wait state false)))
+prompt. Bounded by ONE deadline, `:timeout-ms` from now ([[time-left]]): re-armed per chunk, a
+shell that kept saying something and never got ready waited for good."
+  (let (deadline (+ (os/now) (:timeout-ms state)))
+    (letrec (wait (fn (state sent?)
+                    (let (prompts (prompts-in (:become state) (said-before-ready state)))
+                      (cond
+                        (includes? (:stdout state) ready-marker)
+                          (let (after (index-of (:stdout state)
+                                        "\n"
+                                        (index-of (:stdout state) ready-marker)))
+                            [(assoc state
+                               :stdout
+                                 (if (< after 0)
+                                   ""
+                                   (string/substring (:stdout state)
+                                     (inc after)
+                                     (count (:stdout state))))
+                               :stderr "")
+                              true])
+                        (and sent? (> prompts 1))
+                          [(close-child state)
+                            {:failed {:error :auth
+                                      :become true
+                                      :reason (str (who (:become state) (:parts state))
+                                                " refused the password")}}]
+                        (and (not sent?) (> prompts 0))
+                          (if (nil? password)
+                            [(close-child state) {:failed {:error :become-password}}]
+                            (do (os/write (:proc state) (str password "\n")) (wait state true)))
+                        else
+                          (let (proc (:proc state))
+                            (receive
+                              ([:proc ^proc data] (wait (update state :stdout str data) sent?))
+                              ([:proc-err ^proc data] (wait (update state :stderr str data) sent?))
+                              ([:proc-exit ^proc code]
+                                [(close-child state) {:failed (start-failure state code sent?)}])
+                              ([:proc-closed ^proc code]
+                                [(close-child state) {:failed (start-failure state code sent?)}])
+                              (after (time-left deadline)
+                                [(close-child state)
+                                  {:failed {:error :timeout
+                                            :reason (str (who (:become state) (:parts state))
+                                                      " did not answer in time")}}])))))))
+      (wait state false))))
+
+(defn- time-left (deadline)
+  ;; the ms until `deadline` (an `os/now`), never below zero: what a receive may still wait
+  (math/max 0 (math/round (- deadline (os/now)))))
 (defn- ensure-open (state request)
   "`[state answer]`: the root shell open (started from `request`'s `:argv` / `:env`, with its
 `:password` when the method asks) — `true` — or why not."
@@ -273,8 +279,10 @@ prompt."
 
 (defn- run-request (state script timeout-ms)
   "`[state answer]` for `script` run in the open root shell: `os/cmd`'s map, or `{:failed …}` when
-the shell went away (the connection dropped) or did not answer in time."
-  (let (token (rand/token 8)
+the shell went away (the connection dropped) or did not answer within `timeout-ms` — one
+deadline for the whole answer, not a pause between its chunks."
+  (let (deadline (+ (os/now) timeout-ms)
+        token (rand/token 8)
         proc (:proc state)
         written (check-allow :discarded-catch
                   (try (do (os/write proc (request-text script token)) true) (catch _ false))))
@@ -301,7 +309,7 @@ the shell went away (the connection dropped) or did not answer in time."
                                           :reason (str "the connection to "
                                                     (sshpath/route-label (:parts state))
                                                     " dropped")}}])
-                            (after timeout-ms
+                            (after (time-left deadline)
                               [(close-child state)
                                 {:failed {:error :timeout
                                           :reason (str (who (:become state) (:parts state))

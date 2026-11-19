@@ -81,7 +81,7 @@ src/model.blsp              the ui-run model: buffer pool, panes, *Messages*,
                             point / mark / `:input-start` / `:line-links` and every pane's
                             cursor and scroll moving with the text — Emacs's
                             comint-buffer-maximum-size) on the one CARRY rule every change of
-                            text shares (`ed-carry-position` / `ed-carry-panes`: positions move
+                            text shares (`headcut/ed-carry-position` / `ed-carry-panes`: positions move
                             as Emacs markers do — a head cut here, another frame's splice in
                             `hosted`, the layouts a feature keeps via `register-layout-keeper`),
                             and `ed-ding`: a
@@ -91,12 +91,24 @@ src/model.blsp              the ui-run model: buffer pool, panes, *Messages*,
                             STANDING QUESTION (a y/n read, a query-replace, a minibuffer prompt):
                             it shows beside it in brackets until the next key, as Emacs's
                             minibuffer message, and lands in *Messages* as always
+src/headcut.blsp            an output buffer's HEAD CUT under the model: `ed-cut-head` deletes whole
+                            lines from the top as program output (out of the undo history too),
+                            `ed-head-cut-lines` / `ed-head-cut-chars` say where, and the CARRY
+                            rule moves what points into the text as Emacs markers move
+                            (`ed-carry-position`, `ed-carry-buffer-fields`: point, mark,
+                            `:input-start`, markers, `:line-links`); the line cap a model names
+                            (`ed-output-max-lines`). Knows buffers only — the panes and the sinks'
+                            cap are model's
 src/textpos.blsp            pure text geometry under the model: an offset's line, column, ends, and
                             what an edit changed (the splice log)
 src/lossage.blsp            the recent keys (C-h l), a bounded ring on the model
 src/minibuffer.blsp         the minibuffer: a one-line prompt over std's lineedit with a list under
                             it, modal (`minibuffer-handle`); ranks on the key for a small source,
-                            in a session off the loop for a large one. The accessors (`mb-text`,
+                            in a session off the loop for a large one. What RET takes is ONE policy
+                            (`mb-answer`, a prompt's `:require-match` nil / true / `:exact`): the typed
+                            text when it is an answer, a row moved to, else the top row; M-RET takes
+                            the typed text; a chord the editor's keymap starts (C-x o) is read and
+                            dropped, said. The accessors (`mb-text`,
                             `mb-candidates`) and the echo area's height (`ed-echo-rows`) the layout
                             reads
 src/offloop.blsp            a slow call run OFF the loop, its answer folded when it lands
@@ -492,13 +504,14 @@ src/browse-kill-ring.blsp   M-x browse-kill-ring: *Kill Ring*, newest first, RET
                             entry where it was opened from (the ring is `clipboard`'s)
 src/window-commands.blsp    the window commands: tiled splits, windmove and Emacs's
                             windmove-swap-states-* (C-S-arrows and s-S-arrows), window-swap-states,
-                            the C-x 4 prefix; a side window's `:side` mark stays with its PLACE
+                            the C-x 4 prefix, window sizes (C-x ^ { } + -, `ed-resize-selected`
+                            over the split ratios), C-M-v; a side window's `:side` mark stays with its PLACE
                             (`ed-keep-sides`)
 src/textops.blsp            the commands that rewrite text in bulk: case, whitespace, the replace
                             family, tabify, reversing and deduplicating lines, align-regexp
 src/bufferops.blsp          pure buffer -> buffer text operations under the commands: paragraph and
-                            sentence motion, whitespace around point, join-line, rectangles (moved
-                            from std's `editor/buffer`, brood ADR-417, ADR-630)
+                            sentence motion, whitespace around point, join-line, rectangles by display
+                            column (moved from std's `editor/buffer`, brood ADR-417, ADR-630)
 src/lifecycle.blsp          the file and session commands: write and revert a file, reload the config,
                             quit with its questions (`ed-map-y-or-n`, what is still running)
 src/project-commands.blsp   C-x p f over a file list cached per root, refreshed off the loop; C-x p p
@@ -576,7 +589,9 @@ src/docview.blsp            a PDF opens as its pages (Emacs doc-view, the `:docu
 src/hexl.blsp               hexl-mode: a binary file opened as a read-only hex view (pool's
                             find-file reaches it late-bound); the mode's `:no-write` facet is
                             what makes C-x C-s / C-x C-w refuse it
-src/pool.blsp               the buffer pool and where its buffers are shown — open / select / C-x k /
+src/pool.blsp               the buffer pool and where its buffers are shown — open / select / C-x k (a
+                            prompt; `ed-kill-buffer-asking` runs a continuation once the buffer is gone) / C-x b's
+                            new buffer (`ed-ensure-named`) /
                             kill, `ed-display-buffer` (Emacs display-buffer: init.blsp's
                             `:display-buffer` RULES first — `{:match name-regex | type-or-mode
                             :request :action :same-window | :other-window | :reuse | {:side
@@ -623,7 +638,9 @@ src/vim.blsp                the Vim grammar over the modal profile: `[count] ope
                             motion|text-object`, `.` repeat, the normal-mode commands and the mode
                             transitions (Esc, I, A, o, O, v)
 src/interactive.blsp        the `defcommand` macro + the M-x command registry, command traits, and REPEAT MAPS
-                            (`declare-repeat-map`, Emacs repeat-map: after C-x C-M-+ the keys + / - / 0 repeat)
+                            (`declare-repeat-map`, Emacs repeat-map: after C-x C-M-+ the keys + / - / 0 repeat), and
+                            ALIASES (`declare-aliases`: Emacs's names — save-buffer, delete-window —
+                            offered by M-x and run as bedit's command; keymaps lists them)
 src/transient.blsp          TRANSIENT MENUS (magit's `P`): the editor half of
                             `transient-core` (brood ADR-387) — the modal overlay, the
                             minibuffer read behind a `:read` outcome, and the MEMORY (a
@@ -679,7 +696,7 @@ src/grammars.blsp           tree-sitter grammars the runtime was not built with:
                             recorded `:fingerprint`), moving one back to its pin, and a
                             live swap — drop a new .so in and reload, no restart. An install or
                             reload retypes every open line-lexer stand-in as its parsed mode
-                            (`model/ed-grammars-arrived`). A grammar is native code, so brood
+                            (`grammars/ed-grammars-arrived`). A grammar is native code, so brood
                             VETS a library in a child before its first load and refuses one that
                             crashed or hung there, or that crashed bedit (brood ADR-660): an
                             install vets with the grammar's own test corpus off the loop
@@ -687,7 +704,7 @@ src/grammars.blsp           tree-sitter grammars the runtime was not built with:
                             grammar-reload (`:grammar-reload-proc`, C-g cancels, a library loaded
                             only once its verdict lands); the list shows one
                             (QUARANTINED, why) without loading it; its language stands in with
-                            its line lexer, as a missing grammar's does (`model/grammar-loadable?`,
+                            its line lexer, as a missing grammar's does (`grammarfallback/grammar-loadable?`,
                             `missing-note`)
 src/grammarcheck.blsp       does the installed grammar still have every node kind and field a
                             mode names? Each `deflanguage` registers the names its face table,
@@ -695,9 +712,16 @@ src/grammarcheck.blsp       does the installed grammar still have every node kin
                             `editor/treesit/language-names`); the first use of a grammar checks
                             them against what it contains (`grammar-problems`), kept per language
                             until an install / reload. A failing grammar is reported once in
-                            *Messages* (M-x grammar-update) and is not `model/grammar-ready?`, so
+                            *Messages* (M-x grammar-update) and is not `grammarfallback/grammar-ready?`, so
                             a language with a line lexer stands in with it rather than
                             mis-colouring. Below `model`, which asks it
+src/grammarfallback.blsp    where a language's grammar stands (`grammar-loadable?`, quarantined,
+                            `grammar-ready?`: loadable and `grammarcheck/sound?`) and the
+                            line-lexer STAND-IN a buffer is typed as while it is not ready
+                            (`ed-grammar-fallback`, from `model/ed-stamp`; `:above` keeps a big
+                            JSON lexed), with the note a visit shows (`missing-note`) and where
+                            a grammar is declared to live (`grammar-source`). Below `model`,
+                            knowing only buffers; `grammars` retypes the pool when one arrives
 src/conventions.blsp        a buffer's INDENT WIDTH, TAB WIDTH, tabs-or-spaces and FILL COLUMN,
                             resolved per buffer: its own (M-x set-fill-column) > its
                             .editorconfig > the user's init.blsp entry for its mode > the mode's
@@ -1031,7 +1055,8 @@ src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclien
                             again (`ed-collab-reopen`)
 src/guest.blsp              a guest's session (brood ADR-415): editing what it was given, nothing
                             more — the allowlist (`ed-guest-allows?`, the `:guest` command trait)
-                            that tests/guest_allowed.txt pins
+                            that tests/guest_allowed.txt pins, and what such a session folds at all
+                            (`ed-guest-admits?`: keys, window events, its own timers and traffic)
 tests/*_test.blsp           pure model/view tests, one suite per area (no window needed)
 src/corpus.blsp             the language corpus harness: every sample under tests/corpus/<mode>/ checked —
                             its mode, caret assertions and golden faces, indentation three ways, restart,
@@ -1814,7 +1839,7 @@ src/languages/core.blsp
     JavaScript's, TSX TypeScript's, Terraform HCL's). A language that
     had a line lexer first keeps it as its `:fallback`: a buffer opened
     while the grammar is missing is typed as the lexer's stand-in
-    (`model/ed-grammar-fallback`) and becomes the parsed mode when the
+    (`grammarfallback/ed-grammar-fallback`) and becomes the parsed mode when the
     grammar arrives (`ed-grammars-arrived`); JSON stays lexed past a
     megabyte (`:fallback-above`). A language with no stand-in (Rust,
     Go, C) stays its parsed mode without its grammar, and its services
@@ -1985,7 +2010,7 @@ src/packages.blsp
     defined there) dropped as a backstop; every core global it REDEFINED
     restored through a per-global STACK (two packages patching one
     function come off in either order, the live patch always the top
-    one's); and every global it FIRST defined removed (`plugin-definitions`:
+    one's); and every global it FIRST defined removed (`:packages/definitions`:
     noted at load — sited under its dir and unbound before, a file with no
     `defmodule` included — brood's `reflect/undef`; a core name is never
     undefined). Open buffers in a mode it took away are seeded again —
@@ -2005,9 +2030,19 @@ src/packages.blsp
     not dropped), *Packages* and C-h P mark it. A package prompt (M-x
     package-install, C-h P) fetches the list itself when it has none,
     saying so (`package-prompt`); `package-info` is what C-h P shows.
+    Every install starts ONE job (`install-job-for`): an installed package
+    is UPDATED, newer only (an older copy from a directory after a y/n),
+    its modules loaded again. A copy moves in atomically (`commit-staged`:
+    the old one aside, the new in, then the old deleted, put back on a
+    failure). Nothing is deleted without a y/n (`confirm-remove`; the
+    remove prompt takes an exact name), and *Packages* marks: d marks,
+    u unmarks, x deletes the marked after asking.
     An update is SHOWN first (`:package-review-updates`, default on):
-    staged off the loop, *Package Diff: NAME* (package-review), C-c C-c
-    moves the staged copy in and applies it, C-c C-k / q deletes it;
+    staged off the loop with the new libraries it needs (`stage-dependencies`,
+    shown with their versions and files), *Package Diff: NAME*
+    (package-review), C-c C-c
+    moves the staged copies in and applies it — after a y/n when its signing
+    key changed, which holds even an unreviewed update — C-c C-k / q deletes them;
     an open review's staging dir is kept in `:packages/reviews`.
     M-x package-update-all (U in *Packages*): ONE job stages every
     outdated package side by side (`.staging-<id>-<name>`), ONE

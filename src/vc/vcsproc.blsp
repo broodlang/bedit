@@ -47,9 +47,32 @@ synchronous form headless runs use. Nothing here knows any one VCS's arguments o
 (def *vcs-journal-max* 64) ; entries kept; the oldest go first, never one still running
 
 (def *vcs-op-timeout-ms* 120000)
-;; A network operation gets two minutes before the task is killed and reported as a timeout.
-;; Unbounded is how a wedged pull against an unreachable host becomes a slot that never frees
+;; A network READ gets two minutes before the task is killed and reported as a timeout.
+;; Unbounded is how a wedged fetch against an unreachable host becomes a slot that never frees
 ;; and a command that is "already running" until restart.
+
+;; ---- what kind of operation: which ones a clock may stop ------------------------
+;; Every operation has a CLASS, which says what killing it at a deadline would cost:
+;;   :network-read  talks to the other side and changes nothing here (a fetch, ls-remote) —
+;;                  stopped after `*vcs-op-timeout-ms*`, since all it loses is an answer;
+;;   :writes        writes this checkout (a stage, a checkout, a clone) — runs until done;
+;;   :hooks         runs the repository's hooks or a long sequence of steps (a commit with a
+;;                  pre-commit hook running the tests, a rebase, a pull, a push with its
+;;                  pre-push hook) — runs until done.
+;; Killed at two minutes, a commit whose hook was still testing, or a rebase half applied, is
+;; worse than one that runs long: so only a read is timed, and C-g stops the rest.
+
+(defn vcs-op-timeout (class)
+  "How long an operation of `class` may run before its task is stopped: `*vcs-op-timeout-ms*`
+for a `:network-read`, nil — until it is done, or C-g — for anything that writes.
+
+    (vc/vcsproc/vcs-op-timeout :hooks)   ;=> nil"
+  (when (= class :network-read) *vcs-op-timeout-ms*))
+
+(defn- vcs-no-result (class)
+  ;; why an operation of `class` left no result: its deadline, or its task failing
+  (let (timeout (vcs-op-timeout class))
+    (if timeout (str "no result (timed out after " timeout "ms)") "no result (its task failed)")))
 
 ;; ---- an entry ----------------------------------------------------------------
 ;; `{:id :program :args :exit :ms :output :running? :at}` — one map, built in ONE place, so
@@ -260,7 +283,7 @@ clears, `q` quits."
 (defcommand cmd-vcs-quit
   (m key)
   "Bury the version-control buffer (q)."
-  (cmd-kill-buffer m key))
+  (cmd-kill-current-buffer m key))
 
 ;; ---- reporting -----------------------------------------------------------------
 
@@ -335,8 +358,8 @@ or commit killed mid-write leaves `index.lock` behind)."
 ;; check-allow: `runner` and `then` are opaque caller-supplied functions; the declaration
 ;; is the contract (ADR-341's `:trusted`).
 (check-allow :trusted
-  (sig vcs-launch (model string string string seqable fn any &optional any -> model))
-  (defn vcs-launch (m program verb root args runner then &optional (ordered? true))
+  (sig vcs-launch (model string string string seqable fn any &optional any any -> model))
+  (defn vcs-launch (m program verb root args runner then &optional (ordered? true) (class nil))
     "Run `program args` in `root` OFF the loop — `(runner root args)` in a task, returning
 `{:exit :stdout :stderr}` — and report when it lands, then run `then`, a
 `(model result) -> model` (nil for nothing more).
@@ -350,7 +373,10 @@ must not race the discard for `index.lock`, so the pull starts when the commands
 have landed and one pressed while it runs waits for it. One that only talks to the other
 side (a push, a fetch) is not ordered: it starts at once and staging, reading and
 committing go on beside it — a slow push must not hold `s` for two minutes. Headless runs
-it synchronously, because there is no loop to hand the reply to."
+it synchronously, because there is no loop to hand the reply to.
+
+`class` ([[vcs-op-timeout]]) says whether a deadline may stop it; by default an ordered
+operation `:writes` and any other is a `:network-read`. C-g stops one in flight."
     (let (op {:kind :launch
               :program program
               :verb verb
@@ -358,7 +384,8 @@ it synchronously, because there is no loop to hand the reply to."
               :args args
               :runner runner
               :then then
-              :ordered? ordered?})
+              :ordered? ordered?
+              :class (or class (if ordered? :writes :network-read))})
       (cond
         (vcs-op-running m) (message m (str (vcs-op-running m) " is already running"))
         (vcs-launch-waiting m) (message m (str (vcs-launch-waiting m) " is already waiting to run"))
@@ -380,7 +407,7 @@ question you have when one is slow. `vcs-apply-op` completes it; the entry times
   (let (runner (:runner op)
         root (:root op)
         args (:args op)
-        job (task (fn () (runner root args)) {:timeout *vcs-op-timeout-ms*})
+        job (task (fn () (runner root args)) {:timeout (vcs-op-timeout (:class op))})
         [logged id] (vcs-journal-add m (vcs-entry (:program op) args)))
     (assoc logged
       :vcs-op-proc job
@@ -389,11 +416,17 @@ question you have when one is slow. `vcs-apply-op` completes it; the entry times
          :root root
          :then (:then op)
          :entry id
+         :class (:class op)
          :ordered? (:ordered? op true)})))
 
 (check-allow :trusted
-  ;; a command that can outlast a frame — network, so a task
-  (register-task-reply :vcs-op-proc 'vc/vcsproc/vcs-apply-op nil "vc")
+  ;; a command that can outlast a frame — network, hooks, a rebase — so a task, and one C-g
+  ;; stops: only a network read has a deadline ([[vcs-op-timeout]])
+  (register-task-reply :vcs-op-proc
+    'vc/vcsproc/vcs-apply-op
+    nil
+    "vc"
+    {:cancel-on-quit? true :on-quit 'vc/vcsproc/vcs-op-quit})
   (sig vcs-apply-op (model any -> model))
   (defn vcs-apply-op (m r)
     "Fold a finished `vcs-launch`: report the outcome and run its `then`. A nil `r` is the
@@ -404,15 +437,22 @@ empty output, which is what a bare exit-code check would do with it."
           m1 (vcs-journal-finish (dissoc m :vcs-op :vcs-op-proc) (:entry op) r))
       (if (nil? r)
         (vcs-queue-next (message m1
-                          (str verb
-                            " failed: no result (timed out after "
-                            *vcs-op-timeout-ms*
-                            "ms)"
-                            (vcs-journal-note))))
+                          (str verb " failed: " (vcs-no-result (:class op)) (vcs-journal-note))))
         (let (m2 (vcs-report-cmd m1 verb r))
           (if (nil? (:then op))
             (vcs-queue-next m2)
             (vcs-continue m2 (:root op) (:then op) r)))))))
+
+(defn vcs-op-quit (m)
+  "C-g's clean-up for an operation in flight (`:on-quit`; its task, and the command with it,
+already stopped): its journal entry closed as cancelled, the operation forgotten, a note for
+C-g to say which, and the working-tree queue let go on."
+  (let (op (:vcs-op m)
+        verb (or (:verb op) "command")
+        closed (vcs-journal-finish (dissoc m :vcs-op :vcs-op-proc)
+                 (:entry op)
+                 {:exit nil :stdout "" :stderr "cancelled (C-g)"}))
+    (vcs-queue-next (ed-quit-note closed (str verb " stopped")))))
 
 ;; ---- working-tree commands: off the loop, one at a time, in order ------------------
 ;; A stage, an unstage, a discard, a claim: a command that changes this checkout and stays
@@ -558,7 +598,8 @@ in flight takes no turn — staging and reading go on beside it."
           :launch (vcs-start-launch waiting op)
           (let (runner (:runner op)
                 args (:args op)
-                job (task (fn () (runner root args)) {:timeout *vcs-op-timeout-ms*})
+                ;; a working-tree command writes this checkout: no deadline
+                job (task (fn () (runner root args)) {:timeout (vcs-op-timeout :writes)})
                 [logged id] (vcs-journal-add waiting (vcs-entry (:program op) args)))
             (assoc logged
               :vcs-queue-proc job
@@ -593,11 +634,7 @@ task having errored or timed out, said plainly."
     (let (op (:vcs-queue-op m)
           m1 (vcs-journal-finish (dissoc m :vcs-queue-op :vcs-queue-proc) (:entry op) r))
       (if (nil? r)
-        (vcs-queue-next (message m1
-                          (str "failed: no result (timed out after "
-                            *vcs-op-timeout-ms*
-                            "ms)"
-                            (vcs-journal-note))))
+        (vcs-queue-next (message m1 (str "failed: " (vcs-no-result :writes) (vcs-journal-note))))
         (vcs-continue m1 (:root op) (:then op) r)))))
 
 (check-allow :trusted

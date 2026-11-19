@@ -14,7 +14,6 @@ reverse: the two things find-file needs from above it — the hex view of a bina
   (:use editor/buffer) ; make-buffer / point motion
   (:use editor/buffer-file) ; find-file-buffer / save-buffer
   (:use editor/pane) ; pane-leaf-paths / pane-split / pane-update-path — where a buffer goes
-  (:use filename) ; expand / as-input / shadow-end — a typed path read the Emacs way
   (:use mincomplete) ; ed-complete-name / ed-complete-path / path candidates — the prompts
   (:use projects) ; project-root / file-display-name / remember-* — the project a file is in
   (:use sidecar) ; a saved file's sidecar removed
@@ -34,7 +33,12 @@ switch-buffer, recentf, describe-function, and bookmark-jump. `recent` (a most-r
 list, default none) floats its entries to the top on empty input via the shared
 `projects/float-recent` — the same recency any completion opts into (see `recent-commands`) —
 and, once something is typed, ranks them above equally good matches (`projects/history-boost`,
-the fuzzy ranking's `:boost`)."
+the fuzzy ranking's `:boost`).
+
+What RET takes is the minibuffer's one policy (`minibuffer/mb-answer`): free text by default
+(a new buffer's name), or one of `names` when the spec is given `:require-match true` (M-x,
+C-h f) or `:exact` (never a fuzzy match for it: a package to delete). Under each the typed text
+wins when it is a name itself, and M-RET takes it over the list."
   {:edit (ed-mb-edit prompt "")
    :on-complete on-complete
    :complete-fn (fn (t) (ed-complete-name t names))
@@ -743,6 +747,20 @@ pane; if the buffer is already visible, that pane is refreshed in place (press-t
   (let (index (ed-buffer-index-by-name m name))
     (if (nil? index) (message m (str "no buffer named " name)) (ed-select m index))))
 
+(defn ed-ensure-named (m name &optional (buffer nil))
+  "`m` with a buffer named `name` in the pool — appended, not shown: `buffer` when given, else an
+empty one in fundamental mode, as Emacs's `get-buffer-create` makes — unless one is there
+already. It carries a `:dir` like every buffer that enters the pool ([[ed-inherit-dir]])."
+  (if (nil? (ed-buffer-index-by-name m name))
+    (assoc m
+      :buffers (conj (:buffers m) (ed-inherit-dir m (ed-stamp (or buffer (make-buffer "" name))))))
+    m))
+
+(defn ed-switch-to-buffer (m name)
+  "Show the buffer named `name` in the selected pane, making an empty one when there is none —
+Emacs's `switch-to-buffer`, what `C-x b NEW RET` does."
+  (ed-switch-to-named (ed-ensure-named m name) name))
+
 ;; ---- *scratch* (Emacs's: always there, a place to type that is no file) -------------
 (def scratch-name "*scratch*")
 
@@ -753,12 +771,8 @@ pane; if the buffer is already visible, that pane is refreshed in place (press-t
 (defn ed-ensure-scratch (m &optional (scratch nil))
   "`m` with a `*scratch*` in the pool — appended, not shown: `scratch` when given (a buffer
 prepared as the startup one is), else an empty one ([[ed-scratch-buffer]]) — unless one is
-there already, as Emacs keeps one whatever the editor started on. It carries a `:dir` like
-every buffer that enters the pool ([[ed-inherit-dir]])."
-  (if (nil? (ed-buffer-index-by-name m scratch-name))
-    (assoc m
-      :buffers (conj (:buffers m) (ed-inherit-dir m (ed-stamp (or scratch (ed-scratch-buffer))))))
-    m))
+there already, as Emacs keeps one whatever the editor started on ([[ed-ensure-named]])."
+  (ed-ensure-named m scratch-name (or scratch (ed-scratch-buffer))))
 
 ;; ---- next-error: jump to a source location from a results buffer -------------
 ;; The Emacs `next-error` / `display-buffer-other-window` discipline, as ONE
@@ -797,6 +811,12 @@ already showing the buffer is reused, the current one included."
     ;; point moves; the loop's own scroll-clamp on the (now-selected) source pane
     ;; brings it on screen this tick, as with `cmd-goto-definition`.
     (if (nil? line) m1 (ed-apply m1 (fn (buffer) (ed-goto-line buffer line))))))
+
+(defn ed-display-index (m index)
+  "Show pool buffer `index` in a pane OTHER than the selected one — reusing one already
+showing it, else beside the selected one — and leave the selection where it is: Emacs's
+`display-buffer` (C-x 4 C-o), the half of [[ed-pop-to-index]] that does not move you."
+  (assoc m :layout (:layout (ed-place-other (:layout m) index (buffer-name (ed-buf-at m index))))))
 
 (defn ed-pop-to-buffer-named (m name line)
   "[[ed-pop-to-index]] for a buffer named rather than a file — what a location `{:buffer …}`
@@ -910,7 +930,7 @@ that project's recent list (the \"last access\" the project-file sort orders by)
 
 (defn ed-find-file (m path)
   "Open `path`: switch to it if already open, read it if it exists, else start a
-fresh buffer backed by it (so Ctrl-S creates it). A relative or `~` path is resolved
+fresh buffer backed by it (so C-x C-s creates it). A relative or `~` path is resolved
 to absolute (`path-absolute`) first, so the prompt can stay short/relative while the
 buffer's `:file`, dedup, and project-relative name all key off a canonical path. A
 directory and a binary go to their presenters (`model/register-presenter`: dired, as Emacs's
@@ -1005,7 +1025,7 @@ notice, and the rest follow it."
           (str (if (nil? text) (str "new file " path) (str "opened " path))
             (if coding (str " as " (charset/label coding)) "")
             ;; a tree-sitter language with no grammar loaded says how to get one
-            (missing-note (ed-current-buf opened))
+            (grammarfallback/missing-note (ed-current-buf opened))
             (string/join (map (:notes visit) (fn (note) (str " — " note))) "")))))
     (catch e (message m (str "open failed: " (error-message e))))))
 
@@ -1217,38 +1237,70 @@ that was not one (`filecoding`). A buffer with unsaved text is the caller's to r
 one it has)."
     (ed-handler-call (ed-buffer-handler (ed-buf-at m i)) :revert m m i coding)))
 
+;; check-allow: `then` is the caller's continuation, run on the model the kill leaves
+(check-allow :trusted
+  (sig ed-kill-buffer-asking (model int &optional any -> model))
+  (defn ed-kill-buffer-asking (m index &optional (then nil))
+    "Kill pool buffer `index` as C-x k does — asking first when it holds unsaved changes to a
+file, or when its feature says work would stop with it (`model/register-kill-query`: an agent
+mid-turn) — and run `then` (a `(model) -> model`) on the model once it is gone: never when the
+kill is refused or declined, so what follows a kill (C-x 4 0's pane deletion) waits for the
+answer. Refuses to kill `*Messages*`; if it would leave no editable buffer, opens a fresh
+`*scratch*`. Panes showing the killed buffer are re-pointed; indices above it shift down, and
+everything kept by pool index follows (`model/ed-drop-slot`). The buffer's mode layers get
+their `:on-close` (via std's `close-context`) — the async-cleanup seam where a mode kills a
+worker it owns — and any companion buffers that mode asked to take with it
+(`layers/request-close`) are killed as well."
+    (let (buf (ed-buf-at m index)
+          reasons (ed-kill-reasons m buf)
+          kill (fn (mm)
+                 (let (killed (ed-kill-at mm index true)) (if (nil? then) killed (then killed)))))
+      (cond
+        (= (buffer-name buf) "*Messages*") (message m "cannot kill *Messages*")
+        ;; work that would stop with it (`model/register-kill-query`): ask, as Emacs does for a
+        ;; buffer with a live process
+        (not (empty? reasons))
+          (ed-confirm m
+            (str (buffer-name buf) ": " (string/join reasons "; ") " — kill it anyway? (y or n)")
+            kill
+            "kill canceled")
+        ;; unsaved changes to a file: ask, as Emacs does, rather than drop them silently
+        (and (buffer-modified? buf) (buffer-file buf))
+          (ed-confirm m
+            (str "Buffer " (buffer-name buf) " modified; kill anyway? (y or n)")
+            kill
+            "kill canceled")
+        else (kill m)))))
+
+(defcommand cmd-kill-current-buffer
+  (m key)
+  "Kill the current buffer without asking which (Emacs's `kill-current-buffer`) — still asking
+first when it holds unsaved changes or work that would stop ([[ed-kill-buffer-asking]]). What
+`q` in a special buffer runs."
+  (ed-kill-buffer-asking m (ed-current-index m)))
+
 (defcommand cmd-kill-buffer
   (m key)
-  "Kill the current buffer (C-x k) — asking first when it holds unsaved changes to a file, or
-when its feature says work would stop with it (`model/register-kill-query`: an agent mid-turn).
-Refuses to kill `*Messages*`; if it would leave
-no editable buffer, opens a fresh `*scratch*`. Panes showing the killed buffer are
-re-pointed; indices above it shift down, and everything kept by pool index follows
-(`model/ed-drop-slot`). The buffer's mode layers get their `:on-close` (via std's
-`close-context`) — the async-cleanup seam where a mode kills a worker it owns — and any
-companion buffers that mode asked to take with it (`layers/request-close`) are killed as well."
-  (let (buf (ed-current-buf m)
-        reasons (ed-kill-reasons m buf))
-    (cond
-      (= (buffer-name buf) "*Messages*") (message m "cannot kill *Messages*")
-      ;; work that would stop with it (`model/register-kill-query`): ask, as Emacs does for a
-      ;; buffer with a live process
-      (not (empty? reasons))
-        (ed-confirm m
-          (str (buffer-name buf) ": " (string/join reasons "; ") " — kill it anyway? (y or n)")
-          (fn (mm) (ed-kill-at mm (ed-current-index mm) true))
-          "kill canceled")
-      ;; unsaved changes to a file: ask, as Emacs does, rather than drop them silently
-      (and (buffer-modified? buf) (buffer-file buf))
-        (ed-confirm m
-          (str "Buffer " (buffer-name buf) " modified; kill anyway? (y or n)")
-          (fn (mm) (ed-kill-at mm (ed-current-index mm) true))
-          "kill canceled")
-      else (ed-kill-at m (ed-current-index m) true))))
+  "Kill a buffer (C-x k, Emacs's `kill-buffer`): prompt for its name, the current buffer the
+default — `C-x k RET` kills it — then kill it as [[ed-kill-buffer-asking]] does, asking first
+when it holds unsaved changes."
+  (let (current (buffer-name (ed-current-buf m))
+        names (cons current (seq/reject (ed-recent-buffers m) (fn (name) (= name current)))))
+    (assoc m
+      :minibuffer
+        (assoc (ed-name-prompt (str "Kill buffer (default " current "): ")
+                 names
+                 (fn (prompted typed)
+                   (let (index (ed-buffer-index-by-name prompted
+                                 (if (string/blank? typed) current typed)))
+                     (if (nil? index)
+                       (message prompted (str "no buffer named " typed))
+                       (ed-kill-buffer-asking prompted index)))))
+          :require-match true))))
 
 ;; a guest may run these (src/guest.blsp)
 (interactive/declare-trait :guest
-  '(pool/cmd-kill-buffer))
+  '(pool/cmd-kill-buffer pool/cmd-kill-current-buffer))
 
 ;; ---- a file that moved under the editor --------------------------------------------------
 
@@ -1283,7 +1335,7 @@ stays when the name's mode did not change."
   (let (auto (fn (file) (editor/layers/buffer-type-for (assoc (dissoc buffer :type) :file file))))
     (if (= (auto old-file) (auto (buffer-file buffer)))
       buffer
-      (ed-grammar-fallback (editor/layers/init-buffer-layers (dissoc buffer :type))))))
+      (grammarfallback/ed-grammar-fallback (editor/layers/init-buffer-layers (dissoc buffer :type))))))
 
 (defn ed-visit-moved (m index path &optional (plain? false))
   "`m` with pool buffer `index` visiting `path`, its file just moved or written there: named for

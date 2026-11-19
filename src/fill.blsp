@@ -267,14 +267,48 @@ lands on after a refill ([[body-index]]) — or the text's end when it has fewer
                           (walk (rest lines) (inc i) (+ seen here)))))))
       (walk (line-starts text) 0 0))))
 
+;; ---- two spaces after a sentence (Emacs's `sentence-end-double-space`) -----------------------
+;; `string/fill` collapses every run of whitespace to one space. With the setting on (Emacs's
+;; default), a sentence end — `.` `?` `!`, any closing quotes or brackets after it — followed by
+;; two spaces or the end of its line is a sentence end, and keeps two spaces after it when the
+;; fill joins it to the next word. It rides through the fill as a one-column mark glued to the
+;; sentence's last word (the second space's width, so a line's room counts it), turned back
+;; into the space afterwards — or dropped where the line breaks after it.
+
+(def- sentence-mark (string/int->char 57344)) ; a private-use character, one column wide
+(def- sentence-end "([.?!][\"')\\]}]*)")
+
+(defn- mark-sentence-ends (text)
+  ;; `text` with a `sentence-mark` after each sentence end two spaces or a line end follow
+  (regex/replace (regex/replace text (str sentence-end "[ \t]*\n") (str "${1}" sentence-mark "\n"))
+    (str sentence-end " {2,}")
+    (str "${1}" sentence-mark " ")))
+
+(defn- unmark-sentence-ends (text)
+  ;; the filled `text` with each `sentence-mark` back to the second space, or gone at a line end
+  (string/replace (string/replace (string/replace text (str sentence-mark " ") "  ")
+                    (str sentence-mark "\n")
+                    "\n")
+    sentence-mark ""))
+
+(defn fill-text (text width prefixes double-space?)
+  "`text` filled to `width` columns with `prefixes` (`string/fill`), two spaces kept after a
+sentence end when `double-space?` (Emacs's `sentence-end-double-space`).
+
+    (fill/fill-text \"One.  Two three.\\nFour.\" 70 [\"\" \"\"] true)   ;=> \"One.  Two three.  Four.\"
+    (fill/fill-text \"One.  Two.\" 70 [\"\" \"\"] false)   ;=> \"One. Two.\""
+  (if double-space?
+    (unmark-sentence-ends (string/fill (mark-sentence-ends text) width prefixes))
+    (string/fill text width prefixes)))
+
 ;; ---- M-q ------------------------------------------------------------------------------------
 
-(defn fill-paragraph (buf &optional (string-extent nil) (width nil))
+(defn fill-paragraph (buf &optional (string-extent nil) (width nil) (double-space? true))
   "`buf` with the paragraph around point refilled to its fill column (or `width` columns),
 point kept on the same character — the buffer M-q makes. `string-extent` is the string point is
 in, when it is one that can span lines (`stringstate/ed-string-extent`): in code, what is
 filled — its text alone, from its opener to its closer, the code on either side left where it
-is."
+is. Two spaces after a sentence end are kept unless `double-space?` is false ([[fill-text]])."
   (let (bounds (paragraph-lines buf string-extent))
     (if (nil? bounds)
       buf
@@ -292,7 +326,7 @@ is."
             [first-prefix rest-prefix] (paragraph-prefixes buf lines-text)
             prefixes [(if (> start line-start) pad first-prefix) rest-prefix]
             text (str (if (> start line-start) pad "") (text/slice rope start end))
-            filled-padded (string/fill text (or width (fill-column buf)) prefixes)
+            filled-padded (fill-text text (or width (fill-column buf)) prefixes double-space?)
             cut (if (> start line-start) (count pad) 0)
             filled (string/substring filled-padded cut (count filled-padded))
             point (buffer-point buf)
@@ -305,6 +339,37 @@ is."
               (landing start (offset-of-body-index filled-padded prefixes kept) cut)
               (buffer-point buf))))))))
 
+(defn fill-region (buf lo hi &optional (double-space? true))
+  "`buf` with every paragraph that has a line in `[lo hi]` refilled (`fill-paragraph`), as ONE
+undo step, point at `lo` — Emacs's `fill-region`. In code only the comments are filled, as M-q
+fills them."
+  (let (end-marker [:fill-region :end])
+    (undo-group (buffer-marker-set buf end-marker hi true)
+      (fn (b)
+        (letrec (walk (fn (filling line)
+                        (let (rope (buffer-rope filling)
+                              last-line (text/char->line rope
+                                          (or (buffer-marker filling end-marker) (count rope))))
+                          (if (or (> line last-line) (>= line (text/line-count rope)))
+                            filling
+                            (let (at-line (goto-char filling (text/line->char rope line))
+                                  bounds (paragraph-lines at-line))
+                              (if (or (nil? bounds) (> (first bounds) last-line))
+                                (walk filling (inc line))
+                                (let (filled (fill-paragraph at-line nil nil double-space?)
+                                      ;; the paragraph again, as filled: the next starts after it
+                                      refilled (paragraph-lines (goto-char filled
+                                                                  (text/line->char (buffer-rope filled)
+                                                                    (first bounds)))))
+                                  (walk filled
+                                    (inc (if refilled (second refilled) (second bounds)))))))))))
+          (goto-char (buffer-marker-delete (walk b (text/char->line (buffer-rope b) lo)) end-marker)
+            lo))))))
+
+(defn- double-space? (m)
+  ;; the `:sentence-end-double-space` setting: on unless the user turned it off
+  (not (= false (:sentence-end-double-space m))))
+
 (defcommand cmd-fill-paragraph
   (m key)
   "Re-wrap the paragraph around point to the buffer's fill column (M-q;
@@ -313,9 +378,20 @@ is."
 the paragraph's continuation prefix (`string/fill-prefixes`): a list item hangs under its
 text, a comment keeps its marker. Only the comment, quote or list item point is in is filled
 (`paragraph-lines`) — in code, only a string that can span lines — and point stays on the
-character it was on."
-  (let ([m2 extent] (stringstate/ed-string-extent m))
-    (ed-edit m2 (fn (b) (fill-paragraph b extent)))))
+character it was on. With an active region, every paragraph in it is filled, as Emacs's M-q
+does ([[cmd-fill-region]])."
+  (if (region/ed-active-region m)
+    (cmd-fill-region m key)
+    (let ([m2 extent] (stringstate/ed-string-extent m))
+      (ed-edit m2 (fn (b) (fill-paragraph b extent nil (double-space? m2)))))))
+
+(defcommand cmd-fill-region
+  (m key)
+  "Fill every paragraph in the region (M-x fill-region, Emacs's), one undo step; the region
+goes."
+  (region/ed-with-region m
+    (buffer-region-bounds (ed-current-buf m))
+    (fn ([lo hi]) (ed-edit m (fn (b) (clear-mark (fill-region b lo hi (double-space? m))))))))
 
 (def *unfilled-width* 1000000000)
 ;; the column an unfilled paragraph is filled to: wider than any line
@@ -326,7 +402,7 @@ character it was on."
 with no column to break at, so the same paragraph M-q would fill — a comment, a list item, a
 string in code — is joined, its prefix kept on the one line. One undoable edit."
   (let ([m2 extent] (stringstate/ed-string-extent m))
-    (ed-edit m2 (fn (b) (fill-paragraph b extent *unfilled-width*)))))
+    (ed-edit m2 (fn (b) (fill-paragraph b extent *unfilled-width* (double-space? m2))))))
 
 ;; ---- auto-fill ----------------------------------------------------------------------
 
@@ -477,3 +553,11 @@ paragraph's prefix. The `:auto-fill` setting turns it on per mode."
         on (not (auto-fill? m buf)))
     (message (ed-set-buf m (assoc buf :auto-fill on))
       (if on "Auto fill mode enabled in this buffer" "Auto fill mode disabled in this buffer"))))
+
+;; the init file's setting for this feature, declared beside it (config's registry)
+(settings/define config/*settings*
+  :sentence-end-double-space {:default true
+   :type 'bool
+   :model-key :sentence-end-double-space
+   :commented? true
+   :doc "M-q keeps two spaces after a sentence end (Emacs sentence-end-double-space)"})

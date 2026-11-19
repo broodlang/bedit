@@ -501,3 +501,56 @@ and its answer."
       (let (landed (ga-settle typed))
         (is (nil? (:read-char landed)))
         (assert= (:opened-on landed) "message")))))
+
+;; ---- which operations a deadline may stop --------------------------------------------
+
+(describe "git off the loop: only a network read is timed"
+  (test "the classes: a fetch is a read, a commit or a rebase runs hooks, a stage writes"
+    (assert= (git-op-class ["fetch" "origin"]) :network-read)
+    (assert= (git-op-class ["-c" "core.editor=true" "commit" "-m" "x"]) :hooks)
+    (assert= (git-op-class ["rebase" "-i" "HEAD~2"]) :hooks)
+    (assert= (git-op-class ["push" "origin" "main"]) :hooks)
+    (assert= (git-op-class ["add" "--" "a.txt"]) :writes)
+    (assert= (vcs-op-timeout :network-read) *vcs-op-timeout-ms*)
+    (is (nil? (vcs-op-timeout :hooks)))
+    (is (nil? (vcs-op-timeout :writes))))
+  (test "a commit is launched with no deadline, a fetch with one"
+    (let (dir (ga-repo "op-class" {"a.txt" "a\n"})
+          m0 (ga-status dir)
+          committing (ga-live (fn ()
+                                (git-launch-op m0 "commit" ["commit" "--allow-empty" "-m" "x"])))
+          _ (ga-settle committing)
+          fetching (ga-live (fn () (git-launch-op m0 "fetch" ["fetch" "nowhere"]))))
+      (assert= (map/get-in committing [:vcs-op :class]) :hooks)
+      (assert= (map/get-in fetching [:vcs-op :class]) :network-read)
+      (ga-settle fetching)))
+  (test "a rebase through git-do is an operation C-g can stop, not a queued command"
+    (let (dir (ga-repo "rebase-op" {"a.txt" "a\n"})
+          m0 (ga-status dir)
+          pressed (ga-live (fn () (git-do m0 "rebase" ["rebase" "HEAD"]))))
+      (is (not (nil? (:vcs-op-proc pressed))))
+      (is (nil? (:vcs-queue-proc pressed)))
+      (ga-settle pressed)))
+  (test "C-g stops an operation in flight, closes its entry, and lets the queue go on"
+    (let (dir (ga-repo "op-quit" {"a.txt" "a\n"})
+          _ (file/spit (path/join dir "a.txt") "a2\n")
+          m0 (ga-status dir)
+          running (ga-live (fn ()
+                             (vcs-launch m0
+                               "git"
+                               "slow hook"
+                               dir
+                               ["commit"]
+                               (fn (_dir _args) (os/cmd "sleep" ["30"]))
+                               nil
+                               true
+                               :hooks)))
+          queued (ga-live (fn () (git-do running "stage" ["add" "--" "a.txt"])))
+          quit (ga-live (fn () (ed-update queued :ctrl-g 80 24))))
+      (is (nil? (:vcs-op-proc quit)))
+      (is (nil? (:vcs-op quit)))
+      (is (not (:running? (first (vcs-journal quit)))))
+      ;; the stage waiting behind it started
+      (is (not (nil? (:vcs-queue-proc quit))))
+      (ga-settle quit)
+      (assert= (ga-out dir ["diff" "--cached" "--name-only"]) "a.txt"))))

@@ -24,10 +24,6 @@ self-editing editor)."
   (:use model) ; message, the minibuffer field, current-buffer accessors, the registries
   (:use spancache)
   (:use panes) ; ed-selected-text-rows — the split-aware viewport
-  (:use textops) ; replace, tabify, align, case: their keys reach them by symbol
-  (:use window-commands) ; C-x 2 3 0 1 o, windmove, C-x 4: their keys reach them by symbol
-  (:use lifecycle) ; the file and quit commands: their keys reach them by symbol
-  (:use project-commands) ; likewise C-x p
   (:use interactive) ; current-prefix-arg / prefix-consuming? — the prefix-arg seam
   (:use editor/keymap) ; keymap-run — the std chord dispatcher's running half
   (:use editor/ui) ; overlay-route — the shared modal-overlay dispatch fallthrough
@@ -135,18 +131,33 @@ command (`keymaps/ed-vim-command-mode?`)."
   "True if `input` is a single decimal-digit key."
   (and (string? input) (= (count input) 1) (>= (index-of "0123456789" input) 0)))
 
+(defn- ed-argument-key (input)
+  "`input` as the plain key it adds to a prefix argument: `M-4` / `C-4` / `C-M-4` read as `4`
+and `M--` / `C--` as `-` (Emacs's `digit-argument` keys), any other key as itself."
+  (let (text (when (keyword? input) (->string input))
+        plain (when text
+                (match text
+                  ((str "ctrl-meta-" rest) rest)
+                  ((str "alt-" rest) rest)
+                  ((str "ctrl-" rest) rest)
+                  (_ nil))))
+    (if (or (ed-digit? plain) (= plain "-")) plain input)))
+
 (defn- ed-prefix-continues? (m input)
   "Keys that extend a pending prefix arg rather than ending it: another C-u, a digit, or
 a `-` **only while the argument is still raw** (no digits yet) — `C-u -` negates, but a
-`-` after digits terminates the arg and self-inserts (so `C-u 5 -` types five dashes)."
-  (or (= input :ctrl-u)
-    (ed-digit? input)
-    (and (= input "-") (map/get-in m [:prefix-arg :raw]))))
+`-` after digits terminates the arg and self-inserts (so `C-u 5 -` types five dashes). A
+digit or `-` with Meta or Ctrl held (`M-4 M-2`) continues it as the plain key does."
+  (let (key (ed-argument-key input))
+    (or (= key :ctrl-u)
+      (ed-digit? key)
+      (and (= key "-") (map/get-in m [:prefix-arg :raw])))))
 
-(defn- ed-prefix-read (m input)
+(defn- ed-prefix-read (m key)
   "Fold a C-u / digit / `-` into the active prefix-arg accumulator. The count carries its
 sign, so digits after a negative seed (from `M--`/`C--` or `-`) accumulate negative."
   (let (pa (:prefix-arg m)
+        input (ed-argument-key key)
         c (:count pa)
         neg (< c 0))
     (cond
@@ -165,6 +176,19 @@ sign, so digits after a negative seed (from `M--`/`C--` or `-`) accumulate negat
                 :prefix-arg
                   (if (:raw pa) {:count sd :raw false} {:count (+ (* 10 c) sd) :raw false}))))))))
 
+(defn- ed-one-undo-step (start m)
+  "`m` ready for the next repetition of a prefix-repeated command begun at `start`: when an
+earlier repetition already edited the same buffer, the next edit is armed to amalgamate into
+its undo step (`amalgamate-undo`), so `C-u 3 M-d` undoes as one step, as Emacs's does."
+  (let (buf (ed-current-buf m)
+        splices (when (= (ed-current-index m) (ed-current-index start))
+                  (buffer-splices-since (ed-current-buf start) buf)))
+    ;; nil from a different buffer, `()` when the text is the same: nothing to join
+    (if (and (= (ed-current-index m) (ed-current-index start))
+          (or (nil? splices) (not (empty? splices))))
+      (ed-set-buf m (amalgamate-undo buf))
+      m)))
+
 (sig ed-run-arg (model any any any int -> model))
 ;; check-allow: the inverse command is resolved late (`reflect/eval`); its result is the model
 ;; every command answers
@@ -173,9 +197,11 @@ sign, so digits after a negative seed (from `M--`/`C--` or `-`) accumulate negat
     "Run `this-cmd` under numeric prefix argument `n`: `|n|` repetitions, swapping to its
 registered inverse command when `n` is negative (Emacs negative-argument — `C-- C-f`
 goes backward). Repeats thread `:last-command`/`:this-command` so consecutive kills /
-inserts coalesce. With no registered inverse a negative arg just repeats `|n|` times."
+inserts coalesce, and undo as one step ([[ed-one-undo-step]]). With no registered inverse a
+negative arg just repeats `|n|` times."
     (let (an (math/abs n)
-          inv (command-inverse this-cmd))
+          inv (command-inverse this-cmd)
+          prepare (fn (mm i) (if (= i 0) mm (ed-one-undo-step m1 mm))))
       (if (and (< n 0) inv)
         ;; the inverse runs directly, not through the keymap, so it does what a keymap step
         ;; does around a command itself: the echo starts clean, and the chord that led here
@@ -185,13 +211,15 @@ inserts coalesce. With no registered inverse a negative arg just repeats `|n|` t
                  m1
                  (fn (mm i)
                    ((reflect/eval inv)
-                     (assoc mm
+                     (assoc (prepare mm i)
                        :last-command (if (= i 0) (:last-command mm) inv)
                        :this-command inv
                        :echo "")
                      input)))
           :pending nil)
-        (fold (range an) m1 (fn (mm i) (step (if (= i 0) mm (assoc mm :last-command this-cmd)))))))))
+        (fold (range an)
+          m1
+          (fn (mm i) (step (if (= i 0) mm (assoc (prepare mm i) :last-command this-cmd)))))))))
 
 (defn- ed-amalgamate-undo? (this last)
   "Whether `this` command's edit amalgamates into the previous undo group: it repeats
@@ -299,6 +327,8 @@ the chord resolves (a command ran) or aborts."
   (let (chord (append (or (:chord m) []) [input]))
     (cond
       (map? binding) (assoc result :echo (str (ed-keys-label chord) "-") :chord chord)
+      ;; C-g after a prefix (C-x C-g, C-x r C-g) quits the chord, as Emacs's does
+      (and (nil? binding) (:pending m) (= input :ctrl-g)) (ed-ding (assoc result :chord []) "Quit")
       ;; a chord bound to nothing fails, as Emacs's `undefined` rings the bell (and ends a
       ;; keyboard macro)
       (and (nil? binding) (:pending m))
@@ -568,8 +598,9 @@ long line follows point). A press and each of its OS auto-repeats take this same
 the mode `:post-key` guards see every one: holding backspace in a tutorial box stops at its
 ╭─ border instead of eating into the read-only prose. The guards run before the scroll
 clamp, so a veto's restored point is what the viewport follows."
-  (let (guarded (ed-clamp-restriction (ed-adjust-restriction m
-                                        (ed-post-key-guards m (ed-route-transient m input) input))))
+  (let (guarded (ed-clamp-restriction (ed-sync-restrictions (ed-post-key-guards m
+                                                              (ed-route-transient m input)
+                                                              input))))
     (ed-scroll-horizontal (ed-scroll guarded textrows) textcols)))
 
 ;; ---- named timers (ADR-102): firing the model's declared `:timers` -------------
@@ -1035,10 +1066,12 @@ slow (a full-file diff; a fontify) — but debounced on the idle beat (`ed-timer
 (defn ed-update (m input cols rows)
   "ui-run update: fold one input into the next model. While a keyboard macro runs
 (`:macro-run`) the input is [[ed-macro-input]]'s — the run's ticker, C-g, or typeahead that
-waits for it; otherwise [[ed-update-direct]]."
-  (if (nil? (:macro-run m))
-    (ed-update-direct m input cols rows)
-    (ed-macro-input m input cols rows)))
+waits for it; otherwise [[ed-update-direct]]. A guest's session drops, unfolded, what a
+guest could have sent that is not a key (`guest/ed-guest-admits?`)."
+  (cond
+    (and (:guest-session m) (not (ed-guest-admits? m input))) m
+    (nil? (:macro-run m)) (ed-update-direct m input cols rows)
+    else (ed-macro-input m input cols rows)))
 
 (sig ed-update-direct (model any int int -> model))
 (defn- ed-update-direct (m input cols rows)

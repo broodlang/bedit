@@ -7,7 +7,6 @@
   (:use interactive) ; defcommand
   (:use model)
   (:use panes)
-  (:use projects :only [recent-files])
   (:use scroll) ; a split reads a buffer's long-lines policy
   (:use display-settings :only [*long-lines-policies* ed-long-lines-says]) ; a toggle's words
   (:use pool))
@@ -88,8 +87,11 @@ display must be free to use it."
 
 (defcommand cmd-delete-pane
   (m key)
-  "Delete the selected pane; its sibling fills the space (C-x 0)."
-  (assoc m :layout (ed-unside-lone-pane (pane-delete (:layout m)))))
+  "Delete the selected pane; its sibling fills the space (C-x 0). The only pane is never
+deleted, and saying so is Emacs's `Attempt to delete minibuffer or sole ordinary window`."
+  (if (<= (count (pane-leaf-paths (:layout m))) 1)
+    (ed-ding m "Attempt to delete minibuffer or sole ordinary window")
+    (assoc m :layout (ed-unside-lone-pane (pane-delete (:layout m))))))
 
 (defcommand cmd-delete-other-panes
   (m key)
@@ -323,26 +325,161 @@ another pane and selecting it."
           (fn (prompted name)
             (if (string/blank? name)
               (message prompted "no buffer")
-              (ed-pop-to-buffer-named prompted name 1)))))))
+              (ed-pop-to-buffer-named (ed-ensure-named prompted name) name 1)))))))
 
 (defcommand cmd-kill-buffer-and-window
   (m key)
   "Kill this buffer and delete its pane (C-x 4 0) — the pair you almost always want after
 reading something in a `C-x 4` pane, and two keystrokes with a buffer switch between them
-when done as `C-x k` `C-x 0`."
-  (let (doomed (buffer-name (ed-current-buf m))
-        killed (cmd-kill-buffer m key)
-        ;; Did the kill actually happen? Ask whether the buffer is GONE — not whether we
-        ;; landed somewhere that looks like a refusal. `cmd-kill-buffer` can decline
-        ;; (*Messages*) or ask first (unsaved changes, leaving a `:read-char` prompt), and
-        ;; deleting the pane under either would answer a question not yet put to the
-        ;; reader. Proxies for this are wrong in the obvious case: *Messages* is also
-        ;; exactly where a SUCCESSFUL kill often leaves you, so "are we in *Messages*"
-        ;; refused every ordinary kill.
-        gone? (nil? (ed-buffer-index-by-name killed doomed)))
-    (if (and gone? (nil? (:read-char killed)))
-      (assoc killed :layout (pane-delete (:layout killed)))
-      killed)))
+when done as `C-x k` `C-x 0`. The pane goes only once the buffer has: the deletion is the
+kill's continuation ([[pool/ed-kill-buffer-asking]]), so a modified buffer's `y` takes both and
+an `n` (or *Messages*, which is never killed) leaves both."
+  (ed-kill-buffer-asking m
+    (ed-current-index m)
+    (fn (killed) (assoc killed :layout (pane-delete (:layout killed))))))
+
+;; ---- window sizes (C-x ^, C-x {, C-x }, C-x +, C-x -) ---------------------------
+;; A pane's size is the `:ratio` of the splits above it (`editor/pane`). Growing the selected
+;; pane moves the ratio of the nearest split of that direction above it — its side's share
+;; up — by the cells asked for over the cells the split lays out (the last frame's layout;
+;; a headless model counts an 80×24 frame).
+
+(defn- ed-node-at (tree path)
+  ;; the pane-tree node at `path` (a list of `:a` / `:b` steps)
+  (fold path tree (fn (node step) (get node step))))
+
+(defn- ed-split-extent (m path dir)
+  ;; the cells the split at `path` lays out along `dir`, from the last frame's layout
+  (let (layout (ed-layout-now m)
+        divider (when layout (seq/find (:dividers layout) (fn (each) (= (:path each) path))))
+        [_ _ width height] (if divider (:split-rect divider) [0 0 80 24]))
+    (math/max 2 (if (= dir :col) width height))))
+
+(defn ed-resize-selected (m dir cells)
+  "`m` with the selected pane grown by `cells` along `dir` (`:row` taller, `:col` wider; fewer
+when negative): the nearest split of that direction above it re-proportioned
+(`editor/pane/pane-set-ratio`, which keeps both sides on screen). Says so, failing, when no
+split of that direction holds the pane."
+  (let (tree (:layout m)
+        path (vec (pane-selected-path tree))
+        split (seq/find (reverse (range (count path)))
+                (fn (depth) (= dir (:dir (ed-node-at tree (take path depth)))))))
+    (if (nil? split)
+      (ed-ding m
+        (if (= dir :col) "No window to the side to resize" "No window above or below to resize"))
+      (let (split-path (take path split)
+            side (nth path split)
+            ratio (:ratio (ed-node-at tree split-path))
+            delta (/ cells (ed-split-extent m split-path dir)))
+        (assoc m
+          :layout (pane-set-ratio tree split-path (if (= side :a) (+ ratio delta) (- ratio delta))))))))
+
+(defcommand cmd-enlarge-window
+  (m key)
+  "Make the selected window taller by a line, or by the prefix argument's lines (C-x ^);
+then `^` again, `{` / `}` for its width (repeat-mode)."
+  (ed-resize-selected m :row (or (current-prefix-arg m) 1)))
+
+(defcommand cmd-shrink-window
+  (m key)
+  "Make the selected window shorter by a line, or by the prefix argument's lines (M-x
+shrink-window)."
+  (ed-resize-selected m :row (- (or (current-prefix-arg m) 1))))
+
+(defcommand cmd-enlarge-window-horizontally
+  (m key)
+  "Make the selected window wider by a column, or by the prefix argument's columns (C-x })."
+  (ed-resize-selected m :col (or (current-prefix-arg m) 1)))
+
+(defcommand cmd-shrink-window-horizontally
+  (m key)
+  "Make the selected window narrower by a column, or by the prefix argument's columns (C-x {)."
+  (ed-resize-selected m :col (- (or (current-prefix-arg m) 1))))
+
+(defn- ed-span (node dir)
+  ;; how many panes `node` lines up along `dir`: a split of that direction adds its sides'
+  (if (and (:split node) (= (:dir node) dir))
+    (+ (ed-span (:a node) dir) (ed-span (:b node) dir))
+    1))
+
+(defn- ed-balanced (node)
+  ;; `node` with every split's ratio set so the panes along each direction share it evenly
+  (if (not (:split node))
+    node
+    (let (a-span (ed-span (:a node) (:dir node))
+          b-span (ed-span (:b node) (:dir node)))
+      (assoc node
+        :ratio (/ a-span (+ a-span b-span))
+        :a (ed-balanced (:a node))
+        :b (ed-balanced (:b node))))))
+
+(defcommand cmd-balance-windows
+  (m key)
+  "Make every window the same size along each direction (C-x +, Emacs's `balance-windows`)."
+  (assoc m :layout (ed-balanced (:layout m))))
+
+(defcommand cmd-shrink-window-if-larger-than-buffer
+  (m key)
+  "Shrink the selected window to fit its buffer's lines, when it is taller than they need
+(C-x -)."
+  (let (layout (ed-layout-now m)
+        here (when layout (seq/find (:panes layout) (fn (pane) (:selected pane))))
+        rows (when here (nth (:rect here) 3))
+        ;; the buffer's lines and the mode line
+        wanted (inc (buffer-line-count (ed-current-buf m))))
+    (if (or (nil? rows) (<= rows wanted))
+      m
+      (ed-resize-selected m :row (- wanted rows)))))
+
+(register-prefix-consuming 'window-commands/cmd-enlarge-window)
+(register-prefix-consuming 'window-commands/cmd-shrink-window)
+(register-prefix-consuming 'window-commands/cmd-enlarge-window-horizontally)
+(register-prefix-consuming 'window-commands/cmd-shrink-window-horizontally)
+
+;; Emacs 28's resize-window-repeat-map: after C-x ^, `^` / `{` / `}` keep resizing
+(interactive/declare-repeat-map {"^" 'window-commands/cmd-enlarge-window
+                                 "}" 'window-commands/cmd-enlarge-window-horizontally
+                                 "{" 'window-commands/cmd-shrink-window-horizontally}
+  '(window-commands/cmd-enlarge-window window-commands/cmd-enlarge-window-horizontally
+     window-commands/cmd-shrink-window-horizontally))
+
+;; ---- the other window, from this one (C-M-v, C-x 4 C-o) -----------------------------
+
+(defn- ed-in-other-pane (m command key)
+  ;; `command` run in the next pane, the selection then back in this one
+  (if (<= (count (pane-leaf-paths (:layout m))) 1)
+    (ed-ding m "There is no other window")
+    (let (here (pane-selected-path (:layout m))
+          ran (command (assoc m :layout (ed-other-pane-by (:layout m) 1)) key))
+      (assoc ran :layout (pane-select-path (:layout ran) here)))))
+
+(defcommand cmd-scroll-other-window
+  (m key)
+  "Scroll the next window forward a screenful (C-M-v, Emacs's `scroll-other-window`), staying
+in this one — the documentation beside the code, read without leaving it."
+  (ed-in-other-pane m motion/cmd-scroll-up key))
+
+(defcommand cmd-scroll-other-window-down
+  (m key)
+  "Scroll the next window back a screenful (C-M-S-v), staying in this one."
+  (ed-in-other-pane m motion/cmd-scroll-down key))
+
+(defcommand cmd-display-buffer
+  (m key)
+  "Show a buffer in another window without selecting it (C-x 4 C-o, Emacs's
+`display-buffer`): a prompt over the open buffers, the one shown beside this one."
+  (let (current (buffer-name (ed-current-buf m))
+        names (seq/reject (ed-recent-buffers m) (fn (name) (= name current))))
+    (assoc m
+      :minibuffer
+        (assoc (ed-name-prompt "Display buffer: "
+                 names
+                 (fn (prompted name)
+                   (let (index (ed-buffer-index-by-name prompted name))
+                     (if (nil? index)
+                       (message prompted (str "no buffer named " name))
+                       (ed-display-index prompted index)))))
+          :require-match true))))
 
 ;; a guest may run these (src/guest.blsp)
 (interactive/declare-trait :guest

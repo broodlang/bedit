@@ -151,10 +151,18 @@ arrives ANSI-decoded (procstream), its colours beside it as `spans`, which *Run*
 dropped."
   (= generation (map/get-in m [:apprun :gen])))
 
+(defn- apprun-writes? (m generation)
+  "Whether a line of run `generation` goes into *Run*: the run is current and *Run* is still
+there. A line for a *Run* killed meanwhile is not written back into being; that run is
+stopped instead."
+  (and (apprun-current? m generation)
+    (or (not (nil? (ed-buffer-index-by-name m *run-buffer*)))
+      (do (when (:apprun-proc m) (send (:apprun-proc m) [:shutdown])) false))))
+
 (impl UiEvent
   apprun-output-event
   (ui-event-fold (event m textrows columns rows)
-    (if (apprun-current? m (apprun-output-event-gen event))
+    (if (apprun-writes? m (apprun-output-event-gen event))
       (ed-append-follow m
         *run-buffer*
         (str (apprun-output-event-text event) "\n")
@@ -166,7 +174,7 @@ dropped."
 (impl UiEvent
   apprun-spy-event
   (ui-event-fold (event m textrows columns rows)
-    (if (apprun-current? m (apprun-spy-event-gen event))
+    (if (apprun-writes? m (apprun-spy-event-gen event))
       (ed-append-follow m
         *run-buffer*
         (str "~ "
@@ -202,15 +210,18 @@ dropped."
   ;; drop :apprun so the statusbar chip disappears with the app. A stale-gen done
   ;; (an old run exiting just as a new one starts) must NOT clear the new run's chip.
   (ui-event-fold (event m textrows columns rows)
-    (if (not (apprun-current? m (apprun-done-event-gen event)))
-      m
-      (let (code (apprun-done-event-code event))
-        (message (ed-append-follow (dissoc m :apprun)
-                   *run-buffer*
-                   (str "\n[app exited " (if (nil? code) "killed" code) "]\n")
-                   columns
-                   rows)
-          (str "app exited " (if (nil? code) "(killed)" code)))))))
+    (cond
+      (not (apprun-current? m (apprun-done-event-gen event))) m
+      ;; *Run* was killed: the run is over all the same, and nothing writes it back
+      (nil? (ed-buffer-index-by-name m *run-buffer*)) (dissoc m :apprun)
+      else
+        (let (code (apprun-done-event-code event))
+          (message (ed-append-follow (dissoc m :apprun)
+                     *run-buffer*
+                     (str "\n[app exited " (if (nil? code) "killed" code) "]\n")
+                     columns
+                     rows)
+            (str "app exited " (if (nil? code) "(killed)" code)))))))
 
 ;; ---- the commands -------------------------------------------------------------------
 
@@ -237,20 +248,29 @@ Phoenix app wanting `mix phx.server` — is one edit there rather than a branch 
   (let (run-breaks (or (:run-breaks m) '()))
     (file/spit *apprun-script-path* (apprun-script-source run-breaks))
     (let (root (or (:project-root m) (file/cwd))
-          proc (spawn :apprun (processes/stream-loop (apprun-handlers)))
+          ;; this loop's own worker, kept on its model (`processes/loop-worker`)
+          proc (processes/loop-worker (:apprun-proc m)
+                 (fn () (spawn (processes/stream-loop (apprun-handlers)))))
           generation (inc (or (map/get-in m [:apprun :gen]) 0)))
       (send proc
         [:run "nest" ["run" *apprun-script-path*] {:cwd root} generation (ed-loop-address)])
-      (ed-show-named-aside (message (assoc m :apprun {:root root :gen generation})
-                             (str "running project in "
-                               root
-                               "…"
-                               (if (empty? run-breaks)
-                                 ""
-                                 (str " (" (count run-breaks) " breakpoint(s) traced)"))))
+      (ed-update-named (ed-show-named-aside (message (assoc m
+                                                       :apprun {:root root :gen generation}
+                                                       :apprun-proc proc)
+                                              (str "running project in "
+                                                root
+                                                "…"
+                                                (if (empty? run-breaks)
+                                                  ""
+                                                  (str " ("
+                                                    (count run-breaks)
+                                                    " breakpoint(s) traced)"))))
+                         *run-buffer*
+                         (str "-*- run: " root " -*-\n\n")
+                         :run-log)
         *run-buffer*
-        (str "-*- run: " root " -*-\n\n")
-        :run-log))))
+        ;; the worker, for *Run*'s `:on-close` to stop
+        (fn (buffer) (assoc buffer :apprun-proc proc))))))
 
 (defcommand cmd-run-show
   (m key)
@@ -265,7 +285,7 @@ fires the done event, so the chip clears and *Run* gets its footer."
   (if (nil? (:apprun m))
     (message m "nothing is running")
     (do
-      (send :apprun [:shutdown])
+      (when (:apprun-proc m) (send (:apprun-proc m) [:shutdown]))
       m)))
 
 (defn apprun-live (m)
@@ -274,6 +294,18 @@ when its exit folds in."
   (if-let (run (:apprun m)) [(str *run-buffer* ": the app in " (path/basename (:root run)))] []))
 
 (register-exit-query :apprun 'apprun/apprun-live)
+
+(defn apprun-kill-query (m buffer)
+  "C-x k on *Run* while the app runs asks first (`model/register-kill-query`), as Emacs asks of
+a buffer with a live process."
+  (when (and (= (editor/buffer/buffer-name buffer) *run-buffer*) (:apprun m))
+    "it has a running process"))
+
+(register-kill-query :apprun 'apprun/apprun-kill-query)
+
+(defn apprun-on-close (buffer)
+  "The *Run* layer's `:on-close`: the buffer is going, so is the app it shows."
+  (do (when (:apprun-proc buffer) (send (:apprun-proc buffer) [:shutdown])) buffer))
 
 ;; ---- the :run-log buffer type ---------------------------------------------------
 
@@ -303,7 +335,9 @@ line). Clickability is the pointer/hover the view draws from `:line-loc`."
    :writable :toggle
    :keymap apprun/run-log-keymap
    :fontify 'apprun/run-log-fontify
-   :commands (modes/layer-commands apprun/run-log-keymap)})
+   :commands (modes/layer-commands apprun/run-log-keymap)
+   ;; killing *Run* stops the app it shows (layers :on-close)
+   :hooks {:on-close '(apprun/apprun-on-close)}})
 
 (modes/register-special-type :run-log 'apprun/run-log-mode-layer 'results/location-jump-layer)
 

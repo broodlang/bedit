@@ -3,9 +3,11 @@
 root, and streams output to a `*compilation*` buffer. C-x ` / M-g n (cmd-next-error)
 parses error locations and jumps to each in turn; M-g p (cmd-previous-error) walks back.
 
-The compile worker process is named `:compile` (`spawn :compile …`) so it is
-idempotent across M-x compile invocations — a fresh spawn recycles the live process,
-and a dead one (e.g. after a crash) is replaced transparently."
+The compile worker is one process per loop, kept on the model (`:compile-proc`,
+`processes/loop-worker`) so M-x compile reuses it, a dead one (e.g. after a crash) is replaced
+transparently, and a second frame or a served session never takes over this one's build.
+C-c C-k in *compilation* kills the build (`kill-compilation`), `g` runs it again
+(`recompile`), and killing the buffer stops it."
   (:use modes :only []) ; register-special-type runs at load, after modes declares its kinds
   (:use scroll) ; ed-scroll / ed-max-top / ed-long-lines — keeping point on screen
   (:use minibuffer)
@@ -13,6 +15,7 @@ and a dead one (e.g. after a crash) is replaced transparently."
   (:use pool) ; ed-open-buffer / ed-select / ed-goto-line / ed-find-file
   (:use interactive) ; defcommand
   (:use processes :only [insert-output]) ; a stream's ANSI escapes decoded: its colours as text properties, its returns done
+  (:use editor/keymap :only [keymap-bind]) ; the *compilation* keymap
   (:use editor/buffer)) ; make-buffer / insert / end-of-buffer / buffer-text
 (def *compile-buf* "*compilation*")
 
@@ -44,14 +47,16 @@ it said. C-x ` walks the errors in what is kept."
 
 ;; ---- reset the compilation buffer at the start of a new compile -------------
 
-(defn- compile-reset (m cmd)
+(defn- compile-reset (m cmd proc)
   "Clear `*compilation*`, write a header, and select it in the current pane. Stamped
 `:compile-log`, which stacks the shared location-jump layer — RET or a click on a
-`file:line[:col]:` error row visits it (C-x ` still walks them in order)."
+`file:line[:col]:` error row visits it (C-x ` still walks them in order) — and carrying the
+worker `proc`, which its `:on-close` stops."
   (let (header (str "-*- compilation: " cmd " -*-\n\n")
         fresh (ed-stamp (assoc (make-buffer header *compile-buf* nil)
                           :read-only true
-                          :type :compile-log))
+                          :type :compile-log
+                          :compile-proc proc))
         index (ed-buffer-index-by-name m *compile-buf*))
     (if (nil? index)
       (ed-open-buffer m fresh)
@@ -59,8 +64,24 @@ it said. C-x ` walks the errors in what is kept."
         (ed-select (update m :buffers assoc index (assoc fresh :dir (:dir existing))) index)))))
 
 ;; *compilation* rows are GNU-style `file:line[:col]: message` — exactly the shared
-;; parser's shape, so the stock location-jump layer is the whole integration.
-(modes/register-special-type :compile-log 'results/location-jump-layer)
+;; parser's shape, so the stock location-jump layer is the whole integration; Emacs's
+;; compilation-mode keys and the stop-with-the-buffer hook come on top.
+(def compile-log-keymap
+  (-> {}
+    (keymap-bind [:ctrl-c :ctrl-k] 'compile/cmd-kill-compilation)
+    (keymap-bind ["g"] 'compile/cmd-recompile)))
+
+(def compile-log-mode-layer
+  {:name 'compilation
+   ;; C-x C-q flips the flag, as Emacs's compilation-mode (a special mode) does; g stays recompile
+   :writable :toggle
+   :keymap compile/compile-log-keymap
+   :commands (modes/layer-commands compile/compile-log-keymap)
+   ;; killing *compilation* stops the build it shows (layers :on-close)
+   :hooks {:on-close '(compile/compile-on-close)}})
+
+(modes/register-special-type :compile-log
+  'compile/compile-log-mode-layer 'results/location-jump-layer)
 
 ;; *Project Search* rows (C-x p g) are `file:line:text` from grep — the same shape.
 ;; …plus its own `:fontify`, which colours the file, the line number and the match the way
@@ -99,7 +120,17 @@ the current proc and immediately restart — re-running compile never queues."
         (do (send reply (compile-done-event code)) (compile-loop))
         (compile-recv proc reply out err)))
     ([:compile-run cmd root new-reply]
-      (do (processes/close-quietly proc "compile") (compile-start cmd root new-reply)))
+      (do
+        (processes/close-quietly proc "compile")
+        ;; a build another loop started replaces this one: its loop hears it was killed
+        (when (not (= new-reply reply)) (send reply (compile-done-event nil)))
+        (compile-start cmd root new-reply)))
+    ;; C-c C-k, or *compilation* killed: the build stops, said as killed (a nil code)
+    ([:compile-kill]
+      (do
+        (processes/close-quietly proc "compile")
+        (send reply (compile-done-event nil))
+        (compile-loop)))
     ([:shutdown] (do (processes/close-quietly proc "compile") :compile-stopped))))
 
 (defn- compile-start (cmd root reply)
@@ -117,6 +148,8 @@ stay hot.)"
   (proc/hibernate)
   (receive
     ([:compile-run cmd root reply] (compile-start cmd root reply))
+    ;; a kill for a build already over
+    ([:compile-kill] (compile-loop))
     ([:shutdown] :compile-stopped)))
 
 ;; ---- inbound async events (UiEvent records — see model.blsp) ----------------
@@ -127,9 +160,23 @@ stay hot.)"
 (defuievent compile-done-event (code) ed-ev-compile-done) ; the build's exit code
 
 (defn ed-ev-compile-output (m event textrows cols rows)
-  "Stream a chunk of compiler output into `*compilation*`, its ANSI colours as faces."
-  (ed-scroll (compile-append m (compile-output-event-text event) (compile-output-event-spans event))
-    textrows))
+  "Stream a chunk of compiler output into `*compilation*`, its ANSI colours as faces — unless
+the buffer was killed meanwhile: then the build is stopped, and nothing writes a fresh
+`*compilation*` into being."
+  (if (nil? (ed-buffer-index-by-name m *compile-buf*))
+    (do (compile-kill-worker m) m)
+    (ed-scroll (compile-append m
+                 (compile-output-event-text event)
+                 (compile-output-event-spans event))
+      textrows)))
+
+(defn- compile-kill-worker (m)
+  ;; stop the build this loop's worker runs, if there is one
+  (when (:compile-proc m) (send (:compile-proc m) [:compile-kill])))
+
+(defn compile-on-close (buffer)
+  "The *compilation* layer's `:on-close`: the buffer is going, so is the build it shows."
+  (do (when (:compile-proc buffer) (send (:compile-proc buffer) [:compile-kill])) buffer))
 
 (defn ed-ev-compile-done (m event textrows cols rows)
   "Compilation finished: append a summary, parse errors, store on model."
@@ -137,14 +184,18 @@ stay hot.)"
         index (ed-buffer-index-by-name m *compile-buf*)
         text (when index (buffer-text (nth (:buffers m) index)))
         errors (if text (compile-parse-errors text) '())
-        summary (if (= code 0)
-                  "\nCompilation finished\n"
-                  (str "\nCompilation exited with code " code "\n"))
-        finished (assoc (dissoc (compile-append m summary) :compile-running)
+        summary (cond
+                  (= code 0) "\nCompilation finished\n"
+                  (nil? code) "\nCompilation killed\n"
+                  else (str "\nCompilation exited with code " code "\n"))
+        ;; a buffer killed meanwhile is not written back into being
+        written (if (nil? index) m (compile-append m summary))
+        finished (assoc (dissoc written :compile-running)
                    :compile-errors errors
                    :compile-error-idx -1)
         echo (cond
                (= code 0) "Compilation finished"
+               (nil? code) "Compilation killed"
                (empty? errors) (str "Compilation failed (exit " code ")")
                else (str (count errors) " error(s)")))
     (ed-scroll (message finished echo) textrows)))
@@ -172,15 +223,43 @@ project that is not the file's, and its errors would name paths that are not the
         (:dir (ed-current-buf m))
         ") — a build runs on this one; run it from a local buffer"))
     (let (root (or directory (:project-root m) (file/cwd))
-          proc (spawn :compile (compile-loop))
-          reset (compile-reset m cmd))
+          proc (processes/loop-worker (:compile-proc m) (fn () (spawn (compile-loop))))
+          reset (compile-reset m cmd proc))
       (send proc [:compile-run cmd root (ed-loop-address)])
-      (message (assoc reset
-                 :compile-proc proc
-                 :compile-running cmd
-                 :compile-errors '()
-                 :compile-error-idx -1)
+      (message
+        (assoc reset
+          :compile-proc proc
+          :compile-running cmd
+          ;; what `g` runs again, and where C-x ` resolves the paths it prints
+          :compile-run-spec {:cmd cmd :directory root}
+          :compile-errors '()
+          :compile-error-idx -1)
         (str "Running: " cmd)))))
+
+(defn compile-kill-query (m buffer)
+  "C-x k on *compilation* while its build runs asks first (`model/register-kill-query`), as
+Emacs asks of a buffer with a live process."
+  (when (and (= (buffer-name buffer) *compile-buf*) (:compile-running m))
+    "it has a running process"))
+
+(register-kill-query :compile 'compile/compile-kill-query)
+
+(defcommand cmd-kill-compilation
+  (m key)
+  "Kill the running build (C-c C-k in *compilation*, Emacs's `kill-compilation`); its end is
+said in the buffer as killed."
+  (if (nil? (:compile-running m))
+    (message m "no compilation is running")
+    (do (compile-kill-worker m) (message m "killing compilation"))))
+
+(defcommand cmd-recompile
+  (m key)
+  "Run the last compilation again, in the directory it ran in (`g` in *compilation*, Emacs's
+`recompile`)."
+  (let (spec (:compile-run-spec m))
+    (if (nil? spec)
+      (message m "nothing to recompile")
+      (compile-run m (:cmd spec) (:directory spec)))))
 
 (defn compile-live (m)
   "The build C-x C-c would kill (`model/register-exit-query`): `:compile-running` is the
@@ -251,7 +330,11 @@ the cursor would run off the end."
     (if (or (nil? errors) (empty? errors) (< index 0) (>= index (count errors)))
       (message m (if (or (nil? errors) (empty? errors)) "No compilation errors" "No more errors"))
       (let (found (or (nth errors index) (error "no compilation error at the cursor")) ; in range by the test above
-            file (path/absolute (path/join (or (:project-root m) ".") (:file found)))
+            ;; against the directory the build ran in, which printed the paths
+            file (path/absolute (path/join (or (map/get-in m [:compile-run-spec :directory])
+                                             (:project-root m)
+                                             ".")
+                                  (:file found)))
             line (:line found)
             column (if (int? (:col found)) (:col found) 1))
         ;; the column too, when the tool gave one; a large file is read off the loop, point

@@ -54,7 +54,7 @@ built with the GUI backend. Building that lives in the Brood repo:
 
 # here:
 nest run                 # open the editor on a scratch buffer (native window)
-nest run -- notes.txt    # open (Ctrl-S saves) that file
+nest run -- notes.txt    # open that file (C-x C-s saves it)
 nest test                # run the test suite
 nest check               # advisory type/lint check
 ```
@@ -88,8 +88,11 @@ project-aware find-file, a per-project shell, `M-x compile` with next-error,
 and `C-x C-e` eval-in-buffer (run off the loop so a looping form can't freeze
 the editor). brood-mode adds live syntax highlighting, bracket matching, eldoc,
 sexp-aware indentation, paredit-style structural editing, and advisory
-type-check diagnostics; ruby- and elixir-mode get fontification and structural
-motion via tree-sitter. An LSP client wires completion, goto-definition,
+type-check diagnostics. Some 45 other kinds of file have a mode of their own:
+29 tree-sitter grammars (Rust, Go, Python, TypeScript, C and C++, Java, Ruby,
+Elixir, …) give fontification, indentation, folds and structural motion, and
+line lexers cover the other Lisps and the config formats (Makefile, INI,
+.gitignore, .env, …). An LSP client wires completion, goto-definition,
 references, hover, rename, and format into any server-backed buffer, colours
 names by the server's semantic tokens over the mode's own highlighting, and
 shows code lenses (opt-in, `:lsp-code-lens`) as a row above their line. Git is

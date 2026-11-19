@@ -74,6 +74,13 @@ buffer whose program has not exited — claude, htop, the project REPL."
 
 (register-exit-query :terminal 'shells/terminal/term-live)
 
+(defn term-kill-query (m buffer)
+  "C-x k on a terminal whose program still runs asks first (`model/register-kill-query`), as
+Emacs asks of a buffer with a running process."
+  (when (and (term-buffer? buffer) (live-program buffer)) "it has a running process"))
+
+(register-kill-query :terminal 'shells/terminal/term-kill-query)
+
 ;; check-allow: `:term-hstart` is the term buffer's own field, which the buffer record
 ;; does not declare; every write below keeps it an int
 (check-allow :trusted
@@ -163,24 +170,58 @@ palette ahead of it, and start a fresh eviction list."
   ;; the editor said whether a window shows this terminal: shown again, the screen goes at once
   (let (told (assoc state :shown shown?)) (if shown? (term-render told) told)))
 
+;; A program that never stops writing (`yes`, a build log scrolling) never lets the pipe go
+;; quiet, so the drain also renders once a frame is due: `*term-frame-ms*` after the drain
+;; began while a window shows the terminal (about thirty screens a second), a second after the
+;; last render while none does. The keys, a paste and a shutdown are served inside the drain
+;; too, so C-c reaches a program in the middle of a flood.
+(def *term-frame-ms* 33)
+
+(defn- term-key (state key)
+  ;; send `key` to the program, encoded for its terminal's modes
+  (term-write state (or (vt/key->bytes key (:vt state)) "")))
+
+(defn- term-stop (state)
+  ;; the buffer is going: close the child, and mark the worker stopped for its loop
+  (do (when (:proc state) (os/close (:proc state))) (assoc state :proc nil :stopped true)))
+
+(defn- term-frame-due (state began)
+  ;; when the drain that began at `began` must render, however busy the pipe
+  (if (= false (:shown state))
+    (+ (or (:rendered-at state) 0) *term-hidden-render-ms*)
+    (+ began *term-frame-ms*)))
+
 (defn- term-drain (state)
   "After a chunk: keep folding chunks that are already queued (a program writes a frame
-as several), then render once the pipe goes quiet — and while no window shows the terminal,
-no sooner than a second after the last render ([[term-quiet-ms]])."
-  (receive
-    ([:proc _p data] (term-drain (term-feed state data)))
-    ([:term-shown shown?] (let (told (term-shown state shown?)) (if shown? told (term-drain told))))
-    (after (math/round (term-quiet-ms state)) (term-render state))))
+as several), then render once the pipe goes quiet ([[term-quiet-ms]]) — or once a frame is
+due ([[term-frame-due]]), for a program whose output never pauses."
+  (term-drain-from state (os/now)))
+
+(defn- term-drain-from (state began)
+  (if (>= (os/now) (term-frame-due state began))
+    (term-render state)
+    (receive
+      ([:proc _p data] (term-drain-from (term-feed state data) began))
+      ([:term-key key] (do (term-key state key) (term-drain-from state began)))
+      ([:term-paste text]
+        (do (term-write state (vt/paste->bytes text (:vt state))) (term-drain-from state began)))
+      ([:term-shown shown?]
+        (let (told (term-shown state shown?)) (if shown? told (term-drain-from told began))))
+      ([:shutdown] (term-stop state))
+      (after (math/round (term-quiet-ms state)) (term-render state)))))
+
+(defn- term-next (state)
+  ;; carry on serving, unless a drain met the shutdown
+  (if (:stopped state) :term-stopped (term-loop state)))
 
 (defn- term-loop (state)
   (receive
-    ([:proc _p data] (term-loop (term-drain (term-feed state data))))
+    ([:proc _p data] (term-next (term-drain (term-feed state data))))
     ([:proc-closed _p code]
       (do
         (send (:reply state) (shells/terminal/term-exit-event (:buffer state) code))
         (term-loop (assoc state :proc nil))))
-    ([:term-key key]
-      (do (term-write state (or (vt/key->bytes key (:vt state)) "")) (term-loop state)))
+    ([:term-key key] (do (term-key state key) (term-loop state)))
     ([:term-paste text] (do (term-write state (vt/paste->bytes text (:vt state))) (term-loop state)))
     ([:term-shown shown?] (term-loop (term-shown state shown?)))
     ;; line mode: the whole line, as typed, ended the way RET ends it
@@ -197,7 +238,7 @@ no sooner than a second after the last render ([[term-quiet-ms]])."
           (check-allow :discarded-catch
             (try (os/resize-pty (:proc state) cols rows) (catch _ nil))))
         (term-loop (term-render (assoc state :vt (vt/resize (:vt state) cols rows))))))
-    ([:shutdown] (do (when (:proc state) (os/close (:proc state))) :term-stopped))))
+    ([:shutdown] (do (term-stop state) :term-stopped))))
 
 (defn- term-boot (state)
   "Start the child under a pty of the buffer's size — through the platform's shell
@@ -248,8 +289,10 @@ buffer's life. Returns its pid. Its screens go to the loop that opened it
     (spawn (term-boot state))))
 
 (defn term-on-close (buffer)
-  "The term layer's `:on-close`: the buffer is going, so is its worker and the program."
-  (do (when (:term-proc buffer) (send (:term-proc buffer) [:shutdown])) buffer))
+  "The term layer's `:on-close`: the buffer is going, so is its worker and the program. The
+worker is killed rather than asked: one busy with a flood, or stuck, would never read a
+shutdown, and the program under its pty dies with it (a child dies with its owner)."
+  (do (when (:term-proc buffer) (exit (:term-proc buffer) :kill)) buffer))
 
 ;; ---- the inbound events -------------------------------------------------------------
 

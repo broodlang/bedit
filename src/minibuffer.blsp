@@ -7,7 +7,7 @@ one, and a prompt can open once its candidates are ready. A prompt closes in ONE
 (`mb-close`), so what it owns is released exactly once."
   (:use completion) ; completion-rank — the fuzzy rank, capped to what it shows
   (:use clipboard :only [ed-kill-head]) ; C-y pastes the kill ring
-  (:use keyhelp :only [ed-cancel-key?])
+  (:use keyhelp :only [ed-cancel-key? ed-keys-label])
   (:use keymaps :only [*minibuffer-keys*])
   (:use model))
 
@@ -363,16 +363,25 @@ on the prompt itself (`mb-sel` -1), so the typed text is what is meant."
 
 (defn- mb-moved-sel (minibuffer size motion)
   "The row a list-motion key moves the selection to. From the prompt (-1), `C-p` goes to the
-last row as Vertico's does; everything else is `editor/list-motion`'s."
+last row as Vertico's does; from the first row it goes up to the prompt itself — the typed text
+selected — when that text may be taken ([[mb-input-acceptable?]]); everything else is
+`editor/list-motion`'s."
   (let (selected (mb-sel minibuffer))
-    (if (and (< selected 0) (= motion :previous))
-      (dec size)
-      (editor/list-motion/motion-index selected size motion))))
+    (cond
+      (and (< selected 0) (= motion :previous)) (dec size)
+      (and (= selected 0)
+        (= motion :previous)
+        (not (string/blank? (or (mb-text minibuffer) "")))
+        (mb-input-acceptable? minibuffer))
+        -1
+      else (editor/list-motion/motion-index selected size motion))))
 
 (defn- mb-select (m choices index)
   "Move the selection to row `index` of `choices`, firing `:on-preview` with the candidate
-there so a previewing prompt (imenu) tracks the highlight."
-  (mb-preview (map/assoc-in m [:minibuffer :sel] index) (nth choices index)))
+there so a previewing prompt (imenu) tracks the highlight. Row -1 is the prompt itself: nothing
+to preview."
+  (let (selected (map/assoc-in m [:minibuffer :sel] index))
+    (if (< index 0) selected (mb-preview selected (nth choices index)))))
 
 (defn- mb-yank (m)
   "C-y pastes the EDITOR's kill ring (and the OS clipboard) into the line — the minibuffer
@@ -429,6 +438,96 @@ last one, said."
       (let (set (mb-set-line m (nth defaults next)))
         (assoc set :minibuffer (assoc (:minibuffer set) :default-idx next))))))
 
+;; ---- what RET accepts: one policy for every prompt (Emacs's REQUIRE-MATCH) ----------------
+;; A prompt's `:require-match` says whether its answer must be one of its candidates — nil:
+;; free text (C-x b, C-x C-f: a new buffer, a new file); true: one of them (M-x, C-h f); `:exact`:
+;; one of them, typed or chosen, never a fuzzy match taken for it (a package to delete). Under
+;; every policy the TYPED text wins when it is an answer itself — `map` at C-h f is `map`, not
+;; the `mark-paragraph` the fuzzy ranking put first — and M-RET (Vertico's `vertico-exit-input`)
+;; takes the typed text over the list. A prompt may name its own `:valid?` (text -> bool) when
+;; its answers are more than its candidates (C-h f takes any qualified global).
+
+(defn mb-valid-answer? (minibuffer text)
+  "Whether the typed `text` is an answer to `minibuffer` as it stands: its `:valid?` says so, or
+it is one of the candidates exactly. A blank line is no answer.
+
+    (minibuffer/mb-valid-answer? {:rank-source [\"map\" \"mark-paragraph\"]} \"map\")   ;=> true
+    (minibuffer/mb-valid-answer? {:rank-source [\"map\"]} \"ma\")   ;=> false"
+  (let (valid? (:valid? minibuffer)
+        source (:rank-source minibuffer))
+    (cond
+      (or (not (string? text)) (string/blank? text)) false
+      valid? (= true (valid? text))
+      source (includes? source text)
+      else (includes? (mb-candidates minibuffer) text))))
+
+(defn- mb-input-acceptable? (minibuffer)
+  ;; whether the typed text may be taken as it is: any text on a free prompt, else an answer
+  (let (text (mb-text minibuffer))
+    (if (nil? (:require-match minibuffer))
+      (string? text)
+      (mb-valid-answer? minibuffer text))))
+
+(defn- mb-answer (minibuffer choices)
+  "`[answer refusal]`: what RET accepts from `minibuffer` — a row the reader moved to, else the
+typed text when it is an answer itself ([[mb-valid-answer?]]), else what its `:require-match`
+allows: the selection on the prompt (-1) takes the typed text on a free prompt; `:exact` takes
+nothing more; otherwise the top row, and with no rows the typed text on a free prompt.
+`refusal` says why nothing was taken."
+  (let (text (mb-text minibuffer)
+        policy (:require-match minibuffer)
+        explicit (:sel minibuffer)
+        chosen (mb-chosen minibuffer choices))
+    (cond
+      (and (int? explicit) (>= explicit 0) chosen) [chosen nil]
+      (mb-valid-answer? minibuffer text) [text nil]
+      (< (mb-sel minibuffer) 0) (if (nil? policy) [text nil] [nil "[No match]"])
+      (= policy :exact) [nil "[No match]"]
+      chosen [chosen nil]
+      (nil? policy) [text nil]
+      else [nil "[No match]"])))
+
+(defn- mb-refuse (m note)
+  ;; the prompt stays open, `note` shown beside it until the next key, as Emacs's `[No match]`
+  (map/assoc-in m [:minibuffer :message] note))
+
+(defn- mb-accept (m choices)
+  ;; RET: the answer [[mb-answer]] gives submitted, or the prompt kept open saying why not
+  (let ([answer refusal] (mb-answer (:minibuffer m) choices))
+    (if refusal (mb-refuse m refusal) (mb-submit m answer))))
+
+(defn- mb-accept-input (m)
+  ;; M-RET: the typed text submitted as it is — on a prompt that needs a match, only when it is one
+  (if (mb-input-acceptable? (:minibuffer m))
+    (mb-submit m (mb-text (:minibuffer m)))
+    (mb-refuse m "[No match]")))
+
+;; ---- a chord typed in the minibuffer ----------------------------------------------------
+;; A key the line editor does not take but the editor's keymap makes a prefix — C-x, M-g — starts
+;; a chord the minibuffer cannot run: `M-g g 12 C-x o` must not leave `12o` on the line. The whole
+;; chord is read and dropped, and the prompt says so, as Emacs's minibuffer refuses a command it
+;; cannot run there.
+
+(defn- mb-prefix-map (m minibuffer input)
+  ;; the editor's prefix map `input` enters, when the minibuffer has no use of its own for it
+  (when (and (not (string? input))
+          (not (contains? editor/lineedit/*keymap* input))
+          (not (:masked minibuffer)))
+    (let (binding (userkeys/ed-key-binding m input)) (when (map? binding) binding))))
+
+(defn- mb-chord-step (m chord input)
+  ;; the next key of a chord being dropped: C-g ends it, a prefix reads on, any other key ends
+  ;; it unrun, said
+  (let (keys (conj (:keys chord) input)
+        next (get (:map chord) input)
+        label (ed-keys-label keys)
+        ended (assoc m :minibuffer (dissoc (:minibuffer m) :chord)))
+    (cond
+      (= input :ctrl-g) (mb-refuse ended "Quit")
+      (map? next)
+        (mb-refuse (map/assoc-in m [:minibuffer :chord] {:keys keys :map next}) (str label "-"))
+      else (mb-refuse ended (str label " is not available in the minibuffer")))))
+
 (defn minibuffer-handle (m input)
   "Fold one key into the active minibuffer. C-y pastes the kill ring; Tab completes
 (`mb-complete`); Esc / C-g abort (firing `:on-abort`); a list-motion key (`editor/list-motion`
@@ -441,8 +540,12 @@ selected candidate, else the typed text; every other key drives lineedit's pure 
   (let (minibuffer (:minibuffer m)
         choices (mb-choices minibuffer)
         motion (editor/list-motion/motion-of input)
-        bound (get *minibuffer-keys* input))
+        bound (get *minibuffer-keys* input)
+        chord (:chord minibuffer)
+        prefix (when (and (nil? chord) (nil? bound)) (mb-prefix-map m minibuffer input)))
     (cond
+      ;; the rest of a chord the minibuffer cannot run, read and dropped
+      chord (mb-chord-step m chord input)
       ;; a masked read (a password) offers nothing to act on: an action would hand the typed
       ;; secret to a copy or an insert
       (and bound (:masked minibuffer)) m
@@ -460,9 +563,11 @@ selected candidate, else the typed text; every other key drives lineedit's pure 
       ;; long imenu could only be crossed a row at a time.
       (and motion (not (empty? choices)))
         (mb-select m choices (mb-moved-sel minibuffer (count choices) motion))
-      ;; Enter accepts the *selected candidate* (Vertico prompt with candidates), else the
-      ;; typed text (find-file, or no candidates).
-      (= input :enter)
-        (let (chosen (mb-chosen minibuffer choices))
-          (mb-submit m (if (nil? chosen) (mb-text minibuffer) chosen)))
+      ;; Enter accepts what the prompt's policy allows ([[mb-answer]]): a row moved to, the
+      ;; typed text when it is an answer, else the top row; M-RET the typed text
+      (= input :enter) (mb-accept m choices)
+      (= input :alt-enter) (mb-accept-input m)
+      prefix
+        (mb-refuse (assoc m :minibuffer (assoc minibuffer :chord {:keys [input] :map prefix}))
+          (str (ed-keys-label [input]) "-"))
       else (mb-line-edit m input))))

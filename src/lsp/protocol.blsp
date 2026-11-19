@@ -316,10 +316,21 @@ before children, in document order."
 ;; ---- pure protocol: location / hover / edit shapes (goto, refs, hover, rename) ----
 
 (defn lsp-uri->path (uri)
-  "The filesystem path of a `file:` `uri`, percent-decoded (the inverse of
-`lsp-path->uri`, std's `path/file-uri->`: `file:///c%3A/x` is `C:/x` on Windows, a
-host is a UNC path); `uri` unchanged if it is not a `file:` URI."
-  (or (path/file-uri-> uri) uri))
+  "The filesystem path of a `file:` `uri`, percent-decoded and normalized (the inverse of
+`lsp-path->uri`, std's `path/file-uri->`: `file:///c%3A/x` is `C:/x` on Windows, a host is
+a UNC path) — or nil for anything else. A server names files in what it sends, and a uri
+that is not a `file:` one names nothing this editor should open: passed through, a
+`/sudo::/etc/hosts` would be opened as root by the file handler that claims it.
+
+    (lsp/protocol/lsp-uri->path \"file:///p/src/../lib/a.rs\")   ;=> \"/p/lib/a.rs\"
+    (lsp/protocol/lsp-uri->path \"/sudo::/etc/hosts\")   ;=> nil"
+  (let (path (when (string? uri) (path/file-uri-> uri)))
+    (when (string? path)
+      (let (normal (path/normalize path))
+        ;; a UNC path keeps the two slashes that name its host
+        (if (and (string/starts-with? path "//") (not (string/starts-with? normal "//")))
+          (str "/" normal)
+          normal)))))
 
 (defn- lsp-location (location)
   "Normalise one LSP `Location` (`:uri`+`:range`) or `LocationLink` (`:targetUri`+
@@ -331,11 +342,13 @@ host is a UNC path); `uri` unchanged if it is not a `file:` URI."
 
 (defn lsp-locations (result)
   "The `textDocument/definition`/`references` `result` — a single `Location`/`LocationLink`,
-a vector of them, or nil — as a list of `{:path :line :char}`."
-  (cond
-    (nil? result) '()
-    (vector? result) (map result lsp-location)
-    else (list (lsp-location result))))
+a vector of them, or nil — as a list of `{:path :line :char}`, leaving out a location whose
+uri names no local file ([[lsp-uri->path]])."
+  (let (locations (cond
+                    (nil? result) '()
+                    (vector? result) (map result lsp-location)
+                    else (list (lsp-location result))))
+    (seq/filter locations (fn (location) (string? (:path location))))))
 
 (defn- lsp-marked (content)
   "The text of one hover content item — a plain string, or a `{:value …}` (MarkupContent /
@@ -523,37 +536,78 @@ in the picker would promise a fix that cannot happen."
 (`lsp-text-edit`)."
   (if (nil? result) '() (map result lsp-text-edit)))
 
+(defn- lsp-edit-key (uri)
+  "The key a workspace edit files `uri`'s edits under: its path ([[lsp-uri->path]]), or
+`[:not-a-file uri]` for a uri that names no local file — kept, not dropped, so the editor
+refuses the whole edit rather than applying part of it."
+  (let (text (if (keyword? uri) (->string uri) uri)
+        path (lsp-uri->path text))
+    (if (nil? path) [:not-a-file text] path)))
+
 (defn lsp-workspace-edit (result)
   "A `WorkspaceEdit` (`textDocument/rename` result) as `{path -> [edit …]}` (paths, not
-uris; edits normalised). Handles both the `:changes` map and the `:documentChanges` array
-shapes; `{}` when nil."
+uris; edits normalised; a uri that names no local file under `[:not-a-file uri]`). Handles
+both the `:changes` map and the `:documentChanges` array shapes; `{}` when nil."
   (if (nil? result)
     {}
     (let (changes (:changes result)
           document-changes (:documentChanges result))
       (cond
-        changes
         ;; JSON object keys parse to keywords, so a `:changes` uri arrives as `:file:///a`,
-        ;; not a string — coerce back with `->string` before stripping the scheme.
+        ;; not a string — [[lsp-edit-key]] coerces it back
+        changes
           (reduce (keys changes)
             {}
             (fn (by-path uri)
-              (assoc by-path
-                (lsp-uri->path (if (keyword? uri) (->string uri) uri))
-                  (map (get changes uri) lsp-text-edit))))
+              (assoc by-path (lsp-edit-key uri) (map (get changes uri) lsp-text-edit))))
+        ;; an entry with no `:textDocument` is a resource operation (create, rename, delete a
+        ;; file), which this client does not claim (`workspace.workspaceEdit.resourceOperations`)
+        ;; and does not carry out: it is passed over, and the text edits beside it applied
         document-changes
           (reduce document-changes
             {}
             (fn (by-path change)
-              (assoc by-path
-                (lsp-uri->path (map/get-in change [:textDocument :uri]))
-                  (map (:edits change) lsp-text-edit))))
+              (let (uri (when (map? change) (map/get-in change [:textDocument :uri])))
+                (if (nil? uri)
+                  by-path
+                  (assoc by-path (lsp-edit-key uri) (map (or (:edits change) []) lsp-text-edit))))))
         else {}))))
+
+(defn lsp-workspace-edit-versions (result)
+  "The document versions a `WorkspaceEdit`'s `:documentChanges` were computed against, as
+`{path -> version}` — only the entries that name one (a version of null means the file as it
+is on disk). What `workspace/applyEdit` checks against the versions this client sent
+([[lsp-stale-edit-paths]]).
+
+    (lsp/protocol/lsp-workspace-edit-versions {:documentChanges [{:textDocument {:uri \"file:///a\" :version 3} :edits []}]})   ;=> {\"/a\" 3}"
+  (reduce (or (:documentChanges (or result {})) [])
+    {}
+    (fn (versions change)
+      (let (document (or (when (map? change) (:textDocument change)) {})
+            path (lsp-uri->path (:uri document)))
+        (if (and path (int? (:version document)))
+          (assoc versions path (:version document))
+          versions)))))
+
+(defn lsp-stale-edit-paths (state result)
+  "The paths a `WorkspaceEdit` `result` names a version of that is not the version this
+connection (`state`) last sent for that document — the server computed those edits against
+text the editor has since changed, and their offsets would land in the wrong place.
+
+    (lsp/protocol/lsp-stale-edit-paths {:versions {\"file:///a\" 4}} {:documentChanges [{:textDocument {:uri \"file:///a\" :version 3} :edits []}]})   ;=> [\"/a\"]"
+  (let (sent (reduce (or (:versions state) {})
+               {}
+               (fn (by-path entry)
+                 (let ([uri version] entry
+                       path (lsp-uri->path uri))
+                   (if path (assoc by-path path version) by-path))))
+        named (lsp-workspace-edit-versions result))
+    (into [] (seq/filter (keys named) (fn (path) (not (= (get sent path) (get named path))))))))
 
 ;; ---- pure connection logic (state -> [state effects]) -----------------------
 ;; The connection process's state:
 ;;   {:proc handle :buf "" :next-id N :pending {jsonrpc-id -> [reply-to corr]}
-;;    :opened {uri -> true} :version V}
+;;    :opened {uri -> true} :version V :versions {uri -> the version last sent for it}}
 ;; `lsp-ingest` and `lsp-issue` are pure transitions returning the new
 ;; state plus the IO the shell must perform (messages to send / frames to write), so
 ;; correlation and framing are testable without a process or a server.
@@ -567,7 +621,10 @@ shapes; `{}` when nil."
 the server): `didClose` when it was opened, and the uri forgotten, so a later sync opens it
 afresh. `[state' frames]`."
   (if (get (:opened state) uri)
-    [(assoc state :opened (dissoc (:opened state) uri) :tokens (dissoc (or (:tokens state) {}) uri))
+    [(assoc state
+       :opened (dissoc (:opened state) uri)
+       :tokens (dissoc (or (:tokens state) {}) uri)
+       :versions (dissoc (or (:versions state) {}) uri))
       [(jsonrpc/notification "textDocument/didClose" {:textDocument {:uri uri}})]]
     [state []]))
 
@@ -677,18 +734,24 @@ document."
   (let (opened (:opened state)
         version (:version state)
         tokens (or (:tokens state) {})
+        versions (or (:versions state) {})
         changes (:changes sync))
     (cond
       (nil? changes)
         [(assoc state
            :version (+ version 1)
            :opened (assoc opened uri true)
-           :tokens (assoc tokens uri (:token sync)))
+           :tokens (assoc tokens uri (:token sync))
+           ;; what the server holds now carries this version: 1 for a didOpen
+           :versions (assoc versions uri (if (get opened uri) version 1)))
           [(if (get opened uri)
              (lsp-did-change uri version [{:text (:text sync)}])
              (lsp-did-open uri language (:text sync)))]]
       (and (get opened uri) (not (nil? (:base sync))) (= (get tokens uri) (:base sync)))
-        [(assoc state :version (+ version 1) :tokens (assoc tokens uri (:token sync)))
+        [(assoc state
+           :version (+ version 1)
+           :tokens (assoc tokens uri (:token sync))
+           :versions (assoc versions uri version))
           [(lsp-did-change uri version changes)]]
       else
         [(assoc state
@@ -1007,20 +1070,45 @@ it, instead of nowhere."
 
 (defn- lsp-apply-edit-request (state message)
   "A server's `workspace/applyEdit` — the edits a code action's command produced. Queued
-for the editor on `:edits`, and answered `{:applied true}` at once.
+for the editor on `:edits` as `{:edit :tokens}` — the edit, and for each file it touches that
+this connection has synced, the token naming the text the server holds (what the editor's
+guard compares with what it pushed: `lsp/commands/ed-lsp-edit-refusal`) — and answered
+`{:applied true}` at once.
 
-Answered optimistically, and that is a decision rather than a shortcut: the edit is
-applied by the editor loop, which is a different process, so the only honest alternative
-is to block this connection until it reports back — and a connection that stops reading
-its server mid-action is how a client deadlocks. The edits go through the same rope guard
-every other applied edit does, so `true` here means \"accepted\", which is what the field
-is worth in every client."
+Unless the edit is STALE: a document version it names that is not the one this connection
+last sent ([[lsp-stale-edit-paths]]) means the server computed it against text that has
+changed since — typing while the action ran — and its offsets would land in the wrong place.
+That edit is refused here, answered `{:applied false}` with the reason, and said in the echo
+area.
+
+Otherwise answered optimistically, and that is a decision rather than a shortcut: the edit
+is applied by the editor loop, which is a different process, so the only honest alternative
+is to block this connection until it reports back — and a connection that stops reading its
+server mid-action is how a client deadlocks. `true` here means \"accepted for the editor's
+guard\", which drops (and says so) an edit whose file changed after the last sync."
   (let (id (:id message)
         parameters (or (:params message) {})
-        edit (lsp-workspace-edit (:edit parameters)))
-    (assoc state
-      :edits (append (or (:edits state) []) [edit])
-      :outbox (append (or (:outbox state) []) [(jsonrpc/response id {:applied true})]))))
+        stale (lsp-stale-edit-paths state (:edit parameters))
+        outbox (or (:outbox state) []))
+    (if (empty? stale)
+      (let (edit (lsp-workspace-edit (:edit parameters))
+            tokens (reduce (or (:tokens state) {})
+                     {}
+                     (fn (by-path entry)
+                       (let ([uri token] entry
+                             path (lsp-uri->path uri))
+                         (if (contains? edit path) (assoc by-path path token) by-path)))))
+        (assoc state
+          :edits (append (or (:edits state) []) [{:edit edit :tokens tokens}])
+          :outbox (append outbox [(jsonrpc/response id {:applied true})])))
+      (let (reason (str "lsp: edit refused — "
+                     (string/join stale ", ")
+                     " changed while the server worked; run the action again"))
+        (lsp-queue-notice (assoc state
+                            :outbox
+                              (append outbox
+                                [(jsonrpc/response id {:applied false :failureReason reason})]))
+          {:channel :show :level "warning" :text reason :line (lsp-notice-line reason)})))))
 
 (defn- lsp-answer-server (state message)
   "Queue this client's answer to a request the SERVER made, on the state's `:outbox` (the
@@ -1075,6 +1163,43 @@ itself (`*lsp-retried-methods*`). A lookup the reader asked for gets its empty a
     (contains? *lsp-retried-methods* (lsp-request-method kind))))
 
 (defn lsp-dispatch (folded message)
+  "Fold step: route one decoded `message` ([[lsp-dispatch-message]]) — and survive it. A
+message whose shape the routing did not expect (a server's bug, a field of the wrong type)
+raised here, which took down the connection process and the server with it, and autostart
+would not start another. Now the raise is caught: the request's waiter, if it had one, is
+answered with the kind's empty result, a server's request is answered with an error (it is
+waiting on one), and the reason goes to the log."
+  (try
+    (lsp-dispatch-message folded message)
+    (catch failure (lsp-dispatch-failed folded message failure))))
+
+(defn- lsp-dispatch-failed (folded message failure)
+  ;; the fold after `message` raised `failure` in [[lsp-dispatch-message]]: what it owed, paid
+  (let ([state replies] folded
+        id (when (map? message) (:id message))
+        method (when (map? message) (:method message))
+        entry (when (and id (not method)) (map/get-in state [:pending id]))
+        text (str "lsp: a message from the server could not be handled ("
+               (or method (when id (str "reply " id)) "no id")
+               "): "
+               (error-message failure))
+        noted (lsp-queue-notice state
+                {:channel :log :level "error" :text text :line (lsp-notice-line text)}))
+    (cond
+      (and id method)
+        [(assoc noted
+           :outbox
+             (append (or (:outbox noted) [])
+               [(jsonrpc/error-response id (:internal-error jsonrpc/*error-codes*) text)]))
+          replies]
+      entry
+        (let ([reply-to correlation kind] entry
+              [tag empty] (lsp-shape kind nil))
+          [(assoc noted :pending (dissoc (:pending noted) id))
+            (cons [reply-to [tag correlation empty]] replies)])
+      else [noted replies])))
+
+(defn- lsp-dispatch-message (folded message)
   ;; Fold step: route one decoded message. Three kinds arrive on this stream and they are
   ;; told apart by which fields they carry:
   ;;

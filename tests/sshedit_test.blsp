@@ -42,6 +42,8 @@
     "  esac\n"
     "done\n"
     "host=$1; shift\n"
+    "# a stream whose receiving side never starts its receiver (`fail-stream`)\n"
+    "if [ -f \"$state/fail-stream\" ]; then case \"$*\" in '/bin/sh /'*) echo 'broken pipe' >&2; exit 1 ;; esac; fi\n"
     "if [ -f \"$state/hostkey\" ]; then echo 'Host key verification failed.' >&2; exit 255; fi\n"
     "if [ -f \"$state/down\" ]; then echo \"ssh: connect to host $host port 22: Connection refused\" >&2; exit 255; fi\n"
     "# a jump host wanting a password, reached in batch mode through the ProxyCommand: its last word\n"
@@ -265,7 +267,17 @@ run here, `dir/home` their HOME), the editor's config and the control sockets un
                (fn (a) (string/starts-with? a "ProxyCommand="))))))
   (test "a too long state folder puts the sockets in the runtime dir"
     (binding (*config-base* (str "/tmp/" (string/repeat "x" 90)))
-      (is (not (string/starts-with? (tramp/ssh-transport/control-dir) "/tmp/xxxx"))))))
+      (is (not (string/starts-with? (tramp/ssh-transport/control-dir) "/tmp/xxxx")))))
+  ;; ssh reads ControlPath itself: a blank ends the option and a `%` starts an escape, and
+  ;; `ssh -G` refuses the whole run — every operation on every host failed
+  (test "a state folder with a blank or a % puts the sockets where ssh reads the path whole"
+    (doseq (base ["/tmp/my config" "/tmp/100%done"])
+      (binding (*config-base* base)
+        (let (dir (tramp/ssh-transport/control-dir)
+              option (seq/find (tramp/ssh-transport/ssh-options {:host "h"})
+                       (fn (a) (string/starts-with? a "ControlPath="))))
+          (is (not (string/starts-with? dir base)))
+          (is (regex/matches? option "ControlPath=[A-Za-z0-9/._+@-]+/%C")))))))
 
 (describe "the remote scripts"
   (test "quote every argument for POSIX sh"
@@ -382,6 +394,18 @@ run here, `dir/home` their HOME), the editor's config and the control sockets un
                            (is (includes? names "sub/"))
                            (is (includes? names "a.txt"))
                            (assert= (tramp/ssh-transport/cached-listing spec) names)))))))))
+  (test "a listing refused for want of a password is not kept: it is asked again once connected"
+    (with-stub (fn (dir)
+                 (do
+                   (file/spit (path/join dir "needpw") "")
+                   (file/spit (path/join dir "a.txt") "")
+                   (let (spec (remote dir))
+                     (do
+                       (assert= (tramp/ssh-transport/fetch-listing spec) [])
+                       (is (nil? (tramp/ssh-transport/cached-listing spec)))
+                       (is (= true
+                             (tramp/ssh-transport/connect-with-password {:host "web1"} "secret")))
+                       (is (includes? (tramp/ssh-transport/fetch-listing spec) "a.txt"))))))))
   (test "a password reaches ssh through the askpass helper, once"
     (with-stub (fn (dir)
                  (do
@@ -1039,6 +1063,25 @@ run here, `dir/home` their HOME), the editor's config and the control sockets un
                           (fn (name)
                             (and (string/starts-with? name ".bedit-recv.")
                               (includes? calls name)))))))))))
+  (test "a stream that fails before the receiver runs leaves no receiver behind"
+    (with-stub (fn (dir)
+                 (let (tree (remote-fixture dir)
+                       far (path/join dir "far")
+                       _ (file/mkdir far)
+                       _ (file/spit (path/join dir "fail-stream") "")
+                       went (tramp/ssh-transport/cross-transfer :copy
+                              (sshpath/parse (remote tree))
+                              (path/join tree "a.txt")
+                              (sshpath/parse (str "/ssh:web2:" far))
+                              far
+                              true
+                              false)
+                       calls (file/slurp (path/join dir "ssh-calls"))
+                       receiver (:text (regex/find calls "/\\S*\\.bedit-recv\\.\\S+")))
+                   (do
+                     (is (failure? went))
+                     (is (not (nil? receiver)))
+                     (is (not (file/exists? receiver))))))))
   (test "a streamed copy that arrives short or changed is refused, nothing left there"
     (let (staged {:name "a.txt" :count 1 :size 6 :digest (hash/sha256 "alpha\n")}
           target (temp-dir "bedit-ssh-")
@@ -1087,7 +1130,32 @@ run here, `dir/home` their HOME), the editor's config and the control sockets un
         (assert= (:name packed) "a")
         (assert= (:bytes packed) (string/->bytes "hi"))))
     (is (failure? (tramp/ssh-transport/parse-pack "a\n1\n3\naGk=\n")))
-    (is (failure? (tramp/ssh-transport/parse-pack "")))))
+    (is (failure? (tramp/ssh-transport/parse-pack ""))))
+  ;; the entry's name comes from the far side's standard output and lands in `$to/$name`: a
+  ;; name that is a path would place the copy outside its target
+  (test "an entry name that is not one entry is refused, by the parsers and by the receiver"
+    (doseq (name [".." "." "../archive.tar" "a/b" "/etc/passwd"])
+      (is (not (tramp/ssh-transport/name-safe? name)))
+      (is (failure? (tramp/ssh-transport/parse-pack (str name "\n1\n2\naGk=\n"))))
+      (is (failure? (tramp/ssh-transport/parse-staged (str name
+                                                        "\n1\n10240\n-\n/tmp/.bedit-pack.x\n")))))
+    (is (not (tramp/ssh-transport/name-safe? "")))
+    (is (not (tramp/ssh-transport/name-safe? "a\nb")))
+    (is (tramp/ssh-transport/name-safe? "notes.txt"))
+    (is (tramp/ssh-transport/name-safe? ".hidden"))
+    (let (staged {:name "../escaped.txt" :count 1 :size 6 :digest "-"}
+          root (temp-dir "bedit-ssh-")
+          _ (file/mkdir root)
+          inbox (path/join root "inbox")
+          _ (file/mkdir inbox)
+          script (tramp/ssh-transport/receiver-script inbox staged true false "T")
+          receiver (tramp/ssh-transport/run-local script)
+          result (os/cmd "/bin/sh" [(string/trim (:stdout receiver))] {:stdin "alpha\n"}))
+      (do
+        (is (includes? script "case $2 in"))
+        (assert= (:exit result) 4)
+        (is (not (file/exists? (path/join root "escaped.txt"))))
+        (assert= (vec (file/ls root)) ["inbox"])))))
 
 (describe "a file edited as root on another machine (`|sudo:`)"
   (test "is read as a sudo hop on the host before it"
@@ -1296,3 +1364,23 @@ run here, `dir/home` their HOME), the editor's config and the control sockets un
                        (do
                          (is (includes? (pr-str (:minibuffer asked)) "doas on web1 (yours there"))
                          (assert= (buffer-text (ed-current-buf m)) "doas\n")))))))))
+
+(describe "a root shell that never gets ready"
+  :isolated (test "times out at its deadline though it keeps talking"
+    (if (= (os/type) :windows)
+      (io/puts "  (skipped: no sh)")
+      (let (session (spawn (tramp/ssh-root/session-loop {}))
+            request-ref (ref)
+            started (os/now))
+        (send session
+          [:open
+            {:argv ["sh" "-c" "while :; do echo still-starting; sleep 0.05; done"]
+             :env {}
+             :parts {:host "web1" :become {:method :sudo :user nil}}
+             :timeout-ms 400}
+            (self)
+            request-ref])
+        (let (answer (receive ([:sudo ^request-ref answer] answer) (after 10000 :never)))
+          (send session [:stop])
+          (assert= (map/get-in answer [:failed :error]) :timeout)
+          (is (< (- (os/now) started) 5000)))))))

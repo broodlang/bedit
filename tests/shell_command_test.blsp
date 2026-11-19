@@ -9,6 +9,7 @@
   (:use test)
   (:use model)
   (:use input) ; ed-update — a reply through the loop's own update
+  (:use pool) ; ed-open-buffer / ed-select
   (:use-internals shell-command) ; ed-shell-show — how a result is shown
   (:use editor/buffer))
 
@@ -108,3 +109,84 @@ message to receive — trying every 20 ms for up to ten seconds."
                  (map (processes/ansicolor/colour-spans buf) (fn (s) [(first s) (second s)])))
         [[0 3]])
       (is (:bold (nth (first (processes/ansicolor/colour-spans buf)) 2))))))
+
+(defn- sc-region-model (text lo hi)
+  ;; a model on `a.txt` holding `text`, its region lo..hi; a second buffer `b.txt` beside it
+  (let (a (goto-char (set-mark (goto-char (make-buffer text "a.txt") lo)) hi)
+        m (ed-open-buffer (ed-init (make-buffer "other" "b.txt")) a))
+    m))
+
+(defn- sc-text (m name) (buffer-text (ed-buf-at m (ed-buffer-index-by-name! m name))))
+
+(describe "C-u M-| lands in the buffer it was run from"
+  (test "the region is replaced in its own buffer though another is current now"
+    (let (m (sc-region-model "b\na\n" 0 4)
+          target {:name "a.txt" :lo 0 :hi 4 :input "b\na\n"}
+          elsewhere (ed-select m (ed-buffer-index-by-name! m "b.txt"))
+          done (shell-command/shell-region-result elsewhere
+                 "sort"
+                 {:exit 0 :stdout "a\nb\n"}
+                 target
+                 true))
+      (assert= (sc-text done "a.txt") "a\nb\n")
+      (assert= (sc-text done "b.txt") "other")))
+  (test "a region edited while the command ran is left alone, and said"
+    (let (m (sc-region-model "b\na\n" 0 4)
+          target {:name "a.txt" :lo 0 :hi 4 :input "b\na\n"}
+          edited (ed-update-named m "a.txt" (fn (buffer) (insert (goto-char buffer 0) "x")))
+          done (shell-command/shell-region-result edited
+                 "sort"
+                 {:exit 0 :stdout "a\nb\n"}
+                 target
+                 true))
+      (assert= (sc-text done "a.txt") "xb\na\n")
+      (is (includes? (:echo done) "changed"))))
+  (test "a buffer killed while the command ran: the output is shown instead"
+    (let (m (ed-init (make-buffer "other" "b.txt"))
+          target {:name "a.txt" :lo 0 :hi 4 :input "b\na\n"}
+          done (shell-command/shell-region-result m "sort" {:exit 0 :stdout "a\nb\n"} target true))
+      (assert= (sc-text done "b.txt") "other")
+      (is (includes? (:echo done) "a.txt is gone")))))
+
+;; ---- M-&: a command left running ---------------------------------------------------------
+
+(defn- sc-fold-async (m deadline)
+  "`m` with every event the async command sends folded in, through its exit (or `deadline`)."
+  (receive
+    (event :when (record? event)
+      (let (folded (ui-event-fold event m 24 80 24))
+        (if (nil? (:async-shell folded)) folded (sc-fold-async folded deadline))))
+    (after deadline m)))
+
+(defn- sc-async-text (m)
+  (buffer-text (ed-buf-at m (ed-buffer-index-by-name! m "*Async Shell Command*"))))
+
+(describe "M-& (async-shell-command)"
+  :isolated (test "streams the command's output into *Async Shell Command*, and says it finished"
+    (if (= (os/type) :windows)
+      (io/puts "  (skipped: no sh)")
+      (let (m (sc-live (fn ()
+                         (shell-command/async-shell-start (ed-init (make-buffer ""
+                                                                     "a.txt" "/tmp/a.txt"))
+                           "printf 'one\\ntwo\\n'")))
+            done (sc-fold-async m 10000))
+        (is (includes? (sc-async-text done) "one\ntwo\n"))
+        (is (includes? (sc-async-text done) "finished"))
+        (is (nil? (:async-shell done)))
+        (send (:async-shell-proc m) [:shutdown]))))
+  :isolated (test "killing the buffer stops the command, and C-x k asks first while it runs"
+    (if (= (os/type) :windows)
+      (io/puts "  (skipped: no sh)")
+      (let (m (sc-live (fn ()
+                         (shell-command/async-shell-start (ed-init (make-buffer ""
+                                                                     "a.txt" "/tmp/a.txt"))
+                           "sleep 30")))
+            buffer (ed-buf-at m (ed-buffer-index-by-name! m "*Async Shell Command*")))
+        (assert= (shell-command/async-shell-kill-query m buffer) "it has a running process")
+        (shell-command/async-shell-on-close buffer)
+        (let (done (sc-fold-async m 10000))
+          (is (nil? (:async-shell done)))
+          (is (includes? (sc-async-text done) "killed"))))))
+  (test "a second M-& while one runs is refused, and says which"
+    (let (m (assoc (ed-init (make-buffer "")) :async-shell {:cmd "make serve" :token 1}))
+      (is (includes? (:echo (shell-command/cmd-async-shell-command m nil)) "make serve")))))

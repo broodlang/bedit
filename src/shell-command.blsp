@@ -2,7 +2,8 @@
   "Emacs `shell-command` and `shell-command-on-region` (M-! / M-|): one `sh -c` in the
 buffer's default directory, run off the loop as a `std/task`, its output in the echo area
 (one line) or `*Shell Command Output*` beside the buffer; `C-u M-|` replaces the region
-with it. Not a shell BUFFER — that is `shells/bshell`.
+with it; `M-&` leaves one running, its output streamed into `*Async Shell Command*`. Not a
+shell BUFFER — that is `shells/bshell`.
 
 Loaded with the image (`main`): `C-u M-|` must find the command registered as
 prefix-consuming before its module has ever run, or the prefix would repeat it instead."
@@ -12,6 +13,7 @@ prefix-consuming before its module has ever run, or the prefix would repeat it i
   (:use pool) ; ed-default-dir / ed-show-named-aside — where it runs and where output goes
   (:use interactive) ; defcommand / current-prefix-arg / register-prefix-consuming
   (:use processes :only [add-output-faces]) ; a command's output colours (processes/decode-output) as faces
+  (:use modes :only []) ; register-special-type runs at load, after modes declares its kinds
   (:use task :only [task])) ; task — the command runs off the loop
 
 ;; ---- one-off shell commands (M-! / M-|) --------------------------------------
@@ -140,37 +142,170 @@ output goes to the echo area, more to `*Shell Command Output*` in a side pane. R
     (fn (mm command)
       (ed-shell-launch mm command nil (fn (done result) (ed-shell-show done command result))))))
 
-(defn- replace-region-clamped (buffer lo hi text)
-  ;; The region's bounds were captured before the command ran; the reply can land after an
-  ;; edit moved them, so the replace is clamped to the text that is there now.
-  (let (size (buffer-length buffer))
-    (replace-region buffer (math/min lo size) (math/min hi size) text)))
+(defn- region-unchanged? (buffer target)
+  "Whether `buffer` still holds the piped region of `target` (`{:lo :hi :input}`) where it was
+when the command started."
+  (let ({:keys [lo hi input]} target)
+    (and (<= hi (buffer-length buffer)) (= (text/slice (buffer-rope buffer) lo hi) input))))
 
-(defn- shell-region-result (m command result lo hi replace?)
-  ;; What M-| does with a finished command: a successful `C-u M-|` REPLACES the region with
-  ;; its output; anything else is shown like `M-!`.
-  (if (and replace? (= (:exit result) 0))
-    (message (ed-edit m (fn (buffer) (replace-region-clamped buffer lo hi (:stdout result))))
-      (str "region replaced by `" command "`"))
-    (ed-shell-show m command result)))
+(defn- shell-region-result (m command result target replace?)
+  "What M-| does with a finished command: a successful `C-u M-|` REPLACES the region it was
+given — in the buffer it came from (`target`'s `:name`), whichever buffer is current now — and
+only while that region still holds the text that was piped, as it was; a buffer killed or
+edited there meanwhile is said, and the output shown instead. Anything else is shown like
+`M-!`."
+  (if (not (and replace? (= (:exit result) 0)))
+    (ed-shell-show m command result)
+    (let (name (:name target)
+          index (ed-buffer-index-by-name m name))
+      (cond
+        (nil? index)
+          (message (ed-shell-show m command result)
+            (str name " is gone; its output is shown instead"))
+        (not (region-unchanged? (ed-buf-at m index) target))
+          (message (ed-shell-show m command result)
+            (str "the region in " name " changed while `" command "` ran; left as it is"))
+        else
+          (message (ed-update-named m
+                     name
+                     (fn (buffer)
+                       (replace-region buffer (:lo target) (:hi target) (:stdout result))))
+            (str "region replaced by `" command "`"))))))
 
 (defcommand cmd-shell-command-on-region
   (m key)
   "Pipe the region through a shell command (M-|, Emacs `shell-command-on-region`): the
 region is the command's stdin; the output is shown like `M-!` — or, with a prefix
-argument (`C-u M-|`), REPLACES the region (the `sort`/`fmt`/`jq .` idiom)."
+argument (`C-u M-|`), REPLACES the region (the `sort`/`fmt`/`jq .` idiom) in the buffer it
+came from, once the command is done."
   (let (buffer (ed-current-buf m)
         bounds (buffer-region-bounds buffer)
         replace? (not (nil? (current-prefix-arg m))))
     (if (nil? bounds)
       (message m "no region (set the mark first)")
       (let ([lo hi] bounds
-            input (text/slice (buffer-rope buffer) lo hi))
+            input (text/slice (buffer-rope buffer) lo hi)
+            target {:name (buffer-name buffer) :lo lo :hi hi :input input})
         (read-shell-command m
           (if replace? "Shell command on region (replace): " "Shell command on region: ")
           (fn (mm command)
             (ed-shell-launch mm
               command
               input
-              (fn (done result) (shell-region-result done command result lo hi replace?)))))))))
+              (fn (done result) (shell-region-result done command result target replace?)))))))))
 (register-prefix-consuming 'shell-command/cmd-shell-command-on-region)
+
+;; ---- M-&: a command left running, its output streamed ------------------------------------
+;; Emacs's `async-shell-command`: the command runs on, off the loop and with no deadline (a dev
+;; server, `tail -f`, a long build), its output streaming into *Async Shell Command* beside the
+;; buffer. It runs on this loop's own streaming worker (`processes/loop-worker`); C-x k on the
+;; buffer while it runs asks first, and killing the buffer stops it.
+
+(def *async-shell-buffer* "*Async Shell Command*")
+
+(defuievent async-shell-output-event (text spans token) ed-ev-async-shell-output) ; a line of its output
+(defuievent async-shell-done-event (code token) ed-ev-async-shell-done) ; it exited (nil: killed)
+
+(defn- async-shell-handlers ()
+  ;; the `processes/procstream` handlers: each builds the event for its line and the run token
+  {:on-line (fn (line spans token) (shell-command/async-shell-output-event line spans token))
+   :on-err-line (fn (line spans token) (shell-command/async-shell-output-event line spans token))
+   :on-done (fn (code token) (shell-command/async-shell-done-event code token))})
+
+(defn- async-shell-writes? (m token)
+  "Whether a line of run `token` goes into *Async Shell Command*: the run is current and the
+buffer is still there. One killed meanwhile is not written back into being; its run is
+stopped instead."
+  (and (= token (map/get-in m [:async-shell :token]))
+    (or (not (nil? (ed-buffer-index-by-name m *async-shell-buffer*)))
+      (do (when (:async-shell-proc m) (send (:async-shell-proc m) [:shutdown])) false))))
+
+(defn ed-ev-async-shell-output (m event textrows cols rows)
+  "A line of the running command's output, appended where a pane following the tail sees it."
+  (if (async-shell-writes? m (async-shell-output-event-token event))
+    (results/ed-append-follow m
+      *async-shell-buffer*
+      (str (async-shell-output-event-text event) "\n")
+      cols
+      rows
+      (async-shell-output-event-spans event))
+    m))
+
+(defn ed-ev-async-shell-done (m event textrows cols rows)
+  "The command exited: said in the buffer and the echo area, as Emacs's process sentinel says
+`finished` or `exited abnormally`."
+  (let (code (async-shell-done-event-code event)
+        cmd (map/get-in m [:async-shell :cmd] "shell command")
+        said (cond
+               (= code 0) "finished"
+               (nil? code) "killed"
+               else (str "exited abnormally with code " code)))
+    (cond
+      (not (= (async-shell-done-event-token event) (map/get-in m [:async-shell :token]))) m
+      (nil? (ed-buffer-index-by-name m *async-shell-buffer*)) (dissoc m :async-shell)
+      else
+        (message (results/ed-append-follow (dissoc m :async-shell)
+                   *async-shell-buffer*
+                   (str "\n[" cmd " " said "]\n")
+                   cols
+                   rows)
+          (str cmd " " said)))))
+
+(defn- async-shell-start (m cmd)
+  ;; run `cmd` in the buffer's directory on this loop's worker, *Async Shell Command* beside
+  (let (dir (ed-default-dir m)
+        proc (processes/loop-worker (:async-shell-proc m)
+               (fn () (spawn (processes/stream-loop (async-shell-handlers)))))
+        token (inc (or (:async-shell-seq m) 0))
+        [program argv] (if (= (os/type) :windows) ["cmd" ["/c" cmd]] ["sh" ["-c" cmd]]))
+    (do
+      (send proc [:run program argv {:cwd dir} token (ed-loop-address)])
+      (ed-update-named (ed-show-named-aside (message (assoc m
+                                                       :async-shell {:cmd cmd :token token}
+                                                       :async-shell-seq token
+                                                       :async-shell-proc proc)
+                                              (str "running: " cmd))
+                         *async-shell-buffer* "" :async-shell)
+        *async-shell-buffer*
+        ;; the worker, for the buffer's `:on-close` to stop
+        (fn (buffer) (assoc buffer :async-shell-proc proc :read-only true))))))
+
+(defcommand cmd-async-shell-command
+  (m key)
+  "Run a shell command and leave it running (M-&, Emacs `async-shell-command`): its output
+streams into *Async Shell Command* beside the buffer, in the buffer's directory, for as long
+as it runs. One at a time; killing the buffer stops it."
+  (cond
+    (:async-shell m)
+      (message m
+        (str "`" (map/get-in m [:async-shell :cmd]) "` is still running in " *async-shell-buffer*))
+    (sshpath/remote? (ed-default-dir m))
+      (message m "async shell command: this buffer is on another machine — M-& runs on this one")
+    else (read-shell-command m "Async shell command: " async-shell-start)))
+
+(defn async-shell-live (m)
+  "The M-& command C-x C-c would kill (`model/register-exit-query`), while it runs."
+  (if-let (run (:async-shell m)) [(str *async-shell-buffer* ": " (:cmd run))] []))
+
+(register-exit-query :async-shell-command 'shell-command/async-shell-live)
+
+(defn async-shell-kill-query (m buffer)
+  "C-x k on *Async Shell Command* while its command runs asks first (`model/register-kill-query`)."
+  (when (and (= (buffer-name buffer) *async-shell-buffer*) (:async-shell m))
+    "it has a running process"))
+
+(register-kill-query :async-shell-command 'shell-command/async-shell-kill-query)
+
+(defn async-shell-on-close (buffer)
+  "*Async Shell Command*'s close: the buffer is going, so is the command it shows."
+  (do (when (:async-shell-proc buffer) (send (:async-shell-proc buffer) [:shutdown])) buffer))
+
+(def async-shell-layer
+  {:name 'async-shell
+   :doc "A command left running (M-&): its output, streamed."
+   ;; killing the buffer stops the command (layers :on-close)
+   :hooks {:on-close '(shell-command/async-shell-on-close)}})
+
+;; its rows are a program's output: a `file:line:` in it is a location, as in *compilation*
+(modes/register-special-type :async-shell
+  'shell-command/async-shell-layer 'results/location-jump-layer)

@@ -66,16 +66,25 @@ from the call ([[run]]).")
 
 (def- *route-key-length* 8) ; hex characters of a route's hash in front of `%C` (control-name)
 
+(def- control-path-pattern "[A-Za-z0-9/._+@-]+")
+;; a socket folder ssh reads back whole in `ControlPath=`: a blank would end the option and a
+;; `%` start one of ssh's escapes (`ssh -G` refuses either, and every operation fails with it)
+
 (defn control-dir ()
   "Where the shared connections' sockets live: `state/ssh` under the editor's config folder
-(owner-only; [[ensure-control-dir]]) — or, when that path is too long for a Unix socket,
+(owner-only; [[ensure-control-dir]]) — or, when that path is too long for a Unix socket or
+holds a character ssh would not read back in `ControlPath=` (a blank, a `%`),
 `$XDG_RUNTIME_DIR/bedit-ssh`, else `/tmp/bedit-ssh-USER`. `*control-dir*` overrides it."
   (let (preferred (or *control-dir* (path/join (config-paths/config-dir) "state" "ssh")))
-    (if (or *control-dir* (<= (+ (count preferred) 1 *route-key-length* 1 40 17) *socket-path-max*))
+    (if (or *control-dir*
+          (and (<= (+ (count preferred) 1 *route-key-length* 1 40 17) *socket-path-max*)
+            (regex/matches? preferred control-path-pattern)))
       preferred
-      (let (runtime (os/env "XDG_RUNTIME_DIR"))
-        (if (and (string? runtime) (not (string/blank? runtime)))
-          (path/join runtime "bedit-ssh")
+      (let (runtime (os/env "XDG_RUNTIME_DIR")
+            fallback (when (and (string? runtime) (not (string/blank? runtime)))
+                       (path/join runtime "bedit-ssh")))
+        (if (and fallback (regex/matches? fallback control-path-pattern))
+          fallback
           (path/join "/tmp" (str "bedit-ssh-" (or (os/user-name) "user"))))))))
 
 (defn ensure-control-dir ()
@@ -403,7 +412,10 @@ not): over an entry already there only when `replace?`, never over a directory.
   ;; `place TARGET NAME INTO REPLACE` sets `$to` to where an entry called NAME lands for TARGET:
   ;; INTO it when it is a directory (keeping NAME), which it must be when INTO is 1. A directory
   ;; there is never replaced; another entry only when REPLACE is 1. `$d` is its directory.
+  ;; NAME is refused unless it is one entry ([[name-safe?]]): it can come from the far side of
+  ;; a copy, and `$to/NAME` must not reach outside the target.
   (str "place() {\n"
+    "  case $2 in \"\"|.|..|*/*|*'\n'*) echo \"$2: not an entry name\" >&2; exit 4;; esac\n"
     "  home \"$1\" || exit 4\n" "  to=$r\n" "  if [ -d \"$to\" ]; then to=${to%/}/$2\n"
     "  elif [ \"$3\" = 1 ]; then echo \"$1: not a directory\" >&2; exit 4; fi\n"
     "  if [ -d \"$to\" ]; then echo \"$to is a directory — not replaced\" >&2; exit 4; fi\n"
@@ -480,6 +492,21 @@ to another machine ([[parse-pack]] reads its answer): nothing past `limit` bytes
     (includes? (tramp/ssh-transport/pack-script \"/srv/a\") \"tar cf - \")   ;=> true"
   (script-with [path (str limit)] pack-body))
 
+(defn name-safe? (name)
+  "Whether `name`, an entry's name the far side of a copy answered, is ONE entry: not empty,
+not `.` or `..`, with no `/` and no line break — what the receiving side may join to its
+target (`$to/$name`) without reaching outside it.
+
+    (tramp/ssh-transport/name-safe? \"notes.txt\")   ;=> true
+    (tramp/ssh-transport/name-safe? \"../archive.tar\")   ;=> false"
+  (and (string? name)
+    (not (= name ""))
+    (not (= name "."))
+    (not (= name ".."))
+    (not (includes? name "/"))
+    (not (includes? name "\n"))
+    (not (includes? name "\r"))))
+
 (defn parse-pack (stdout)
   "What a pack script answered: `{:name :count :bytes}` — the entry's name, how many entries the
 archive holds, the archive — or a failure when it arrived damaged or short.
@@ -493,6 +520,8 @@ archive holds, the archive — or a failure when it arrived damaged or short.
     (cond
       (or (string/blank? (or name "")) (not (int? count-read)) (not (int? size)))
         (failure "a packed copy that does not read")
+      (not (name-safe? name))
+        (failure (str "a packed copy whose entry is not one name: " (pr-str name)))
       (failure? bytes) (failure "the packed copy arrived damaged")
       (not (= (count bytes) size))
         (failure (str (count bytes) " of " size " bytes of the copy arrived"))
@@ -596,6 +625,8 @@ and the temporary file holding it — or a failure when it does not read.
     (cond
       (or (string/blank? (or name "")) (not (int? count-read)) (not (int? size)))
         (failure "a packed copy that does not read")
+      (not (name-safe? name))
+        (failure (str "a packed copy whose entry is not one name: " (pr-str name)))
       (not (regex/matches? digest "-|[0-9a-f]{64}")) (failure "a packed copy with no checksum")
       (not (regex/matches? archive safe-temp-pattern))
         (failure (str "the packed copy waits at a path a shell would not read as one word: "
@@ -944,7 +975,9 @@ Blocks."
 (defn- streamed-transfer (from-parts from to-parts to into? replace?)
   ;; the copy STREAMED from one side to the other through an OS pipe, never held here: staged
   ;; there, a receiver left where it goes, the two joined by `os/pipeline`, the staged archive
-  ;; removed after whatever happened. Where it went
+  ;; removed after whatever happened — and the receiver too when the stream failed: it removes
+  ;; itself once it runs, and one the stream never started stayed in the host's temp dir. Where
+  ;; it went
   (let (staged-out (run-op from-parts (stage-pack-script from))
         staged (if (failure? staged-out) staged-out (parse-staged staged-out)))
     (if (failure? staged)
@@ -970,7 +1003,11 @@ Blocks."
                        (if (= 0 (:exit result))
                          (string/trim (:stdout result))
                          (stream-failure result to-parts)))))
-        (do (run-op from-parts (script-with [archive] "rm -f -- \"$p\"\n")) went)))))
+        (do
+          (run-op from-parts (script-with [archive] "rm -f -- \"$p\"\n"))
+          (when (and (failure? went) (string? receiver) (regex/matches? receiver safe-temp-pattern))
+            (run-op to-parts (script-with [receiver] "rm -f -- \"$p\"\n")))
+          went)))))
 
 (defn cross-transfer (op from-parts from to-parts to into? replace?)
   "Move (`op` `:move`) or copy (`:copy`) `from` on `from-parts`' host to `to` on `to-parts`' —
@@ -1085,7 +1122,9 @@ answers. Blocks."
 
 (def *listing-fresh-ms* 10000)
 ;; How long a remote listing is trusted. A failure is kept as long, so a host that refuses
-;; is not asked on every key.
+;; is not asked on every key — except one for want of a password (`:auth`,
+;; `:become-password`): the password is typed next, and the listing must be asked again then,
+;; not answered empty for ten seconds after.
 
 (defn cached-listing (dir-spec)
   "The entries of the remote directory `dir-spec` (an ssh path) listed within the last
@@ -1100,11 +1139,15 @@ entries, or `[]` when it cannot be listed (no connection without a password, no 
 directory). Blocks: the prompt calls it from a task."
   (let (parts (sshpath/parse dir-spec)
         answer (if (nil? parts) nil (list-dir parts (:path parts)))
-        names (if (and (map? answer) (vector? (:names answer))) (:names answer) []))
+        names (if (and (map? answer) (vector? (:names answer))) (:names answer) [])
+        wants-password? (contains? #{:auth :become-password}
+                          (when (map? answer) (map/get-in answer [:failed :error]))))
     (do
       (when (>= (count *listings*) 64)
         (doseq (entry (table/snapshot *listings*)) (table/delete *listings* (first entry))))
-      (table/put *listings* dir-spec [(os/now) names])
+      (if wants-password?
+        (table/delete *listings* dir-spec)
+        (table/put *listings* dir-spec [(os/now) names]))
       names)))
 
 (defn forget-listing (dir-spec)

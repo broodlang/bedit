@@ -1,0 +1,173 @@
+(defmodule headcut
+  "An output buffer's HEAD CUT, and the one CARRY rule every change of text shares. A log or a
+stream keeps only its newest lines: [[ed-cut-head]] deletes whole lines from the top as program
+output (out of the undo history too), and everything that points into the text from outside it
+— point and mark, a shell's `:input-start`, the buffer's markers, a results buffer's
+`:line-links` — moves as an Emacs marker does ([[ed-carry-position]],
+[[ed-carry-buffer-fields]]). `model` carries the panes and the kept layouts through the same
+rule (`model/ed-carry-panes`) and caps every streaming sink (`model/ed-cap-output-at`); `hosted`
+carries another frame's splice. Below `model`: this module knows buffers, not the model."
+  (:use editor/buffer)) ; buffer-rope / buffer-point / goto-char / replace-program-output
+
+;; ---- carrying positions through a change of the text ----------------------------
+;; Everything that points into a buffer from outside its text — a pane's window point, mark
+;; and scroll, the buffer's own point and mark, a shell's `:input-start`, a results buffer's
+;; `:line-links` rows, a saved window layout — follows a change of the text as an Emacs
+;; marker does. One rule for every change: a head cut (below), and a change another frame made
+;; that arrives as a splice (`hosted/hosted-apply-content`).
+
+(defn ed-carry-position (position replaced-start replaced-end inserted)
+  "`position` (a char offset, or nil) after `[replaced-start, replaced-end)` is replaced by
+`inserted` chars, as an Emacs marker moves (insertion type nil): at or before `replaced-start`
+it stays, inside the replaced text it lands at `replaced-start`, after it it moves by the
+change in length.
+
+    (headcut/ed-carry-position 10 0 4 0)   ;=> 6
+    (headcut/ed-carry-position 2 0 4 0)   ;=> 0
+    (headcut/ed-carry-position 3 3 3 5)   ;=> 3"
+  (cond
+    (not (int? position)) position
+    (<= position replaced-start) position
+    (< position replaced-end) replaced-start
+    else (+ (- position (- replaced-end replaced-start)) inserted)))
+
+(sig ed-carry-line (any any int int int int -> (tuple int bool)))
+(defn ed-carry-line (before after line replaced-start replaced-end inserted)
+  "`[line' kept?]`: the line of rope `after` that line `line` of rope `before` became — its
+start carried through `[replaced-start, replaced-end)` replaced by `inserted` chars
+([[ed-carry-position]]) — and whether the line survived (false when all of it was inside the
+replaced text)."
+  (let (last-line (dec (text/line-count before))
+        clamped (math/max 0 (math/min line last-line))
+        start (text/line->char before clamped)
+        end (text/after-line->char before clamped)
+        gone? (and (< replaced-start replaced-end)
+                (>= start replaced-start)
+                (<= end replaced-end)
+                (< start end))
+        carried (ed-carry-position start replaced-start replaced-end inserted))
+    [(text/char->line after (math/min carried (count after))) (not gone?)]))
+
+;; The buffer fields that hold one char offset into its text, carried as markers: a shell's
+;; (or a line-mode terminal's) input start. Its process mark is a real buffer marker, and
+;; every marker is carried too (below).
+(def- carried-position-keys [:input-start])
+
+(defn ed-carry-buffer-fields (buf before replaced-start replaced-end inserted)
+  "`buf` — a buffer after `[replaced-start, replaced-end)` of `before` was replaced by
+`inserted` chars — with what `before` kept beside its text carried through the change: point,
+mark, a shell's `:input-start`, the buffer's markers (a shell's process mark among them), and
+the `:line-links` rows (keyed by line; a row whose line went is dropped). Text properties (a
+program's colours) need no carrying: they belong to the text, and the edit that made `buf`
+carried them (brood ADR-579)."
+  (let (carry (fn (position) (ed-carry-position position replaced-start replaced-end inserted))
+        placed (assoc (goto-char buf (or (carry (buffer-point before)) 0))
+                 :mark (carry (buffer-mark before)))
+        fields (fold carried-position-keys
+                 placed
+                 (fn (acc key)
+                   (if (int? (get before key)) (assoc acc key (carry (get before key))) acc)))
+        ;; the buffer's markers (a shell's process mark, folds, a prompt mark): an edit
+        ;; carries them itself, a text rebuilt from another holder's copy does not
+        inputs (if (empty? (get before :markers))
+                 fields
+                 (assoc fields
+                   :markers
+                     (into {}
+                       (map (get before :markers) (fn ([id position]) [id (carry position)]))))))
+    (if (:line-links before)
+      (assoc inputs
+        :line-links
+          (fold (:line-links before)
+            {}
+            (fn (acc [line location])
+              (if (int? line)
+                (let ([moved kept?] (ed-carry-line (buffer-rope before)
+                                      (buffer-rope buf)
+                                      line
+                                      replaced-start
+                                      replaced-end
+                                      inserted))
+                  (if kept? (assoc acc moved location) acc))
+                acc))))
+      inputs)))
+
+;; ---- cutting an output buffer's head ------------------------------------------
+;; A log or a stream (*Messages*, *Tests*, *Run*, *compilation*, a shell) grows for as long
+;; as its producer talks, so it keeps only its newest lines (Emacs's `message-log-max`,
+;; `comint-buffer-maximum-size`). The cut is always whole lines from the top, and nothing
+;; that points into the text may notice it moved: the buffer's point and mark, a shell's
+;; `:input-start`, the off-text `:line-links` a results buffer jumps by (keyed by LINE), and
+;; every pane on it — its window point and mark, and its scroll, so a reader up in the
+;; scrollback keeps reading the same lines.
+
+;; How many lines a streaming output buffer keeps when the model names none
+;; (`:output-max-lines`, the `:output-buffer-max-lines` setting). A cut takes it back to
+;; nine tenths of that, so a stream at the cap pays for a cut once per tenth.
+(defdyn *output-max-lines* 10000)
+
+(sig ed-cut-head (buffer int -> buffer))
+(defn ed-cut-head (buf cut)
+  "`buf` with its first `cut` chars deleted — `cut` a line start, as every head trim makes it
+— and every position into it kept ([[ed-carry-buffer-fields]]): point, mark and a shell's
+`:input-start` and process mark move back by `cut` (one inside the deleted text lands at 0), the
+text's colours with it (they are its text properties), the `:line-links`
+rows move up by the lines deleted. The cut is PROGRAM OUTPUT (brood's `replace-program-output`,
+ADR-712): out of every snapshot of the undo history too, recording nothing — so undo never
+brings the old lines back and the history holds no copy of them. A read-only buffer takes it."
+  (if (<= cut 0)
+    buf
+    (ed-carry-buffer-fields (replace-program-output buf 0 cut "") buf 0 cut 0)))
+
+(sig ed-head-cut-chars (buffer int -> (or nil int)))
+(defn ed-head-cut-chars (buf limit)
+  "Where to cut `buf` so it is no longer than `limit` chars, or nil when it is not: the
+first line start past the newest two thirds of `limit`, so a log that keeps growing pays
+for the cut once per third rather than on every append."
+  (let (length (buffer-length buf))
+    (when (> length limit)
+      (let (from (- length (math/quot (* 2 limit) 3))
+            newline (buffer-search-forward buf "\n" from))
+        (if (nil? newline) from (inc newline))))))
+
+(sig ed-complete-lines (buffer -> int))
+(defn ed-complete-lines (buf)
+  "How many lines `buf` holds, a final newline ending the last line rather than starting
+another (an empty buffer holds none)."
+  (let (rope (buffer-rope buf)
+        length (count rope)
+        lines (buffer-line-count buf))
+    (if (and (> length 0) (= (text/slice rope (dec length) length) "\n")) (dec lines) lines)))
+
+(sig ed-head-cut-lines (buffer int &optional (or nil int) -> (or nil int)))
+(defn ed-head-cut-lines (buf limit &optional keep)
+  "Where to cut `buf` so at most `keep` (default `limit`) of its lines remain, or nil when it
+holds no more than `limit` — a line start, the oldest lines before it."
+  (let (lines (ed-complete-lines buf)
+        excess (- lines (or keep limit)))
+    (when (and (> lines limit) (> excess 0)) (text/line->char (buffer-rope buf) excess))))
+
+(defn ed-trim-head (buf limit)
+  "`buf` with its oldest lines dropped once it is longer than `limit` chars
+([[ed-head-cut-chars]] says where), every position kept ([[ed-cut-head]]). A no-op at or
+below `limit`."
+  (let (cut (ed-head-cut-chars buf limit)) (if (nil? cut) buf (ed-cut-head buf cut))))
+
+(sig ed-trim-head-lines (buffer int -> buffer))
+(defn ed-trim-head-lines (buf limit)
+  "`buf` with its oldest lines dropped so at most `limit` remain (a final newline ends the
+last line rather than starting another), every position kept ([[ed-cut-head]]). A no-op at
+or under `limit`; one cut at the head — a rope splice — when over."
+  (let (cut (ed-head-cut-lines buf limit)) (if (nil? cut) buf (ed-cut-head buf cut))))
+
+(defn ed-output-max-lines (m)
+  "How many lines a streaming output buffer keeps: the model's `:output-max-lines` (the
+`:output-buffer-max-lines` setting) when it is a positive whole number, else
+[[*output-max-lines*]]."
+  (let (limit (:output-max-lines m)
+        fallback *output-max-lines*)
+    (cond
+      (and (int? limit) (> limit 0)) limit
+      ;; a `binding` of the dynamic var to something that is not a count keeps the default
+      (and (int? fallback) (> fallback 0)) fallback
+      else 10000)))
