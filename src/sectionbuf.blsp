@@ -82,6 +82,21 @@ line, and — a heading's text gains an ellipsis when folded with something to h
 is folded and has children."
   [(:id row) (:heading? row) (:line row) (:hidden? row) (:children? row)])
 
+;; A paint holds its faces RESOLVED — the mode's services answer with face maps, and the spans,
+;; bands and margin carry them onto the buffer as data — so it is good for one theme only. The
+;; cache records the theme's generation (`theme/generation`) it was painted under
+;; (`:section-paint-generation`) and is empty under any other; a theme switch repaints every
+;; section buffer at once (`repainted`, a palette step), and a TAB on a buffer a theme reached
+;; another way renders it whole rather than splice new colours among old.
+
+(defn- held-paint (b)
+  "Section buffer `b`'s paint cache, or `{}` when it was painted under another theme."
+  (if (= (:section-paint-generation b) (theme/generation)) (or (:section-paint b) {}) {}))
+
+(defn- with-paint-cache (b cache)
+  "`b` keeping `cache` as its `:section-paint`, painted under the theme in force now."
+  (assoc b :section-paint cache :section-paint-generation (theme/generation)))
+
 (defn- paint-lines (services rows lines cache)
   "`[paints cache]`: the paint of each of `lines` (parallel to `rows`), from `cache` where it
 has one and from the services otherwise, and the cache with the new ones added."
@@ -228,8 +243,10 @@ shows (a fold, a level), `{}` for a tree that is new."
         [paints painted-cache] (paint-lines services (:rows r) (:lines r) cache)
         m2 (ed-set-buf-at m1
              i
-             (with-rows (assoc (with-paint placed services (assemble paints (:lines r) 0 0))
-                          :section-paint painted-cache
+             (with-rows (assoc (with-paint-cache (with-paint placed
+                                                   services
+                                                   (assemble paints (:lines r) 0 0))
+                                 painted-cache)
                           :section-tree tree
                           :section-extents (:extents r)
                           :section-vis vis
@@ -263,7 +280,7 @@ point on its line. No fetch: the tree is already here, and so is every line it p
         (:section-tree b)
         (:type b)
         {:vis (or vis (:section-vis b))}
-        (or (:section-paint b) {})))))
+        (held-paint b)))))
 (sig sb-rerender (model &optional any -> model))
 
 ;; ---- re-rendering ONE section in place -----------------------------------------
@@ -338,16 +355,17 @@ REPLACED by another value must not answer from, since the same ids may now be ot
   "Buffer `b` with section `id` of `tree` re-rendered under `vis` and spliced over the lines
 it covered — `replaced?` when the section is a new value rather than the same one folded, so
 its old paints are forgotten. A section with no lines on screen (inside a folded one) changes
-only the tree. Nil when the section cannot be found to splice (the caller renders the whole
-tree instead)."
+only the tree. Nil when the section cannot be found to splice, or the buffer was painted under
+another theme ([[held-paint]]) — the caller renders the whole tree instead."
   (let (rows (:section-rows b)
         extent (get (or (:section-extents b) {}) id)
         head (when rows (section-heading-index rows id))
         s (section-at tree id)
-        known (if replaced? (forget-paint (or (:section-paint b) {}) id) (or (:section-paint b) {})))
+        current? (= (:section-paint-generation b) (theme/generation))
+        known (if replaced? (forget-paint (held-paint b) id) (held-paint b)))
     (cond
-      (or (nil? rows) (nil? s)) nil
-      (nil? extent) (assoc b :section-tree tree :section-vis vis :section-paint known)
+      (or (nil? rows) (nil? s) (not current?)) nil
+      (nil? extent) (with-paint-cache (assoc b :section-tree tree :section-vis vis) known)
       (nil? head) nil
       else
         (let ([lo hi] extent
@@ -372,22 +390,22 @@ tree instead)."
                                                (< point lo-char) point
                                                (>= point hi-char) (+ point char-delta)
                                                else lo-char)
-                                           :mark nil)))
-          (with-rows (assoc (with-paint spliced
-                              services
-                              {:spans (splice-spans (:face-spans b)
-                                        lo-char
-                                        hi-char
-                                        char-delta
-                                        (:spans parts))
-                               :bands (splice-lines (:line-bands b) lo hi line-delta (:bands parts))
-                               :margin (splice-lines (get (:right-margin b) :lines)
-                                         lo
-                                         hi
-                                         line-delta
-                                         (:margin parts))
-                               :links (splice-lines (:line-links b) lo hi line-delta (:links parts))})
-                       :section-paint cache
+                                           :mark nil))
+              painted (with-paint spliced
+                        services
+                        {:spans (splice-spans (:face-spans b)
+                                  lo-char
+                                  hi-char
+                                  char-delta
+                                  (:spans parts))
+                         :bands (splice-lines (:line-bands b) lo hi line-delta (:bands parts))
+                         :margin (splice-lines (get (:right-margin b) :lines)
+                                   lo
+                                   hi
+                                   line-delta
+                                   (:margin parts))
+                         :links (splice-lines (:line-links b) lo hi line-delta (:links parts))}))
+          (with-rows (assoc (with-paint-cache painted cache)
                        :section-tree tree
                        :section-extents
                          (splice-extents (:section-extents b) id hi line-delta (:extents r))
@@ -408,9 +426,33 @@ cannot be spliced."
         tree
         (:type b)
         {:vis vis :action (if (= i (ed-current-index m)) :here :none)}
-        (if replaced? {} (or (:section-paint b) {})))
+        (if replaced? {} (held-paint b)))
       (ed-set-buf-at m i spliced))))
 (sig sb-splice (model int vector map map &optional any -> model))
+
+;; ---- a theme switch: every section buffer in the new colours ------------------------
+
+(defn- repaint-buffer (b)
+  "Section buffer `b` painted afresh from its tree under the theme in force: the same text, rows
+and extents, every line's spans, band and margin asked of the mode's services again."
+  (let (r (section-render (:section-tree b) (or (:section-vis b) {}))
+        services (buffer-services b (:section-ctx b))
+        [paints cache] (paint-lines services (:rows r) (:lines r) {}))
+    (with-paint-cache (with-paint b services (assemble paints (:lines r) 0 0)) cache)))
+
+(defn repainted (m)
+  "`m` with every section buffer painted under another theme painted again ([[held-paint]]) — a
+palette step, so `*git-status*`, a log or a diff takes a new theme's colours as the theme is
+applied, rather than keeping the old until it is next refreshed."
+  (fold (range (count (:buffers m)))
+    m
+    (fn (acc index)
+      (let (b (ed-buf-at acc index))
+        (if (or (nil? (:section-tree b)) (= (:section-paint-generation b) (theme/generation)))
+          acc
+          (ed-set-buf-at acc index (repaint-buffer b)))))))
+
+(register-palette-step :section-buffers 'sectionbuf/repainted)
 
 ;; ---- asking the buffer ------------------------------------------------------------
 
