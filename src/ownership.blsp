@@ -25,9 +25,12 @@ remove an entry with [[define-kind]].")
 ;; (its themes are registered by the manager, not by the package's own load).
 (defdyn *claimant* nil)
 
-;; :ownership/claims  [kind key] -> {:stack [{:file :entry} …] :base-present? :base}
-;;   the top of `:stack` (its last element) is the entry the registry holds now; `:base` is
-;;   what it held before the first claim (absent when `:base-present?` is false)
+;; :ownership/claims  [kind key] -> {:stack [{:file :entry} … {:file}] :base-present? :base}
+;;   the top of `:stack` (its last element) is the claim whose entry the registry holds now,
+;;   so it keeps no copy; every claim under it keeps the entry it gives back when the ones
+;;   above it go. `:base` is what the registry held before the first claim (absent when
+;;   `:base-present?` is false). A copy per top claim was most of the editor's startup image:
+;;   ~2 900 claims, each carrying its whole row, closures included, decoded on every start.
 ;; :ownership/kinds   kind -> {:lookup :write :remove}, symbols called late
 
 (defn define-kind (kind lookup write remove)
@@ -129,17 +132,20 @@ ADR-596) — a timer or a worker it spawned — else nil (a registration at run 
 file owns)."
   (or (reflect/current-file) *claimant* (acting-claimant)))
 
-(defn- push-claim (kind key entry file)
-  "Record that `file` claims `entry` under `[kind key]` — on top of what was there, replacing
-its own earlier claim — without writing the registry."
+(defn- push-claim (kind key file shadowed)
+  "Record that `file` claims `[kind key]` — on top of what was there, replacing its own
+earlier claim — without writing the registry. `shadowed` is what the registry held before
+this claim: the entry of the claim it now covers, which that claim keeps from here on."
   (let (claim-key [kind key]
         record (or (registry/lookup :ownership/claims claim-key)
                  (let ([present? value] (kind-lookup kind key))
                    {:stack [] :base-present? present? :base value}))
-        others (into [] (seq/reject (:stack record) (fn (layer) (= (:file layer) file)))))
-    (registry/put :ownership/claims
-      claim-key
-      (assoc record :stack (conj others {:file file :entry entry})))
+        others (into [] (seq/reject (:stack record) (fn (layer) (= (:file layer) file))))
+        covered (if (or (empty? others) (contains? (last others) :entry))
+                  others
+                  (conj (into [] (take others (- (count others) 1)))
+                    (assoc (last others) :entry shadowed))))
+    (registry/put :ownership/claims claim-key (assoc record :stack (conj covered {:file file})))
     ;; indexed by file, so taking a package's claims back reads its own, not every claim
     ;; (a key a claim no longer holds is checked against the record when it is read)
     (registry/put :ownership/by-file
@@ -164,7 +170,7 @@ nobody's to take back. Returns `entry`."
   (let (file (current-claimant))
     (if (nil? file)
       (registry/remove :ownership/claims [kind key])
-      (push-claim kind key entry file))
+      (push-claim kind key file (second (kind-lookup kind key))))
     (kind-write kind key entry)
     entry))
 
@@ -172,13 +178,14 @@ nobody's to take back. Returns `entry`."
   "Record that `file` claims what `[kind key]` holds NOW — written by code that does not go
 through [[claim!]] (std's `settings/define`) — over `base`, what it held before (absent when
 `base-present?` is false). A key that holds nothing is not adopted."
-  (let ([present? value] (kind-lookup kind key))
+  (let ([present? _] (kind-lookup kind key))
     (when present?
       (when (nil? (registry/lookup :ownership/claims [kind key]))
         (registry/put :ownership/claims
           [kind key]
           {:stack [] :base-present? base-present? :base base}))
-      (push-claim kind key value file))))
+      ;; the registry already holds the new row, so what the covered claim gives back is `base`
+      (push-claim kind key file base))))
 
 (defn unclaim! (kind key)
   "Remove `key` from the registry `kind` outright, with every claim on it — an explicit
@@ -231,10 +238,16 @@ is, the entry goes."
         [kind key] claim-key)
     (when (< (count kept) (count stack))
       (cond
-        (not (empty? kept))
-          (do
-            (registry/put :ownership/claims claim-key (assoc record :stack kept))
-            (when (not (= (last kept) (last stack))) (kind-write kind key (:entry (last kept)))))
+        ;; the top went: the claim now on top gives its entry back to the registry, and
+        ;; keeps no copy of it from here on
+        (and (not (empty? kept)) (not (= (last kept) (last stack))))
+          (let (top (last kept))
+            (registry/put :ownership/claims
+              claim-key
+              (assoc record
+                :stack (conj (into [] (take kept (- (count kept) 1))) (dissoc top :entry))))
+            (kind-write kind key (:entry top)))
+        (not (empty? kept)) (registry/put :ownership/claims claim-key (assoc record :stack kept))
         (:base-present? record)
           (do (registry/remove :ownership/claims claim-key) (kind-write kind key (:base record)))
         else (do (registry/remove :ownership/claims claim-key) (kind-remove kind key)))
