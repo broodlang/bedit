@@ -495,6 +495,7 @@ take (`:interpeters`) fails the load, naming the one meant:
 | `:faces`, `:injections` | colours, and the code embedded in it |
 | `:indent`, `:restart`, `:definitions`, `:folds` | RET/TAB, the windowed fontify, C-M-a, folding |
 | `:resume [{:open :close}]` | the outer construct a window far down the file may begin inside (PHP's `<?php … ?>`): the last marker above it decides, an opener being re-read first |
+| `:count-above true` on a `:restart` `:opaque` pair | a symmetric multi-line string (`"""`) is counted over the whole text above a window too, so a window in or below a docstring longer than the lead-in knows it (`:heredocs` markers always are) |
 | `:format` | the formatter M-x format-buffer and format-on-save run |
 | `:lsp {:id :ids :servers}` | its language servers, reached by every buffer in the mode however it got there (name, `#!`, M-x), and its LSP `languageId` — `:ids` only for an extension LSP names apart (`jsx`) (`model/register-lsp`) |
 | `:snippets` | its built-in snippet templates |
@@ -578,8 +579,9 @@ their own:
    Lines of verbatim content (a heredoc's body) are found from the spec's `:indent :verbatim`
    kinds and kept as written.
 5. **restart** — fontifying from the spec's `:restart` answer paints what the whole text paints,
-   at every line: the windowed fontify's one assumption, proven per sample. A language with a
-   `:resume` is checked again from a short lead-in, the opener above it re-read.
+   at every line: the windowed fontify's one assumption, proven per sample — and again from a
+   short lead-in, read after what is open above it (a `<?php`, a docstring), wherever the restart
+   finds a point in it.
 6. **robustness** — seeded random one-character edits: fontify, indent, restart, fold extent and
    breadcrumbs raise nothing and the spans stay in bounds and in order.
 
