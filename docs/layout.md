@@ -81,7 +81,7 @@ src/model.blsp              the ui-run model: buffer pool, panes, *Messages*,
                             point / mark / `:input-start` / `:line-links` and every pane's
                             cursor and scroll moving with the text — Emacs's
                             comint-buffer-maximum-size) on the one CARRY rule every change of
-                            text shares (`ed-carry-position` / `ed-carry-panes`: positions move
+                            text shares (`headcut/ed-carry-position` / `ed-carry-panes`: positions move
                             as Emacs markers do — a head cut here, another frame's splice in
                             `hosted`, the layouts a feature keeps via `register-layout-keeper`),
                             and `ed-ding`: a
@@ -91,6 +91,14 @@ src/model.blsp              the ui-run model: buffer pool, panes, *Messages*,
                             STANDING QUESTION (a y/n read, a query-replace, a minibuffer prompt):
                             it shows beside it in brackets until the next key, as Emacs's
                             minibuffer message, and lands in *Messages* as always
+src/headcut.blsp            an output buffer's HEAD CUT under the model: `ed-cut-head` deletes whole
+                            lines from the top as program output (out of the undo history too),
+                            `ed-head-cut-lines` / `ed-head-cut-chars` say where, and the CARRY
+                            rule moves what points into the text as Emacs markers move
+                            (`ed-carry-position`, `ed-carry-buffer-fields`: point, mark,
+                            `:input-start`, markers, `:line-links`); the line cap a model names
+                            (`ed-output-max-lines`). Knows buffers only — the panes and the sinks'
+                            cap are model's
 src/textpos.blsp            pure text geometry under the model: an offset's line, column, ends, and
                             what an edit changed (the splice log)
 src/lossage.blsp            the recent keys (C-h l), a bounded ring on the model
