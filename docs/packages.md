@@ -505,6 +505,7 @@ take (`:interpeters`) fails the load, naming the one meant:
 | `:format` | the formatter M-x format-buffer and format-on-save run: a command, alternatives, or a function of the buffer's layout (`formatter/buffer-layout`) answering either |
 | `:lsp {:id :ids :servers}` | its language servers, reached by every buffer in the mode however it got there (name, `#!`, M-x), and its LSP `languageId` — `:ids` only for an extension LSP names apart (`jsx`) (`model/register-lsp`) |
 | `:snippets` | its built-in snippet templates |
+| `:embedded-languages` | a function of the text answering the languages it embeds that only the text names (Markdown's fence info strings): the corpus's golden check runs only once their grammars are loaded too |
 | `:pairs`, `:strings` | electric pairs, and its strings and comments without a parse (`stringstate`) |
 | `:fallback` | a line lexer to colour by while the grammar is missing |
 
