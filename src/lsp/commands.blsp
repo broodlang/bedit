@@ -762,7 +762,8 @@ applies the edits to every affected file (left modified for you to save)."
 ;; annotations (`inlinetext`, owner `:lsp-inlay`) in the dim hint voice — never buffer text,
 ;; so they take cells but no chars. Opt-in, as eglot's is: the init file's `:lsp-inlay-hints`
 ;; per mode, or M-x lsp-inlay-hints-mode for one buffer. Between an edit and the next answer
-;; the hints already shown ride their markers; the answer replaces them whole.
+;; the hints already shown ride their markers; the answer replaces them whole. The asking, the
+;; answer's guard and a refresh are `lsp/pull`'s, from the spec `*inlay-pull*`.
 
 (def *inlay-owner* :lsp-inlay)
 
@@ -776,56 +777,44 @@ lsp-inlay-hints-mode) when it has one, else the init file's `:lsp-inlay-hints` f
       (= true
         (display-settings/ed-local-setting :lsp-inlay-hints (:lsp-inlay-hints m) buffer false)))))
 
-(defn- ed-inlay-lines (m)
-  ;; `[first last]` — the lines the selected pane shows (its top and the rows below it)
-  (let (top (ed-current-top m)) [top (+ top (or (:view-rows m) 50))]))
+(def *inlay-pull*
+  ;; the asking, answering and refreshing every pulled feature shares (`lsp/pull`); a file's
+  ;; ask is about its text and the lines its pane shows
+  {:store :lsp-inlays
+   :provider :inlayHintProvider
+   :on? 'lsp/commands/ed-inlay-hints-on?
+   :view 'lsp/commands/inlay-lines
+   :ask 'lsp/commands/inlay-ask})
+
+(defn inlay-lines (m _index opts)
+  "`[first last]` — the lines an inlay-hint ask is about (`lsp/pull`'s `:view`): `opts`'s
+`:lines`, else the rows below a pane's `:top` (a refresh's), else below the selected pane's."
+  (or (:lines opts)
+    (let (top (or (:top opts) (ed-current-top m))) [top (+ top (or (:view-rows m) 50))])))
+
+(defn inlay-ask (_m buffer _entry lines)
+  "The ask for `buffer`'s inlay hints over `lines` (`lsp/pull`'s `:ask`); the answer folds
+onto that buffer ([[ed-apply-inlay-hints]]), whichever pane shows it."
+  [(lsp-inlay-hints)
+    (inlay-range (buffer-rope buffer) lines)
+    {:at [(buffer-file buffer) (buffer-rope buffer) lines]}])
 
 (defn ed-inlay-hints-due? (m)
-  "True when the current buffer's inlay hints want asking for: they are on
+  "True when the current buffer's inlay hints want asking for (`lsp/pull/due?`): they are on
 ([[ed-inlay-hints-on?]]), it has a file and a live server that offers them, and the text or
-the lines on screen moved since the last ask (`:inlay-hints-at`). The idle job's `:stale?`,
-so a buffer with hints off — or a server without them — never keeps the beat armed."
-  (let (buffer (ed-current-buf m)
-        file (buffer-file buffer))
-    (and file
-      (ed-inlay-hints-on? m buffer)
-      (ed-lsp-live m)
-      (lsp/client/lsp-capable? (ed-lsp-caps m :inlayHintProvider) :inlayHintProvider)
-      (not (= [file (buffer-rope buffer) (ed-inlay-lines m)] (:inlay-hints-at m))))))
+the lines on screen moved since the last ask. The idle job's `:stale?`, so a buffer with hints
+off — or a server without them — never keeps the beat armed."
+  (lsp/pull/due? *inlay-pull* m))
 
 (defn ed-launch-inlay-hints (m)
-  "The idle beat's inlay hints: ask the server for the lines on screen
-([[ed-inlay-hints-due?]] decides when), stamping `:inlay-hints-at` with the file, text and
-lines asked about. Quiet: never starts a server, never messages. Off the loop, as every
-lookup is — the answer folds in [[ed-apply-inlay-hints]]."
-  (if (or (ed-headless?) (not (ed-inlay-hints-due? m)))
-    m
-    (let (buffer (ed-current-buf m)
-          lines (ed-inlay-lines m))
-      (ed-inlay-request-at (assoc m
-                             :inlay-hints-at [(buffer-file buffer) (buffer-rope buffer) lines])
-        (ed-current-index m)
-        (:conn (ed-lsp-for m :inlayHintProvider))
-        lines))))
+  "The idle beat's inlay hints: ask the server for the lines on screen when
+[[ed-inlay-hints-due?]] (`lsp/pull/launch`). Quiet: never starts a server, never messages."
+  (lsp/pull/launch *inlay-pull* m))
 
 (defn ed-inlay-request-at (m index connection lines)
   "Ask `connection` for the inlay hints of pool buffer `index`'s `lines` (`[first last]`),
-quietly; the answer folds onto that buffer ([[ed-apply-inlay-hints]]), whichever pane shows
-it — the idle beat asks for the current one, a server's refresh for each on screen."
-  (let (buffer (ed-buf-at m index)
-        file (buffer-file buffer)
-        ;; `:inlay-asked`, per file: the ask the answer must be — one asked while the server
-        ;; was still loading that lands after a newer one is dropped, not painted over it
-        token (ref))
-    (ed-lsp-ask-server-at (map/assoc-in m [:inlay-asked file] token)
-      index
-      connection
-      (lsp-inlay-hints)
-      (merge {:uri (lsp/protocol/lsp-path->uri file)
-              :lang (lsp/client/lsp-buffer-language-id buffer)}
-        (inlay-range (buffer-rope buffer) lines))
-      {:at [file (buffer-rope buffer) lines] :token token}
-      :quiet)))
+quietly (`lsp/pull/request-at`)."
+  (lsp/pull/request-at *inlay-pull* m index {:conn connection :lines lines}))
 
 (defn inlay-range (rope lines)
   "The range an inlay-hint request for `lines` (`[first last]`, a pane's top and its rows) asks
@@ -876,30 +865,22 @@ idle beat asks again), as one for a file no longer open is."
 (defn ed-ev-inlay-refresh (m input text-rows columns rows)
   "A server asking for its inlay hints again (`[:lsp-refresh-inlay-hints connection]`,
 `workspace/inlayHint/refresh` — rust-analyzer once the crate has loaded): each buffer of its
-on screen with hints on is asked for the lines its pane shows, and the idle beat's stamp is
-forgotten, so the current one is asked again however it moves."
-  (let (connection (nth input 1 nil)
-        forgotten (dissoc m :inlay-hints-at))
-    (fold (ed-lsp-shown forgotten connection)
-      forgotten
-      (fn (acc [index top])
-        (let (buffer (ed-buf-at acc index)
-              entry (lsp/client/lsp-entry-for acc (buffer-file buffer) :inlayHintProvider))
-          (if (and (ed-inlay-hints-on? acc buffer)
-                (= (:conn entry) connection)
-                (lsp/client/lsp-capable? (:caps entry) :inlayHintProvider))
-            (ed-inlay-request-at acc index connection [top (+ top (or (:view-rows acc) 50))])
-            acc))))))
+on screen with hints on is asked for the lines its pane shows, and every file it answered is
+due again (`lsp/pull/refresh`), so the current one is asked again however it moves."
+  (lsp/pull/refresh *inlay-pull* m input))
 
 (impl LspRequest
   lsp/requests/lsp-inlay-hints
   (lsp-request-fold (pending m payload)
-    (cond
-      (not (= (:token pending) (map/get-in m [:inlay-asked (first (:at pending))]))) m
-      ;; the server said ask again (`lsp/protocol/lsp-retry?`): the idle beat's stamp forgotten,
-      ;; so the current buffer is asked on the next beat
-      (= payload :lsp-retry) (dissoc m :inlay-hints-at)
-      else (ed-apply-inlay-hints m (:at pending) payload))))
+    ;; filed with the connection that answered, which is whose refresh makes the file due again
+    (lsp/pull/landing *inlay-pull*
+      pending
+      m
+      payload
+      (fn (m path _index)
+        (ed-apply-inlay-hints (map/assoc-in m [:lsp-inlays path :conn] (:conn pending))
+          (:at pending)
+          payload)))))
 
 (defcommand cmd-lsp-inlay-hints-mode
   (m key)
@@ -909,7 +890,7 @@ hints shown go at once; on, the next idle beat asks for the lines on screen."
   (let (buffer (ed-current-buf m)
         on? (not (ed-inlay-hints-on? m buffer))
         toggled (assoc buffer :lsp-inlay-hints on?))
-    (message (ed-set-buf (dissoc m :inlay-hints-at)
+    (message (ed-set-buf (lsp/pull/forget *inlay-pull* m (buffer-file buffer))
                (if on? toggled (inlinetext/clear toggled *inlay-owner*)))
       (if on? "lsp-inlay-hints-mode on" "lsp-inlay-hints-mode off"))))
 

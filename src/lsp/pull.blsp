@@ -1,0 +1,216 @@
+(defmodule lsp/pull
+  "The **pull lifecycle** of a language-server feature the editor asks for by itself, as a
+mechanism — everything about semantic tokens, code lenses and inlay hints that is not about
+what they are.
+
+Each of the three is the same loop: the idle beat asks the current buffer's server when the
+buffer's text (and whatever else the ask is about, an inlay hint's lines) moved since the last
+ask; one ask per file is the one its answer must be (an older answer landing late is dropped,
+not painted over the newer); a server's `content modified` makes the file due again; a server's
+refresh forgets what it answered and asks each of its buffers on screen now; turning the feature
+off takes its paint off every buffer. That loop lives here:
+
+  [[due?]]        the idle job's `:stale?` — wanted, a server offering it, moved, not busy
+  [[launch]]      the idle job's `:run` — ask when due, never in a headless run
+  [[request-at]]  ask about one pool buffer: stamp the file, mark the ask, send it quietly
+  [[landing]]     an answer's guard: closed file, feature off, a newer ask, a retry
+  [[refresh]]     a server's `workspace/…/refresh`
+  [[follow]]      a post-step's walk over the files, a file whose buffer is gone forgotten
+  [[toggle]]      the M-x mode command of a feature on or off for every buffer
+
+What a FEATURE supplies is a spec, symbols resolved at call time as a keymap's commands are, so a
+service redefined at runtime takes effect on the next beat:
+
+    {:store :lsp-semantic                ; the model key of its per-file state, `{path {…}}`:
+                                         ; `:requested` (what the last ask was about) and
+                                         ; `:asked` (its token) are this module's, the rest
+                                         ; the feature's
+     :provider :semanticTokensProvider   ; the capability a server offers it under
+     :offers? 'sym                       ; optional: (caps) -> bool, past the provider's presence
+     :setting :lsp-semantic-tokens       ; the model key that turns it on or off…
+     :default-on? true                   ; …on unless false (true), or off unless true
+     :on? 'sym                           ; optional, instead: (m buffer) -> bool, per buffer
+     :busy? 'sym                         ; optional: (m file) -> bool, an ask still under way
+     :view 'sym                          ; optional: (m index opts) -> what else an ask is
+                                         ; about besides the text (inlay hints: the lines)
+     :ask 'sym                           ; (m buffer entry view) -> [kind request extra]: the
+                                         ; request kind, its params past `:uri`/`:lang`, and
+                                         ; what the pending lookup keeps past `:path`/`:token`
+     :clear 'sym                         ; optional: (m) -> m, its paint off every buffer
+     :label \"lsp code lenses\"}          ; what [[toggle]] says
+
+The per-connection loop sink, the pending timeout (`lsp/servers/ed-lsp-in-flight?`), the shape
+dispatch of an answer and the applyEdit guard are the request path's (`lsp/servers`,
+`lsp/client`, `lsp/protocol`), which every ask here goes through."
+  (:use model) ; ed-current-index / ed-buf-at / ed-buffer-index-by-file / ed-headless? / message
+  (:use editor/buffer) ; buffer-rope / buffer-file
+  (:use lsp/servers)) ; ed-lsp-ask-server-at / ed-lsp-shown — one request path for every lookup
+
+;; ---- reading the spec ------------------------------------------------------------
+
+(defn- svc (spec key args)
+  ;; call the spec's `key` service with `args`, resolved now (see the module docstring)
+  (apply (reflect/eval (get spec key)) args))
+
+(defn- has? (spec key) (not (nil? (get spec key))))
+
+(defn store-of (spec m path)
+  "The feature's state for the file at `path` under `m` (`spec`'s `:store`), or nil."
+  (map/get-in m [(:store spec) path]))
+
+(defn on? (spec m buffer)
+  "Whether `spec`'s feature is wanted for `buffer` (nil asks about every buffer): its `:on?`
+service when it has one, else its `:setting` on the model — on unless false when it is
+`:default-on?`, off unless true otherwise."
+  (if (has? spec :on?)
+    (svc spec :on? (list m buffer))
+    (let (value (get m (:setting spec)))
+      (if (:default-on? spec) (not (= false value)) (= true value)))))
+
+(defn entry (spec m file)
+  "The live server for `file` that offers `spec`'s feature, or nil."
+  (seq/find (lsp/client/lsp-live-entries m file)
+    (fn (live)
+      (let (caps (:caps live))
+        (and (lsp/client/lsp-capable? caps (:provider spec))
+          (or (not (has? spec :offers?)) (svc spec :offers? (list caps))))))))
+
+(defn- busy? (spec m file) (and (has? spec :busy?) (svc spec :busy? (list m file))))
+
+(defn- view (spec m index opts)
+  (when (has? spec :view) (svc spec :view (list m index opts))))
+
+(defn- stamp (spec m index opts)
+  ;; what an ask about pool buffer `index` is about: its text, and the spec's view of it
+  (let (rope (buffer-rope (ed-buf-at m index))
+        seen (view spec m index opts))
+    (if (nil? seen) rope [rope seen])))
+
+(sig forget (map model any -> model))
+(defn forget (spec m path)
+  "`m` with the file at `path` due again: what its last ask was about forgotten."
+  (if (string? path) (map/assoc-in m [(:store spec) path :requested] nil) m))
+
+;; ---- asking ----------------------------------------------------------------------
+
+(defn due? (spec m)
+  "True when the current buffer is due an ask of `spec`'s feature: wanted, it has a file, what
+an ask is about moved since the last one, no ask for it under way, and a live server offers it.
+The idle job's `:stale?`, so false whenever the ask would not happen."
+  (let (index (ed-current-index m)
+        buffer (ed-buf-at m index)
+        file (buffer-file buffer))
+    (and (string? file)
+      (on? spec m buffer)
+      (not (= (stamp spec m index {}) (:requested (store-of spec m file))))
+      (not (busy? spec m file))
+      (not (nil? (entry spec m file))))))
+
+(sig request-at (map model int &optional map -> model))
+(defn request-at (spec m index &optional (opts {}))
+  "Ask the server offering `spec`'s feature about pool buffer `index`, whichever pane shows it,
+quietly: the file stamped with what the ask is about (`:requested`) and the ask marked as the
+one its answer must be (`:asked`, the pending lookup's `:token`). `opts` reaches the spec's
+`:view`; its `:conn` asks that connection. Nothing for a buffer no live server serves."
+  (let (buffer (ed-buf-at m index)
+        file (buffer-file buffer)
+        live (when (string? file) (entry spec m file)))
+    (if (nil? live)
+      m
+      (let ([kind request extra] (svc spec :ask (list m buffer live (view spec m index opts)))
+            token (ref)
+            store (:store spec))
+        (ed-lsp-ask-server-at (map/assoc-in (map/assoc-in m
+                                              [store file :requested]
+                                              (stamp spec m index opts))
+                                [store file :asked]
+                                token)
+          index
+          (or (:conn opts) (:conn live))
+          kind
+          (merge {:uri (lsp/protocol/lsp-path->uri file)
+                  :lang (lsp/client/lsp-buffer-language-id buffer)}
+            request)
+          (merge (or extra {}) {:path file :token token})
+          :quiet)))))
+
+(sig launch (map model -> model))
+(defn launch (spec m)
+  "The idle beat's ask of `spec`'s feature for the current buffer, when [[due?]]. Never in a
+headless run, whose stand-in servers are the test process itself."
+  (if (or (ed-headless?) (not (due? spec m))) m (request-at spec m (ed-current-index m))))
+
+;; ---- answers ---------------------------------------------------------------------
+
+;; check-allow: `land` is the feature's fold, whose result the checker cannot see; it
+;; answers a model
+(sig landing (map any model any fn -> model))
+(check-allow :trusted
+  (defn landing (spec pending m payload land)
+    "An answer `payload` to the ask `pending` landing: `(land m path index)` with the file's pool
+index, unless the file closed, the feature is off for it, a newer ask replaced this one, or the
+payload is nil. A server's `content modified` (`:lsp-retry`, `lsp/protocol/lsp-retry?`) makes
+the file due on the next beat instead."
+    (let (path (:path pending)
+          index (when path (ed-buffer-index-by-file m path)))
+      (cond
+        (or (nil? payload) (nil? index) (not (on? spec m (ed-buf-at m index)))) m
+        (not (= (:token pending) (:asked (store-of spec m path)))) m
+        (= payload :lsp-retry) (forget spec m path)
+        else (land m path index)))))
+
+;; check-allow: `step` is the feature's, whose result the checker cannot see; it answers
+;; a model
+(sig follow (map model fn -> model))
+(check-allow :trusted
+  (defn follow (spec m step)
+    "A post-step's walk: `(step m index path state)` for each file `spec`'s feature keeps state
+for, with its buffer's pool index; a file whose buffer is gone is forgotten."
+    (let (stores (or (get m (:store spec)) {}))
+      (if (empty? stores)
+        m
+        (fold (%map-pairs stores)
+          m
+          (fn (acc [path state])
+            (let (index (ed-buffer-index-by-file acc path))
+              (if (nil? index)
+                (assoc acc (:store spec) (dissoc (get acc (:store spec)) path))
+                (step acc index path state)))))))))
+
+(sig refresh (map model vector -> model))
+(defn refresh (spec m input)
+  "A server asking for `spec`'s feature again (`input` is `[event connection]`, its
+`workspace/…/refresh`): every file it answered is due again, and each buffer of its on screen
+that wants the feature is asked now — unless an ask is already out, whose file is then due again
+once it lands."
+  (let (connection (nth input 1 nil)
+        stores (or (get m (:store spec)) {})
+        forgotten (assoc m
+                    (:store spec)
+                      (fold (%map-pairs stores)
+                        stores
+                        (fn (acc [path state])
+                          (if (= (:conn state) connection)
+                            (assoc acc path (dissoc state :requested))
+                            acc)))))
+    (fold (ed-lsp-shown forgotten connection)
+      forgotten
+      (fn (acc [index top])
+        (let (buffer (ed-buf-at acc index)
+              file (buffer-file buffer))
+          (if (and (= (:conn (entry spec acc file)) connection)
+                (on? spec acc buffer)
+                (not (busy? spec acc file)))
+            (request-at spec acc index {:conn connection :top top})
+            acc))))))
+
+(sig toggle (map model -> model))
+(defn toggle (spec m)
+  "`spec`'s feature turned off for every buffer when it is on — its paint taken off (`:clear`)
+and every file forgotten — else on, from the next idle beat; said in the echo area."
+  (let (setting (:setting spec)
+        store (:store spec))
+    (if (on? spec m nil)
+      (message (assoc (if (has? spec :clear) (svc spec :clear (list m)) m) setting false store {})
+        (str (:label spec) " off"))
+      (message (assoc m setting true store {}) (str (:label spec) " on")))))

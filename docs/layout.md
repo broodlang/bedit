@@ -1497,6 +1497,17 @@ src/lsp/requests.blsp
     the LSP request-kind records + `LspRequest` ability — the shape/fold vocabulary
     shared by lsp (connection side) and lsp-commands (model side); eager-loaded so
     lsp-commands can register fold impls while lsp stays deferred
+src/lsp/pull.blsp
+    the PULL LIFECYCLE a feature the editor asks a server for by itself shares —
+    semantic tokens, code lenses, inlay hints — as a mechanism taking a spec
+    (the `playground-core` shape): `due?` / `launch` (the idle job's `:stale?`
+    and `:run`), `request-at` (the file stamped with what the ask is about, the
+    ask marked as the one its answer must be), `landing` (an answer's guard:
+    closed file, feature off, a newer ask, `content modified`), `refresh` (a
+    server's `workspace/…/refresh`), `follow` (a post-step's walk, a gone
+    buffer's file forgotten) and `toggle`. A feature's spec names its store,
+    provider, setting (or per-buffer `:on?`), `:ask` and `:clear`, symbols
+    resolved late
 src/lsp/semantic.blsp
     LSP SEMANTIC TOKENS (`semanticTokens/full`, `/full/delta`): the integer
     array (a delta applied) turned into spans by a TASK off the loop, each token

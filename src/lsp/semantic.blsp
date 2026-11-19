@@ -16,7 +16,8 @@ Three halves, as every LSP feature here:
 - **the wire**: two request kinds (`lsp-semantic-tokens`, `lsp-semantic-tokens-delta`) under
   the `LspRequest` ability, shaped and folded like every other lookup.
 - **the model**: the idle beat asks when the current buffer's text moved since the last ask
-  (`ed-semantic-due?`), the answer is turned into spans by a task off the loop and
+  (`ed-semantic-due?`; the asking, the answer's guard and a refresh are `lsp/pull`'s, from the
+  spec `*pull*`), the answer is turned into spans by a task off the loop and
   `ed-semantic-land` stamps them on the pool buffer with the rope they are about
   (`:semantic-spans`, `:semantic-rope`). A frame asks for the lines it shows
   (`semantic-window`, the span overlay `spanpaint/ed-buffer-spans` lays over the mode's spans),
@@ -30,7 +31,7 @@ On while the server offers it (`semanticTokensProvider`) unless init.blsp's
   (:use editor/buffer) ; buffer-rope / buffer-file / buffer-splices-since
   (:use interactive) ; defcommand — M-x lsp-semantic-tokens-mode
   (:use lsp/requests) ; the LspRequest ability the two request kinds implement
-  (:use lsp/servers) ; ed-lsp-ask-server — one request path for every lookup
+  (:use lsp/servers) ; ed-lsp-in-flight? — an ask of its own still out
   (:use task) ; task — an answer turned into spans off the loop
   (:use memo)) ; defmemo — a frame's window of the spans, worked out once
 
@@ -323,86 +324,66 @@ frame asks of a file's spans between answers, so it costs the spans shown, not t
 
 ;; ---- the model ---------------------------------------------------------------------
 
+(def *pull*
+  ;; the asking, answering and refreshing every pulled feature shares (`lsp/pull`)
+  {:store :lsp-semantic
+   :provider :semanticTokensProvider
+   :offers? 'lsp/semantic/legend-offered?
+   :setting :lsp-semantic-tokens
+   :default-on? true
+   :busy? 'lsp/semantic/ed-semantic-busy?
+   :ask 'lsp/semantic/semantic-ask
+   :clear 'lsp/semantic/ed-semantic-clear
+   :label "lsp semantic tokens"})
+
 (defn semantic-on? (m)
   "Whether semantic tokens are wanted: init.blsp's `:lsp-semantic-tokens` (on unless false)."
-  (not (= false (:lsp-semantic-tokens m))))
+  (lsp/pull/on? *pull* m nil))
 
-(defn semantic-entry (m file)
-  "The live server for `file` that offers semantic tokens with a legend, or nil."
-  (seq/find (lsp/client/lsp-live-entries m file)
-    (fn (entry)
-      (map? (map/get-in entry [:caps :semanticTokensProvider :legend])))))
+(defn legend-offered? (caps)
+  "Whether a server's `caps` offer semantic tokens with a legend — which a token means nothing
+without."
+  (map? (map/get-in caps [:semanticTokensProvider :legend])))
 
 (defn- delta-offered? (provider)
   ;; `semanticTokensProvider.full` is `true` or `{:delta bool}`
   (let (full (:full provider)) (and (map? full) (= true (:delta full)))))
 
-(defn- ed-semantic-busy? (m file)
-  ;; an ask out for `file`, or its answer still being turned into spans off the loop or waiting
-  ;; its turn: one at a time, as two in flight are two deltas against one answer, and the
-  ;; server, which keeps only its newest, answers the second whole
+(defn ed-semantic-busy? (m file)
+  "Whether an ask for `file` is out, or its answer is still being turned into spans off the
+loop or waiting its turn: one at a time, as two in flight are two deltas against one answer,
+and the server, which keeps only its newest, answers the second whole."
   (or (ed-lsp-in-flight? m (map/get-in m [:lsp-semantic file :asked]))
     (= file (:path (:lsp-semantic-job m)))
     (any? (or (:lsp-semantic-queue m) []) (fn (job) (= file (:path job))))))
 
 (defn ed-semantic-due? (m)
-  "True when the current buffer's tokens are due an ask: wanted, a live server offering them,
-the text moved since the last ask, and no ask or answer for it under way. The idle job's
-`:stale?`, so false whenever the ask would not happen."
-  (let (buffer (ed-current-buf m)
-        file (buffer-file buffer))
-    (and (semantic-on? m)
-      (string? file)
-      (not (= (buffer-rope buffer) (map/get-in m [:lsp-semantic file :requested])))
-      (not (ed-semantic-busy? m file))
-      (not (nil? (semantic-entry m file))))))
+  "True when the current buffer's tokens are due an ask (`lsp/pull/due?`): wanted, a live
+server offering them, the text moved since the last ask, and no ask or answer for it under way."
+  (lsp/pull/due? *pull* m))
 
-(defn ed-semantic-request (m)
-  "Ask the current buffer's server for its semantic tokens — the delta since the last answer
-when the server offers deltas and that answer came from it, else the whole set. Quiet: the
-reader did not ask. The text the answer is about is the buffer as it is now (the ask pushes
-it first, `lsp/servers/ed-lsp-ask-server`), kept on the lookup as `:seen`."
-  (ed-semantic-request-at m (ed-current-index m)))
-
-(defn ed-semantic-request-at (m index)
-  "[[ed-semantic-request]] for pool buffer `index`, whichever pane shows it — what a server's
-refresh asks for each buffer of its on screen. Nothing for a buffer no live server colours."
-  (let (buffer (ed-buf-at m index)
-        file (buffer-file buffer)
-        entry (semantic-entry m file)
+(defn semantic-ask (m buffer entry _view)
+  "The ask for `buffer`'s tokens (`lsp/pull`'s `:ask`): the delta since the last answer when
+the server offers deltas and that answer came from it, else the whole set. The text the answer
+is about is the buffer as it is now (the ask pushes it first), kept on the lookup as `:seen`."
+  (let (file (buffer-file buffer)
         provider (map/get-in entry [:caps :semanticTokensProvider])
         store (map/get-in m [:lsp-semantic file])
         delta? (and (delta-offered? provider)
                  (= (:conn store) (:conn entry))
                  (string? (:result-id store))
-                 (vector? (:data store)))
-        request (assoc {:uri (lsp/protocol/lsp-path->uri file)
-                        :lang (lsp/client/lsp-buffer-language-id buffer)}
-                  :previous-result-id (when delta? (:result-id store)))
-        token (ref)
-        ;; the ask this answer must be: an older one landing after it (asked while the server
-        ;; was still loading, say) is dropped rather than painted over the newer
-        marked (map/assoc-in (map/assoc-in m [:lsp-semantic file :requested] (buffer-rope buffer))
-                 [:lsp-semantic file :asked]
-                 token))
-    (if (or (nil? entry) (not (string? file)))
-      m
-      (ed-lsp-ask-server-at marked
-        index
-        (:conn entry)
-        (if delta? (lsp-semantic-tokens-delta) (lsp-semantic-tokens))
-        request
-        {:path file
-         :seen buffer
-         :legend (:legend provider)
-         :previous-id (when delta? (:result-id store))
-         :token token}
-        :quiet))))
+                 (vector? (:data store))))
+    [(if delta? (lsp-semantic-tokens-delta) (lsp-semantic-tokens))
+      {:previous-result-id (when delta? (:result-id store))}
+      {:seen buffer :legend (:legend provider) :previous-id (when delta? (:result-id store))}]))
+
+(defn ed-semantic-request (m)
+  "Ask the current buffer's server for its semantic tokens, quietly (`lsp/pull/request-at`)."
+  (lsp/pull/request-at *pull* m (ed-current-index m)))
 
 (defn ed-launch-semantic (m)
-  "The idle beat's semantic tokens: ask when [[ed-semantic-due?]]. Never in a headless run,
-whose stand-in servers are the test process itself."
-  (if (or (ed-headless?) (not (ed-semantic-due? m))) m (ed-semantic-request m)))
+  "The idle beat's semantic tokens: ask when [[ed-semantic-due?]] (`lsp/pull/launch`)."
+  (lsp/pull/launch *pull* m))
 
 (defn- ed-semantic-stamp (m index spans rope)
   ;; `spans` stamped on pool buffer `index` with `rope`, the text they are about: what
@@ -489,38 +470,34 @@ thousands of tokens — and landed by [[ed-semantic-land]]. One answer is worked
 one arriving meanwhile waits its turn (`:lsp-semantic-queue`, the newest per file). Dropped for
 a closed file, with the feature off, or for an ask a newer one replaced; a delta against an
 answer no longer kept forgets the result id, so the next ask is a whole one."
-  (let (path (:path pending)
-        store (or (map/get-in m [:lsp-semantic path]) {})
-        index (when path (ed-buffer-index-by-file m path)))
-    (cond
-      (or (nil? payload) (nil? index) (not (semantic-on? m))) m
-      (not (= (:token pending) (:asked store))) m
-      ;; the server said ask again (`lsp/protocol/lsp-retry?`): due on the next beat
-      (= payload :lsp-retry) (map/assoc-in m [:lsp-semantic path :requested] nil)
-      else
-        (let (data (cond
-                     (not (nil? (:edits payload)))
-                       (when (and (:previous-id pending)
-                               (= (:previous-id pending) (:result-id store)))
-                         (apply-delta (:data store) (:edits payload)))
-                     else (as-vector (:data payload))))
-          (if (nil? data)
-            (map/assoc-in m [:lsp-semantic path] (dissoc store :result-id :data :requested))
-            (let (job {:path path
-                       ;; the text the answer is about: the rope alone, not the whole buffer
-                       :rope (buffer-rope (:seen pending))
-                       :token (:token pending)
-                       :legend (:legend pending)
-                       :answer {:data data
-                                ;; whether this array was rebuilt from a delta — what
-                                ;; *lsp-log* and a driver read to tell the two answers apart
-                                :delta? (not (nil? (:edits payload)))
-                                :result-id (:result-id payload)
-                                :conn (:conn pending)}}
-                  waiting (seq/reject (or (:lsp-semantic-queue m) [])
-                            (fn (queued) (= (:path queued) path))))
-              (ed-semantic-next (assoc m :lsp-semantic-queue (conj (into [] waiting) job)))))))))
-
+  (lsp/pull/landing *pull*
+    pending
+    m
+    payload
+    (fn (m path _index)
+      (let (store (or (map/get-in m [:lsp-semantic path]) {})
+            data (cond
+                   (not (nil? (:edits payload)))
+                     (when (and (:previous-id pending)
+                             (= (:previous-id pending) (:result-id store)))
+                       (apply-delta (:data store) (:edits payload)))
+                   else (as-vector (:data payload))))
+        (if (nil? data)
+          (map/assoc-in m [:lsp-semantic path] (dissoc store :result-id :data :requested))
+          (let (job {:path path
+                     ;; the text the answer is about: the rope alone, not the whole buffer
+                     :rope (buffer-rope (:seen pending))
+                     :token (:token pending)
+                     :legend (:legend pending)
+                     :answer {:data data
+                              ;; whether this array was rebuilt from a delta — what
+                              ;; *lsp-log* and a driver read to tell the two answers apart
+                              :delta? (not (nil? (:edits payload)))
+                              :result-id (:result-id payload)
+                              :conn (:conn pending)}}
+                waiting (seq/reject (or (:lsp-semantic-queue m) [])
+                          (fn (queued) (= (:path queued) path))))
+            (ed-semantic-next (assoc m :lsp-semantic-queue (conj (into [] waiting) job)))))))))
 (defn ed-semantic-land (m spans)
   "The spans of the answer [[ed-semantic-fold]] handed off (`:lsp-semantic-job`) landing: stamped
 on the file's buffer with the text they were computed against (a frame carries them from there,
@@ -556,16 +533,7 @@ stamped for and a frame carries what it shows ([[semantic-window]]), so an event
 only a look at each file's log: spans whose edits the log cannot say are dropped and the file
 asked again; spans read through more than `*rebase-after*` edits are carried whole once and
 restamped. A file whose buffer is gone is forgotten."
-  (let (stores (or (:lsp-semantic m) {}))
-    (if (empty? stores)
-      m
-      (fold (keys stores)
-        m
-        (fn (acc path)
-          (let (index (ed-buffer-index-by-file acc path))
-            (if (nil? index)
-              (assoc acc :lsp-semantic (dissoc (:lsp-semantic acc) path))
-              (ed-semantic-rebase acc index path))))))))
+  (lsp/pull/follow *pull* m (fn (acc index path _store) (ed-semantic-rebase acc index path))))
 
 (defn- ed-semantic-rebase (m index path)
   ;; pool buffer `index`'s stamp kept while the log reaches it and few edits lie since; carried
@@ -574,9 +542,7 @@ restamped. A file whose buffer is gone is forgotten."
         splices (splices-since-stamp buffer))
     (cond
       (nil? splices)
-        (map/assoc-in (ed-semantic-stamp m index [] (buffer-rope buffer))
-          [:lsp-semantic path :requested]
-          nil)
+        (lsp/pull/forget *pull* (ed-semantic-stamp m index [] (buffer-rope buffer)) path)
       (> (count splices) *rebase-after*)
         (ed-semantic-stamp m
           index
@@ -584,9 +550,9 @@ restamped. A file whose buffer is gone is forgotten."
           (buffer-rope buffer))
       else m)))
 
-(defn- ed-semantic-clear (m)
-  ;; every buffer's spans taken off and the files forgotten, the answers waiting with them (a
-  ;; job running lands as dropped: the feature is off)
+(defn ed-semantic-clear (m)
+  "Every buffer's spans taken off, and the answers waiting with them (a job running lands as
+dropped: the feature is off) — `lsp/pull`'s `:clear`."
   (assoc (fold (range (count (:buffers m)))
            m
            (fn (acc index)
@@ -594,7 +560,6 @@ restamped. A file whose buffer is gone is forgotten."
                (if (contains? buffer :semantic-spans)
                  (ed-set-buf-at acc index (dissoc buffer :semantic-spans :semantic-rope))
                  acc))))
-    :lsp-semantic {}
     :lsp-semantic-queue []))
 
 (defcommand cmd-lsp-semantic-tokens-mode
@@ -602,38 +567,16 @@ restamped. A file whose buffer is gone is forgotten."
   "Toggle colouring by the language server's semantic tokens (Emacs eglot's semantic tokens):
 what a name IS — a parameter, a macro, a type, a definition — over the mode's own colours.
 On by default where the server offers it; init.blsp's `:lsp-semantic-tokens false` starts it off."
-  (if (semantic-on? m)
-    (message (assoc (ed-semantic-clear m) :lsp-semantic-tokens false) "lsp semantic tokens off")
-    (message (assoc m :lsp-semantic-tokens true :lsp-semantic {}) "lsp semantic tokens on")))
+  (lsp/pull/toggle *pull* m))
 
 (defn ed-ev-semantic-refresh (m input text-rows columns rows)
   "A server asking for its semantic tokens again (`[:lsp-refresh-semantic-tokens connection]`,
 `workspace/semanticTokens/refresh` — the project finished loading, a dependency changed):
-every file it colours is due again, and each buffer of its on screen is asked now — as a delta
-against the last answer when there is one, as VS Code asks: the server keeps that answer and
-sends what changed since (rust-analyzer refreshes after most edits, so forgetting it would make
-every answer a whole one)."
-  (let (connection (nth input 1 nil)
-        stores (or (:lsp-semantic m) {})
-        forgotten (assoc m
-                    :lsp-semantic
-                      (fold (%map-pairs stores)
-                        stores
-                        (fn (acc [path store])
-                          (if (= (:conn store) connection)
-                            (assoc acc path (dissoc store :requested))
-                            acc)))))
-    (if (not (semantic-on? forgotten))
-      forgotten
-      (fold (ed-lsp-shown forgotten connection)
-        forgotten
-        (fn (acc [index _top])
-          (let (entry (semantic-entry acc (buffer-file (ed-buf-at acc index))))
-            (cond
-              (not (= (:conn entry) connection)) acc
-              ;; an ask already out: this file is due again once it lands (`:requested` forgotten)
-              (ed-semantic-busy? acc (buffer-file (ed-buf-at acc index))) acc
-              else (ed-semantic-request-at acc index))))))))
+every file it colours is due again, and each buffer of its on screen is asked now
+(`lsp/pull/refresh`) — as a delta against the last answer when there is one, as VS Code asks:
+the server keeps that answer and sends what changed since (rust-analyzer refreshes after most
+edits, so forgetting it would make every answer a whole one)."
+  (lsp/pull/refresh *pull* m input))
 
 ;; ---- registration -------------------------------------------------------------------
 (register-event-handler :lsp-semantic-tokens 'lsp/commands/ed-ev-lsp-reply)

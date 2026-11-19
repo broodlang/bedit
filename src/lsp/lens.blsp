@@ -8,12 +8,12 @@ command makes come back as the server's `workspace/applyEdit`, applied as a code
 (`lsp/commands/ed-ev-lsp-apply-edit`).
 
 Asked on the idle beat when the current buffer's text moved since the last ask — so on open
-and once edits settle — of a live server offering `codeLensProvider`. A lens the server sends
-without its command is resolved (`codeLens/resolve`) when the server says it resolves. Each
-lens is anchored by a char offset carried through the buffer's splice log by a post-step
-(`lens-follow`), so a row stays above its line while you type rather than vanishing until the
-next answer. Per file under `:lsp-lenses`: `{path {:seen buffer :lenses [...] :generation ref
-:requested rope :conn}}`.
+and once edits settle — of a live server offering `codeLensProvider` (`lsp/pull`, from the spec
+`*pull*`). A lens the server sends without its command is resolved (`codeLens/resolve`) when
+the server says it resolves. Each lens is anchored by a char offset carried through the
+buffer's splice log by a post-step (`lens-follow`), so a row stays above its line while you
+type rather than vanishing until the next answer. Per file under `:lsp-lenses`: `{path {:seen
+buffer :lenses [...] :generation ref :requested rope :conn}}`.
 
 Off unless init.blsp's `:lsp-code-lens` is true (most Emacs clients make lenses opt-in);
 M-x lsp-code-lens-mode toggles it."
@@ -141,55 +141,37 @@ cannot say what changed."
 
 (def- *inlay-owner* :lsp-code-lens)
 
+(def *pull*
+  ;; the asking, answering and refreshing every pulled feature shares (`lsp/pull`)
+  {:store :lsp-lenses
+   :provider :codeLensProvider
+   :setting :lsp-code-lens
+   :default-on? false
+   :ask 'lsp/lens/lens-ask
+   :clear 'lsp/lens/ed-lens-clear
+   :label "lsp code lenses"})
+
 (defn lens-on? (m)
   "Whether code lenses are wanted: init.blsp's `:lsp-code-lens` (off unless true)."
-  (= true (:lsp-code-lens m)))
-
-(defn lens-entry (m file)
-  "The live server for `file` that offers code lenses, or nil."
-  (seq/find (lsp/client/lsp-live-entries m file)
-    (fn (entry) (lsp/client/lsp-capable? (:caps entry) :codeLensProvider))))
+  (lsp/pull/on? *pull* m nil))
 
 (defn ed-lens-due? (m)
-  "True when the current buffer's lenses are due an ask: wanted, a live server offering them,
-and the text moved since the last ask. The idle job's `:stale?`."
-  (let (buffer (ed-current-buf m)
-        file (buffer-file buffer))
-    (and (lens-on? m)
-      (string? file)
-      (not (= (buffer-rope buffer) (map/get-in m [:lsp-lenses file :requested])))
-      (not (nil? (lens-entry m file))))))
+  "True when the current buffer's lenses are due an ask (`lsp/pull/due?`): wanted, a live
+server offering them, and the text moved since the last ask. The idle job's `:stale?`."
+  (lsp/pull/due? *pull* m))
+
+(defn lens-ask (_m buffer _entry _view)
+  "The ask for `buffer`'s code lenses (`lsp/pull`'s `:ask`); the text they are about is the
+buffer as it is now, kept on the lookup as `:seen`."
+  [(lsp-code-lens) {} {:seen buffer}])
 
 (defn ed-lens-request (m)
-  "Ask the current buffer's server for its code lenses, quietly; the text they are about is
-the buffer as it is now, kept on the lookup as `:seen`."
-  (ed-lens-request-at m (ed-current-index m)))
-
-(defn ed-lens-request-at (m index)
-  "[[ed-lens-request]] for pool buffer `index`, whichever pane shows it — what a server's
-refresh asks for each buffer of its on screen. Nothing for a buffer no live server lenses."
-  (let (buffer (ed-buf-at m index)
-        file (buffer-file buffer)
-        entry (when (string? file) (lens-entry m file)))
-    (if (nil? entry)
-      m
-      ;; `:asked`: the ask the answer must be — an older one landing later is dropped
-      (let (token (ref))
-        (ed-lsp-ask-server-at (map/assoc-in (map/assoc-in m
-                                              [:lsp-lenses file :requested]
-                                              (buffer-rope buffer))
-                                [:lsp-lenses file :asked]
-                                token)
-          index
-          (:conn entry)
-          (lsp-code-lens)
-          {:uri (lsp/protocol/lsp-path->uri file) :lang (lsp/client/lsp-buffer-language-id buffer)}
-          {:path file :seen buffer :token token}
-          :quiet)))))
+  "Ask the current buffer's server for its code lenses, quietly (`lsp/pull/request-at`)."
+  (lsp/pull/request-at *pull* m (ed-current-index m)))
 
 (defn ed-launch-lens (m)
-  "The idle beat's code lenses: ask when [[ed-lens-due?]]. Never in a headless run."
-  (if (or (ed-headless?) (not (ed-lens-due? m))) m (ed-lens-request m)))
+  "The idle beat's code lenses: ask when [[ed-lens-due?]] (`lsp/pull/launch`)."
+  (lsp/pull/launch *pull* m))
 
 (defn- ed-lens-stamp (m index path store)
   "`m` with `store` filed for `path` and its rows stamped on pool buffer `index` as its inlay
@@ -232,26 +214,21 @@ it resolves them (`codeLensProvider.resolveProvider`) — at most `*resolve-max*
   "A code-lens answer landing: anchored on the text it was about (`:seen`), carried to the text
 now, its rows stamped, and the lenses without a command sent to be resolved. Dropped for a
 closed file, with lenses off, or for an ask a newer one has replaced."
-  (let (path (:path pending)
-        index (when path (ed-buffer-index-by-file m path)))
-    (if (or (nil? payload)
-          (nil? index)
-          (not (lens-on? m))
-          (not (= (:token pending) (map/get-in m [:lsp-lenses path :asked]))))
-      m
-      (if (= payload :lsp-retry)
-        ;; the server said ask again (`lsp/protocol/lsp-retry?`): due on the next beat
-        (map/assoc-in m [:lsp-lenses path :requested] nil)
-        (let (seen (:seen pending)
-              anchored (anchor-lenses payload (buffer-rope seen))
-              carried (carry-lenses anchored seen (ed-buf-at m index))
-              store (assoc (or (map/get-in m [:lsp-lenses path]) {})
-                      :lenses (or carried [])
-                      :generation (ref)
-                      :conn (:conn pending))
-              store (if carried store (assoc store :requested nil))
-              stamped (ed-lens-stamp m index path store))
-          (ed-lens-resolve-all stamped path store))))))
+  (lsp/pull/landing *pull*
+    pending
+    m
+    payload
+    (fn (m path index)
+      (let (seen (:seen pending)
+            anchored (anchor-lenses payload (buffer-rope seen))
+            carried (carry-lenses anchored seen (ed-buf-at m index))
+            store (assoc (or (map/get-in m [:lsp-lenses path]) {})
+                    :lenses (or carried [])
+                    :generation (ref)
+                    :conn (:conn pending))
+            store (if carried store (assoc store :requested nil))
+            stamped (ed-lens-stamp m index path store))
+        (ed-lens-resolve-all stamped path store)))))
 
 (defn ed-lens-resolved (pending m payload)
   "A resolved lens landing: its title and command put on the lens it was asked for — when that
@@ -278,27 +255,20 @@ lens is still from the same answer (`:generation`) — and the rows restamped."
 (defn lens-follow (m)
   "The post-step: every file's lenses carried through what this event did to its buffer
 ([[carry-lenses]]) and their rows restamped; a file whose buffer is gone forgotten."
-  (let (stores (or (:lsp-lenses m) {}))
-    (if (empty? stores)
-      m
-      (fold (%map-pairs stores)
-        m
-        (fn (acc pair)
-          (let ([path store] pair
-                index (ed-buffer-index-by-file acc path)
-                seen (:seen store))
-            (cond
-              (nil? index) (assoc acc :lsp-lenses (dissoc (:lsp-lenses acc) path))
-              (nil? seen) acc
-              (= (buffer-rope seen) (buffer-rope (ed-buf-at acc index))) acc
-              else
-                (let (carried (carry-lenses (:lenses store) seen (ed-buf-at acc index)))
-                  (ed-lens-stamp acc
-                    index
-                    path
-                    (if (nil? carried)
-                      (assoc store :lenses [] :requested nil)
-                      (assoc store :lenses carried)))))))))))
+  (lsp/pull/follow *pull*
+    m
+    (fn (acc index path store)
+      (let (seen (:seen store)
+            buffer (ed-buf-at acc index))
+        (if (or (nil? seen) (= (buffer-rope seen) (buffer-rope buffer)))
+          acc
+          (let (carried (carry-lenses (:lenses store) seen buffer))
+            (ed-lens-stamp acc
+              index
+              path
+              (if (nil? carried)
+                (assoc store :lenses [] :requested nil)
+                (assoc store :lenses carried)))))))))
 
 ;; ---- running a lens: the server's command, or the client's ------------------------------
 ;; A lens's command is one of two things. A SERVER command — one the server lists in
@@ -481,49 +451,28 @@ With several on the line, pick one."
                   (let (hit (seq/find labeled (fn (pair) (= (first pair) label))))
                     (if (nil? hit) (message mm "lsp: lens gone") (ed-lens-run mm (second hit)))))))))))
 
-(defn- ed-lens-clear (m)
-  ;; every buffer's lens rows taken off and the files forgotten
-  (assoc (fold (range (count (:buffers m)))
-           m
-           (fn (acc index)
-             (let (buffer (ed-buf-at acc index)
-                   inlays (wrap/raw-inlays buffer))
-               (if (contains? inlays *inlay-owner*)
-                 (ed-set-buf-at acc
-                   index
-                   (annotate buffer :inlay-lines (dissoc inlays *inlay-owner*)))
-                 acc))))
-    :lsp-lenses {}))
+(defn ed-lens-clear (m)
+  "Every buffer's lens rows taken off — `lsp/pull`'s `:clear`."
+  (fold (range (count (:buffers m)))
+    m
+    (fn (acc index)
+      (let (buffer (ed-buf-at acc index)
+            inlays (wrap/raw-inlays buffer))
+        (if (contains? inlays *inlay-owner*)
+          (ed-set-buf-at acc index (annotate buffer :inlay-lines (dissoc inlays *inlay-owner*)))
+          acc)))))
 
 (defcommand cmd-lsp-code-lens-mode
   (m key)
   "Toggle the language server's code lenses — `3 references`, `Run test` — as a dim row above
 the lines they are about. Off by default; init.blsp's `:lsp-code-lens true` starts it on."
-  (if (lens-on? m)
-    (message (assoc (ed-lens-clear m) :lsp-code-lens false) "lsp code lenses off")
-    (message (assoc m :lsp-code-lens true :lsp-lenses {}) "lsp code lenses on")))
+  (lsp/pull/toggle *pull* m))
 
 (defn ed-ev-lens-refresh (m input text-rows columns rows)
   "A server asking for its code lenses again (`[:lsp-refresh-code-lens connection]`,
 `workspace/codeLens/refresh`): every file it lenses is due again, and each buffer of its on
-screen is asked now."
-  (let (connection (nth input 1 nil)
-        stores (or (:lsp-lenses m) {})
-        forgotten (assoc m
-                    :lsp-lenses
-                      (fold (%map-pairs stores)
-                        stores
-                        (fn (acc [path store])
-                          (if (= (:conn store) connection)
-                            (assoc acc path (dissoc store :requested))
-                            acc)))))
-    (if (not (lens-on? forgotten))
-      forgotten
-      (fold (ed-lsp-shown forgotten connection)
-        forgotten
-        (fn (acc [index _top])
-          (let (entry (lens-entry acc (buffer-file (ed-buf-at acc index))))
-            (if (= (:conn entry) connection) (ed-lens-request-at acc index) acc)))))))
+screen is asked now (`lsp/pull/refresh`)."
+  (lsp/pull/refresh *pull* m input))
 
 ;; ---- registration -------------------------------------------------------------------
 (register-event-handler :lsp-code-lens 'lsp/commands/ed-ev-lsp-reply)
