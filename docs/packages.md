@@ -479,9 +479,10 @@ dialect) — the face-table helpers (`call-faces`, `method-call-faces`, `field-f
 `token-faces`), the Lisp helpers (`head-set`, `lisp-indent-with`) and the tables several
 languages share (`*quote-pairs*`, `*backtick-pairs*`, `*hash-strings*`, `*c-strings*`,
 `*block-comment-opaque*`, `*triple-quote-opaque*`, `*backtick-opaque*`,
-`*triple-quote-heredocs*`, `*prettier*`). Nothing under `languages/` is named by a language:
-that is the context's detail. A table one language uses is that language's own. The macro
-names what it generates by the module it expands in (`zig-spec`, `zig-fontify`, …), and every
+`*triple-quote-heredocs*`, `*prettier*`, `*case-label-electric*`). Nothing under `languages/` is
+named by a language: that is the context's detail. A table one language uses is that language's
+own. The macro names what it generates by the module it expands in (`zig-spec`, `zig-fontify`,
+…), and every
 table it writes is claimed for the file that loads it, so a package's language goes back with
 the package. One spec carries everything the editor knows of the language, and a key it does not
 take (`:interpeters`) fails the load, naming the one meant:
