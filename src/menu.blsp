@@ -1,121 +1,145 @@
 (defmodule menu
-  "The right-click context menu's model ops: which items it offers now, opening and closing
-it, moving the selection, and running the selected item. The view draws it
-(`overlayview/ed-menu-widget`) and input drives it (the `:menu` overlay, `ed-menu-mouse-*`); this
-module is the pure model half they share.
+  "The right-click context menu: which actions it offers now, opening and closing it, and
+running one. It is a key panel (`panel`, the `:context-menu` source), the way embark offers
+its actions: each action under a key — the last key of its own binding, so Copy (M-w) is `w`
+— and a click on an entry runs it too. How it looks is the panel style's; this module is the
+model half.
 
 An item names its command by SYMBOL and resolves it when it runs, exactly as a key binding
 does — so redefining `cmd-copy-region` at runtime changes what the menu's Copy does too."
-  (:use editor/buffer) ; buffer-region — whether there is a region to copy / cut
+  (:use editor/buffer) ; buffer-region — whether there is a region to copy / cut; point's cell
+  (:use interactive) ; defcommand
   (:use results) ; ed-link-at-point — Copy is enabled on a link line too
   (:use editor/ui :only [Overlay overlay-active? overlay-owns? overlay-handle overlay-exit]) ; its key overlay
   (:use keyhelp :only [ed-cancel-key?])
+  (:use panel :only [register-panel-source]) ; the menu shown as a key panel
   (:use guest)
   (:use model)) ; ed-current-buf
 
-;; ---- right-click context menu (a standard dropdown) -------------------------
-;; A modal overlay on `:menu` listing actions that run the *same* commands as the
-;; keyboard (so Copy is exactly M-w, Cut C-w, Paste C-y, Select All C-x h — and thus the
-;; same OS-clipboard sync). Opened by a right-press (events/ed-ev-mouse), navigated by
-;; arrows + Enter (the `:menu` overlay handler in input), hovered + clicked by the mouse.
-;; Items are maps `{:label :key :run :enabled :sep}` — enabled/disabled computed when the
-;; menu opens so it reflects the current region / clipboard, like a native menu. The view
-;; renders from the item maps + the shared geometry (completion/context-menu-*); the `:run`
-;; command SYMBOL is only resolved here, when the item runs.
+;; ---- the items --------------------------------------------------------------
+;; A modal overlay on `:menu` offering actions that run the *same* commands as the keyboard
+;; (so Copy is exactly M-w, Cut C-w, Paste C-y, Select All C-x h — and thus the same
+;; OS-clipboard sync). Opened by a right-press (events/ed-ev-mouse), an action chosen by its
+;; key or by a click on its entry. Items are maps `{:key :label :binding :group :run
+;; :enabled}` — enabled/disabled computed when the menu opens, so it reflects the current
+;; region / clipboard, like a native menu. The `:run` command SYMBOL is only resolved when the
+;; item runs.
 
 (defn- ed-menu-items-for (m)
-  "The context-menu items for the current model — each with its keyboard shortcut and
-whether it applies now (`:enabled`; a disabled item renders dimmed and won't run). `:sep`
-marks a divider drawn above the item (the group break before Select All). Copy is enabled
-by a region OR a link under point; Cut by a region; Paste by a non-empty kill ring."
+  "The context-menu items for the current model — each with the key that chooses it, its
+keyboard binding, its group and whether it applies now (`:enabled`; a disabled item shows
+dimmed and won't run). Copy is enabled by a region OR a link under point; Cut by a region;
+Paste by a non-empty kill ring."
   (let (has-region (not (nil? (buffer-region (ed-current-buf m))))
         has-link (not (nil? (ed-link-at-point m)))
         has-clip (not (empty? (:kill-ring m))))
-    (list {:label "Copy" :key "M-w" :run 'killing/cmd-copy-region :enabled (or has-region has-link)}
-      {:label "Cut" :key "C-w" :run 'killing/cmd-kill-region :enabled has-region}
-      {:label "Paste" :key "C-y" :run 'killing/cmd-yank :enabled has-clip}
-      {:label "Select All"
-       :key "C-x h"
+    [{:key "w"
+      :label "Copy"
+      :binding "M-w"
+      :group "Edit"
+      :run 'killing/cmd-copy-region
+      :enabled (or has-region has-link)}
+      {:key "k"
+       :label "Cut"
+       :binding "C-w"
+       :group "Edit"
+       :run 'killing/cmd-kill-region
+       :enabled has-region}
+      {:key "y"
+       :label "Paste"
+       :binding "C-y"
+       :group "Edit"
+       :run 'killing/cmd-yank
+       :enabled has-clip}
+      {:key "h"
+       :label "Select All"
+       :binding "C-x h"
+       :group "Select"
        :run 'region/cmd-mark-whole-buffer
-       :enabled true
-       :sep true})))
-
-(defn- ed-menu-enabled (items)
-  "The indices of the enabled items — navigation and the initial selection land only on
-these (disabled items and the divider are skipped)."
-  (seq/filter (range (count items)) (fn (i) (:enabled (nth items i)))))
+       :enabled true}]))
 
 (defn ed-open-menu (m row col)
-  "Open the context menu anchored at screen cell `[row col]` (point and the region are
-left untouched, so Copy/Cut act on the current selection). Selection starts on the first
-enabled item."
-  (let (items (ed-menu-items-for m)
-        enabled (ed-menu-enabled items))
-    (assoc m
-      :menu
-        {:row row
-         :col col
-         :items items
-         :sel (if (empty? enabled) 0 (first enabled))})))
+  "Open the context menu for screen cell `[row col]`, where the right press was (point and the
+region are left untouched, so Copy/Cut act on the current selection)."
+  (assoc m :menu {:row row :col col :items (ed-menu-items-for m)}))
 
 (defn ed-close-menu (m) "Dismiss the context menu." (dissoc m :menu))
 
-(defn- ed-menu-motion (m motion)
-  "Move the selection by a list `motion` (`editor/list-motion`) among the ENABLED items —
-the divider and disabled items are skipped: C-n / ↓ the next, C-p / ↑ the previous (both
-wrap), M-< / M-> the first and last, the keys every list in the editor reads."
-  (let (menu (:menu m)
-        enabled (ed-menu-enabled (:items menu)))
-    (if (empty? enabled)
-      m
-      ;; `index-of` answers -1 for "not found", never nil: a selection that is no longer
-      ;; enabled moves from the first enabled item
-      (let (at (index-of enabled (:sel menu))
-            from (if (>= at 0) at 0)
-            to (editor/list-motion/motion-index from (count enabled) motion))
-        (assoc m :menu (assoc menu :sel (nth enabled to)))))))
+(defcommand cmd-context-menu-open
+  (m _key)
+  "Open the context menu for point, as a right click opens it for the pointer — Emacs's
+`context-menu-open`, on the menu key and S-F10."
+  (let (buf (ed-current-buf m))
+    (ed-open-menu m (- (buffer-current-line buf) (ed-current-top m)) (buffer-column buf))))
 
 ;; check-allow: the item's command is resolved late (`reflect/eval`), so its result is unknown
 ;; to the checker; every command answers a model
 (check-allow :trusted
-  (defn ed-menu-run (m)
-    "Run the selected item's command (`key` = nil) with the menu closed — so the command
-sees no `:menu` and its copy/cut/paste is the real edit. A disabled item is a no-op. The
-command symbol is resolved now, not when the menu opened, so a redefined command runs."
-    (let (menu (:menu m)
-          item (nth (:items menu) (:sel menu))
+  (defn ed-menu-activate (m i)
+    "Run item `i`'s command (`key` = nil) with the menu closed — so the command sees no `:menu`
+and its copy/cut/paste is the real edit. A disabled item is a no-op. The command symbol is
+resolved now, not when the menu opened, so a redefined command runs."
+    (let (item (nth (:items (:menu m)) i nil)
           run (:run item))
       (cond
-        (not (:enabled item)) m
+        (or (nil? item) (not (:enabled item))) m
         ;; a guest's session runs only what it may — from the menu as from a key
         (and (:guest-session m) (not (ed-guest-allows? run))) (ed-guest-refusal (ed-close-menu m))
         else ((if (symbol? run) (reflect/eval run) run) (ed-close-menu m) nil)))))
-(sig ed-menu-run (model -> model))
+(sig ed-menu-activate (model int -> model))
 
-;; The click geometry + hit-test live in the view's ui-kit widget (events/hittest/ed-menu-hit reads
-;; the widget's zones), so a click can't disagree with what's drawn. These are the pure
-;; model ops the mouse dispatch (input/ed-menu-mouse-*) drives from that hit result.
+(defn- ed-menu-key-index (m input)
+  ;; the index of the item `input` chooses, or nil
+  (let (items (:items (:menu m)))
+    (seq/find (range (count items)) (fn (i) (= (:key (nth items i)) input)))))
 
-(defn ed-menu-activate (m i)
-  "Run item `i` — a click landed on it. Selects then runs; a disabled item is unreachable
-(the widget emits no zone for it), so this only ever runs an enabled command."
-  (ed-menu-run (assoc m :menu (assoc (:menu m) :sel i))))
+;; ---- the menu as a key panel ------------------------------------------------
 
-(defn ed-menu-select (m i)
-  "Hover-select item `i` (the pointer moved over it) without running it — the standard
-dropdown's hover-follows-pointer."
-  (assoc m :menu (assoc (:menu m) :sel i)))
+(defn menu-panel-deps (m) "What the context menu's panel is made from: the open menu." (:menu m))
 
-(defrecord menu-overlay ()) ; the right-click context menu: arrows move, M-<|M-> jump, Enter runs, Esc closes
+(defn menu-panel (menu _rows)
+  "The open context `menu` as a key panel: its items under their keys, grouped as they are
+(Edit, Select), each saying its binding; nil when none is open. It carries the cell the menu was
+opened at as `:anchor`, for a style that floats it there."
+  (when menu
+    (let (items (:items menu)
+          groups (reduce (range (count items))
+                   []
+                   (fn (groups i)
+                     (let (item (nth items i)
+                           entry {:key (:key item)
+                                  :text (str (:label item) "  " (:binding item))
+                                  :enabled (:enabled item)
+                                  :index i}
+                           group (last groups))
+                       (if (and group (= (:title group) (:group item)))
+                         (assoc groups
+                           (dec (count groups)) (assoc group :rows (conj (:rows group) entry)))
+                         (conj groups {:title (:group item) :rows [entry]}))))))
+      {:title "Context menu" :groups groups :layout :balanced :anchor [(:row menu) (:col menu)]})))
+
+(defn menu-panel-click (m entry)
+  "A click on the context menu's `entry`: run its item."
+  (ed-menu-activate m (:index entry)))
+
+(register-panel-source :context-menu
+  {:rank 5
+   :when :menu
+   :deps 'menu/menu-panel-deps
+   :run 'menu/menu-panel
+   :click 'menu/menu-panel-click})
+
+;; ---- the key overlay --------------------------------------------------------
+
+(defrecord menu-overlay ()) ; the right-click context menu: an item's key runs it, Esc / C-g close
 (impl Overlay
   menu-overlay
   (overlay-active? (_ m) (:menu m))
   ;; no overlay-owns? — modal: every key is the menu's while it's open
   (overlay-handle (_ m input)
-    (let (motion (editor/list-motion/motion-of input))
+    (let (index (ed-menu-key-index m input))
       (cond
-        motion (ed-menu-motion m motion)
-        (= input :enter) (ed-menu-run m)
+        (not (nil? index)) (ed-menu-activate m index)
         (ed-cancel-key? input) (ed-close-menu m)
         ;; any other key is swallowed (the menu stays open)
         else m))))

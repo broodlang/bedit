@@ -117,15 +117,23 @@ src/keycolumns.blsp         keys and what they do, in titled groups, laid into c
                             the key panel (which-key flowing, `flow-lines`; a transient's whole
                             groups balanced, `balanced-columns`) and the start page (`entry-cell`)
                             share; each host paints the lines its own way
-src/keypanel.blsp           the KEY PANEL — a transient menu (git's push, embark) and which-key's
-                            continuations as ONE shape of data (`{:title :groups :layout :page}`):
-                            features register a SOURCE (`register-panel-source`, the first with a
-                            panel shows), and a STYLE draws it (`register-panel-style`), chosen by
-                            the `:key-panel` setting — the editor's own `:echo` is Emacs's: a flat
-                            strip in the echo area below the mode line, groups side by side, keys
-                            in the accent colour; a package registers another. The echo area's
-                            height asks it (`minibuffer/ed-echo-rows`); a source names its `:deps`,
-                            and the panel is built once per change of them
+src/panel.blsp              the PANEL — what you can choose or learn here, as data of three kinds:
+                            `:keys` (a transient menu, which-key, the context menu), `:list`
+                            (completion-at-point's candidates), `:text` (a hover's help).
+                            Features register a SOURCE (`register-panel-source`, the first with a
+                            panel shows; a `:click` makes its entries clickable,
+                            `ed-panel-click`), and a STYLE draws it (`register-panel-style`),
+                            chosen by the `:panel-style` setting — the editor's own `:echo` is
+                            Emacs's, everything in the echo area: keys and candidates as a flat
+                            strip below the mode line, help on the echo row (help-echo with
+                            `tooltip-mode` off). A style names the kinds it draws (`:kinds`), the
+                            rest fall back to `:echo`. The echo area's height asks it
+                            (`minibuffer/ed-echo-rows`); a source names its `:deps`, and the
+                            panel is built once per change of them
+src/popups.blsp             the `:popup` panel style: completion's candidates as Corfu's card
+                            (`complete-card`) and a hover's help as a tooltip card
+                            (`tooltip-card-ops`); key panels stay in the echo area. The shape a
+                            package copies to register a style of its own
 src/scroll.blsp             keeping point on screen: the scroll-margin clamp, horizontal scroll,
                             `ed-max-top`, and the snap that ends a glide on a line; in a
                             row-wise (wrapped) buffer the pane starts on a screen ROW of its top
@@ -341,14 +349,12 @@ src/whichkey.blsp           C-h after a prefix (Emacs which-key's `which-key-C-h
                             describe-prefix-bindings, grouped as the panel is), a / C-g abort; any other key goes to the
                             prefix, so the chord still completes. A prefix that binds C-h keeps
                             it. `input/ed-dispatch` asks it before the keymap. Also the panel's
-                            PANEL (`key-panel`, a `keypanel` source; `panel-groups`, run down then across): a prefix key as the
+                            PANEL (`key-panel`, a `panel` source; `panel-groups`, run down then across): a prefix key as the
                             `+name` its map was described with, the keys under the headings
                             their bindings gave them (`keyhelp/ed-key-groups`, brood ADR-745)
 src/modeline.blsp           a pane's mode line: its segments (`ed-statusbar-segments`, the registered
                             chips included), the bar painted from them, the pointer's layout and the
-                            hover tooltips. What `hittest` asks again, so `input` never imports the view
-src/overlayview.blsp        the context menu, a card over the panes as a ui-kit widget, paint and
-                            zones in one pass (a transient menu is a key panel: `keypanel`)
+                            hover tooltips (`:text` panel sources). What `hittest` asks again, so `input` never imports the view
 src/headerline.blsp         the HEADER LINE above each pane (Emacs breadcrumb-mode, on with `:header-line`):
                             the file by its project and path, then the mode's `:breadcrumbs` at point
                             (an Org heading's path); the layout takes the pane's top row for it
@@ -415,13 +421,13 @@ src/statusbar.blsp          the mode line as extensible segments (render ops + c
                             node (attach) — ordered by rank
 src/ui-kit.blsp             the widget kit over editor/display: a widget is `(area ctx) ->
                             {:ops :zones}` — paint and hit-test in ONE pass, styled by semantic
-                            role. The shared shape behind the context menu, popup, plume, which-key.
+                            role. The shared shape behind the completion card and the echo lists.
                             And the ONE SPACING TABLE (`ui-spacing`: rows vertically, cells
                             horizontally, half the only fraction, a card 1 row : 2 cells): a
                             style's `:pad` / `:inset` / `:gap` names a token, `ui-space` raises on
                             a raw number, tests/spacing_ratchet_test fails on one in src/.
                             And the ONE PLACEMENT RULE for a floating card (`ui-place`): the
-                            transient, context menu, completion + info card and tooltips keep
+                            completion + info card and the tooltips (the `:popup` style) keep
                             `:card-gap` off the mode line / echo area / header line and the
                             window's edges, over the stage `panes/ed-card-stage` names
 src/input.blsp              dispatch: fold a key or tick into the next model, first through the
@@ -596,9 +602,10 @@ src/file-save.blsp          writing a pool buffer to its file: `ed-save-buf-at` 
                             wait on. C-x C-w rides the same queue (`ed-write-buf-as`): the buffer
                             visits the new path only once the write lands, and keeps its old one
                             when it fails. Headless, inline; tests bind `*write-off-loop*` / `*write-file*`
-src/menu.blsp               the right-click context menu's model ops (open / move / run /
-                            close); an item names its command by SYMBOL, resolved when it
-                            runs, so a redefined command reaches the menu too
+src/menu.blsp               the right-click context menu (and M-x context-menu-open, on the menu key
+                            and S-F10): a key panel source, each action under the last key of its
+                            binding (Copy M-w is `w`), a click on an entry runs it; an item names
+                            its command by SYMBOL, resolved when it runs
 src/keymaps.blsp            keybinding profiles (emacs / modal vim) as model-scope layers, and the
                             which-key name and groups of each prefix map, in the keymap itself
                             (`keymap-describe`, a heading on each `keymap-bind`; brood ADR-745)
@@ -725,9 +732,10 @@ src/formatter.blsp          M-x format-buffer + format-on-save: the language's o
                             first, so a project module called `format` never ran)
 src/complete-words.blsp     what completion knows of a buffer's words: the word boundary, the rope
                             scan, the `:word-index` built off the loop, the always-on source
-src/complete-card.blsp      the popup as drawn: the menu card, anchored where the completion STARTS
-                            (Corfu's), so it does not slide as letters are typed into it, and the
-                            info card beside it
+src/complete-card.blsp      the completion as shown: its `:list` panel (the echo area's list, the
+                            selected candidate's first doc line beside it), the documentation it
+                            loads, and the Corfu card the `:popup` style draws, anchored where the
+                            completion STARTS, with the info card beside it
 src/complete-at-point.blsp  completion-at-point (the in-buffer Tab popup) — multi-source merge
                             (named to dodge std's `tool/complete`, which shadows a bare `complete`).
                             The auto popup is per
@@ -773,7 +781,8 @@ src/filename.blsp           a typed path read the Emacs way (`substitute-in-file
                             name (`pool/ed-into-dir`) and a file already there is asked about
                             (`pool/ed-confirm-overwrite`). A prompt opens in a directory spelled
                             as one (`filename/as-dir`, `pool/ed-default-dir-input`)
-src/completion.blsp         shared fuzzy ranking + vertical-menu card (complete + plume)
+src/completion.blsp         shared fuzzy ranking, the menu window / width helpers, and the echo list
+                            (`completion-list`) the minibuffer and completion-at-point both draw
 src/fileperm.blsp           the `ls -l` permission string (`rwx`, `perms-string`, setuid / setgid /
                             sticky as `s` / `t`) and back (`perms->mode`, wdired) — dired + plume marginalia
 src/plume.blsp              the minibuffer completion UI — vertical list + marginalia + N/M counter (our Vertico/Marginalia)
@@ -2087,7 +2096,7 @@ src/view/echoarea.blsp
     (the first registered echo source with something to say,
     `model/register-echo-source`: a question, a message, then diagpaint's
     diagnostic, eolnotes' note, eldoc's hint), the minibuffer's prompt
-    and candidate list (Plume); the key panel below it (which-key, a transient menu) is `keypanel`'s
+    and candidate list (Plume, `completion/completion-list`); the panel below it is `panel`'s
 ```
 
 ## events — what reaches the loop besides keys: each [:tag …] event's handler, the mouse and where it landed
@@ -2108,7 +2117,7 @@ src/events/mouse.blsp
 src/events/hittest.blsp
     the mouse side of the view: every hit-test / hover fold that takes
     a model and returns one (:hover, :diag-hover, :link-hover, a chip
-    click, the context menu's hit) — recomputed from the same widget /
+    click) — recomputed from the same widget /
     segments / layout the view drew, so input never imports the renderer
 ```
 

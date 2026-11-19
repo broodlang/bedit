@@ -94,9 +94,8 @@ A finer hierarchy, if ever needed, is: **subtle** `*surface0*` · **default** `*
 
 7. **Spacing comes from one table.** `ui-kit/ui-spacing` holds the steps — `:none`,
    `:hairline`, `:half`, `:one`, `:two`, `:three`, in ROWS vertically and CELLS
-   horizontally — and the semantic tokens over them (`:card` = 1 row : 2 cells, `:menu` = 1
-   row : 1 cell with `:menu-row-inset` 2 inside the pill, `:popup`,
-   `:row-inset`, `:key-gap`, `:menu-key-gap`, `:hover-pad`, …). A widget style's `:pad` /
+   horizontally — and the semantic tokens over them (`:card` = 1 row : 2 cells, `:popup`,
+   `:row-inset`, `:key-gap`, `:hover-pad`, …). A widget style's `:pad` /
    `:inset` / `:gap` names a token; `ui-space` raises on a raw number, and
    `tests/spacing_ratchet_test.blsp` fails on one in a spacing position anywhere in src/.
    A card pads 1 row to 2 cells because a cell is about half as wide as a row is tall, so
@@ -106,9 +105,9 @@ A finer hierarchy, if ever needed, is: **subtle** `*surface0*` · **default** `*
    left the text cramped in it. **Text moves by whole rows and cells** (`ui-space-cells`
    refuses `:half`); the sub-cell steps only decorate inside a row — the mode line's hover
    block, a scrollbar thumb's gap from the edge.
-8. **A floating card keeps its distance from the chrome.** Every card that floats — the
-   transient, the context menu, the completion card and its info card, the mode line's
-   and a diagnostic's tooltip — is placed by ONE helper, `ui-kit/ui-place`, over a STAGE:
+8. **A floating card keeps its distance from the chrome.** Every card that floats — under the `:popup`
+   panel style, the completion card and its info card, a mode line's and a diagnostic's
+   tooltip; the editor's own style floats nothing — is placed by ONE helper, `ui-kit/ui-place`, over a STAGE:
    the text rows between a header line above and a mode line (or the echo area) below,
    across the window's width (`panes/ed-card-stage`: the pane the card belongs to, or the
    frame's). It keeps `:card-gap` (1 row : 1 cell) from every side of the stage, gives the
@@ -148,7 +147,7 @@ terminal falls back to a flat bg band). A click runs the segment's late-bound `:
 **Floating cards + tooltips** share one surface primitive — `display/card-surface` (a rounded
 `frect` in the GUI, flat `rect` in the terminal, with an optional rounded hairline **border**
 done as a border-coloured `frect` *behind* the surface — never a shadow) + `card-pill` +
-`tooltip`. The completion popup, context menu, and the segment tooltip all elevate through it,
+`tooltip`. The completion card and the tooltips (the `:popup` panel style) elevate through it,
 so they read as one system. These live in `std/editor/display.blsp` as pure Brood over the
 existing op vocabulary (`frect`/`rect`/`text`/`cursor-zone`) — **no new frontend/kernel op**:
 capability is added as composable std abstractions, not by growing the GUI surface.

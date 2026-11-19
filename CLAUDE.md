@@ -103,8 +103,8 @@ must not take a std module's name (`vcs` shadowed std's: hence `vc`).
 |---|---|
 | kernel + loop | `main` `startup` `startpage` `model` (the registries every feature plugs into) `sources` `input` `lifeline` `offloop` `interactive` `modes` `pool` `theme` |
 | text | `textpos` `bufferops` `wrap` `inlinetext` `folds` `codefold` `stringstate` `stringlex` `stringwarm` `conventions` `editorconfig` `dirlocals` `syntaxtree` `tsbrackets` |
-| view | `panes` `panegeometry` `display-settings` `spanpaint` `treewarm` `modeline` `statusbar` `headerline` `overlayview` `ui-kit` `themes` `desktopprefs` `appearance` `scrollbar` `scroll` `eolnotes` `linkview` `foldview` `gutter` |
-| editing + keys | `commands` `motion` `structural` `indent` `typing` `killing` `editing` `region` `textops` `comment` `fill` `electric` `kmacro` `registers` `window-commands` `search-commands` `isearch` `query-replace` `avy` `embark` `menu` `clipboard` `browse-kill-ring` `yankmedia` `keymaps` `vim` `userkeys` `transient` `transient-core` `whichkey` `keypanel` `keyhelp` `keycolumns` `help` |
+| view | `panes` `panegeometry` `display-settings` `spanpaint` `treewarm` `modeline` `statusbar` `headerline` `ui-kit` `themes` `desktopprefs` `appearance` `scrollbar` `scroll` `eolnotes` `linkview` `foldview` `gutter` |
+| editing + keys | `commands` `motion` `structural` `indent` `typing` `killing` `editing` `region` `textops` `comment` `fill` `electric` `kmacro` `registers` `window-commands` `search-commands` `isearch` `query-replace` `avy` `embark` `menu` `clipboard` `browse-kill-ring` `yankmedia` `keymaps` `vim` `userkeys` `transient` `transient-core` `whichkey` `panel` `popups` `keyhelp` `keycolumns` `help` |
 | minibuffer + completion | `minibuffer` `lossage` `mincomplete` `filename` `completion` `plume` `complete-*` `cape` `snippet` `savehist` `passwd` |
 | files | `file-save` `lifecycle` `autosave` `backup` `sidecar` `autorevert` `recover` `filecoding` `hexl` `imageview` `docview` `sshpath` `fileperm` `lastsession` `saveplace` `reopen` `solong` `sibling` `thingatpt` |
 | buffer kinds | `section` `sectionbuf` `formbuf` `aside` |
