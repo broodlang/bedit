@@ -688,7 +688,7 @@ src/grammars.blsp           tree-sitter grammars the runtime was not built with:
                             recorded `:fingerprint`), moving one back to its pin, and a
                             live swap — drop a new .so in and reload, no restart. An install or
                             reload retypes every open line-lexer stand-in as its parsed mode
-                            (`model/ed-grammars-arrived`). A grammar is native code, so brood
+                            (`grammars/ed-grammars-arrived`). A grammar is native code, so brood
                             VETS a library in a child before its first load and refuses one that
                             crashed or hung there, or that crashed bedit (brood ADR-660): an
                             install vets with the grammar's own test corpus off the loop
@@ -696,7 +696,7 @@ src/grammars.blsp           tree-sitter grammars the runtime was not built with:
                             grammar-reload (`:grammar-reload-proc`, C-g cancels, a library loaded
                             only once its verdict lands); the list shows one
                             (QUARANTINED, why) without loading it; its language stands in with
-                            its line lexer, as a missing grammar's does (`model/grammar-loadable?`,
+                            its line lexer, as a missing grammar's does (`grammarfallback/grammar-loadable?`,
                             `missing-note`)
 src/grammarcheck.blsp       does the installed grammar still have every node kind and field a
                             mode names? Each `deflanguage` registers the names its face table,
@@ -704,9 +704,16 @@ src/grammarcheck.blsp       does the installed grammar still have every node kin
                             `editor/treesit/language-names`); the first use of a grammar checks
                             them against what it contains (`grammar-problems`), kept per language
                             until an install / reload. A failing grammar is reported once in
-                            *Messages* (M-x grammar-update) and is not `model/grammar-ready?`, so
+                            *Messages* (M-x grammar-update) and is not `grammarfallback/grammar-ready?`, so
                             a language with a line lexer stands in with it rather than
                             mis-colouring. Below `model`, which asks it
+src/grammarfallback.blsp    where a language's grammar stands (`grammar-loadable?`, quarantined,
+                            `grammar-ready?`: loadable and `grammarcheck/sound?`) and the
+                            line-lexer STAND-IN a buffer is typed as while it is not ready
+                            (`ed-grammar-fallback`, from `model/ed-stamp`; `:above` keeps a big
+                            JSON lexed), with the note a visit shows (`missing-note`) and where
+                            a grammar is declared to live (`grammar-source`). Below `model`,
+                            knowing only buffers; `grammars` retypes the pool when one arrives
 src/conventions.blsp        a buffer's INDENT WIDTH, TAB WIDTH, tabs-or-spaces and FILL COLUMN,
                             resolved per buffer: its own (M-x set-fill-column) > its
                             .editorconfig > the user's init.blsp entry for its mode > the mode's
@@ -1824,7 +1831,7 @@ src/languages/core.blsp
     JavaScript's, TSX TypeScript's, Terraform HCL's). A language that
     had a line lexer first keeps it as its `:fallback`: a buffer opened
     while the grammar is missing is typed as the lexer's stand-in
-    (`model/ed-grammar-fallback`) and becomes the parsed mode when the
+    (`grammarfallback/ed-grammar-fallback`) and becomes the parsed mode when the
     grammar arrives (`ed-grammars-arrived`); JSON stays lexed past a
     megabyte (`:fallback-above`). A language with no stand-in (Rust,
     Go, C) stays its parsed mode without its grammar, and its services

@@ -1,0 +1,122 @@
+(defmodule grammarfallback
+  "Where a language's tree-sitter grammar stands, and the line-lexer stand-in a buffer is typed
+as while its grammar is not ready. `model` stamps every buffer through [[ed-grammar-fallback]];
+`grammars` (the commands that install and reload a grammar) retypes the pool when one arrives
+(`grammars/ed-grammars-arrived`); `grammarcheck` says whether an installed grammar has the
+names bedit's modes use. Below `model`: this module knows no model, only buffers."
+  (:use editor/buffer) ; buffer-rope / set-buffer-type
+  (:use editor/layers) ; layer-facet / init-buffer-layers
+  (:use grammarcheck :only [sound?])) ; does the installed grammar have the names a mode uses
+
+;; ---- a tree-sitter mode without its grammar -------------------------------------
+;; A language whose mode is a tree-sitter grammar (`languages/core/deflanguage`) colours nothing
+;; when the grammar is not installed — and the grammar is a separate download. A language
+;; that also has a LINE LEXER (shell, JSON, YAML, TOML, Dockerfile) declares it as its
+;; fallback: the tree-sitter layer names a second buffer type, `:grammar-fallback {:type
+;; :shell-lexer}`, and a buffer stamped while the grammar is missing is typed as that one
+;; instead. The choice is per buffer, made when it is stamped, and remade for every pool
+;; buffer when a grammar arrives (`grammars/ed-grammars-arrived`) — so `M-x grammar-install` turns an
+;; open lexer-coloured buffer into a parsed one without reopening it.
+;;
+;; `:above` is a size past which the lexer is the better mode even with the grammar: a
+;; held tree costs memory per node, and JSON — machine-written at any size — has a node
+;; every few bytes, where a line lexer pays only for the lines on screen.
+
+(defdyn *grammar-status*
+  ;; where a language's grammar stands in the runtime (brood ADR-481, ADR-660) — a dynvar so
+  ;; a test can stand in a quarantine without a grammar that crashes
+  editor/treesit/grammar-status)
+
+(defn grammar-loadable? (lang)
+  "Whether the runtime has a grammar for `lang` — built in, loaded, or declared from a
+library (brood ADR-481: a declared grammar loads at its first use). A failed load has none,
+and neither has a QUARANTINED library (brood ADR-660: it crashed or hung the child that vetted
+it, or crashed an editor), which the runtime refuses to load — its language stands in with
+its line lexer as a missing grammar's does. Asks; loads nothing."
+  (contains? #{:declared :loaded :built-in} (*grammar-status* lang)))
+
+(defn grammar-quarantine (lang)
+  "Why `lang`'s declared grammar library is quarantined (brood ADR-660), or nil when it is not."
+  (let (status (*grammar-status* lang))
+    (when (map? status) (get status :quarantined))))
+
+(defn grammar-ready? (lang)
+  "Whether `lang` is parsed by a grammar its modes can use: one the runtime has
+(`grammar-loadable?`) that has every node kind and field bedit's modes name
+(`grammarcheck/sound?`, brood ADR-583). A grammar of another revision that renamed one is not
+ready — its language stands in with its line lexer rather than mis-colouring, and the first
+time this is asked *Messages* says why. Loads a declared grammar, as the parse it precedes
+would."
+  (and (grammar-loadable? lang) (sound? lang)))
+
+(defdyn *grammar-ready?*
+  ;; the question `ed-grammar-fallback` asks — a dynvar so a test can ask it of a runtime
+  ;; that has every grammar installed, as one with none
+  grammar-ready?)
+
+(sig ed-grammar-fallback (buffer -> buffer))
+;; check-allow: `init-buffer-layers` (std) answers the buffer it was given, which the checker
+;; does not carry through — as for `model/ed-stamp`
+(check-allow :trusted
+  (defn ed-grammar-fallback (buf)
+    "`buf` retyped as its mode's line-lexer stand-in when its tree-sitter grammar is not
+ready, or it is past the mode's `:above` size; `buf` itself otherwise. The stand-in
+remembers the type it stands in for (`:grammar-wanted`), which is how
+`grammars/ed-grammars-arrived` finds it again."
+    (let (fallback (layer-facet buf :grammar-fallback)
+          lang (layer-facet buf :ts-lang))
+      (cond
+        (nil? lang) buf
+        ;; no stand-in to choose, but the grammar is still checked as the buffer meets it,
+        ;; so a mis-colouring one is reported (once) when its first file opens
+        (nil? fallback) (do (*grammar-ready?* lang) buf)
+        else
+          (let (above (:above fallback)
+                too-big (and above (> (count (buffer-rope buf)) above)))
+            (if (and (not too-big) (*grammar-ready?* lang))
+              buf
+              (assoc (init-buffer-layers (set-buffer-type buf (:type fallback)))
+                :grammar-wanted (:type buf))))))))
+
+(defn grammar-source (lang)
+  "Where `lang`'s grammar lives, as declared — nil for a language that declared none."
+  (registry/lookup :grammars/sources lang))
+
+(defn buffer-grammar (buf)
+  "The tree-sitter language `buf`'s mode parses with — or, for a line-lexer stand-in
+([[ed-grammar-fallback]]), the one it is waiting for — else nil."
+  (or (layer-facet buf :ts-lang) (layer-facet buf :wants-grammar)))
+
+(defn missing-note (buf)
+  "What to add to the message that opened `buf` when its mode is a tree-sitter language
+with no grammar ready — how to get one — else \"\". A stand-in buffer is coloured by its line
+lexer meanwhile, and says so rather than claiming no colours. A grammar that is installed but
+fails its check (another revision than bedit's tables were written for) is named as that,
+with the command that installs the pinned one."
+  (let (lang (buffer-grammar buf)
+        stand-in? (layer-facet buf :wants-grammar))
+    (cond
+      (or (nil? lang) (*grammar-ready?* lang)) ""
+      (grammar-quarantine lang)
+        (str " — the "
+          (->string lang)
+          " grammar is quarantined ("
+          (grammar-quarantine lang)
+          (if stand-in? "), so coloured line by line: " "), so no colours or structure: ")
+          "M-x grammar-list")
+      (and (grammar-loadable? lang) (not (empty? (grammarcheck/verdict lang))))
+        (str " — the installed "
+          (->string lang)
+          " grammar is not the revision bedit expects ("
+          (first (grammarcheck/verdict lang))
+          (if stand-in? "), so coloured line by line: " "): ")
+          "M-x grammar-update")
+      else
+        (str " — no "
+          (->string lang)
+          (if stand-in?
+            " grammar, so coloured line by line with no structure: "
+            " grammar, so no colours or structure: ")
+          (if (nil? (grammar-source lang))
+            "M-x grammar-list says how to build one"
+            "M-x grammar-install")))))
