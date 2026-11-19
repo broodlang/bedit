@@ -281,7 +281,9 @@ src/theme.blsp              every colour the editor paints (Catppuccin Mocha), r
                             which tests/theme_test.blsp holds every registered theme to them. The
                             mode line is recessed (the mantle, secondary text; colour only for a
                             state: modified `●`, `Def`, a failing check); the gutter is the base, its
-                            current number lavender
+                            current number lavender. `generation`: one number, new on every theme
+                            applied (palette, faces, rainbow switch), that every cache or memo of
+                            colours keys on
 src/desktopprefs.blsp       the window follows the desktop (brood's `gui/desktop-preferences`): with no `:theme`
                             its light or dark setting picks `:theme-light` / `:theme-dark`; with `:text-aa
                             :desktop` its text rendering is the window's (GNOME: grayscale, sRGB, as GTK 4);
@@ -1225,7 +1227,9 @@ src/sectionbuf.blsp
     section (a status file whose diff was never fetched) asks the
     mode's `:section-reload`. Each line's KIND (`:line-kinds`: a heading,
     a body) is how a long one shows — a commit or stash row ends in `…`,
-    a hunk's code wraps (`scroll/ed-long-lines`)
+    a hunk's code wraps (`scroll/ed-long-lines`). Its paints hold faces resolved,
+    so they keep the theme's `generation` and a theme switch repaints every
+    section buffer (`repainted`, a palette step)
 ```
 
 ## diffs — a diff painted: its lines' faces, its hunks as sections, its code in its language's colours, the words that changed
@@ -1901,7 +1905,8 @@ src/languages/lex-*.blsp
     mdpreview paints). std's `editor/*` until brood ADR-417
 src/languages/markdown.blsp
     Markdown: the lexer (colours as a pure function, and the document RENDERED for
-    the preview) and the `.md` mode (a fence coloured as its language, C-c C-p)
+    the preview) and the `.md` mode (a fence coloured as its language, C-c C-p);
+    its faces (`:markdown/*`) inherit the theme's `:syntax/*` colours
 src/languages/markdown-preview.blsp
     C-c C-p in a .md buffer: the document rendered beside it
     (std's `markdown-render`, faces as data on the buffer), following
@@ -2144,7 +2149,8 @@ src/spancache/linecache.blsp
     threaded by the span refresh, dropped on kill; an edit re-lexes the
     lines it touched, exact at any depth — no lead-in, no restart. A
     mode's `:line-band-pass` then sees the band: what spans lines, as
-    markdown's fences coloured as their language (brood ADR-489)
+    markdown's fences coloured as their language (brood ADR-489). A lexer
+    is rebuilt, and its lines lexed again, under a new `theme/generation`
 ```
 
 ## charset — the encodings a file may be in besides UTF-8, and the single-byte codings as data
