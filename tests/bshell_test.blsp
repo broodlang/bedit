@@ -481,10 +481,25 @@ folded as the loop folds them."
       (assert= (bshell-istart m) (count (bshell-text m)))
       (is (nil? (receive ([:bshell-run line] line) (after 200 nil))))))
 
-  (test "RET is ignored while a command is already running"
-    (let (m0 (set-field (bshell-model) :input-running true)
-          m (send-line m0 nil))
-      (assert= m m0))))
+  (test "RET while a command runs sends the typed line to its stdin, and takes it out of the buffer"
+    ;; the command's terminal echoes the line back as output, in its place
+    (let (running (set-field (set-field (set-field (bshell-model) :bshell-proc (self))
+                               :input-running true)
+                    :bshell-command "read x")
+          m0 (with-mark running (count (bshell-text running)))
+          before (bshell-text m0)
+          m (send-line (type-into m0 "yes") nil))
+      (assert= (receive ([:bshell-input line] line) (after 0 :nothing-sent)) "yes")
+      (assert= (bshell-text m) before)
+      (assert= (bshell-running m) true)))
+  (test "RET while a Brood form evaluates keeps the line, and sends nothing"
+    (let (running (set-field (set-field (set-field (bshell-model) :bshell-proc (self))
+                               :input-running true)
+                    :bshell-command "(loop-forever)")
+          m0 (with-mark running (count (bshell-text running)))
+          m (send-line (type-into m0 "x") nil))
+      (is (string/ends-with? (bshell-text m) "x"))
+      (assert= (receive ([:bshell-input line] line) (after 0 :nothing-sent)) :nothing-sent))))
 
 ;; ---- multi-line input (an incomplete Brood form keeps editing) --------------
 
@@ -659,3 +674,68 @@ folded as the loop folds them."
     (let (m (cmd-bshell-interrupt (set-field (bshell-model) :bshell-proc (self)) nil))
       (assert= (:echo m) "no command running")
       (is (nil? (receive ([:bshell-interrupt] :sent) (after 100 nil)))))))
+
+;; ---- a Brood form: evaluated in a child, interruptible, gone with its buffer ---------------
+
+(defn- bshell-next-event (deadline)
+  ;; the next event the worker sent this test (a record), or :timeout
+  (receive (e :when (record? e) e) (after deadline :timeout)))
+
+(describe "a Brood form in the shell"
+  :isolated (test "evaluates and answers, with defs persisting across lines"
+    (let (worker (binding (editor/ui/*loop* (self))
+                   (shells/bshell/bshell-connect bshell-name (path/temp-root))))
+      (send worker [:bshell-run "(def bshell-test-kept 41)"])
+      (bshell-next-event 5000)
+      (bshell-next-event 5000)
+      (send worker [:bshell-run "(inc bshell-test-kept)"])
+      (is (includes? (or (:text (bshell-next-event 5000)) "") "=> 42"))
+      (assert= (:code (bshell-next-event 5000)) 0)
+      (exit worker :kill)))
+  :isolated (test "C-c C-c interrupts a form that never returns, and the shell carries on"
+    (let (worker (binding (editor/ui/*loop* (self))
+                   (shells/bshell/bshell-connect bshell-name (path/temp-root))))
+      (send worker [:bshell-run "(letrec (spin (fn (n) (spin (inc n)))) (spin 0))"])
+      (shells/bshell/bshell-interrupt worker)
+      (assert= (string/trim (or (:text (bshell-next-event 5000)) "")) "interrupted")
+      (assert= (:code (bshell-next-event 5000)) 130)
+      ;; the worker survived its child's kill: the next form answers
+      (send worker [:bshell-run "(+ 1 2)"])
+      (is (includes? (or (:text (bshell-next-event 5000)) "") "=> 3"))
+      (exit worker :kill)))
+  :isolated (test "killing the buffer kills the worker and the form it was evaluating"
+    (let (worker (binding (editor/ui/*loop* (self))
+                   (shells/bshell/bshell-connect bshell-name (path/temp-root)))
+          mref (monitor worker))
+      ;; the form says where it runs, then spins: its message is the barrier
+      (proc/register :bshell-test-probe (self))
+      (send worker
+        [:bshell-run
+          "(do (send :bshell-test-probe [:spinner (self)]) (letrec (spin (fn (n) (spin (inc n)))) (spin 0)))"])
+      (let (spinner (receive ([:spinner pid] pid) (after 5000 nil))
+            spinner-ref (monitor spinner))
+        (shells/bshell/bshell-on-close {:bshell-proc worker})
+        (assert= (receive ([:down ^mref _ _] :down) (after 5000 :timeout)) :down)
+        (assert= (receive ([:down ^spinner-ref _ _] :down) (after 5000 :timeout)) :down)))))
+
+(describe "a line for a running command"
+  :isolated (test "reaches its stdin, and its terminal echoes it back into the output"
+    (if (= (os/type) :windows)
+      (io/puts "  (skipped: no sh)")
+      (let (worker (binding (editor/ui/*loop* (self))
+                     (shells/bshell/bshell-connect bshell-name (path/temp-root))))
+        (send worker [:bshell-run "printf 'name? '; read x; echo \"got $x\""])
+        (letrec (gather (fn (text)
+                          (let (event (bshell-next-event 5000))
+                            (cond
+                              (= event :timeout) text
+                              (contains? event :code) text
+                              else
+                                (let (more (str text (:text event)))
+                                  (when (string/ends-with? more "name? ")
+                                    (send worker [:bshell-input "ada"]))
+                                  (gather more))))))
+          (let (output (gather ""))
+            (is (includes? output "name? ada"))
+            (is (includes? output "got ada"))))
+        (exit worker :kill)))))

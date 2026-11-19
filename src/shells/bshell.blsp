@@ -164,15 +164,22 @@ the error)."
     (try (do (reflect/read-all line) true) (catch caught (not (bshell-incomplete? caught))))
     true))
 
-(defn- bshell-eval-and-reply (state line)
-  "Evaluate `line` as Brood **in this process** (so defs persist across the session, like
-a REPL — and off the editor loop), then push the formatted result + a success exit back."
-  ;; `eval-source` never throws: captured output then `=> value`, or `error: …`
-  (let (buffer (:buffer state)
-        out (eval-source line))
-    (send (:reply state) (shells/bshell/bshell-output-event buffer (str out "\n") [] nil))
-    (send (:reply state) (shells/bshell/bshell-done-event buffer 0))
-    (bshell-loop state)))
+(defn- bshell-eval-start (state line)
+  "Evaluate `line` as Brood in a child of this process, linked to it, and remember the child
+as `:eval`: off the editor loop and off this one, so C-c C-c can kill an evaluation that
+loops, and one still running dies with the shell when its buffer is killed. Defs persist
+across the session all the same — a definition is global, whichever process makes it."
+  (let (shell (self)
+        child (spawn-link (send shell [:bshell-evaluated (self) (eval-command/eval-source line)])))
+    (bshell-loop (assoc state :eval child))))
+
+(defn- bshell-eval-finish (state out code)
+  "The evaluation is over: its `out` and a done with `code` to the editor, and no `:eval`."
+  (let (buffer (:buffer state))
+    (do
+      (send (:reply state) (shells/bshell/bshell-output-event buffer (str out "\n") [] nil))
+      (send (:reply state) (shells/bshell/bshell-done-event buffer code))
+      (bshell-loop (assoc state :eval nil)))))
 
 ;; The record constructors the shell process sends are named QUALIFIED: it runs in a
 ;; `spawn`ed process, where a free global re-resolves on the receiver and only the
@@ -188,20 +195,29 @@ a REPL — and off the editor loop), then push the formatted result + a success 
 
 (defn- bshell-loop (state)
   "The shell process's receive loop: `[:bshell-run line]` evaluates `line` as Brood when it
-starts with `(`, else spawns `sh -c line` in `:root` under a pty; the child's output
-forwards to the editor as a `bshell-output-event` (ANSI-decoded: its output is append-only
-text that happens to be coloured, so its escapes become faces — a decoder fresh per
-command — rather than an emulated screen); its exit as a
+starts with `(` (in a linked child, `bshell-eval-start`), else spawns `sh -c line` in `:root`
+under a pty; the child's output forwards to the editor as a `bshell-output-event`
+(ANSI-decoded: its output is append-only text that happens to be coloured, so its escapes
+become faces — a decoder fresh per command — rather than an emulated screen); its exit as a
 `bshell-done-event`; `:shutdown` kills any live child and stops. A LONG-LIVED program —
 the project REPL — is not hosted here: that is a terminal buffer (shells/terminal.blsp), under
 a pty and a real emulator."
   (receive
     ([:bshell-run line]
       (if (bshell-brood-form? line)
-        (bshell-eval-and-reply state line)
+        (bshell-eval-start state line)
         (let (child (os/shell-spawn-pty line
                       {:cwd (:root state) :cols *bshell-columns* :rows 24 :env *bshell-environment*}))
           (bshell-loop (assoc state :proc child :decoder (processes/output-decoder))))))
+    ;; the evaluation answered; a late answer from one C-c C-c already ended is dropped
+    ([:bshell-evaluated pid out]
+      (if (= pid (:eval state)) (bshell-eval-finish state out 0) (bshell-loop state)))
+    ;; the evaluation died without answering (`eval-source` never throws, so this is the
+    ;; runtime's own limit); a normal exit follows its answer, and one already ended is gone
+    ([:EXIT pid reason]
+      (if (and (= pid (:eval state)) (not (= reason :normal)))
+        (bshell-eval-finish state (str "error: the evaluation died: " (pr-str reason)) 1)
+        (bshell-loop state)))
     ;; `cd DIR` at the prompt (`cmd-bshell-send`): the next command runs there
     ([:bshell-cd dir] (bshell-loop (assoc state :root dir)))
     ([:proc _p data] (bshell-loop (bshell-forward state data)))
@@ -209,7 +225,8 @@ a pty and a real emulator."
       (do
         (send (:reply state) (shells/bshell/bshell-done-event (:buffer state) code))
         (bshell-loop (assoc state :proc nil))))
-    ;; a line for the running command's stdin — a password it asked for (`bshell-read-secret`)
+    ;; a line for the running command's stdin — what RET sends while it runs (`read x`,
+    ;; `rm -i`), or a password it asked for (`bshell-read-secret`)
     ([:bshell-input text]
       (do
         (when (:proc state)
@@ -221,26 +238,35 @@ a pty and a real emulator."
     ;; (`os/interrupt`: SIGINT to its process group on Unix, the whole tree stopped on
     ;; Windows); its exit arrives as `[:proc-closed …]` like any other. A command already
     ;; gone is no error — the shell process must not die of a late key. A Brood form is
-    ;; evaluated in THIS process, so there is nothing to interrupt then.
+    ;; killed with its evaluating child, and said done at once.
     ([:bshell-interrupt]
-      (do
-        (when (:proc state)
-          (check-allow :discarded-catch (try (os/interrupt (:proc state)) (catch _ nil))))
-        (bshell-loop state)))
+      (cond
+        (:eval state) (do (exit (:eval state) :kill) (bshell-eval-finish state "interrupted" 130))
+        else
+          (do
+            (when (:proc state)
+              (check-allow :discarded-catch (try (os/interrupt (:proc state)) (catch _ nil))))
+            (bshell-loop state))))
     ([:shutdown]
-      (do (when (:proc state) (processes/close-quietly (:proc state) "bshell")) :bshell-stopped))))
+      (do
+        (when (:eval state) (exit (:eval state) :kill))
+        (when (:proc state) (processes/close-quietly (:proc state) "bshell"))
+        :bshell-stopped))))
 
 (defn bshell-connect (buffer root)
   "Spawn the shell process for `buffer` rooted at `root`; returns its pid (stored on that
 buffer under `:bshell-proc`). `(bshell-shutdown pid)` stops it. Output and exits go to
 the loop that opened the shell (`editor/ui/*loop*`), so a shell opened in a second frame answers
-there — `:editor` only for one started before any loop runs."
+there — `:editor` only for one started before any loop runs. It traps exits, so an
+evaluation it kills (C-c C-c) does not take it down."
   (let (reply (ed-loop-address))
-    (spawn (bshell-loop {:buffer buffer
-                         :root root
-                         :proc nil
-                         :reply reply
-                         :decoder (processes/output-decoder)}))))
+    (spawn (do
+             (proc/trap-exit true)
+             (bshell-loop {:buffer buffer
+                           :root root
+                           :proc nil
+                           :reply reply
+                           :decoder (processes/output-decoder)})))))
 
 (defn bshell-interrupt (pid)
   "Interrupt whatever command shell process `pid` is running (Ctrl-C to its process group);
@@ -253,9 +279,10 @@ a no-op when it is idle."
 
 (defn bshell-on-close (buffer)
   "The bshell layer's `:on-close` hook (fired by `pool/cmd-kill-current-buffer` via
-`close-context`): the shell buffer is going away, so stop the worker it owns and
-whatever child it was running."
-  (do (when (:bshell-proc buffer) (bshell-shutdown (:bshell-proc buffer))) buffer))
+`close-context`): the shell buffer is going away, so kill the worker it owns — killed, not
+asked, the one `:on-close` rule for a worker — and with it whatever it was running: a command
+dies with its owner, an evaluation with the worker it is linked to."
+  (do (when (:bshell-proc buffer) (exit (:bshell-proc buffer) :kill)) buffer))
 
 ;; ---- buffer plumbing --------------------------------------------------------
 ;; Every write to a shell buffer goes through `bshell-write`, because of where the cursor
@@ -766,20 +793,39 @@ Says so while a command runs: its output still has somewhere to go."
       (:input-running shell) (message m "a command is running — C-c C-c first")
       else (bshell-clear m (buffer-name shell)))))
 
+(defn- bshell-send-stdin (m shell)
+  "RET while `shell`'s command runs: the line typed after its output goes to the command's
+standard input — `read x`, `rm -i`'s question — as comint's `comint-send-input` sends it. The
+line leaves the buffer as it goes: the command's terminal echoes it back, at the process
+mark, in its place among the output (comint's `comint-process-echoes`). A Brood form being
+evaluated reads no input; RET leaves the line there for after it."
+  (let (name (buffer-name shell)
+        line (input-text shell))
+    (if (bshell-brood-form? (or (:bshell-command shell) ""))
+      (message m "a Brood form is evaluating — C-c C-c interrupts it")
+      (do
+        (send (:bshell-proc shell) [:bshell-input line])
+        (bshell-write m
+          name
+          (fn (buffer)
+            (let ([start end] (input-region buffer))
+              (end-of-buffer (replace-region buffer start end "")))))))))
+
 (defcommand cmd-bshell-send
   (m key)
   "RET in a bshell buffer: run the current input (everything from the prompt to the buffer's
 end) in *this* buffer's shell. An empty line emits a fresh prompt; an **incomplete Brood
 form** inserts a newline so you keep typing it (REPL-style multi-line); otherwise the input
-is sent to this shell's process. Ignored in a non-bshell buffer or while a command is running
-— unless that command waits at a password prompt, which RET then reads, masked —
-holding what was typed since the prompt appeared, moved out of the buffer."
+is sent to this shell's process. Ignored in a non-bshell buffer. While a command runs the
+line goes to its standard input (`bshell-send-stdin`) — and when that command waits at a
+password prompt, RET reads the password, masked, holding what was typed since the prompt
+appeared, moved out of the buffer."
   (let (shell (ed-current-buf m))
     (cond
       (not (bshell-buffer? shell)) m
       (and (:input-running shell) (:bshell-secret shell))
         (bshell-read-secret m (buffer-name shell) "")
-      (:input-running shell) m
+      (:input-running shell) (bshell-send-stdin m shell)
       else
         (let (name (buffer-name shell)
               line (string/trim-right (input-text shell)))
