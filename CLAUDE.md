@@ -112,7 +112,7 @@ must not take a std module's name (`vcs` shadowed std's: hence `vc`).
 | projects + build | `projects` `project-commands` `project-search` `toolchain` `compile` `results` `formatter` `projectdiag` `editspans` `searchedit` `apprun` |
 | eval + sessions | `eval-command` `eval-commands` `shell-command` `session` `sandbox` `sandbox-events` `elixir-sandbox` `liveeval` `playground-core` `playground` `elixir-playground` `workings` `debugger` `beam` `process-list` `attach` `eldoc` |
 | multi-frame + remote | `hosted` `guest` `frames` `tabbar` `winner` `remote` `web` |
-| tests + tools | `tests/support/testkit.blsp` (shared helpers: `press`, `source-files` …), `tests/guards_test` `tests/strict_ratchet_test` `tests/layout_doc_test`, `tools/drive-*.blsp` (live pty drivers), `tools/screenshot.blsp`, `tools/affected-tests.sh`, `tools/ci/*` |
+| tests + tools | `corpus` (the language corpus harness over `tests/corpus/<mode>/`), `tests/support/testkit.blsp` (shared helpers: `press`, `source-files` …), `tests/guards_test` `tests/strict_ratchet_test` `tests/layout_doc_test`, `tools/drive-*.blsp` (live pty drivers), `tools/screenshot.blsp`, `tools/affected-tests.sh`, `tools/ci/*` |
 
 ## Commands
 
@@ -125,8 +125,8 @@ be built with the GUI backend. Building it lives in the Brood repo:
 
 # here:
 nest run                 # open the editor on a scratch buffer (native window)
-nest run -- notes.txt    # open (Ctrl-S saves) that file
-nest test                # run the test suite (~3s, 900+ tests)
+nest run -- notes.txt    # open that file (C-x C-s saves it)
+nest test                # run the test suite (about 6300 tests, about 3 minutes)
 nest test tests/git_test.blsp:42     # one file, or the one test at that line
 nest test --failed       # just what failed last run — the edit/rerun loop
 nest test --cover        # function-level coverage: what the suite never calls
