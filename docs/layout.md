@@ -496,7 +496,8 @@ src/browse-kill-ring.blsp   M-x browse-kill-ring: *Kill Ring*, newest first, RET
                             entry where it was opened from (the ring is `clipboard`'s)
 src/window-commands.blsp    the window commands: tiled splits, windmove and Emacs's
                             windmove-swap-states-* (C-S-arrows and s-S-arrows), window-swap-states,
-                            the C-x 4 prefix; a side window's `:side` mark stays with its PLACE
+                            the C-x 4 prefix, window sizes (C-x ^ { } + -, `ed-resize-selected`
+                            over the split ratios), C-M-v; a side window's `:side` mark stays with its PLACE
                             (`ed-keep-sides`)
 src/textops.blsp            the commands that rewrite text in bulk: case, whitespace, the replace
                             family, tabify, reversing and deduplicating lines, align-regexp
@@ -580,7 +581,9 @@ src/docview.blsp            a PDF opens as its pages (Emacs doc-view, the `:docu
 src/hexl.blsp               hexl-mode: a binary file opened as a read-only hex view (pool's
                             find-file reaches it late-bound); the mode's `:no-write` facet is
                             what makes C-x C-s / C-x C-w refuse it
-src/pool.blsp               the buffer pool and where its buffers are shown — open / select / C-x k /
+src/pool.blsp               the buffer pool and where its buffers are shown — open / select / C-x k (a
+                            prompt; `ed-kill-buffer-asking` runs a continuation once the buffer is gone) / C-x b's
+                            new buffer (`ed-ensure-named`) /
                             kill, `ed-display-buffer` (Emacs display-buffer: init.blsp's
                             `:display-buffer` RULES first — `{:match name-regex | type-or-mode
                             :request :action :same-window | :other-window | :reuse | {:side
@@ -627,7 +630,9 @@ src/vim.blsp                the Vim grammar over the modal profile: `[count] ope
                             motion|text-object`, `.` repeat, the normal-mode commands and the mode
                             transitions (Esc, I, A, o, O, v)
 src/interactive.blsp        the `defcommand` macro + the M-x command registry, command traits, and REPEAT MAPS
-                            (`declare-repeat-map`, Emacs repeat-map: after C-x C-M-+ the keys + / - / 0 repeat)
+                            (`declare-repeat-map`, Emacs repeat-map: after C-x C-M-+ the keys + / - / 0 repeat), and
+                            ALIASES (`declare-aliases`: Emacs's names — save-buffer, delete-window —
+                            offered by M-x and run as bedit's command; keymaps lists them)
 src/transient.blsp          TRANSIENT MENUS (magit's `P`): the editor half of
                             `transient-core` (brood ADR-387) — the modal overlay, the
                             minibuffer read behind a `:read` outcome, and the MEMORY (a

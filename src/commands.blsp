@@ -12,6 +12,7 @@ those commands (what types, what kills, what a guest may run) are declared at th
 file."
   (:use editor/buffer)
   (:use editor/buffer-file) ; file-text-decode — C-x i reads a file as a visit does
+  (:use filename :only []) ; as-input — C-x C-v starts on the buffer's file, spelled as the line reads it
   (:use bufferops) ; line-blank?, region-line-range, map-text-lines
   (:use interactive) ; defcommand — define + register an interactive command (M-x)
   (:use complete-words :only [complete-word-char?])
@@ -51,6 +52,16 @@ first, fuzzy-narrowed). The list is the persisted ~/.cache/brood/recent-files ca
   "C-u — begin a numeric prefix argument (default 4; a further C-u multiplies it by 4,
 digits set it). The next command runs that many times; `C-u C-SPC` pops the mark."
   (assoc m :prefix-arg {:count 4 :raw true} :echo "C-u-"))
+
+(defcommand cmd-digit-argument
+  (m key)
+  "M-<digit> / C-<digit> / ESC <digit> (Emacs's `digit-argument`) — begin a numeric prefix
+argument with that digit: `M-4 M-2 M-g g` goes to line 42, `M-5 C-f` moves five characters.
+Further digits, with or without the modifier, add to it."
+  (let (digit (string/->number (last (string/split (->string key) "-"))))
+    (if (failure? digit)
+      (message m "digit-argument: no digit on this key")
+      (assoc m :prefix-arg {:count digit :raw false} :echo (str "C-u " digit "-")))))
 
 (defcommand cmd-negative-argument
   (m key)
@@ -235,14 +246,10 @@ so one that throws is not."
   ;; `names` less what a guest's session may not run (`ed-guest-allows-name?`)
   (if (:guest-session m) (seq/filter names ed-guest-allows-name?) names))
 
-(defcommand cmd-execute-extended-command
-  (m key)
-  "Prompt for an interactive command name and run it (M-x). Completes against the
-commands relevant to the current buffer's active layers: global commands plus any
-mode-specific ones the active layers expose via their `:commands` facet. Recently-run
-commands appear first (most-recent at the top), then the alphabetical remainder — the
-history is **persisted across restarts** via the same recentf mechanism (`recent-commands`
-/ `remember-command!`), floated by the shared `projects/float-recent`."
+(defn ed-mx-prompt (m prompt &optional (extra {}))
+  "The M-x prompt over `m`'s commands, shown as `prompt`, with `extra` (`{name command-name}`)
+offered beside them and run as the command each names — Vim's `:w` is `save` there. What M-x
+and Vim's `:` open."
   (let (buf (ed-current-buf m)
         all-names (ed-mx-names m
                     (ed-mx-command-names (interactive/command-names)
@@ -250,9 +257,9 @@ history is **persisted across restarts** via the same recentf mechanism (`recent
                       (ed-active-mode-commands buf))))
     (assoc m
       :minibuffer
-        (assoc (ed-name-prompt "M-x "
-                 all-names
-                 ed-mx-run
+        (assoc (ed-name-prompt prompt
+                 (if (empty? extra) all-names (append (sort (keys extra)) all-names))
+                 (fn (mm name) (ed-mx-run mm (or (get extra name) name)))
                  15
                  ;; the persisted M-x history, floated to the top
                  (if (:recent-files m) (recent-commands) []))
@@ -262,6 +269,17 @@ history is **persisted across restarts** via the same recentf mechanism (`recent
           ;; a command is run by its name: the typed name when it is one, else a listed one
           :require-match true
           :anno-keys (ed-key-table (editor/layers/scope-keymap (userkeys/ed-user-scope buf m)))))))
+
+(defcommand cmd-execute-extended-command
+  (m key)
+  "Prompt for an interactive command name and run it (M-x). Completes against the
+commands relevant to the current buffer's active layers: global commands plus any
+mode-specific ones the active layers expose via their `:commands` facet. Recently-run
+commands appear first (most-recent at the top), then the alphabetical remainder — the
+history is **persisted across restarts** via the same recentf mechanism (`recent-commands`
+/ `remember-command!`), floated by the shared `projects/float-recent`. A name typed exactly
+runs that command, whatever the ranking put first ([[ed-mx-prompt]])."
+  (ed-mx-prompt m "M-x "))
 
 (defcommand cmd-repeat-complex-command
   (m key)
@@ -607,6 +625,80 @@ text and the mark after it, so the inserted text is the region."
               ;; delete-selection the next key typed would replace the whole file — so none
               (message (ed-edit mm (fn (b) (goto-char (insert b content) p)))
                 (str "inserted " t))))))))
+
+;; ---- buffer and file names (M-x rename-buffer, C-x C-v, C-x 8 RET) ---------------------
+
+(defcommand cmd-rename-buffer
+  (m key)
+  "Give the current buffer another name (M-x rename-buffer). A name another buffer has is
+refused, as Emacs refuses it; the file it visits, if any, stays the same."
+  (let (current (buffer-name (ed-current-buf m)))
+    (assoc m
+      :minibuffer
+        {:edit (ed-mb-edit (str "Rename buffer (to new name): ") current)
+         :on-complete (fn (mm typed)
+                        (let (name (string/trim typed))
+                          (cond
+                            (string/blank? name) (message mm "(no new name)")
+                            (= name current) mm
+                            (ed-buffer-index-by-name mm name)
+                              (message mm (str "Buffer name `" name "' is in use"))
+                            else (ed-set-buf mm (assoc (ed-current-buf mm) :name name)))))})))
+
+(defcommand cmd-find-alternate-file
+  (m key)
+  "Find a file in place of the current buffer (C-x C-v, Emacs's `find-alternate-file`): the
+prompt starts on this buffer's file, and the file chosen replaces the buffer — after asking,
+when the buffer has unsaved changes. Visiting the same file again reads it from the disk."
+  (let (file (buffer-file (ed-current-buf m))
+        spec (ed-find-file-spec m
+               (fn (prompted path)
+                 (pool/ed-kill-buffer-asking prompted
+                   (ed-current-index prompted)
+                   (fn (killed) (ed-visit-file killed path))))
+               "Find alternate file: "))
+    (assoc m
+      :minibuffer
+        (if (nil? file)
+          spec
+          (assoc spec :edit (ed-mb-set-text (:edit spec) (filename/as-input file)))))))
+
+(defn char-of-input (text)
+  "The character `text` names at C-x 8 RET: a code point in hex (`3bb`, `U+03BB`, `#x3bb`) or
+in decimal after `#` (`#955`) — a string of that one character — or nil.
+
+    (commands/char-of-input \"U+03BB\")   ;=> \"λ\"
+    (commands/char-of-input \"nope\")     ;=> nil"
+  (let (trimmed (string/trim text)
+        [digits radix] (match trimmed
+                         ((str "U+" hex) [hex 16])
+                         ((str "u+" hex) [hex 16])
+                         ((str "#x" hex) [hex 16])
+                         ((str "#" decimal) [decimal 10])
+                         (_ [trimmed 16]))
+        code (if (string/blank? digits) nil (string/->number digits radix)))
+    (when (and (int? code)
+            (>= code 0)
+            (<= code 1114111)
+            (not (and (>= code 55296) (<= code 57343))))
+      (string/codepoints-> [code]))))
+
+(defcommand cmd-insert-char
+  (m key)
+  "Insert a character by its code point (C-x 8 RET, Emacs's `insert-char`): hex (`3bb`,
+`U+03BB`) or `#955` in decimal; with a prefix argument, that many of it. Unicode names are not
+known to the editor, so a name is refused, said."
+  (let (count-of (math/max 1 (or (current-prefix-arg m) 1)))
+    (assoc (dissoc m :prefix-arg)
+      :minibuffer
+        {:edit (ed-mb-edit "Insert character (code point, e.g. U+03BB): " "")
+         :on-complete (fn (mm typed)
+                        (let (char (char-of-input typed))
+                          (if (nil? char)
+                            (message mm (str "Invalid character: " (string/trim typed)))
+                            (ed-edit mm (fn (b) (insert b (string/repeat char count-of)))))))})))
+
+(register-prefix-consuming 'commands/cmd-insert-char)
 
 ;; ---- what the core must know of these commands (`interactive/declare-trait`) ------------
 ;; Each command module declares its own commands' traits beside them.

@@ -70,24 +70,68 @@ as written when it is defined, else as the command of that M-x name."
           (not (nil? known)) [(keymap-spelling known) nil]
           else [nil (str "no command named " text " (M-x lists them)")])))))
 
-(defn- user-bindings (keys where known-globals origin)
+(defn- binding-at (keymap sequence)
+  ;; what `sequence` is bound to in `keymap`, walking its prefix maps; nil when nothing is
+  (fold sequence keymap (fn (acc key) (when (map? acc) (get acc key)))))
+
+(defn- non-prefix-key (sequence bound base)
+  "The first proper prefix of `sequence` that runs a COMMAND rather than leading on to more
+keys, or nil: one the same map's earlier `bound` (`{sequence command}`) binds to a command, or
+one `base` (the keymap they amend) binds to one that `bound` does not rebind. A binding under
+it would replace the command with a prefix map, which Emacs refuses as `starts with non-prefix
+key`."
+  (seq/find (map (range 1 (count sequence)) (fn (length) (vec (take sequence length))))
+    (fn (prefix)
+      (if (contains? bound prefix)
+        (symbol? (get bound prefix))
+        (symbol? (binding-at base prefix))))))
+
+(defn- prefix-checked (bindings base label-of)
+  "`[kept warnings]`: `bindings` (shortest first) less each one whose key starts with a key that
+runs a command ([[non-prefix-key]]), with Emacs's warning for it — `C-x C-f C-a starts with
+non-prefix key C-x C-f` — so a typo in init.blsp never silently loses find-file."
+  (fold bindings
+    [[] []]
+    (fn (acc [sequence command])
+      (let ([kept warnings] acc
+            bound (into {} kept)
+            clash (non-prefix-key sequence bound base))
+        (if (nil? clash)
+          [(conj kept [sequence command]) warnings]
+          [kept
+            (conj warnings
+              (str (label-of sequence)
+                "Key sequence "
+                (key-description sequence)
+                " starts with non-prefix key "
+                (key-description clash)
+                " ("
+                (->string (or (get bound clash) (binding-at base clash)))
+                ") — not bound"))])))))
+
+(defn- user-bindings (keys where known-globals origin &optional (base {}))
   "`[bindings warnings]` for one `{key-description command}` map: each binding a
 `[sequence command]`, shortest sequence first (so `C-c` then `C-c f` reads as a prefix
-rebound and then filled), and a warning per key that does not read or command that is not
-one. `where` names the map in a warning (`:keys`, `:mode-keys markdown`), `origin` whose map it
-is (`init.blsp`, `package bedit-agent`)."
-  (let (parsed (map (or keys {})
+rebound and then filled), and a warning per key that does not read, command that is not
+one, or key under a key that runs a command — in `base`, the keymap the bindings amend, or in
+this map ([[prefix-checked]]). `where` names the map in a warning (`:keys`, `:mode-keys
+markdown`), `origin` whose map it is (`init.blsp`, `package bedit-agent`)."
+  (let (label-of (fn (description) (str origin ": " where " " (pr-str description) " — "))
+        parsed (map (or keys {})
                  (fn ([description value])
                    (let (sequence (key-parse description)
                          [command problem] (user-command value known-globals)
-                         label (str origin ": " where " " (pr-str description) " — "))
+                         label (label-of description))
                      (cond
                        (failure? sequence) [nil (str label (error-message sequence))]
                        problem [nil (str label problem)]
                        else [[sequence command] nil]))))
         bindings (seq/sort-by (seq/filter (map parsed first) (fn (b) (not (nil? b))))
-                   (fn ([sequence _]) [(count sequence) (key-description sequence)])))
-    [(vec bindings) (vec (seq/filter (map parsed second) string?))]))
+                   (fn ([sequence _]) [(count sequence) (key-description sequence)]))
+        [kept clashes] (prefix-checked bindings
+                         base
+                         (fn (sequence) (label-of (key-description sequence)))))
+    [(vec kept) (into (vec (seq/filter (map parsed second) string?)) clashes)]))
 
 (defn- layer-ref-name (ref)
   "The `:mode-keys` name of layer reference `ref` WITHOUT resolving it: a map's `:name`, a
@@ -125,7 +169,9 @@ layers with. A mode no registered layer is named is warned about but still bound
 module may not have loaded yet. `origin` names whose bindings they are in a warning: a
 package's `:keys` compile here too ([[register-package-keys]])."
   (let (known-globals (reflect/global-names)
-        [global global-warnings] (user-bindings keys ":keys" known-globals origin)
+        ;; the global keys the bindings amend, so one under a key that runs a command is refused
+        base (if (and (empty? keys) (empty? mode-keys)) {} (keymaps/profile-keymap :emacs))
+        [global global-warnings] (user-bindings keys ":keys" known-globals origin base)
         known-modes (if (empty? mode-keys) #{} (ed-user-mode-names))
         modes (map (or mode-keys {})
                 (fn ([mode bindings])
@@ -133,7 +179,8 @@ package's `:keys` compile here too ([[register-package-keys]])."
                         [compiled warnings] (user-bindings bindings
                                               (str ":mode-keys " name)
                                               known-globals
-                                              origin))
+                                              origin
+                                              base))
                     [name
                       [compiled
                         (if (contains? known-modes name)
