@@ -7,11 +7,13 @@
   (:use minibuffer)
   (:use model)
   (:use-internals compile)
+  (:use editor/ui :only []) ; its `*loop*`, bound below as the live loop binds it
   (:use editor/buffer))
 
 (defn compile-model ()
-  "A bare model with no *compilation* buffer — event handlers create it on first use."
-  (ed-init (make-buffer "")))
+  "A model with an empty *compilation* buffer, as a running build has one (the handlers write
+into it, and never create it: a buffer killed meanwhile stays killed)."
+  (pool/ed-open-buffer (ed-init (make-buffer "")) (make-buffer "" "*compilation*" nil)))
 
 (def compile-buf-name "*compilation*")
 
@@ -92,11 +94,11 @@
 
 (describe "compile--reset"
   (test "creates a *compilation* buffer with the command in its header"
-    (let (m (compile/compile-reset (compile-model) "make test"))
+    (let (m (compile/compile-reset (compile-model) "make test" nil))
       (is (includes? (compile-buf-text m) "make test"))))
   (test "re-running reset clears previous output"
     (let (m1 (compile/compile-append (compile-model) "old output\n")
-          m2 (compile/compile-reset m1 "make"))
+          m2 (compile/compile-reset m1 "make" nil))
       (is (not (includes? (compile-buf-text m2) "old output"))))))
 
 ;; ---- event handlers ----------------------------------------------------------
@@ -159,7 +161,7 @@
       (assert= face {:fg 1})))
   (test "a fresh compilation starts with no faces"
     (let (m (compile-stream-into (compile-model) ["\e[31mred\e[0m\n"]))
-      (is (empty? (compile-output-spans (compile/compile-reset m "make")))))))
+      (is (empty? (compile-output-spans (compile/compile-reset m "make" nil)))))))
 
 (describe "ed-ev-compile-done"
   (test "exit 0 appends 'Compilation finished' and echoes it"
@@ -255,3 +257,76 @@
                                   :ready-wait :handle
                                   :ready-label "listing mix tasks"))
           "listing mix tasks"))))
+
+;; ---- a build per loop; C-c C-k, g, and the buffer killed ------------------------------------
+
+(defn- compile-await-done (deadline)
+  ;; the next compile-done-event this test is sent, or :timeout
+  (receive
+    (event :when (= (type-of event) (type-of (compile/compile-done-event 0))) event)
+    (after deadline :timeout)))
+
+(describe "compile: the build belongs to the loop that started it"
+  :isolated (test "two loops get two workers, and a build in one leaves the other's alone"
+    (let (first-loop (binding (editor/ui/*loop* (self))
+                       (compile/compile-run (compile-model) "sleep 5" "/tmp"))
+          second-loop (binding (editor/ui/*loop* (self))
+                        (compile/compile-run (compile-model) "true" "/tmp")))
+      (is (not (= (:compile-proc first-loop) (:compile-proc second-loop))))
+      (send (:compile-proc first-loop) [:shutdown])
+      (send (:compile-proc second-loop) [:shutdown])))
+  :isolated (test "a worker whose run is taken over by another loop tells the first it was killed"
+    (let (other (spawn (receive ([:done _event] nil) (after 10000 nil)))
+          worker (spawn (compile/compile-loop)))
+      (send worker [:compile-run "sleep 5" "/tmp" (self)])
+      (send worker [:compile-run "true" "/tmp" other])
+      (assert= (compile/compile-done-event-code (compile-await-done 5000)) nil)
+      (send worker [:shutdown])))
+  :isolated (test "C-c C-k kills the running build, said as killed"
+    (let (m (binding (editor/ui/*loop* (self))
+              (compile/compile-run (compile-model) "sleep 30" "/tmp"))
+          killing (compile/cmd-kill-compilation m nil)
+          done (compile-await-done 5000)
+          folded (compile/ed-ev-compile-done killing done 24 80 24))
+      (assert= (:echo killing) "killing compilation")
+      (is (nil? (compile/compile-done-event-code done)))
+      (is (includes? (compile-buf-text folded) "Compilation killed"))
+      (is (nil? (:compile-running folded)))
+      (send (:compile-proc m) [:shutdown])))
+  (test "g runs the last build again, in the directory it ran in"
+    (let (m (assoc (compile-model)
+              :compile-run-spec {:cmd "make check" :directory "/tmp"}
+              :compile-proc (self))
+          again (binding (editor/ui/*loop* (self)) (compile/cmd-recompile m nil)))
+      (assert= (receive ([:compile-run cmd root _] [cmd root]) (after 0 :nothing-sent))
+        ["make check" "/tmp"])
+      (assert= (:compile-running again) "make check")))
+  (test "output for a killed *compilation* does not bring it back, and stops the build"
+    (let (m (assoc (ed-init (make-buffer "")) :compile-running "make" :compile-proc (self))
+          out (compile/ed-ev-compile-output m (compile/compile-output-event "late\n" []) 24 80 24)
+          done (compile/ed-ev-compile-done out (compile/compile-done-event nil) 24 80 24))
+      (is (nil? (compile-buf-text out)))
+      (is (nil? (compile-buf-text done)))
+      (is (nil? (:compile-running done)))
+      (assert= (receive ([:compile-kill] :killed) (after 0 :nothing-sent)) :killed)))
+  (test "killing *compilation* stops its build"
+    (do
+      (compile/compile-on-close (assoc (make-buffer "" "*compilation*" nil) :compile-proc (self)))
+      (assert= (receive ([:compile-kill] :killed) (after 0 :nothing-sent)) :killed)))
+  (test "C-x k on *compilation* while it builds asks first"
+    (let (m (assoc (compile-model) :compile-running "make"))
+      (assert= (compile/compile-kill-query m
+                 (ed-buf-at m (ed-buffer-index-by-name! m "*compilation*")))
+        "it has a running process")
+      (is (nil? (compile/compile-kill-query (dissoc m :compile-running) (ed-current-buf m))))))
+  (test "C-x ` resolves a path against the directory the build ran in"
+    (let (dir (path/temp "bedit-compile-root-")
+          _ (file/mkdir dir)
+          _ (file/spit (path/join dir "a.c") "one\ntwo\n")
+          m (assoc (ed-init (make-buffer ""))
+              :project-root "/nonexistent-root"
+              :compile-run-spec {:cmd "make" :directory dir}
+              :compile-errors (list {:file "a.c" :line 2 :col 1})
+              :compile-error-idx -1)
+          visited (compile/cmd-next-error m nil))
+      (assert= (editor/buffer/buffer-file (ed-current-buf visited)) (path/join dir "a.c")))))
