@@ -19,7 +19,9 @@ into the echo area every time point moves."
   (let (correlation (ref))
     (fire correlation)
     (let (asked (assoc m
-                  :lsp-pending (assoc (:lsp-pending m {}) correlation (merge kind (or extra {})))))
+                  :lsp-pending
+                    (assoc (:lsp-pending m {})
+                      correlation (assoc (merge kind (or extra {})) :asked-at (os/now)))))
       (if (= note :quiet) asked (message asked (or note "lsp: resolving…"))))))
 
 (defn ed-lsp-ask-server (m connection kind request &optional extra note)
@@ -706,13 +708,24 @@ asks again for (`lsp/protocol/*lsp-refresh-requests*`)."
             (conj acc [index (or (:top payload) 0)])
             acc))))))
 
+(def *lsp-answer-wait-ms* 15000)
+;; How long a lookup the editor makes by itself (semantic tokens, inlay hints) counts as in
+;; flight. A server that never answers one — busy, or a bug — otherwise held every later ask of
+;; its kind back until C-g dropped the pending lookups; past this the next idle beat asks again
+;; (a late answer still folds).
+
 (defn ed-lsp-in-flight? (m token)
   "Whether a lookup asked with `token` (a feature's own mark on its pending lookup, `:token`) is
-still waiting for its answer — false once it lands, is dropped (C-g) or its server dies.
+still waiting for its answer — false once it lands, is dropped (C-g), its server dies, or it has
+waited past [[*lsp-answer-wait-ms*]].
 
     (lsp/servers/ed-lsp-in-flight? {:lsp-pending {}} :t)   ;=> false"
-  (and (not (nil? token))
-    (any? (vals (or (:lsp-pending m) {})) (fn (lookup) (= (:token lookup) token)))))
+  (let (now (os/now))
+    (and (not (nil? token))
+      (any? (vals (or (:lsp-pending m) {}))
+        (fn (lookup)
+          (and (= (:token lookup) token)
+            (< (- now (or (:asked-at lookup) now)) *lsp-answer-wait-ms*)))))))
 
 ;; the init file's setting for this feature, declared beside it (config's registry)
 (settings/define config/*settings*
@@ -723,3 +736,30 @@ still waiting for its answer — false once it lands, is dropped (C-g) or its se
    :doc (str "start a file's language server when it is opened (Emacs eglot-ensure); false\n"
           "starts one only when asked (M-x lsp-connect) — Expert compiles a whole mix\n"
           "project before it answers, a cost to pay on demand")})
+
+;; ---- quitting: every server told, as the protocol asks -------------------------------------
+
+(def *lsp-quit-wait-ms* 3000)
+;; How long C-x C-c waits, at most, for the servers to go: each is told `shutdown` then `exit`
+;; by its connection (`lsp/client/lsp-stop`, which gives a server 1.5 s for each), and the
+;; editor ends once every connection has, or this has passed.
+
+(defn ed-lsp-stop-all (m)
+  "Stop every language server the model runs, as the protocol asks (`shutdown`, then `exit`), and
+wait — at most [[*lsp-quit-wait-ms*]] — for their connections to end: what quitting does, so a
+server finishes writing its caches and lock files instead of having its pipe cut when the
+editor's runtime ends under it. Answers `m`."
+  (let (connections (seq/filter (into [] (map (vals (or (:lsp-servers m) {})) :conn))
+                      (fn (connection) (and (pid? connection) (proc/alive? connection))))
+        monitors (into [] (map connections (fn (connection) (monitor connection))))
+        deadline (+ (os/now) *lsp-quit-wait-ms*))
+    (do
+      (doseq (connection connections) (lsp/client/lsp-shutdown connection))
+      (letrec (await (fn (left)
+                       (when (not (empty? left))
+                         (receive
+                           ([:down reference _ _] :when (includes? left reference)
+                             (await (seq/reject left (fn (other) (= other reference)))))
+                           (after (math/max 0 (- deadline (os/now))) nil)))))
+        (await monitors))
+      m)))
