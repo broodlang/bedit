@@ -16,18 +16,27 @@ in the echo area below the mode line — where which-key's side window and Magit
 buffer sit — with no card. A package registers another style and the setting names it; the
 sources never know which one draws them."
   (:use model :only [register-frame-overlay])
+  (:use sources :only []) ; loaded first: the tables' `sources/define-table` run at load
   (:use theme) ; ui-ctx — the palette as the kit's roles
   (:use ui-kit :only [ui-face ui-clip])
-  (:use editor/display :only [text]))
+  (:use editor/display :only [text])
+  (:use memo :only [defmemo])) ; the panel, built once per change of what it reads
 
 ;; ---- the registries --------------------------------------------------------------------------
 
+(sources/define-table :keypanel/sources {:required #{:rank :deps :run} :optional #{:when}})
+
 (defn register-panel-source (name row)
-  "Add the panel source `name`: `{:rank n :when key :run 'sym}`. `(sym m rows)` answers the panel
-to show, or nil — `rows` the most lines a column may take. `:when` names a model key that must be
-set before the source is asked, so a feature that is not in use is never loaded to say so (the
-transient's `:transient`, which-key's `:which-key`). Lowest `:rank` first."
+  "Add the panel source `name`: `{:rank n :when key :deps 'deps-fn :run 'panel-fn}`.
+`(deps-fn m)` answers what the panel is made from — everything `panel-fn` reads, kept small —
+and `(panel-fn deps rows)` the panel to show, or nil, `rows` the most lines a column may take. A
+panel is built once for each change of its deps, not on every read (the layout and the frame
+both ask for it). `:when` names a model key that must be set before the source is asked, so a
+feature that is not in use is never loaded to say so (the transient's `:transient`, which-key's
+`:which-key`). Lowest `:rank` first."
   (sources/register :keypanel/sources name row))
+
+(sources/define-table :keypanel/styles {:required #{:rows :paint}})
 
 (defn register-panel-style (name row)
   "Add the panel style `name`: `{:rows 'rows-fn :paint 'paint-fn}`. `(rows-fn panel rows)` is how
@@ -36,9 +45,21 @@ tall (0 for a style that draws over the text instead); `(paint-fn panel m column
 render ops. The `:key-panel` setting names the style in use."
   (sources/register :keypanel/styles name row))
 
+(defn style-name? (name)
+  "Whether `name` is a registered panel style ([[register-panel-style]]): what the `:key-panel`
+setting accepts. The init file is checked after the installed packages load, so a package's style
+registered as it loads is known; one registered later still draws once it exists, but the init
+check has already said it was unknown.
+
+    (keypanel/style-name? :echo)   ;=> true
+    (keypanel/style-name? :no-such-style)   ;=> false"
+  (contains? (registry/entries :keypanel/styles) name))
+
 (settings/define config/*settings*
   :key-panel {:default :echo
    :type 'keyword
+   :valid? 'keypanel/style-name?
+   :want "a registered key panel style: :echo, or one a package adds (keypanel/register-panel-style)"
    :model-key :key-panel
    :commented? true
    :doc (str "how a key panel (a transient menu, which-key) is shown: :echo, a flat strip in the\n"
@@ -55,22 +76,33 @@ render ops. The `:key-panel` setting names the style in use."
   ;; the lines a column may take in a frame `rows` tall: the cap, leaving a pane room above
   (math/max 1 (math/min panel-max-rows (- rows 6))))
 
+(defmemo built-panel 4 (panel-fn deps rows)
+  ;; the panel `panel-fn` (the function itself, so a redefinition is a new key) makes of `deps`
+  ;; for columns of `rows` lines: built once per change, though the echo area's height alone is
+  ;; asked several times a frame
+  (panel-fn deps rows))
+
+(defn- source-panel (m rows row)
+  ;; the panel the source `row` has for `m`, or nil: none asked while its `:when` key is unset,
+  ;; nor while its module has not loaded
+  (when (or (nil? (:when row)) (get m (:when row)))
+    (let (panel-fn (reflect/bound-value (:run row) nil))
+      (when (fn? panel-fn)
+        (built-panel panel-fn (reflect/call-if-bound (:deps row) nil m) rows)))))
+
 (defn ed-key-panel (m rows)
   "The panel to show for `m` in a frame `rows` tall, or nil: the first source with one, none
 while a prompt lists candidates (its list owns the echo area)."
   (let (minibuffer (:minibuffer m))
     (when (not (and minibuffer (:accept-selection minibuffer)))
-      (fold (sources/rows :keypanel/sources)
-        nil
-        (fn (found row)
-          (or found
-            (when (or (nil? (:when row)) (get m (:when row)))
-              (reflect/call-if-bound (:run row) nil m (column-limit rows)))))))))
+      (first (sources/first-answer :keypanel/sources
+               (fn (row) (source-panel m (column-limit rows) row)))))))
 
 (defn- style-of (m)
   ;; the style row the `:key-panel` setting names, the editor's own when it names none there is
-  (let (rows (into {} (map (registry/ranked :keypanel/styles) (fn ([name row]) [name row]))))
-    (or (get rows (get m :key-panel :echo)) (get rows :echo))))
+  ;; (a style whose package went away)
+  (or (registry/lookup :keypanel/styles (get m :key-panel :echo))
+    (registry/lookup :keypanel/styles :echo)))
 
 (sig panel-rows (map int -> int))
 (defn panel-rows (m rows)
@@ -188,8 +220,9 @@ columns side by side."
   (let (faces (echo-faces (:gui m))
         height (panel-height panel rows)
         pages (panel-pages (panel-columns panel height) columns)
-        index (math/mod (or (:page panel) 0) (count pages))
-        page (nth pages index)
+        ;; a panel with no groups has no pages: nothing to lay out, and no page to turn to
+        index (math/mod (or (:page panel) 0) (math/max 1 (count pages)))
+        page (nth pages index [])
         titled? (not (string/blank? (or (:title panel) "")))
         top (- rows height (if titled? 1 0))
         hint (when (> (count pages) 1)
