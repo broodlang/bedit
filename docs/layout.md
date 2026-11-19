@@ -610,9 +610,10 @@ src/file-save.blsp          writing a pool buffer to its file: `ed-save-buf-at` 
                             visits the new path only once the write lands, and keeps its old one
                             when it fails. Headless, inline; tests bind `*write-off-loop*` / `*write-file*`
 src/menu.blsp               the right-click context menu (and M-x context-menu-open, on the menu key
-                            and S-F10): a key panel source, each action under the last key of its
-                            binding (Copy M-w is `w`), a click on an entry runs it; an item names
-                            its command by SYMBOL, resolved when it runs
+                            and S-F10): a key panel source, each action under a letter of its own
+                            (Copy M-w is `w`, but Cut C-w is `k`), a click on an entry runs it, a
+                            key on one that does not apply says why; an item names its command by
+                            SYMBOL, resolved when it runs
 src/keymaps.blsp            keybinding profiles (emacs / modal vim) as model-scope layers, and the
                             which-key name and groups of each prefix map, in the keymap itself
                             (`keymap-describe`, a heading on each `keymap-bind`; brood ADR-745)
