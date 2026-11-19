@@ -202,19 +202,25 @@ in absolute coordinates. The long-line path."
       (fn ([start end]) (shift-spans (fontify (text/slice rope start end)) start)))))
 (sig ed-window-src (buffer any int int -> any))
 (defn- ed-window-src (buf restart from-line to-line)
-  "The `[source base]` the mode's `fontify` runs over for lines `from-line`..`to-line - 1`: a text/slice of
-that window plus a lead-in, trimmed forward to a restart point (`restart`, the mode's optional
-`:fontify-restart`, or nil) so head-position context stays correct. `base` is `source`'s absolute
-char offset. Factored out so the span cache can compare this fontify INPUT cheaply (a
-text/slice) to decide whether a re-fontify is even needed — far cheaper than re-running
-`fontify` — without duplicating the window arithmetic.
+  "The `[source base lead]` the mode's `fontify` runs over for lines `from-line`..`to-line - 1`: a
+text/slice of that window plus a lead-in, trimmed forward to a restart point (`restart`, the mode's
+optional `:fontify-restart`, or nil) so head-position context stays correct. `base` is the
+absolute char offset of the buffer text in `source`, and `lead` the length of what the mode's
+`:fontify-prefix` put before it ([[ed-window-fontify]]). Factored out so the span cache can compare
+this fontify INPUT cheaply (a text/slice) to decide whether a re-fontify is even needed — far
+cheaper than re-running `fontify` — without duplicating the window arithmetic.
 
 The lead-in is `ed-fontify-backscan` lines: a restart mode searches that range for a column-0
 form and TRIMS the front (so its fontified source stays small), while a no-restart mode lexes all
 of it as raw CONTEXT. A mode with cross-line state must therefore either name a restart that
 knows that state (markdown's and org's find the open fence / `#+BEGIN_` above the band, else
 cut at the band's first line) or pay for the whole lead-in on every edit — which, for
-markdown, was the jitter typing into a long document had."
+markdown, was the jitter typing into a long document had.
+
+What a restart cannot know is what the text ABOVE the lead-in left open: a PHP file is HTML until
+its `<?php`, which may be thousands of lines up. A mode with a `:fontify-prefix` answers the text
+to re-read first (`languages/core/resume-prefix`: one backward search from `base`), so the window
+parses inside it."
   (let (rope (buffer-rope buf)
         line-count (buffer-line-count buf)
         last-line (math/min (dec line-count) (dec to-line))
@@ -227,8 +233,19 @@ markdown, was the jitter typing into a long document had."
                   0
                   (restart chunk (- (text/line->char rope from-line) window-start)))
         base (+ window-start trimmed)
-        source (if (= trimmed 0) chunk (string/substring chunk trimmed (count chunk))))
-    [source base]))
+        text (if (= trimmed 0) chunk (string/substring chunk trimmed (count chunk)))
+        resume (ed-mode-service buf :fontify-prefix)
+        prefix (when resume (resume rope base)))
+    (if (nil? prefix) [text base 0] [(str prefix text) base (count prefix)])))
+
+(defn- ed-window-fontify (fontify window)
+  "`fontify` run over `window`, an `ed-window-src` `[source base lead]`, its spans in absolute
+coordinates — those of the re-read prefix dropped, since its text is not the buffer's."
+  (let ([source base lead] window
+        spans (shift-spans (fontify source) (- base lead)))
+    (if (= lead 0)
+      spans
+      (seq/keep spans (fn ([start end face]) (when (> end base) [(math/max start base) end face]))))))
 
 (defn ed-window-spans (buf fontify restart from-line to-line &optional (clip 1000))
   "Absolute `[start end face]` syntax spans covering buffer lines `from-line`..`to-line - 1` of `buf` —
@@ -237,8 +254,7 @@ into absolute coordinates (`highlight/shift-spans`) so the per-line renderer nee
 A window holding a line past `*fontify-line-cap*` takes the per-line path instead."
   (if (ed-long-lines? buf from-line to-line)
     (ed-clipped-line-spans buf fontify from-line to-line clip)
-    (let ([source base] (ed-window-src buf restart from-line to-line))
-      (shift-spans (fontify source) base))))
+    (ed-window-fontify fontify (ed-window-src buf restart from-line to-line))))
 
 (defn- ed-band-contains? (entry buf top visible-rows)
   "Whether cached band `entry`'s `[blo bhi)` lines contain the viewport `[top, top+visible-rows)`,
@@ -268,7 +284,7 @@ costs."
       (math/min (buffer-line-count buf) (+ top visible-rows margin))]))
 
 (defn- ed-band-window (entry buf top visible-rows restart)
-  "The fontify input `[source base]` (`ed-window-src`) a re-lex of slice band `entry`'s own
+  "The fontify input `[source base lead]` (`ed-window-src`) a re-lex of slice band `entry`'s own
 lines would take NOW — when `entry` still contains the viewport and is a slice band that kept
 its input (not a tree band, not a long-line one) lying within the buffer (a shrink would make
 its line range slice past EOF). Nil when it cannot be revalidated at all.
@@ -282,6 +298,10 @@ than slicing the same lines a second time."
           (<= (:bhi entry) (buffer-line-count buf)))
     (ed-window-src buf restart (:blo entry) (:bhi entry))))
 
+(defn- ed-entry-window (entry)
+  ;; the `ed-window-src` input slice band `entry` was lexed from
+  [(:src entry) (:base entry) (get entry :lead 0)])
+
 (defn- ed-band-covers? (entry buf top visible-rows restart)
   "True if cached span `entry` still serves a pane showing `buf` at scroll `top` over
 `visible-rows` rows: its `[blo bhi)` line band contains the viewport (clamped to EOF, since the
@@ -294,20 +314,21 @@ one of hundreds of appended lines. A band coloured from a tree kept no fontify i
 compare: its tree's change ranges say whether it survives (`ed-tree-band-survives?`)."
   (and (ed-band-contains? entry buf top visible-rows)
     (or (= (:rope entry) (buffer-rope buf))
-      (= (ed-band-window entry buf top visible-rows restart) [(:src entry) (:base entry)]))))
+      (= (ed-band-window entry buf top visible-rows restart) (ed-entry-window entry)))))
 
 (defn- ed-slice-entry (buf fontify band-low band-high window)
   "A `:span-cache` entry for lines `[band-low, band-high)` of `buf` lexed from `window`, the
-`[source base]` `ed-window-src` sliced for them — tagged with the rope and that exact input, so
+`[source base lead]` `ed-window-src` sliced for them — tagged with the rope and that exact input, so
 `ed-band-covers?` can revalidate it cheaply after an off-band edit."
-  (let ([source base] window)
+  (let ([source base lead] window)
     {:rope (buffer-rope buf)
      :type (:type buf)
      :blo band-low
      :bhi band-high
      :src source
      :base base
-     :spans (shift-spans (fontify source) base)}))
+     :lead lead
+     :spans (ed-window-fontify fontify window)}))
 
 (sig ed-band-for (buffer any any int int any -> map))
 (defn- ed-band-for (buf fontify restart top visible-rows clip)
@@ -743,7 +764,7 @@ the viewport, or a viewport on the long-line path, goes to `ed-band-for`."
     (cond
       (ed-band-hits? old buf top visible-rows) old
       (nil? window) (ed-band-for buf fontify restart top visible-rows (ed-fontify-clip pane buf))
-      (= window [(:src old) (:base old)]) old
+      (= window (ed-entry-window old)) old
       (ed-long-lines? buf top (+ top visible-rows))
         (ed-band-for buf fontify restart top visible-rows (ed-fontify-clip pane buf))
       else (ed-slice-entry buf fontify (:blo old) (:bhi old) window))))

@@ -148,6 +148,12 @@ must also notice `=begin`. A language with none declines to restart, which is a 
 the language — `editor/treesit/language-contract` says which services are required and
 which are optional.
 
+A restart only TRIMS the lead-in, so a window can never learn what the text above its lead-in
+left open. `:resume [{:open re :close re}]` says what can be: an outer construct the grammar
+reads the rest of the file inside of, as PHP reads `<?php … ?>`. Whichever of
+those markers comes last above a window decides: an opener is re-read before the window (the
+`:fontify-prefix` service, [[resume-prefix]]), a closer or none leaves it as it is.
+
 The generated restart is `<name>-restart`, not `<name>-fontify-restart`: the obvious name is
 the one a language with a CUSTOM restart uses (Ruby's), and generating it would silently
 replace that one. A generated definition must not be able to take a hand-written name.
@@ -173,6 +179,9 @@ The spec is evaluated ONCE, into `<name>-spec`, so a spec built from a shared ba
          (languages/core/spec-indent-column ~spec-ref text line-start tree))
        (defn ~(generated "-restart") (source position)
          (languages/core/spec-restart ~spec-ref source position))
+       ;; what a window at `offset` re-reads first, so it starts inside what is open above it
+       (defn ~(generated "-resume-prefix") (rope offset)
+         (languages/core/resume-prefix (get ~spec-ref :resume) rope offset))
        ;; show-paren over the parse: the view's window of text, or the held tree
        ;; (`:bracket-match-tree`, `tsbrackets/match-tree`) when the buffer keeps one
        (defn ~(generated "-bracket-match") (text position)
@@ -196,6 +205,7 @@ The spec is evaluated ONCE, into `<name>-spec`, so a spec built from a shared ba
            {:fontify '~(qualified "-fontify")
             :indent '~(qualified "-indent")
             :restart '~(qualified "-restart")
+            :resume-prefix '~(qualified "-resume-prefix")
             :faces '~(qualified "-ts-faces")
             :injections '~(qualified "-ts-injections")
             :bracket-match '~(qualified "-bracket-match")
@@ -228,8 +238,8 @@ The spec is evaluated ONCE, into `<name>-spec`, so a spec built from a shared ba
    :stack :prog
    :keys (into (set/union *registration-keys* *convention-keys*)
            #{:lang
-             :faces :indent :heredocs :restart :comment-block :format :definitions :folds
-             :grammar :fallback :fallback-above :injections :electric-indent})})
+             :faces :indent :heredocs :restart :resume :comment-block :format :definitions
+             :folds :grammar :fallback :fallback-above :injections :electric-indent})})
 
 (def deflexer-kind
   {:macro 'deflexer
@@ -574,7 +584,7 @@ indent reads content (`:indent :content`) and says no `:folds`.
 
 (defn language-layer (name spec refs)
   "The mode layer for a `deflanguage`, checked against `editor/treesit/language-contract`.
-`refs` names the generated services: `{:fontify :indent :restart :faces :injections
+`refs` names the generated services: `{:fontify :indent :restart :resume-prefix :faces :injections
 :bracket-match}`.
 
 Raises on an incomplete language rather than registering one. A mode missing `:indent`
@@ -595,6 +605,8 @@ by someone opening a file."
                :ts-injections (when (get spec :injections) (:injections refs))
                :file-pattern (get spec :pattern)
                :fontify (:fontify refs)
+               ;; the text a window re-reads first: the outer construct still open above it
+               :fontify-prefix (when (get spec :resume) (:resume-prefix refs))
                :indent (:indent refs)
                ;; a hand-written one by name (Ruby's, which must also see `=begin`), the
                ;; generated one for a rule declared as data, or none — a language with no
@@ -864,3 +876,27 @@ declining on it re-parsed the whole lead-in on every key. A language with nothin
                         (let (start (unclosed-opener lead pair))
                           (if (and start (or (nil? earliest) (< start earliest))) start earliest)))))
         (if (nil? open-at) candidate (column0-item-restart source open-at item-start opaque))))))
+
+;; ---- resuming an outer construct above a window --------------------------------------------
+;; A restart sees only the lead-in, so the one fact it cannot recover is what the text ABOVE the
+;; lead-in left open — PHP's `<?php`, which the grammar reads the rest of the file inside of. One
+;; backward search finds the last marker; nothing above it is read.
+
+(defn resume-prefix (pairs rope offset)
+  "The text a window starting at char `offset` of `rope` re-reads first, so its parse begins
+inside the outer construct the text above leaves open — or nil when none is. `pairs` is a
+`:resume` spec, `[{:open re :close re :prefix s}]`: the marker that comes last above `offset`
+decides, an opener answering its `:prefix` (by default the opener's own text and a newline), a
+closer nil. One backward search over the rope, whose cost is the distance to that marker.
+
+    (languages/core/resume-prefix [{:open \"<\\\\?php\" :close \"\\\\?>\"}] (text/string-> \"<p>\\n<?php\\n$x;\\n\") 10)   ;=> \"<?php\\n\""
+  (when (and pairs (> offset 0))
+    (let (markers (mapcat pairs (fn (pair) [(:open pair) (:close pair)]))
+          found (regex/rope-find-backward rope
+                  (string/join (map markers (fn (marker) (str "(?:" marker ")"))) "|")
+                  offset))
+      (when found
+        (let (text (:text found)
+              opener (seq/find pairs
+                       (fn (pair) (regex/match? text (str "^(?:" (:open pair) ")$")))))
+          (when opener (get opener :prefix (str text "\n"))))))))

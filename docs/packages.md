@@ -494,6 +494,7 @@ take (`:interpeters`) fails the load, naming the one meant:
 | `:grammar {:url :revision :fingerprint}` | where its tree-sitter grammar lives, pinned |
 | `:faces`, `:injections` | colours, and the code embedded in it |
 | `:indent`, `:restart`, `:definitions`, `:folds` | RET/TAB, the windowed fontify, C-M-a, folding |
+| `:resume [{:open :close}]` | the outer construct a window far down the file may begin inside (PHP's `<?php … ?>`): the last marker above it decides, an opener being re-read first |
 | `:format` | the formatter M-x format-buffer and format-on-save run |
 | `:lsp {:id :ids :servers}` | its language servers, reached by every buffer in the mode however it got there (name, `#!`, M-x), and its LSP `languageId` — `:ids` only for an extension LSP names apart (`jsx`) (`model/register-lsp`) |
 | `:snippets` | its built-in snippet templates |
@@ -577,7 +578,8 @@ their own:
    Lines of verbatim content (a heredoc's body) are found from the spec's `:indent :verbatim`
    kinds and kept as written.
 5. **restart** — fontifying from the spec's `:restart` answer paints what the whole text paints,
-   at every line: the windowed fontify's one assumption, proven per sample.
+   at every line: the windowed fontify's one assumption, proven per sample. A language with a
+   `:resume` is checked again from a short lead-in, the opener above it re-read.
 6. **robustness** — seeded random one-character edits: fontify, indent, restart, fold extent and
    breadcrumbs raise nothing and the spans stay in bounds and in order.
 
