@@ -1849,7 +1849,7 @@ src/languages/javascript.blsp
     JavaScript and JSX; TypeScript extends its spec (its JSX nodes public for TSX)
 src/languages/json.blsp
     JSON (and JSONC), JSON Lines over the same grammar without the formatter, and JSON5
-    as a `deflexer` over JSON's lexer; lexed past a megabyte
+    as a `deflexer` over its own lexer (JSON's and what JSON5 adds); lexed past a megabyte
 src/languages/julia.blsp
     Julia: `end`-closed blocks, a module's body not indented, interpolations injected back
 src/languages/kotlin.blsp
