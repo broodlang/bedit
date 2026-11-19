@@ -1995,7 +1995,7 @@ src/packages.blsp
     defined there) dropped as a backstop; every core global it REDEFINED
     restored through a per-global STACK (two packages patching one
     function come off in either order, the live patch always the top
-    one's); and every global it FIRST defined removed (`plugin-definitions`:
+    one's); and every global it FIRST defined removed (`:packages/definitions`:
     noted at load — sited under its dir and unbound before, a file with no
     `defmodule` included — brood's `reflect/undef`; a core name is never
     undefined). Open buffers in a mode it took away are seeded again —
