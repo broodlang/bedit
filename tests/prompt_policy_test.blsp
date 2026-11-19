@@ -1,0 +1,116 @@
+;; What RET takes at a prompt — ONE policy (`minibuffer/mb-answer`): the typed text when it is
+;; an answer, a row the reader moved to, else the top row, or nothing on a prompt that must match
+;; — and M-RET, C-p to the typed text, a chord typed into a prompt, y/n questions, C-g after a
+;; prefix and an empty goto. Through the real dispatch (`testkit/press`).
+
+(defmodule prompt-policy-test
+  (:use test)
+  (:use testkit :only [m-of cur press type-str said])
+  (:use minibuffer :only [mb-text ed-mb-set-text])
+  (:use pool :only [ed-name-prompt])
+  (:use model)
+  (:use editor/buffer))
+
+(defn- pp-prompt (names policy)
+  "A model with a name prompt over `names` open, its answer kept as `:answered`."
+  (assoc (m-of "")
+    :minibuffer
+      (assoc (ed-name-prompt "Pick: " names (fn (m text) (assoc m :answered text)))
+        :require-match policy)))
+
+(describe "RET: the typed text wins when it is an answer"
+  (test "an exact name beats the fuzzy top match, on every policy"
+    (doseq (policy [nil true :exact])
+      (let (done (press (type-str (pp-prompt ["mark-paragraph" "map"] policy) "map") [:enter]))
+        (assert= (:answered done) "map"))))
+  (test "C-h f map describes map, not the command the ranking put first"
+    (let (done (press (m-of "") [:ctrl-h "f" "m" "a" "p" :enter]))
+      (assert= (buffer-name (cur done)) "*Help*")
+      (is (string/starts-with? (buffer-text (cur done)) "map is a function"))))
+  (test "a free prompt takes the top match for a partial name, and M-RET the typed text"
+    (let (typed (type-str (pp-prompt ["notes-old.md"] nil) "notes"))
+      (assert= (:answered (press typed [:enter])) "notes-old.md")
+      (assert= (:answered (press typed [:alt-enter])) "notes")))
+  (test "a must-match prompt refuses text that is no name, and stays open"
+    (let (typed (type-str (pp-prompt ["alpha" "beta"] true) "zzz")
+          refused (press typed [:enter])
+          refused-input (press typed [:alt-enter]))
+      (assert= (said refused) "[No match]")
+      (is (:minibuffer refused))
+      (is (nil? (:answered refused)))
+      (assert= (said refused-input) "[No match]")))
+  (test "an :exact prompt never takes a fuzzy match, nor a blank line"
+    (let (fuzzy (press (type-str (pp-prompt ["pkgsone"] :exact) "one") [:enter])
+          blank (press (pp-prompt ["pkgsone"] :exact) [:enter])
+          chosen (press (pp-prompt ["pkgsone"] :exact) [:ctrl-n :ctrl-p :enter]))
+      (assert= (said fuzzy) "[No match]")
+      (assert= (said blank) "[No match]")
+      (is (nil? (:answered blank)))
+      ;; a row moved to with C-n / C-p is chosen, not guessed
+      (assert= (:answered chosen) "pkgsone")))
+  (test "C-p from the first row selects the typed text when it may be taken"
+    (let (typed (type-str (pp-prompt ["notes-old.md" "notes-new.md"] nil) "notes")
+          up (press typed [:ctrl-p]))
+      (assert= (:sel (:minibuffer up)) -1)
+      (assert= (:answered (press up [:enter])) "notes")
+      ;; on a must-match prompt the typed text is no answer: C-p wraps to the last row
+      (assert= (:sel (:minibuffer (press (type-str (pp-prompt ["notes-old.md" "notes-new.md"] true)
+                                           "notes")
+                                    [:ctrl-p])))
+        1))))
+
+(describe "C-x b and C-x C-f make what they are given"
+  (test "C-x b NAME makes an empty buffer in fundamental mode"
+    (let (done (press (type-str (press (m-of "x") [:ctrl-x "b"]) "fresh-buffer") [:enter]))
+      (assert= (buffer-name (cur done)) "fresh-buffer")
+      (assert= (buffer-text (cur done)) "")))
+  (test "C-x 4 b NAME makes it too, in another window"
+    (let (done (press (type-str (press (m-of "x") [:ctrl-x "4" "b"]) "other-fresh") [:enter]))
+      (assert= (buffer-name (cur done)) "other-fresh")))
+  (test "C-x C-f M-RET opens a new file whose name fuzzy-matches an existing one"
+    (let (dir (temp-dir "bedit-ff-")
+          _ (file/mkdir dir)
+          _ (file/spit (path/join dir "notes-old.md") "old\n")
+          opened (press (m-of "")
+                   [:ctrl-x :ctrl-f])
+          typed (type-str (assoc opened
+                            :minibuffer
+                              (assoc (:minibuffer opened)
+                                :edit (ed-mb-set-text (:edit (:minibuffer opened)) (str dir "/"))))
+                  "notes")
+          done (press typed [:alt-enter]))
+      (assert= (buffer-file (cur done)) (path/join dir "notes")))))
+
+(describe "a chord typed into a prompt is dropped whole"
+  (test "M-g g 12 C-x o leaves 12, says why, and RET still jumps"
+    (let (m (press (m-of (string/join (map (range 20) str) "\n")) [:alt-g "g" "1" "2" :ctrl-x "o"])
+          jumped (press m [:enter]))
+      (assert= (mb-text (:minibuffer m)) "12")
+      (assert= (said m) "C-x o is not available in the minibuffer")
+      (assert= (buffer-current-line (cur jumped)) 11)))
+  (test "a longer chord is read to its end; C-g in it quits the chord, not the prompt"
+    (let (long (press (m-of "") [:alt-g "g" :ctrl-x "r" "t"])
+          quit (press (m-of "") [:alt-g "g" :ctrl-x :ctrl-g]))
+      (assert= (mb-text (:minibuffer long)) "")
+      (assert= (said long) "C-x r t is not available in the minibuffer")
+      (assert= (said quit) "Quit")
+      (is (:minibuffer quit)))))
+
+(describe "y/n questions and quitting a prefix"
+  (test "any key but y or n asks again; y then answers"
+    (let (asked (ed-confirm (m-of "") "Do it? (y or n)" (fn (m) (assoc m :done-it true)))
+          again (press asked ["x"])
+          yes (press again ["y"])
+          no (press again [:backspace]))
+      (assert= (:prompt (:read-char again)) "Please answer y or n.  Do it? (y or n)")
+      (assert= (:prompt (:read-char (press again ["q"]))) "Please answer y or n.  Do it? (y or n)")
+      (is (:done-it yes))
+      (is (nil? (:done-it no)))
+      (assert= (:echo no) "canceled")))
+  (test "C-x C-g and C-x r C-g say Quit"
+    (assert= (:echo (press (m-of "") [:ctrl-x :ctrl-g])) "Quit")
+    (assert= (:echo (press (m-of "") [:ctrl-x "r" :ctrl-g])) "Quit"))
+  (test "M-g g with nothing typed says so"
+    (assert= (:echo (press (m-of "a\nb\n") [:alt-g "g" :enter])) "no line number given")
+    (assert= (:echo (press (type-str (press (m-of "a\n") [:alt-g "g"]) "x1") [:enter]))
+      "\"x1\" is not a line number")))

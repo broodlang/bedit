@@ -96,7 +96,11 @@ src/textpos.blsp            pure text geometry under the model: an offset's line
 src/lossage.blsp            the recent keys (C-h l), a bounded ring on the model
 src/minibuffer.blsp         the minibuffer: a one-line prompt over std's lineedit with a list under
                             it, modal (`minibuffer-handle`); ranks on the key for a small source,
-                            in a session off the loop for a large one. The accessors (`mb-text`,
+                            in a session off the loop for a large one. What RET takes is ONE policy
+                            (`mb-answer`, a prompt's `:require-match` nil / true / `:exact`): the typed
+                            text when it is an answer, a row moved to, else the top row; M-RET takes
+                            the typed text; a chord the editor's keymap starts (C-x o) is read and
+                            dropped, said. The accessors (`mb-text`,
                             `mb-candidates`) and the echo area's height (`ed-echo-rows`) the layout
                             reads
 src/offloop.blsp            a slow call run OFF the loop, its answer folded when it lands
