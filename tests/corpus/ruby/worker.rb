@@ -50,6 +50,24 @@ module Words
       raise ArgumentError, e.message
     end
 
+    def load(path)
+      File.read(path)
+    rescue Errno::ENOENT
+      ""
+    else
+      "read"
+    ensure
+      @loaded = true
+    end
+
+    def safely
+      begin
+        yield
+      rescue StandardError
+        nil
+      end
+    end
+
     def to_json(*args)
       { name: @name, total: @seen.values.sum, ratio: 1.5, ok: true, gone: nil }.to_json(*args)
       #                                              ^^^ number           ^^^ constant
