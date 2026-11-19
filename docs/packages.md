@@ -502,7 +502,7 @@ take (`:interpeters`) fails the load, naming the one meant:
 | `:indent`, `:restart`, `:definitions`, `:folds` | RET/TAB, the windowed fontify, C-M-a, folding |
 | `:resume [{:open :close}]` | the outer construct a window far down the file may begin inside (PHP's `<?php … ?>`): the last marker above it decides, an opener being re-read first |
 | `:count-above true` on a `:restart` `:opaque` pair | a symmetric multi-line string (`"""`) is counted over the whole text above a window too, so a window in or below a docstring longer than the lead-in knows it (`:heredocs` markers always are) |
-| `:format` | the formatter M-x format-buffer and format-on-save run |
+| `:format` | the formatter M-x format-buffer and format-on-save run: a command, alternatives, or a function of the buffer's layout (`formatter/buffer-layout`) answering either |
 | `:lsp {:id :ids :servers}` | its language servers, reached by every buffer in the mode however it got there (name, `#!`, M-x), and its LSP `languageId` — `:ids` only for an extension LSP names apart (`jsx`) (`model/register-lsp`) |
 | `:snippets` | its built-in snippet templates |
 | `:pairs`, `:strings` | electric pairs, and its strings and comments without a parse (`stringstate`) |
