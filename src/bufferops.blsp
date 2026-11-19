@@ -217,55 +217,124 @@ wrapped paragraph together from the bottom.
       (fixup-whitespace (delete-char (goto-char line-start (dec start)) 1)))))
 
 ;; ---- rectangles: column-block ops (Emacs C-x r r/k/d/o/c/t/y) ---------------
-;; A RECTANGLE is the character grid between two corners — point and mark taken as
-;; (line, column) rather than as a linear span. Every op is pure and line-wise: it acts
-;; on `[left, right)` of each line in `[top, bottom]`. Edits run BOTTOM-TO-TOP so an
-;; earlier splice never invalidates a lower line's offsets. Short lines (content shorter
-;; than a column) are handled per op — `extract` pads to width so a kill round-trips, the
-;; blanking ops pad to `left` where Emacs does, `delete` simply takes what is there.
+;; A RECTANGLE is the block between two corners — point and mark taken as (line, display
+;; column) rather than as a linear span. Columns are DISPLAY columns, as the pane lays the
+;; line out (`string/display-width` at the buffer's tab width, `conventions/with-cell-layout`),
+;; so a tab or a wide character cuts where it shows. Every op is pure and line-wise: it acts on
+;; the cells `[left, right)` of each line in `[top, bottom]`. As Emacs's do, an editing op first
+;; splits a tab straddling an edge into the spaces it shows as, so the edge falls between
+;; characters; a wide character straddling one is taken whole at the right edge and left out
+;; at the left (Emacs's `move-to-column`, which lands past a character it cannot split). Edits
+;; run BOTTOM-TO-TOP so an earlier splice never invalidates a lower line's offsets, and one op
+;; is one undo step. Short lines are handled per op — `extract` pads to width so a kill
+;; round-trips, the blanking ops pad to `left` where Emacs does, `delete` takes what is there.
 ;;
 ;; The kernel has no rectangle primitive and needs none: this is `replace-region` over a
 ;; computed set of per-line spans. The commands wire the keys and hold the killed rows (a
 ;; rectangle kill is a LIST of rows, not a flat string — that is what makes a rectangle
 ;; yank rebuild the block).
 
-(defn rectangle-bounds (buffer:buffer -> (or nil (tuple int int int int)))
-  "`[top bottom left right]` — the rectangle point↔mark spans as line/column corners
-(`top <= bottom`, `left <= right`), or nil when no mark is set. `left`/`right` are columns
-(0-based char offsets within a line); the block on each line is `[left, right)`.
+(defn- cell-starts (text:string -> (vector int))
+  ;; the display cell each char of `text` starts at, and its whole width last: n + 1 entries
+  (fold (string/->list text)
+    [0]
+    (fn (starts ch)
+      (let (column (cell-at starts (dec (count starts))))
+        (conj starts (+ column (string/display-width ch column)))))))
 
-    (bufferops/rectangle-bounds (editor/buffer/goto-char (editor/buffer/set-mark (editor/buffer/goto-char (editor/buffer/make-buffer \"abcd\\nefgh\") 1)) 8))   ;=> [0 1 1 3]"
-  (let (mark (get buffer :mark))
-    (if (nil? mark)
-      nil
-      (let (rope (get buffer :rope)
-            point (get buffer :point)
-            point-line (text/char->line rope point)
-            mark-line (text/char->line rope mark)
-            point-column (- point (text/line->char rope point-line))
-            mark-column (- mark (text/line->char rope mark-line)))
-        [(math/min point-line mark-line)
-          (math/max point-line mark-line)
-          (math/min point-column mark-column)
-          (math/max point-column mark-column)]))))
+;; check-allow: `nth` answers `nil | int`; every index asked is inside `cell-starts`' n + 1
+(check-allow :type-mismatch
+  (defn- cell-at (starts: (vector int) i:int -> int)
+    ;; the cell char `i` starts at (`i` = n: the line's width)
+    (nth starts i)))
 
-(defn- line-content-length (rope:any line:int -> int)
-  ;; the line's length excluding any trailing newline
-  (count (wrap/rope-line-text rope line)))
+(defn- cell->index (starts: (vector int) column:int -> int)
+  ;; the first char index starting at or after `column` — past a char straddling it — or the
+  ;; line's end when the line is shorter
+  (let (end (dec (count starts)))
+    (letrec (scan (fn (i) (if (or (>= i end) (>= (cell-at starts i) column)) i (scan (inc i)))))
+      (scan 0))))
 
-(defn- rectangle-spans (buffer)
-  ;; per line top..bottom, `[start low high]`: absolute line-start char, and the block's
-  ;; column offsets clamped to the line's content. nil when there is no rectangle.
-  (let (bounds (rectangle-bounds buffer))
-    (if (nil? bounds)
-      nil
-      (let ([top bottom left right] bounds
-            rope (get buffer :rope))
-        (map (range top (inc bottom))
-          (fn (line)
-            (let (start (text/line->char rope line)
-                  content (line-content-length rope line))
-              [start (math/min left content) (math/min right content)])))))))
+(defn- offset-column (rope:any offset:int -> int)
+  ;; the display column of char `offset` within its line
+  (let (line (text/char->line rope offset)
+        text (wrap/rope-line-text rope line))
+    (string/display-width (string/substring text
+                            0
+                            (math/min (count text) (- offset (text/line->char rope line)))))))
+
+;; check-allow: `with-cell-layout` binds in a thunk whose result the checker does not carry
+(check-allow :trusted
+  (defn rectangle-bounds (buffer:buffer -> (or nil (tuple int int int int)))
+    "`[top bottom left right]` — the rectangle point↔mark spans as line/column corners
+(`top <= bottom`, `left <= right`), or nil when no mark is set. `left`/`right` are DISPLAY
+columns at the buffer's tab width; the block on each line is the cells `[left, right)`.
+
+    (bufferops/rectangle-bounds (editor/buffer/goto-char (editor/buffer/set-mark (editor/buffer/goto-char (editor/buffer/make-buffer \"abcd\\nefgh\") 1)) 8))   ;=> [0 1 1 3]
+    (bufferops/rectangle-bounds (editor/buffer/goto-char (editor/buffer/set-mark (editor/buffer/goto-char (editor/buffer/make-buffer \"\\tab\\n日本語\") 1)) 6))   ;=> [0 1 4 8]"
+    (let (mark (get buffer :mark))
+      (if (nil? mark)
+        nil
+        (conventions/with-cell-layout buffer
+          (fn ()
+            (let (rope (get buffer :rope)
+                  point (get buffer :point)
+                  point-line (text/char->line rope point)
+                  mark-line (text/char->line rope mark)
+                  point-column (offset-column rope point)
+                  mark-column (offset-column rope mark))
+              [(math/min point-line mark-line)
+                (math/max point-line mark-line)
+                (math/min point-column mark-column)
+                (math/max point-column mark-column)])))))))
+
+(defn- line-span (rope:any line:int left:int right:int -> (tuple int int int int int))
+  ;; `[start low high pad cells]` of `line` for the cells `[left, right)`: its absolute start,
+  ;; the char offsets the block takes within it, the spaces a line short of `left` needs to
+  ;; reach it, and the cells `[low, high)` show as
+  (let (starts (cell-starts (wrap/rope-line-text rope line))
+        low (cell->index starts left)
+        high (cell->index starts right))
+    [(text/line->char rope line)
+      low
+      high
+      (math/max 0 (- left (cell-at starts low)))
+      (- (cell-at starts high) (cell-at starts low))]))
+
+(defn- straddling-tabs (text:string edges: (vector int) -> (list int))
+  ;; the indices of the tabs in `text` an edge column falls inside, highest first
+  (let (starts (cell-starts text)
+        chars (vec (string/->list text)))
+    (reverse (seq/filter (range (count chars))
+               (fn (i)
+                 (and (= (nth chars i) "\t")
+                   (any? edges
+                     (fn (edge) (and (< (cell-at starts i) edge) (< edge (cell-at starts (inc i))))))))))))
+
+(defn- split-edge-tabs (buffer:buffer top:int bottom:int edges: (vector int) -> buffer)
+  ;; `buffer` with every tab an edge column falls inside, on lines `[top, bottom]`, replaced by
+  ;; the spaces it showed as — so each edge lies between characters
+  (fold (reverse (range top (inc bottom)))
+    buffer
+    (fn (splitting line)
+      (let (rope (get splitting :rope)
+            start (text/line->char rope line)
+            text (wrap/rope-line-text rope line)
+            starts (cell-starts text))
+        (fold (straddling-tabs text edges)
+          splitting
+          (fn (editing i)
+            (replace-region editing
+              (+ start i)
+              (+ start i 1)
+              (string/repeat " " (- (cell-at starts (inc i)) (cell-at starts i))))))))))
+
+(defn- rectangle-spans
+  (buffer:buffer bounds: (tuple int int int int) -> (list (tuple int int int int int)))
+  ;; the `line-span` of every line `bounds` covers
+  (let ([top bottom left right] bounds
+        rope (get buffer :rope))
+    (map (range top (inc bottom)) (fn (line) (line-span rope line left right)))))
 
 (defn rectangle-mark-active? (buffer)
   "Whether `buffer`'s region is a RECTANGLE (Emacs's `rectangle-mark-mode`, C-x SPC or a
@@ -274,78 +343,101 @@ C-M-drag): its `:rectangle-mark` on and a mark set. With the mark gone the flag 
     (bufferops/rectangle-mark-active? (assoc (editor/buffer/make-buffer \"ab\") :rectangle-mark true))   ;=> false"
   (and (= true (get buffer :rectangle-mark)) (not (nil? (get buffer :mark)))))
 
-(defn rectangle-ranges (buffer:buffer -> list)
-  "The char ranges `[from to]` the rectangle point↔mark covers, one per line top..bottom, each
+;; check-allow: `with-cell-layout` binds in a thunk whose result the checker does not carry
+(check-allow :trusted
+  (defn rectangle-ranges (buffer:buffer -> list)
+    "The char ranges `[from to]` the rectangle point↔mark covers, one per line top..bottom, each
 clamped to its line's text (a line short of the left column covers nothing, `[from from]`) —
 what the view tints for a rectangle region. `()` when no mark is set.
 
     (bufferops/rectangle-ranges (editor/buffer/goto-char (editor/buffer/set-mark (editor/buffer/goto-char (editor/buffer/make-buffer \"abcd\\nefgh\") 1)) 8))   ;=> ([1 3] [6 8])"
-  (map (or (rectangle-spans buffer) '())
-    (fn ([start low high]) [(+ start low) (+ start high)])))
+    (let (bounds (rectangle-bounds buffer))
+      (if (nil? bounds)
+        '()
+        (conventions/with-cell-layout buffer
+          (fn ()
+            (map (rectangle-spans buffer bounds)
+              (fn (span) (let ([start low high _pad _cells] span) [(+ start low) (+ start high)])))))))))
 
-(defn extract-rectangle (buffer:buffer -> list)
-  "The rectangle's rows as a list of strings, one per line top..bottom, each right-padded
-with spaces to the rectangle's full width — so a kill round-trips through
+(defn- extract-line (rope:any line:int left:int right:int -> string)
+  ;; the cells `[left, right)` of `line` as text, tabs as the spaces they show as (a tab
+  ;; straddling an edge, the part inside), padded with spaces to the full width
+  (let (text (wrap/rope-line-text rope line)
+        chars (vec (string/->list text))
+        starts (cell-starts text)
+        low (cell->index starts left)
+        high (cell->index starts right)
+        from (if (and (> low 0) (= (nth chars (dec low)) "\t")) (dec low) low)
+        piece (string/join (map (range from high)
+                             (fn (i)
+                               (if (= (nth chars i) "\t")
+                                 (string/repeat " "
+                                   (math/max 0
+                                     (- (math/min right (cell-at starts (inc i)))
+                                       (math/max left (cell-at starts i)))))
+                                 (nth chars i))))
+                ""))
+    (str piece (string/repeat " " (math/max 0 (- (- right left) (string/display-width piece)))))))
+
+;; check-allow: `with-cell-layout` binds in a thunk whose result the checker does not carry
+(check-allow :trusted
+  (defn extract-rectangle (buffer:buffer -> list)
+    "The rectangle's rows as a list of strings, one per line top..bottom, tabs expanded and each
+right-padded with spaces to the rectangle's full width — so a kill round-trips through
 [[insert-rectangle]]. `()` when no mark is set.
 
     (bufferops/extract-rectangle (editor/buffer/goto-char (editor/buffer/set-mark (editor/buffer/goto-char (editor/buffer/make-buffer \"abcd\\nefgh\") 1)) 8))   ;=> (\"bc\" \"fg\")"
-  (let (bounds (rectangle-bounds buffer))
-    (if (nil? bounds)
-      '()
-      (let ([top bottom left right] bounds
-            rope (get buffer :rope)
-            width (- right left))
-        (map (range top (inc bottom))
-          (fn (line)
-            (let (start (text/line->char rope line)
-                  content (line-content-length rope line)
-                  low (math/min left content)
-                  high (math/min right content)
-                  piece (text/slice rope (+ start low) (+ start high)))
-              (str piece (string/repeat " " (- width (count piece)))))))))))
+    (let (bounds (rectangle-bounds buffer))
+      (if (nil? bounds)
+        '()
+        (conventions/with-cell-layout buffer
+          (fn ()
+            (let ([top bottom left right] bounds
+                  rope (get buffer :rope))
+              (map (range top (inc bottom)) (fn (line) (extract-line rope line left right))))))))))
 
-(defn- fold-rectangle-lines
-  (buffer:buffer
-    spans:
-      (len (list (tuple int int int)) 1 _)
-    edit:
-      (buffer int int int -> buffer)
-      ->
-      buffer)
-  ;; apply `(edit buffer start low high)` to each span, BOTTOM-TO-TOP so offsets above the
-  ;; edit stay valid, then park point at the rectangle's top-left. `spans` is
-  ;; `rectangle-spans`' output.
-  (let (edited (fold (reverse spans)
-                 buffer
-                 (fn (editing span) (let ([start low high] span) (edit editing start low high)))))
-    (goto-char edited (+ (first (first spans)) (second (first spans))))))
-;; A NON-EMPTY list of spans: `(first spans)` is what point parks at, so an empty
-;; rectangle is the caller's to refuse (`rectangle-spans` never yields one).
+;; check-allow: `with-cell-layout` binds in a thunk whose result the checker does not carry
+(check-allow :trusted
+  (defn- edit-rectangle
+    (buffer:buffer edit: (buffer (tuple int int int int int) int int -> buffer) -> buffer)
+    ;; `(edit buffer span left right)` applied to each line's `line-span`, BOTTOM-TO-TOP so
+    ;; offsets above the edit stay valid, after the tabs straddling an edge are split — one undo
+    ;; step — then point parked at the rectangle's top-left. `buffer` itself with no mark.
+    (let (bounds (rectangle-bounds buffer))
+      (if (nil? bounds)
+        buffer
+        (conventions/with-cell-layout buffer
+          (fn ()
+            (let ([top bottom left right] bounds)
+              (undo-group buffer
+                (fn (b)
+                  (let (split (split-edge-tabs b top bottom [left right])
+                        spans (rectangle-spans split bounds)
+                        edited (fold (reverse spans)
+                                 split
+                                 (fn (editing span) (edit editing span left right)))
+                        [start low _high _pad _cells] (first spans))
+                    (goto-char edited (+ start low))))))))))))
 
 (defn delete-rectangle (buffer)
   "Delete `[left, right)` of every line the rectangle spans, closing the gap; point lands
 at the top-left. A no-op when no mark is set. Throws if the text is read-only.
 
     (editor/buffer/buffer-text (bufferops/delete-rectangle (editor/buffer/goto-char (editor/buffer/set-mark (editor/buffer/goto-char (editor/buffer/make-buffer \"abcd\\nefgh\") 1)) 8)))   ;=> \"ad\\neh\""
-  (let (spans (rectangle-spans buffer))
-    (if (nil? spans)
-      buffer
-      (fold-rectangle-lines buffer
-        spans
-        (fn (editing start low high) (replace-region editing (+ start low) (+ start high) ""))))))
+  (edit-rectangle buffer
+    (fn (editing span _left _right)
+      (let ([start low high _pad _cells] span)
+        (replace-region editing (+ start low) (+ start high) "")))))
 
 (defn clear-rectangle (buffer)
   "Blank the rectangle in place — replace `[left, right)` of each line with spaces, keeping
 every following column where it was. A no-op when no mark is set. Throws if read-only.
 
     (editor/buffer/buffer-text (bufferops/clear-rectangle (editor/buffer/goto-char (editor/buffer/set-mark (editor/buffer/goto-char (editor/buffer/make-buffer \"abcd\\nefgh\") 1)) 8)))   ;=> \"a  d\\ne  h\""
-  (let (spans (rectangle-spans buffer))
-    (if (nil? spans)
-      buffer
-      (fold-rectangle-lines buffer
-        spans
-        (fn (editing start low high)
-          (replace-region editing (+ start low) (+ start high) (string/repeat " " (- high low))))))))
+  (edit-rectangle buffer
+    (fn (editing span _left _right)
+      (let ([start low high _pad cells] span)
+        (replace-region editing (+ start low) (+ start high) (string/repeat " " cells))))))
 
 (defn open-rectangle (buffer)
   "Shift the rectangle's text to the right — insert the rectangle's width in spaces at its
@@ -353,21 +445,13 @@ left column on every line, so the block becomes blank and what was there moves o
 lines are padded to the left column first. A no-op when no mark is set; throws if read-only.
 
     (editor/buffer/buffer-text (bufferops/open-rectangle (editor/buffer/goto-char (editor/buffer/set-mark (editor/buffer/goto-char (editor/buffer/make-buffer \"abcd\\nefgh\") 1)) 8)))   ;=> \"a  bcd\\ne  fgh\""
-  (let (bounds (rectangle-bounds buffer))
-    (if (nil? bounds)
-      buffer
-      (let ([_top _bottom left right] bounds
-            width (- right left)
-            spans (rectangle-spans buffer))
-        (fold-rectangle-lines buffer
-          spans
-          (fn (editing start low _high)
-            ;; low is the content-clamped left; pad a short line out to `left`, then the width
-            (let (padding (- left low))
-              (replace-region editing
-                (+ start low)
-                (+ start low)
-                (string/repeat " " (+ padding width))))))))))
+  (edit-rectangle buffer
+    (fn (editing span left right)
+      (let ([start low _high pad _cells] span)
+        (replace-region editing
+          (+ start low)
+          (+ start low)
+          (string/repeat " " (+ pad (- right left))))))))
 
 (defn string-rectangle (buffer:buffer replacement:string -> buffer)
   "Replace `[left, right)` of every line the rectangle spans with the string `replacement`
@@ -375,51 +459,51 @@ lines are padded to the left column first. A no-op when no mark is set; throws i
 first. A no-op when no mark is set; throws if read-only.
 
     (editor/buffer/buffer-text (bufferops/string-rectangle (editor/buffer/goto-char (editor/buffer/set-mark (editor/buffer/goto-char (editor/buffer/make-buffer \"abcd\\nefgh\") 1)) 8) \"-\"))   ;=> \"a-d\\ne-h\""
-  (let (bounds (rectangle-bounds buffer))
-    (if (nil? bounds)
-      buffer
-      (let ([_top _bottom left _right] bounds
-            spans (rectangle-spans buffer))
-        (fold-rectangle-lines buffer
-          spans
-          (fn (editing start low high)
-            (let (padding (- left low))
-              (replace-region editing
-                (+ start low)
-                (+ start high)
-                (str (string/repeat " " padding) replacement)))))))))
+  (edit-rectangle buffer
+    (fn (editing span _left _right)
+      (let ([start low high pad _cells] span)
+        (replace-region editing
+          (+ start low)
+          (+ start high)
+          (str (string/repeat " " pad) replacement))))))
 
-(defn insert-rectangle (buffer:buffer rows:list -> buffer)
-  "Insert `rows` (a list of strings — an [[extract-rectangle]] result) as a column block at
-point: the first row at point, each later row on the next line at point's column, padding a
-short line (or a missing one at end of buffer) with spaces so the block stays aligned. Point
-returns to where it started. `rows` empty leaves `buffer` unchanged. Throws if read-only.
+;; check-allow: `with-cell-layout` binds in a thunk whose result the checker does not carry
+(check-allow :trusted
+  (defn insert-rectangle (buffer:buffer rows:list -> buffer)
+    "Insert `rows` (a list of strings — an [[extract-rectangle]] result) as a column block at
+point: the first row at point, each later row on the next line at point's display column —
+splitting a tab that column falls inside, padding a short line (or a missing one at end of
+buffer) with spaces so the block stays aligned. Point returns to where it started. `rows`
+empty leaves `buffer` unchanged. One undo step. Throws if read-only.
 
     (editor/buffer/buffer-text (bufferops/insert-rectangle (editor/buffer/goto-char (editor/buffer/make-buffer \"ab\\ncd\") 1) (list \"X\" \"Y\")))   ;=> \"aXb\\ncYd\""
-  (if (empty? rows)
-    buffer
-    (let (rope (get buffer :rope)
-          start-point (get buffer :point)
-          start-line (text/char->line rope start-point)
-          column (- start-point (text/line->char rope start-line)))
-      (goto-char
-        (fold (seq/enumerate rows)
-          buffer
-          (fn (inserted pair)
-            (let ([index row] pair
-                  line (+ start-line index)
-                  rope (get inserted :rope)
-                  line-count (text/line-count rope))
-              (if (>= line line-count)
-                ;; past the end: a fresh line at `column`, made by padding after the last char
-                (let (end (buffer-length inserted))
-                  (insert (goto-char inserted end) (str "\n" (string/repeat " " column) row)))
-                (let (line-start (text/line->char rope line)
-                      content (line-content-length rope line)
-                      at (+ line-start (math/min column content))
-                      padding (math/max 0 (- column content)))
-                  (insert (goto-char inserted at) (str (string/repeat " " padding) row)))))))
-        start-point))))
+    (if (empty? rows)
+      buffer
+      (conventions/with-cell-layout buffer
+        (fn ()
+          (let (rope (get buffer :rope)
+                start-point (get buffer :point)
+                start-line (text/char->line rope start-point)
+                column (offset-column rope start-point))
+            (goto-char
+              (undo-group buffer
+                (fn (b)
+                  (fold (seq/enumerate rows)
+                    b
+                    (fn (inserted pair)
+                      (let ([index row] pair
+                            line (+ start-line index))
+                        (if (>= line (text/line-count (get inserted :rope)))
+                          ;; past the end: a fresh line at `column`, made by padding after the last char
+                          (let (end (buffer-length inserted))
+                            (insert (goto-char inserted end)
+                              (str "\n" (string/repeat " " column) row)))
+                          (let (split (split-edge-tabs inserted line line [column])
+                                [start low _high pad _cells] (line-span (get split :rope)
+                                                               line column column))
+                            (insert (goto-char split (+ start low))
+                              (str (string/repeat " " pad) row)))))))))
+              start-point)))))))
 
 ;; ---- a region's text as lines (sort, reverse, dedupe, align, flush) -----------------
 

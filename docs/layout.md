@@ -497,8 +497,8 @@ src/window-commands.blsp    the window commands: tiled splits, windmove and Emac
 src/textops.blsp            the commands that rewrite text in bulk: case, whitespace, the replace
                             family, tabify, reversing and deduplicating lines, align-regexp
 src/bufferops.blsp          pure buffer -> buffer text operations under the commands: paragraph and
-                            sentence motion, whitespace around point, join-line, rectangles (moved
-                            from std's `editor/buffer`, brood ADR-417, ADR-630)
+                            sentence motion, whitespace around point, join-line, rectangles by display
+                            column (moved from std's `editor/buffer`, brood ADR-417, ADR-630)
 src/lifecycle.blsp          the file and session commands: write and revert a file, reload the config,
                             quit with its questions (`ed-map-y-or-n`, what is still running)
 src/project-commands.blsp   C-x p f over a file list cached per root, refreshed off the loop; C-x p p
