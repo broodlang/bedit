@@ -42,6 +42,8 @@
     "  esac\n"
     "done\n"
     "host=$1; shift\n"
+    "# a stream whose receiving side never starts its receiver (`fail-stream`)\n"
+    "if [ -f \"$state/fail-stream\" ]; then case \"$*\" in '/bin/sh /'*) echo 'broken pipe' >&2; exit 1 ;; esac; fi\n"
     "if [ -f \"$state/hostkey\" ]; then echo 'Host key verification failed.' >&2; exit 255; fi\n"
     "if [ -f \"$state/down\" ]; then echo \"ssh: connect to host $host port 22: Connection refused\" >&2; exit 255; fi\n"
     "# a jump host wanting a password, reached in batch mode through the ProxyCommand: its last word\n"
@@ -392,6 +394,18 @@ run here, `dir/home` their HOME), the editor's config and the control sockets un
                            (is (includes? names "sub/"))
                            (is (includes? names "a.txt"))
                            (assert= (tramp/ssh-transport/cached-listing spec) names)))))))))
+  (test "a listing refused for want of a password is not kept: it is asked again once connected"
+    (with-stub (fn (dir)
+                 (do
+                   (file/spit (path/join dir "needpw") "")
+                   (file/spit (path/join dir "a.txt") "")
+                   (let (spec (remote dir))
+                     (do
+                       (assert= (tramp/ssh-transport/fetch-listing spec) [])
+                       (is (nil? (tramp/ssh-transport/cached-listing spec)))
+                       (is (= true
+                             (tramp/ssh-transport/connect-with-password {:host "web1"} "secret")))
+                       (is (includes? (tramp/ssh-transport/fetch-listing spec) "a.txt"))))))))
   (test "a password reaches ssh through the askpass helper, once"
     (with-stub (fn (dir)
                  (do
@@ -1049,6 +1063,25 @@ run here, `dir/home` their HOME), the editor's config and the control sockets un
                           (fn (name)
                             (and (string/starts-with? name ".bedit-recv.")
                               (includes? calls name)))))))))))
+  (test "a stream that fails before the receiver runs leaves no receiver behind"
+    (with-stub (fn (dir)
+                 (let (tree (remote-fixture dir)
+                       far (path/join dir "far")
+                       _ (file/mkdir far)
+                       _ (file/spit (path/join dir "fail-stream") "")
+                       went (tramp/ssh-transport/cross-transfer :copy
+                              (sshpath/parse (remote tree))
+                              (path/join tree "a.txt")
+                              (sshpath/parse (str "/ssh:web2:" far))
+                              far
+                              true
+                              false)
+                       calls (file/slurp (path/join dir "ssh-calls"))
+                       receiver (:text (regex/find calls "/\\S*\\.bedit-recv\\.\\S+")))
+                   (do
+                     (is (failure? went))
+                     (is (not (nil? receiver)))
+                     (is (not (file/exists? receiver))))))))
   (test "a streamed copy that arrives short or changed is refused, nothing left there"
     (let (staged {:name "a.txt" :count 1 :size 6 :digest (hash/sha256 "alpha\n")}
           target (temp-dir "bedit-ssh-")
@@ -1331,3 +1364,23 @@ run here, `dir/home` their HOME), the editor's config and the control sockets un
                        (do
                          (is (includes? (pr-str (:minibuffer asked)) "doas on web1 (yours there"))
                          (assert= (buffer-text (ed-current-buf m)) "doas\n")))))))))
+
+(describe "a root shell that never gets ready"
+  :isolated (test "times out at its deadline though it keeps talking"
+    (if (= (os/type) :windows)
+      (io/puts "  (skipped: no sh)")
+      (let (session (spawn (tramp/ssh-root/session-loop {}))
+            request-ref (ref)
+            started (os/now))
+        (send session
+          [:open
+            {:argv ["sh" "-c" "while :; do echo still-starting; sleep 0.05; done"]
+             :env {}
+             :parts {:host "web1" :become {:method :sudo :user nil}}
+             :timeout-ms 400}
+            (self)
+            request-ref])
+        (let (answer (receive ([:sudo ^request-ref answer] answer) (after 10000 :never)))
+          (send session [:stop])
+          (assert= (map/get-in answer [:failed :error]) :timeout)
+          (is (< (- (os/now) started) 5000)))))))

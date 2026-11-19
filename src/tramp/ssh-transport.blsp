@@ -975,7 +975,9 @@ Blocks."
 (defn- streamed-transfer (from-parts from to-parts to into? replace?)
   ;; the copy STREAMED from one side to the other through an OS pipe, never held here: staged
   ;; there, a receiver left where it goes, the two joined by `os/pipeline`, the staged archive
-  ;; removed after whatever happened. Where it went
+  ;; removed after whatever happened — and the receiver too when the stream failed: it removes
+  ;; itself once it runs, and one the stream never started stayed in the host's temp dir. Where
+  ;; it went
   (let (staged-out (run-op from-parts (stage-pack-script from))
         staged (if (failure? staged-out) staged-out (parse-staged staged-out)))
     (if (failure? staged)
@@ -1001,7 +1003,11 @@ Blocks."
                        (if (= 0 (:exit result))
                          (string/trim (:stdout result))
                          (stream-failure result to-parts)))))
-        (do (run-op from-parts (script-with [archive] "rm -f -- \"$p\"\n")) went)))))
+        (do
+          (run-op from-parts (script-with [archive] "rm -f -- \"$p\"\n"))
+          (when (and (failure? went) (string? receiver) (regex/matches? receiver safe-temp-pattern))
+            (run-op to-parts (script-with [receiver] "rm -f -- \"$p\"\n")))
+          went)))))
 
 (defn cross-transfer (op from-parts from to-parts to into? replace?)
   "Move (`op` `:move`) or copy (`:copy`) `from` on `from-parts`' host to `to` on `to-parts`' —
@@ -1116,7 +1122,9 @@ answers. Blocks."
 
 (def *listing-fresh-ms* 10000)
 ;; How long a remote listing is trusted. A failure is kept as long, so a host that refuses
-;; is not asked on every key.
+;; is not asked on every key — except one for want of a password (`:auth`,
+;; `:become-password`): the password is typed next, and the listing must be asked again then,
+;; not answered empty for ten seconds after.
 
 (defn cached-listing (dir-spec)
   "The entries of the remote directory `dir-spec` (an ssh path) listed within the last
@@ -1131,11 +1139,15 @@ entries, or `[]` when it cannot be listed (no connection without a password, no 
 directory). Blocks: the prompt calls it from a task."
   (let (parts (sshpath/parse dir-spec)
         answer (if (nil? parts) nil (list-dir parts (:path parts)))
-        names (if (and (map? answer) (vector? (:names answer))) (:names answer) []))
+        names (if (and (map? answer) (vector? (:names answer))) (:names answer) [])
+        wants-password? (contains? #{:auth :become-password}
+                          (when (map? answer) (map/get-in answer [:failed :error]))))
     (do
       (when (>= (count *listings*) 64)
         (doseq (entry (table/snapshot *listings*)) (table/delete *listings* (first entry))))
-      (table/put *listings* dir-spec [(os/now) names])
+      (if wants-password?
+        (table/delete *listings* dir-spec)
+        (table/put *listings* dir-spec [(os/now) names]))
       names)))
 
 (defn forget-listing (dir-spec)
