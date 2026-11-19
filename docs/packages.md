@@ -45,7 +45,7 @@ Brood/`nest` ships the hard parts (ADR-037, ADR-147 in the brood repo):
 
 And the editor's modules already wire themselves in purely by calling registration
 functions at load time — `defcommand`, `register-type-layers` / `register-file-type`,
-`register-profile`, `register-log-route`, the mode-service facets.
+`register-profile`, the mode-service facets.
 
 Put those two facts together and the design falls out:
 
