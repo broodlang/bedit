@@ -114,10 +114,17 @@ src/keyhelp.blsp            key / command LABELS for help text: `C-x C-e` spelli
                             last, a sub-prefix as `+name`) — the ONE grouping the which-key panel, C-x C-h and C-h b list
                             by, and those listings' sections and text (`ed-prefix-sections`, `ed-sections-text`)
 src/keycolumns.blsp         keys and what they do, in titled groups, laid into columns — pure data
-                            the which-key panel (flowing, `flow-lines`), a transient card (whole
+                            the key panel (which-key flowing, `flow-lines`; a transient's whole
                             groups balanced, `balanced-columns`) and the start page (`entry-cell`)
-                            share, and which-key's grid of text cells (`grid-rows`: columns side by
-                            side while they fit, paged past that); each host paints the lines its own way
+                            share; each host paints the lines its own way
+src/keypanel.blsp           the KEY PANEL — a transient menu (git's push, embark) and which-key's
+                            continuations as ONE shape of data (`{:title :groups :layout :page}`):
+                            features register a SOURCE (`register-panel-source`, the first with a
+                            panel shows), and a STYLE draws it (`register-panel-style`), chosen by
+                            the `:key-panel` setting — the editor's own `:echo` is Emacs's: a flat
+                            strip in the echo area below the mode line, groups side by side, keys
+                            in the accent colour; a package registers another. The echo area's
+                            height asks it (`minibuffer/ed-echo-rows`)
 src/scroll.blsp             keeping point on screen: the scroll-margin clamp, horizontal scroll,
                             `ed-max-top`, and the snap that ends a glide on a line; in a
                             row-wise (wrapped) buffer the pane starts on a screen ROW of its top
@@ -331,15 +338,14 @@ src/whichkey.blsp           C-h after a prefix (Emacs which-key's `which-key-C-h
                             describe-prefix-bindings, grouped as the panel is), a / C-g abort; any other key goes to the
                             prefix, so the chord still completes. A prefix that binds C-h keeps
                             it. `input/ed-dispatch` asks it before the keymap. Also the panel's
-                            CELLS (`panel-items`, the groups run down then across by `keycolumns`, laid out by `echoarea`): a prefix key as the
+                            PANEL (`key-panel`, a `keypanel` source; `panel-groups`, run down then across): a prefix key as the
                             `+name` its map was described with, the keys under the headings
                             their bindings gave them (`keyhelp/ed-key-groups`, brood ADR-745)
 src/modeline.blsp           a pane's mode line: its segments (`ed-statusbar-segments`, the registered
                             chips included), the bar painted from them, the pointer's layout and the
                             hover tooltips. What `hittest` asks again, so `input` never imports the view
-src/overlayview.blsp        the cards over the panes as ui-kit widgets: the context menu and the
-                            transient menu, paint and zones in one pass. The transient card is
-                            Magit's: groups side by side in balanced columns (`keycolumns`), each row KEY first
+src/overlayview.blsp        the context menu, a card over the panes as a ui-kit widget, paint and
+                            zones in one pass (a transient menu is a key panel: `keypanel`)
 src/headerline.blsp         the HEADER LINE above each pane (Emacs breadcrumb-mode, on with `:header-line`):
                             the file by its project and path, then the mode's `:breadcrumbs` at point
                             (an Org heading's path); the layout takes the pane's top row for it
@@ -1996,8 +2002,7 @@ src/view/echoarea.blsp
     (the first registered echo source with something to say,
     `model/register-echo-source`: a question, a message, then diagpaint's
     diagnostic, eolnotes' note, eldoc's hint), the minibuffer's prompt
-    and candidate list (Plume), the which-key grid (`keycolumns/grid-rows`: paged when it does not fit, the last cell
-    `page 1/3 · C-h n/p`, the page `whichkey/page`)
+    and candidate list (Plume); the key panel below it (which-key, a transient menu) is `keypanel`'s
 ```
 
 ## events — what reaches the loop besides keys: each [:tag …] event's handler, the mouse and where it landed
