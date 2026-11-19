@@ -428,24 +428,71 @@ a package."
                     :version (if (>= at 0) (nth options (inc at)) nil)})))))
       [])))
 
+(defn- missing-dependencies (dir name)
+  ;; the hive libraries package `name` (its copy in `dir`) depends on that are not installed
+  (seq/reject (hive-dependencies dir name) (fn (dependency) (installed? (:name dependency)))))
+
+(defn- dependency-outcome (dependency result)
+  ;; what library `dependency` (`{:name :version}`, as the plugin names it) became, its install
+  ;; `result` a map or a failure: `{:name :version :wanted}` — `:wanted` the version the plugin
+  ;; named when the hive's newest is another — or `{:name :error}`
+  (if (failure? result)
+    {:name (:name dependency) :error (error-message result)}
+    {:name (:name dependency)
+     :version (:version result)
+     :wanted (if (and (:version dependency) (not (= (:version dependency) (:version result))))
+               (:version dependency)
+               nil)}))
+
 (defn- install-dependencies (registry name id &optional (dir nil))
   "Install the hive libraries package `name` depends on — its copy in `dir`, by default the
-installed one (a staged update under review names its own) — that are not installed yet,
-each staged and moved into place as a plugin is ([[staged-install]], as a library). Answers
-`[{:name :version :wanted} | {:name :error}]`: what each became. The hive installs a library's
-newest release, so `:wanted` is the version the plugin named when that is another."
-  (vec (map (seq/reject (hive-dependencies (or dir (user-package-dir)) name)
-              (fn (dependency) (installed? (:name dependency))))
+installed one — that are not installed yet, each staged and moved into place as a plugin is
+([[staged-install]], as a library). Answers `[{:name :version :wanted} | {:name :error}]`: what
+each became ([[dependency-outcome]])."
+  (vec (map (missing-dependencies (or dir (user-package-dir)) name)
          (fn (dependency)
-           (let (result (staged-install registry (:name dependency) id true))
-             (if (failure? result)
-               {:name (:name dependency) :error (error-message result)}
-               {:name (:name dependency)
-                :version (:version result)
-                :wanted (if (and (:version dependency)
-                              (not (= (:version dependency) (:version result))))
-                          (:version dependency)
-                          nil)}))))))
+           (dependency-outcome dependency (staged-install registry (:name dependency) id true))))))
+
+(defn- stage-dependencies (registry name id dir)
+  "STAGE — never move into place — the hive libraries the update of package `name` (its staged
+copy in `dir`) needs and that are not installed, each in a staging directory of its own
+(`[job name]`, [[staging-id]]), so nothing installed changes before the update is applied:
+`[{:name :version :wanted :staged} | {:name :error}]`, `:staged` what [[stage-package]] gave.
+What an update under review holds until C-c C-c moves them in ([[commit-dependencies]]) or
+C-c C-k deletes them."
+  (vec (map (missing-dependencies dir name)
+         (fn (dependency)
+           (let (staged (stage-package registry (:name dependency) [(job-id id) name] true))
+             (if (failure? staged)
+               (dependency-outcome dependency staged)
+               (assoc (dependency-outcome dependency (:result staged)) :staged staged)))))))
+
+(defn- commit-dependencies (dependencies)
+  "The libraries an applied update staged ([[stage-dependencies]]) moved into place, each as
+[[commit-staged]] moves a package; one installed meanwhile keeps its copy, the staged one
+deleted. Answers what each became, as [[install-dependencies]] does."
+  (vec (map (or dependencies [])
+         (fn (dependency)
+           (let (staged (:staged dependency)
+                 outcome (dissoc dependency :staged))
+             (cond
+               (nil? staged) outcome
+               (installed? (:name dependency)) (do (delete-staging (:staging staged)) outcome)
+               else
+                 (let (result (try
+                                (commit-staged (:name dependency) staged)
+                                (catch e (failure (error-message e)))))
+                   (if (failure? result)
+                     {:name (:name dependency) :error (error-message result)}
+                     outcome))))))))
+
+(defn- delete-staging (staging)
+  ;; a staging directory deleted; one already gone is what deleting it wanted
+  (when staging (check-allow :discarded-catch (try (file/rmdir staging) (catch _ nil)))))
+
+(defn- dependency-stagings (dependencies)
+  ;; the staging directories the staged libraries of an update hold
+  (vec (seq/keep (or dependencies []) (fn (dependency) (:staging (:staged dependency))))))
 
 (defn dependencies-note (dependencies)
   "What an install says about the libraries it installed beside the plugin, or \"\".
@@ -473,8 +520,12 @@ newest release, so `:wanted` is the version the plugin named when that is anothe
 
 (defn- staging-id (id name)
   ;; the staging directory's id for package `name` in job `id`: an update of EVERY package
-  ;; (`:all` job ids, `[id :all]`) stages each under its own name, so they stand side by side
-  (if (vector? id) (str (first id) "-" name) id))
+  ;; (`[id :all]`) stages each under its own name, so they stand side by side, and a library a
+  ;; reviewed update needs (`[id plugin]`) under the plugin's name and its own
+  (cond
+    (not (vector? id)) id
+    (string? (second id)) (str (first id) "-" (second id) "-" name)
+    else (str (first id) "-" name)))
 
 (defn- job-id (id)
   ;; the job a staging id belongs to, whose own stagings a clean-up keeps
@@ -506,15 +557,30 @@ package of an update of every package ([[staging-id]])."
 (defn- commit-staged (name staged)
   "Move the copy of `name` that [[stage-package]] `staged` into place over the installed one,
 the signing pins it saw back with it, and answer the install's result map, its `:path` the
-final one. Local file moves, so an applied review runs it on the loop."
+final one. Local file moves, so an applied review runs it on the loop.
+
+Never leaves the package missing: the installed copy is renamed ASIDE first, the new one moved
+in, and only then the old one deleted — when the move in fails, the old copy is put back and the
+failure raised. The pins are copied back only once the new copy is in place."
   (let (staging (:staging staged)
-        staged-pins (path/join staging ".signing-pins.blsp"))
+        staged-pins (path/join staging ".signing-pins.blsp")
+        target (package-dir name)
+        ;; aside INSIDE the staging dir: never at the top of the package dir, where it would read
+        ;; as an installed package, and deleted with the staging
+        aside (path/join staging (str ".replaced-" name))
+        had-old? (file/exists? target))
+    (when had-old? (file/rename target aside))
+    (try
+      (file/rename (path/join staging name) target)
+      (catch e
+        (do
+          (when (and had-old? (not (file/exists? target))) (file/rename aside target))
+          (throw e))))
     (when (file/exists? staged-pins)
       (file/cp staged-pins (path/join (user-package-dir) ".signing-pins.blsp")))
-    (file/rmdir (package-dir name))
-    (file/rename (path/join staging name) (package-dir name))
-    (file/rmdir staging)
-    (assoc (:result staged) :path (package-dir name))))
+    ;; the staging dir and the old copy aside in it, gone together
+    (check-allow :discarded-catch (try (file/rmdir staging) (catch _ nil)))
+    (assoc (:result staged) :path target)))
 
 (defn- staged-install (registry name id &optional (library? false))
   "Install `name` through `registry`'s `:install`: staged ([[stage-package]]) and moved into
@@ -574,12 +640,30 @@ the directory holds no manifest that names one."
 (defn package-install-directory (m directory)
   "Install the package in `directory` (`M-x package-install-directory`) as a hive install
 would, off the loop: staged, checked that it enhances this bedit, applied live, its language's
-grammars built. An installed one of the same name is updated from it. Refused, said, when the
-directory holds no package."
-  (let (name (package-directory-name directory))
-    (if (nil? name)
-      (message m (str (path/abbreviate directory) " holds no package (no project.blsp naming one)"))
-      (launch-job m {:kind :install :name name :from directory}))))
+grammars built. An installed one of the same name is updated from it, its modules loaded again
+— the same version too, since a checkout edited in place keeps its version; an OLDER one only
+after a y/n naming both versions. Refused, said, when the directory holds no package."
+  (let (name (package-directory-name directory)
+        version (when name (manifest-value-in directory :version))
+        installed (when name (installed-version name))
+        job {:kind :install :name name :from directory})
+    (cond
+      (nil? name)
+        (message m
+          (str (path/abbreviate directory) " holds no package (no project.blsp naming one)"))
+      (and (string? installed) (string? version) (version/newer? installed version))
+        (ed-confirm m
+          (str name
+            " "
+            installed
+            " is installed — install the OLDER "
+            version
+            " from "
+            (path/abbreviate directory)
+            "? (y or n)")
+          (fn (asked) (launch-job asked job))
+          (str name " " installed " stays installed"))
+      else (launch-job m job))))
 
 (defn- hive-versions (registry names)
   ;; the hive's latest version of each of `names` — `{name version}`, nil for one it does not
@@ -615,26 +699,35 @@ directory holds no package."
        :result result
        :dependencies (install-dependencies registry name id)})))
 
-(defn- review-job (registry name id)
-  "An update to REVIEW: the new version staged ([[stage-package]]) and what it changes against
-the installed copy read ([[packages/review/review-of]]) — both here, in the task — as
-`{:kind :update :name :staged :review}`, nothing moved into place."
-  (let (staged (stage-package registry name id (library? name)))
-    (if (failure? staged)
-      {:kind :update :name name :error (error-message staged)}
-      (let (new-version (or (:version (:result staged))
-                          (manifest-value-in (path/join (:staging staged) name) :version)))
-        {:kind :update
-         :name name
-         :staged staged
-         :review (packages/review/review-of name (path/join (:staging staged) name) new-version)
-         ;; the libraries the new version needs are installed now, beside it: new ones only,
-         ;; so nothing installed changes until the update is applied
-         :dependencies (install-dependencies registry name id (:staging staged))}))))
+(defn key-changed? (staged)
+  "Whether the copy [[stage-package]] `staged` is signed by another key than the one pinned
+for its package (brood ADR-212's `:key-changed`): a key rotation, or a compromise — what an
+update never applies without asking."
+  (= :key-changed (:signature (:result staged))))
+
+(defn- review-outcome (registry name id staged)
+  "The outcome of an update staged to be looked at first: `{:kind :update :name :staged :review
+:dependencies}` — what it changes against the installed copy ([[packages/review/review-of]]),
+the libraries it needs STAGED beside it ([[stage-dependencies]]) and shown in the review, and
+`:key-changed` when its signing key changed. Nothing is moved into place."
+  (let (new-version (or (:version (:result staged))
+                      (manifest-value-in (path/join (:staging staged) name) :version))
+        dependencies (stage-dependencies registry name id (:staging staged)))
+    {:kind :update
+     :name name
+     :staged staged
+     :key-changed (key-changed? staged)
+     :review (assoc (packages/review/review-of name (path/join (:staging staged) name) new-version)
+               :libraries (packages/review/libraries-review dependencies)
+               :key-changed (key-changed? staged))
+     :dependencies dependencies}))
 
 (defn- update-job (registry name id review?)
-  ;; newer on the hive: install it — or, `review?`, stage it to be looked at first; current:
-  ;; say so; the version check failing: say why
+  "Update package `name` when the hive has a NEWER version — never an older one — and say so
+when it is current, or why the check failed. `review?`: staged and shown first
+([[review-outcome]]); otherwise moved into place with its libraries — except a copy whose
+signing key changed ([[key-changed?]]), which is held for review, since applying it needs a
+yes."
   (let (installed (installed-version name)
         latest (try ((:latest-version registry) name) (catch e (failure (error-message e)))))
     (cond
@@ -646,15 +739,19 @@ the installed copy read ([[packages/review/review-of]]) — both here, in the ta
          :error (str name " is not published on the registry")}
       (and installed (not (version/newer? latest installed)))
         {:kind :update :name name :current true}
-      review? (review-job registry name id)
       else
-        (let (result (staged-install registry name id (library? name)))
-          (if (failure? result)
-            {:kind :update :name name :error (error-message result)}
-            {:kind :update
-             :name name
-             :result result
-             :dependencies (install-dependencies registry name id)})))))
+        (let (staged (stage-package registry name id (library? name)))
+          (cond
+            (failure? staged) {:kind :update :name name :error (error-message staged)}
+            (or review? (key-changed? staged)) (review-outcome registry name id staged)
+            else
+              (let (result (try (commit-staged name staged) (catch e (failure (error-message e)))))
+                (if (failure? result)
+                  {:kind :update :name name :error (error-message result)}
+                  {:kind :update
+                   :name name
+                   :result result
+                   :dependencies (install-dependencies registry name id)})))))))
 
 (defn- update-all-job (registry id review?)
   "Update EVERY installed package (`M-x package-update-all`): each one's update as [[update-job]]
@@ -688,9 +785,12 @@ reason it failed. Never raises. What a package task runs; inline when headless."
         (case (:kind job)
           :list (fetch-list registry)
           :install
-            (if (:from job)
-              (local-install-job registry job)
-              (install-job registry (:name job) (:id job)))
+            (cond
+              (:from job) (local-install-job registry job)
+              ;; installed meanwhile (another window, a prompt typed over an installed name): an
+              ;; update, newer only — never the hive's copy put over the one loaded
+              (installed? (:name job)) (update-job registry (:name job) (:id job) (:review job))
+              else (install-job registry (:name job) (:id job)))
           :update (update-job registry (:name job) (:id job) (:review job))
           :update-all (update-all-job registry (:id job) (:review job))
           {:kind (:kind job) :name (:name job) :error (str "no such package job: " (:kind job))}))
@@ -929,9 +1029,10 @@ installed, is a library ([[library?]]) and no other installed package depends on
 ;; ---- reviewing an update before it is applied (Emacs bug #74604) -----------------
 ;; With `:package-review-updates` (the default) an update stages the new version off the loop
 ;; and shows *Package Diff: NAME* — the versions, the changelog between them, the files'
-;; diff — instead of applying it. C-c C-c moves the staged copy into place and applies it as
-;; an update always was; C-c C-k (or q) deletes the staged copy. Either way, until C-c C-c the
-;; installed copy is never touched.
+;; diff, and the new libraries it needs, staged beside it — instead of applying it. C-c C-c
+;; moves the staged copies into place and applies the update as an update always was (after a
+;; y/n when its signing key changed); C-c C-k (or q) deletes them. Either way, until C-c C-c
+;; nothing installed is touched.
 
 (defn review-updates? (m)
   "Whether an update from `m` is shown before it is applied (`:package-review-updates`)."
@@ -942,18 +1043,52 @@ installed, is a library ([[library?]]) and no other installed package depends on
   "The package job that updates `name` from `m`: reviewed first when [[review-updates?]]."
   {:kind :update :name name :review (review-updates? m)})
 
+(defn install-job-for (m name)
+  "The ONE job every install starts for package `name` — `i` in *Packages*, M-x package-install
+and its prompt: an install when it is not installed, else its update ([[update-job-for]]) —
+newer only, reviewed first when [[review-updates?]], its modules loaded again when applied — so
+an install never puts the hive's copy over the version loaded, nor an older one."
+  (if (installed? name) (update-job-for m name) {:kind :install :name name}))
+
+(defn- held-stagings (name)
+  ;; the registry keys an open review of `name` holds stagings under: its own, and one
+  ;; `[name library]` per library staged for it
+  (seq/filter (keys (or (registry/entries :packages/reviews) {}))
+    (fn (key) (or (= key name) (and (vector? key) (= (first key) name))))))
+
+(defn- forget-review (name)
+  ;; the review of `name` forgotten — its stagings no longer held, the directories left as they are
+  (doseq (key (held-stagings name))
+    (registry/remove :packages/reviews key)))
+
 (defn- drop-staging (name)
-  ;; the staged copy an open review of `name` holds deleted, and the review forgotten
-  (let (staging (registry/lookup :packages/reviews name))
-    (when staging
-      ;; a staging folder already gone is what dropping it wanted, and a leftover is harmless
-      (check-allow :discarded-catch (try (file/rmdir staging) (catch _ nil)))
-      (registry/remove :packages/reviews name))))
+  ;; the staged copies an open review of `name` holds — the package's and its libraries' —
+  ;; deleted, and the review forgotten
+  (doseq (key (held-stagings name))
+    (delete-staging (registry/lookup :packages/reviews key)))
+  (forget-review name))
+
+(defn- hold-staging (name staging &optional (dependencies []))
+  ;; the update of `name` staged in `staging`, with the libraries it staged, held for review,
+  ;; replacing any other review of it
+  (when (not (= (registry/lookup :packages/reviews name) staging))
+    (drop-staging name))
+  (registry/put :packages/reviews name staging)
+  (doseq (dependency (or dependencies []))
+    (when-let (library-staging (:staging (:staged dependency)))
+      (registry/put :packages/reviews [name (:name dependency)] library-staging))))
+
+(defn- review-update (outcome)
+  ;; what a review buffer keeps of a staged update `outcome`, to apply or drop it
+  {:name (:name outcome)
+   :staged (:staged outcome)
+   :version (:new-version (:review outcome))
+   :dependencies (or (:dependencies outcome) [])})
 
 (defn- show-review (m outcome)
-  "Show the update `outcome` staged as *Package Diff: NAME*, holding its staged copy
+  "Show the update `outcome` staged as *Package Diff: NAME*, holding its staged copies
 (`:packages/reviews`, replacing a review of the same package still open), and say how to
-apply or drop it."
+apply or drop it — and that applying asks first when its signing key changed."
   (let (name (:name outcome)
         staged (:staged outcome)
         review (:review outcome)
@@ -961,33 +1096,74 @@ apply or drop it."
                name
                " → "
                (:new-version review)
+               (if (:key-changed outcome) " (its SIGNING KEY CHANGED)" "")
                ": C-c C-c applies it, C-c C-k drops it"))
-    (hold-staging name (:staging staged))
+    (hold-staging name (:staging staged) (:dependencies outcome))
     (message (assoc (sb-show m
                       (packages/review/review-buffer-name name)
                       (packages/review/review-tree review)
-                      :package-diff {:action :pop
-                       :ctx {:name name :staged staged :version (:new-version review)}
-                       :vis {}
-                       :line 1})
+                      :package-diff {:action :pop :ctx (review-update outcome) :vis {} :line 1})
                :package-status note)
       note)))
 
 (defn- review-at (m)
-  ;; the review the current buffer shows, `{:name :staged :version}`, while its copy is staged
-  (let (ctx (sb-ctx m)
-        staging (:staging (:staged ctx)))
-    (when (and (:name ctx)
-            staging
-            (= (registry/lookup :packages/reviews (:name ctx)) staging)
-            (file/dir? staging))
-      ctx)))
+  ;; the review the current buffer shows, `{:name :staged :version :dependencies}`, while its
+  ;; copy is staged
+  (let (ctx (sb-ctx m))
+    (when (and (:name ctx) (still-staged? ctx)) ctx)))
+
+(defn- still-staged? (update)
+  ;; whether the staged copy `update` (`{:name :staged}`) holds is still the one held for review
+  (let (staging (:staging (:staged update)))
+    (and staging
+      (= (registry/lookup :packages/reviews (:name update)) staging)
+      (file/dir? staging))))
+
+(defn- commit-update (m update)
+  "`[m' note]`: the staged update `update` (`{:name :staged :dependencies}`) moved into place —
+the package ([[commit-staged]]), then the libraries staged for it ([[commit-dependencies]]) —
+its review forgotten, and applied live ([[apply-outcome]], which loads its modules again).
+When the package cannot be moved in, its staged libraries are deleted too and the note says
+why; the installed copy stays."
+  (let (name (:name update)
+        result (try (commit-staged name (:staged update)) (catch e (failure (error-message e)))))
+    (if (failure? result)
+      (do
+        (drop-staging name)
+        (doseq (staging (dependency-stagings (:dependencies update)))
+          (delete-staging staging))
+        [m (str "update of " name " failed: " (error-message result))])
+      (let (dependencies (commit-dependencies (:dependencies update)))
+        (forget-review name)
+        (apply-outcome m {:kind :update :name name :result result :dependencies dependencies})))))
+
+(defn- key-change-question (updates)
+  "The y/n question applying `updates` must ask first, or nil: when any of them is signed by
+another key than the one pinned ([[key-changed?]]), naming each and the warning brood's check
+gave."
+  (let (changed (seq/filter updates (fn (update) (key-changed? (:staged update)))))
+    (when (not (empty? changed))
+      (str (string/join (map changed
+                          (fn (update)
+                            (or (:warning (:result (:staged update)))
+                              (str (:name update)
+                                " is signed by a DIFFERENT key than the one pinned"))))
+             " ")
+        " Apply anyway? (y or n)"))))
+
+(defn- confirm-key-change (m updates then)
+  ;; `(then m)` — after a yes when one of `updates` changed its signing key
+  (let (question (key-change-question updates))
+    (if (nil? question)
+      (then m)
+      (ed-confirm m question then "not applied — the signing key changed; C-c C-k drops it"))))
 
 ;; ---- an update of every package (M-x package-update-all, U) -----------------------
 ;; One job stages every outdated package side by side; the review is ONE *Package Diff*, a
 ;; folded section per package, and C-c C-c / C-c C-k apply or drop them all. A package whose
 ;; update failed is named and the rest go on. Without review the job installs them all and the
-;; loop applies each, as a single update without review does.
+;; loop applies each, as a single update without review does — but one whose signing key
+;; changed is held, and shown for review.
 
 (defn- said (m note)
   ;; `note` in the echo area and on the *Packages* status line
@@ -1009,8 +1185,8 @@ apply or drop it."
 
 (defn- update-all-done (m outcome)
   "Fold an update of every package: nothing newer said; under review the staged updates shown
-as one *Package Diff* ([[show-review-all]]); else each applied live — and every package that
-failed named with its reason."
+as one *Package Diff* ([[show-review-all]]); else each applied live — but one held because its
+signing key changed shown for review — and every package that failed named with its reason."
   (let (outcomes (:outcomes outcome)
         failed (failure-notes outcomes)
         staged (seq/filter outcomes :staged))
@@ -1021,21 +1197,23 @@ failed named with its reason."
           (said m (str "no update could be staged — " (string/join failed "; ")))
           (show-review-all m staged (vec (seq/filter outcomes :error))))
       else
-        (let ([applied notes] (apply-outcomes m (seq/reject outcomes :error)))
-          (said applied (string/join (append notes failed) "; "))))))
-
-(defn- hold-staging (name staging)
-  ;; the update of `name` staged in `staging` held for review, replacing any other review of it
-  (when (not (= (registry/lookup :packages/reviews name) staging))
-    (drop-staging name))
-  (registry/put :packages/reviews name staging))
+        (let ([applied notes] (apply-outcomes m
+                                (seq/reject outcomes (fn (each) (or (:error each) (:staged each)))))
+              held (if (empty? staged) applied (show-review-all applied staged [])))
+          (said held
+            (string/join (append notes
+                           failed
+                           (map staged
+                             (fn (each)
+                               (str (:name each) " held for review: its signing key changed"))))
+              "; "))))))
 
 (defn- show-review-all (m staged failures)
   "Show the updates `staged` (outcomes with `:staged` and `:review`) as ONE *Package Diff*, a
 folded section per package and the packages that `failures` name in its title, holding every
 staged copy (`:packages/reviews`), and say how to apply or drop them."
   (doseq (outcome staged)
-    (hold-staging (:name outcome) (:staging (:staged outcome))))
+    (hold-staging (:name outcome) (:staging (:staged outcome)) (:dependencies outcome)))
   (let (count-label (str (count staged) " update" (if (= (count staged) 1) "" "s"))
         note (str "review "
                count-label
@@ -1045,50 +1223,37 @@ staged copy (`:packages/reviews`), and say how to apply or drop them."
             packages/review/*review-all-buffer*
             (packages/review/review-all-tree (map staged :review) failures)
             :package-diff {:action :pop
-             :ctx {:updates (vec (map staged
-                                   (fn (outcome)
-                                     {:name (:name outcome)
-                                      :staged (:staged outcome)
-                                      :version (:new-version (:review outcome))})))}
+             :ctx {:updates (vec (map staged review-update))}
              :vis {}
              :line 1})
       note)))
 
-(defn- still-staged? (update)
-  ;; whether the staged copy `update` (`{:name :staged}`) holds is still the one held for review
-  (let (staging (:staging (:staged update)))
-    (and staging
-      (= (registry/lookup :packages/reviews (:name update)) staging)
-      (file/dir? staging))))
-
 (defn- apply-all (m updates)
   "C-c C-c in the *Package Diff* of every package: each of `updates` still staged moved into
-place and applied live in turn; one that cannot be moved is said and the rest go on."
+place and applied live in turn ([[commit-update]]) — after one y/n when any changed its signing
+key; one that cannot be moved is said and the rest go on."
   (let (kept (seq/filter updates still-staged?))
     (cond
       (empty? kept)
         (message m "these updates are no longer staged — U in *Packages* fetches them again")
       (or (:package-job m) (job-slot)) (busy-message m)
       else
-        (let (outcomes (map kept
-                         (fn (update)
-                           (let (name (:name update)
-                                 result (try
-                                          (commit-staged name (:staged update))
-                                          (catch e (failure (error-message e)))))
-                             (registry/remove :packages/reviews name)
-                             (if (failure? result)
-                               {:kind :update :name name :error (error-message result)}
-                               {:kind :update :name name :result result}))))
-              [applied notes] (apply-outcomes (ed-kill-buffer-named m
-                                                packages/review/*review-all-buffer*)
-                                (seq/reject outcomes :error)))
-          (refresh-packages (said applied
-                              (string/join (append notes (failure-notes outcomes)) "; ")))))))
+        (confirm-key-change m
+          kept
+          (fn (asked)
+            (let ([applied notes] (fold kept
+                                    [(ed-kill-buffer-named asked
+                                       packages/review/*review-all-buffer*)
+                                      []]
+                                    (fn (acc update)
+                                      (let ([current notes] acc
+                                            [next note] (commit-update current update))
+                                        [next (conj notes note)]))))
+              (refresh-packages (said applied (string/join notes "; ")))))))))
 
 (defn- drop-all (m updates)
-  "C-c C-k in the *Package Diff* of every package: each staged copy still held deleted, the
-installed versions kept."
+  "C-c C-k in the *Package Diff* of every package: each staged copy still held deleted — the
+libraries staged for it too — the installed versions kept."
   (doseq (update (seq/filter updates still-staged?))
     (drop-staging (:name update)))
   (refresh-packages (said (ed-kill-buffer-named m packages/review/*review-all-buffer*)
@@ -1109,33 +1274,30 @@ go on."
 
 (defcommand cmd-package-review-apply
   (m key)
-  "Apply the update this *Package Diff* buffer shows (C-c C-c): the staged copy moved into place
-and loaded live, as an update without review is — refused while a package job runs. In the
-*Package Diff* of every package, every update it still holds."
+  "Apply the update this *Package Diff* buffer shows (C-c C-c): the staged copy and the
+libraries staged for it moved into place and loaded live, as an update without review is —
+after a y/n naming the change when its signing key changed; refused while a package job runs.
+In the *Package Diff* of every package, every update it still holds."
   (let (review (review-at m)
         updates (:updates (sb-ctx m)))
     (cond
       updates (apply-all m updates)
-      (nil? review) (message m "this update is no longer staged — u in *Packages* fetches it again")
+      (nil? review) (message m "this update is no longer staged — i in *Packages* fetches it again")
       (or (:package-job m) (job-slot)) (busy-message m)
       else
-        (let (name (:name review)
-              result (try
-                       (commit-staged name (:staged review))
-                       (catch e (failure (error-message e)))))
-          (if (failure? result)
-            (message m (str "update of " name " failed: " (error-message result)))
-            (do
-              (registry/remove :packages/reviews name)
-              (let ([applied note] (apply-outcome (ed-kill-buffer-named m
-                                                    (packages/review/review-buffer-name name))
-                                     {:kind :update :name name :result result}))
-                (refresh-packages (message (assoc applied :package-status note) note)))))))))
+        (confirm-key-change m
+          [review]
+          (fn (asked)
+            (let ([applied note] (commit-update (ed-kill-buffer-named asked
+                                                  (packages/review/review-buffer-name (:name review)))
+                                   review))
+              (refresh-packages (said applied note))))))))
 
 (defcommand cmd-package-review-drop
   (m key)
-  "Drop the update this *Package Diff* buffer shows (C-c C-k, q): its staged copy deleted, the
-installed version kept. In the *Package Diff* of every package, every update it holds."
+  "Drop the update this *Package Diff* buffer shows (C-c C-k, q): its staged copy and the
+libraries staged for it deleted, the installed version kept. In the *Package Diff* of every
+package, every update it holds."
   (let (ctx (sb-ctx m)
         name (:name ctx))
     (cond
@@ -1150,9 +1312,7 @@ installed version kept. In the *Package Diff* of every package, every update it 
                      (or (installed-version name) "nothing")
                      " stays installed"))
           (when (review-at m) (drop-staging name))
-          (refresh-packages (message (assoc (ed-kill-buffer-named m
-                                              (packages/review/review-buffer-name name))
-                                       :package-status note)
+          (refresh-packages (said (ed-kill-buffer-named m (packages/review/review-buffer-name name))
                               note))))))
 
 (def package-diff-keymap
@@ -1269,14 +1429,14 @@ load is `:broken` or `:incompatible`, its description the reason ([[package-stat
         (count heading)
         (fn (widest width) (if (> width widest) width widest))))))
 
-(defn- render-line (cells widths last-cell)
-  (str "  "
+(defn- render-line (cells widths last-cell &optional (lead "  "))
+  (str lead
     (string/join (map (seq/zip cells widths) (fn ([text width]) (pad text width))) "  ")
     "  "
     last-cell))
 
 (def *packages-title*
-  "  bedit packages — RET describe · i install · d remove · u update · U update all · g refresh · q quit")
+  "  bedit packages — RET describe · i install/update · d mark delete · u unmark · x execute · U update all · g refresh · q quit")
 
 (def *packages-header-lines* 3)
 ;; The title, the STATUS line (what is running, how the last job ended — blank when there is
@@ -1284,7 +1444,8 @@ load is `:broken` or `:incompatible`, its description the reason ([[package-stat
 
 (defn render-packages (rows &optional (status nil))
   "The *Packages* buffer text, and the line→row vector aligned to it (nil for header lines).
-`status` is the second line: what is running, or how the last job ended (one line)."
+`status` is the second line: what is running, or how the last job ended (one line). A row marked
+for deletion (`:marked`) reads `D` in the first column, as Emacs's package menu shows a mark."
   (let (widths (column-widths rows)
         header-lines [*packages-title*
                        (if (nil? status) "" (str "  " (one-line status)))
@@ -1295,7 +1456,8 @@ load is `:broken` or `:incompatible`, its description the reason ([[package-stat
                  (string/trim-right (render-line (map *package-columns*
                                                    (fn ([_ cell]) (str (cell row))))
                                       widths
-                                      (one-line (or (:description row) ""))))))
+                                      (one-line (or (:description row) ""))
+                                      (if (:marked row) "D " "  ")))))
         ;; rows aligned to buffer lines: one nil per header line, then one row per body line
         line-rows (append (map header-lines (fn (_) nil)) rows))
     {:text (string/join (append header-lines body) "\n")
@@ -1308,9 +1470,12 @@ load is `:broken` or `:incompatible`, its description the reason ([[package-stat
     (if (and rows (>= i 0) (< i (count rows))) (nth rows i) nil)))
 
 (defn- browser-text (m)
-  ;; the rendering of what the model knows: the last fetched list against the disk now
-  (render-packages (package-rows (or (:package-list m) []) (or (:package-others m) {}))
-    (:package-status m)))
+  ;; the rendering of what the model knows: the last fetched list against the disk now, each
+  ;; row marked for deletion flagged
+  (let (marks (package-marks m))
+    (render-packages (map (package-rows (or (:package-list m) []) (or (:package-others m) {}))
+                       (fn (row) (if (contains? marks (:name row)) (assoc row :marked true) row)))
+      (:package-status m))))
 
 (defn refresh-packages (m)
   "Redraw *Packages* in place from what the model knows — the last fetched list, the disk as
@@ -1385,12 +1550,12 @@ package is installed either way, and this is where the user finds out."
 (defcommand cmd-package-install
   (m key)
   "Install the package on the current *Packages* line (i), off the loop — its theme appears in
-theme-select when it lands. Outside the browser, prompts for a package name."
+theme-select when it lands; an installed one is UPDATED instead, newer only and reviewed first
+([[install-job-for]]). Outside the browser, prompts for a package name (M-x package-install)."
   (let (row (package-row-at m))
-    (cond
-      (nil? row) (cmd-package-install-prompt m key)
-      (installed? (:name row)) (message m (str (:name row) " is already installed — u to update"))
-      else (launch-job m {:kind :install :name (:name row)}))))
+    (if (nil? row)
+      (cmd-package-install-prompt m key)
+      (launch-job m (install-job-for m (:name row))))))
 
 (defn- prompt-status (m)
   ;; what a package prompt says it is waiting on: the list on its way, or why it is not
@@ -1440,13 +1605,14 @@ nil) as what it says. Any other prompt, or none, is left alone."
   "Prompt for a bedit package to install (M-x package-install), completing over the hive's
 packages. Before the list has ever been fetched it is fetched now, off the loop: the prompt
 opens at once saying so, and its candidates arrive when the hive answers. Any name may be
-typed meanwhile."
+typed meanwhile (M-RET takes it over a listed name). An installed package is updated instead —
+newer only, reviewed first ([[install-job-for]])."
   (let (fetched (fetch-list-once m))
     (assoc fetched
       :minibuffer
         (package-prompt fetched
           :install "Install package: "
-          (fn (mm name) (launch-job mm {:kind :install :name name}))))))
+          (fn (mm name) (launch-job mm (install-job-for mm name)))))))
 
 (defcommand cmd-package-install-directory
   (m key)
@@ -1495,49 +1661,76 @@ plugin contributes as loaded now. An installed package this image could not load
         (or (:label (job-slot)) "with another job")
         " in another window"))))
 
+(defn- removal-blocker (m name)
+  ;; why package `name` cannot be removed now, or nil: a package job runs in some window (an
+  ;; install or update of it landing afterwards would put it straight back), it is a library
+  ;; another package uses, or it is not installed
+  (cond
+    (or (:package-job m) (job-slot)) :busy
+    (not (installed? name)) (str name " is not installed")
+    else (removal-refusal name)))
+
+(defn- removal-note (name)
+  ;; what removing `name` says it took: the package, and the libraries only it used
+  (let (orphans (orphaned-by name))
+    (str name
+      (if (empty? orphans)
+        ""
+        (str " and the "
+          (if (= (count orphans) 1) "library " "libraries ")
+          (string/join orphans ", ")
+          " only it used")))))
+
 (defn remove-package (m name)
   "Remove package `name` live and redraw *Packages* — refused while a package job runs in any
-window, since an install or update of it landing afterwards would put it straight back, and
-for a library another package uses ([[removal-refusal]]). The libraries only it used go with
-it, said ([[orphaned-by]])."
-  (let (refusal (removal-refusal name)
-        orphans (orphaned-by name))
+window and for a library another package uses ([[removal-refusal]]). The libraries only it used
+go with it, said ([[orphaned-by]]). Asks nothing: [[confirm-remove]] is what a person's command
+runs."
+  (let (blocker (removal-blocker m name))
     (cond
-      (or (:package-job m) (job-slot)) (busy-message m)
-      refusal (message m refusal)
+      (= blocker :busy) (busy-message m)
+      blocker (message m blocker)
       else
-        (let ([removed-model removed?] (remove! (message m
-                                                  (str "removed "
-                                                    name
-                                                    (if (empty? orphans)
-                                                      ""
-                                                      (str " and the "
-                                                        (if (= (count orphans) 1)
-                                                          "library "
-                                                          "libraries ")
-                                                        (string/join orphans ", ")
-                                                        " only it used"))))
+        (let ([removed-model removed?] (remove! (message m (str "removed " (removal-note name)))
                                          name))
           (if removed? (refresh-packages removed-model) (message m (str name " is not installed")))))))
 
+(defn confirm-remove (m name)
+  "Remove package `name` after a y/n naming it and the libraries that go with it, as Emacs's
+package menu asks before it deletes — refused first, said, when it cannot be removed at all."
+  (let (blocker (removal-blocker m name))
+    (cond
+      (= blocker :busy) (busy-message m)
+      blocker (message m blocker)
+      else
+        (ed-confirm m
+          (str "Delete package " (removal-note name) "? (y or n)")
+          (fn (asked) (remove-package asked name))
+          (str name " kept")))))
+
 (defcommand cmd-package-remove
   (m key)
-  "Remove the package on the current *Packages* line (d), live — its theme leaves theme-select.
-Outside the browser, prompts."
+  "Remove a package, asking first: the one on the current *Packages* line, else the one a
+prompt names (M-x package-remove, Emacs's `package-delete`). Live — its theme leaves
+theme-select."
   (let (row (package-row-at m))
-    (if (nil? row) (cmd-package-remove-prompt m key) (remove-package m (:name row)))))
+    (if (nil? row) (cmd-package-remove-prompt m key) (confirm-remove m (:name row)))))
 
 (defcommand cmd-package-remove-prompt
   (m key)
-  "Prompt for an installed package to remove (M-x package-remove)."
+  "Prompt for an installed package to remove (M-x package-remove), then ask y/n. The name must
+be an installed package's exactly — typed, or chosen with C-n / C-p — never a fuzzy match taken
+for it, and a blank answer removes nothing."
   (assoc m
-    :minibuffer (ed-name-prompt "Remove package: " (installed-packages) remove-package)))
+    :minibuffer
+      (assoc (ed-name-prompt "Remove package: " (installed-packages) confirm-remove)
+        :require-match :exact)))
 
 (defcommand cmd-package-update
   (m key)
-  "Update the package on the current *Packages* line (u) to the hive's newest version, off the
-loop — staged and shown as *Package Diff* first with `:package-review-updates` (the default),
-C-c C-c applying it — and reload it live. Outside the browser, prompts."
+  "Update the package on the current *Packages* line to the hive's newest version, off the loop
+— staged and shown as *Package Diff* first with `:package-review-updates` (the default), C-c C-c
+applying it — and reload it live. Outside the browser, prompts (M-x package-update)."
   (let (row (package-row-at m))
     (cond
       (nil? row) (cmd-package-update-prompt m key)
@@ -1549,16 +1742,75 @@ C-c C-c applying it — and reload it live. Outside the browser, prompts."
   "Prompt for an installed package to update (M-x package-update)."
   (assoc m
     :minibuffer
-      (ed-name-prompt "Update package: "
-        (installed-packages)
-        (fn (mm name) (launch-job mm (update-job-for mm name))))))
+      (assoc (ed-name-prompt "Update package: "
+               (installed-packages)
+               (fn (mm name) (launch-job mm (update-job-for mm name))))
+        :require-match true)))
+
+;; ---- marking in *Packages*: d marks, u unmarks, x deletes the marked (Emacs's package menu) ----
+;; Emacs's package menu never deletes on one key: `d` marks a package, `u` takes the mark off,
+;; `x` executes the marks after asking. The marks are the model's `:package-marks` (a set of
+;; names), drawn as `D` in the row's first column.
+
+(defn package-marks (m)
+  "The packages marked for deletion in *Packages*, a set of names."
+  (or (:package-marks m) #{}))
+
+(defn- next-row (m)
+  ;; point on the next line of *Packages*, as a mark moves on in Emacs's menu
+  (ed-apply m (fn (b) (ed-goto-line b (+ 2 (buffer-current-line b))))))
+
+(defcommand cmd-package-mark-delete
+  (m key)
+  "Mark the installed package on this *Packages* line for deletion (d) and move to the next
+line; x deletes the marked ones after asking."
+  (let (row (package-row-at m))
+    (cond
+      (nil? row) (message m "no package on this line")
+      (not (installed? (:name row))) (message m (str (:name row) " is not installed"))
+      else
+        (next-row (refresh-packages (assoc m :package-marks (conj (package-marks m) (:name row))))))))
+
+(defcommand cmd-package-unmark
+  (m key)
+  "Take the mark off the package on this *Packages* line (u) and move to the next line."
+  (let (row (package-row-at m))
+    (if (nil? row)
+      (message m "no package on this line")
+      (next-row (refresh-packages (assoc m :package-marks (set/disj (package-marks m) (:name row))))))))
+
+(defn- delete-marked (m names)
+  ;; each of `names` still installed removed in turn, plugins before the libraries they use
+  (let (ordered (seq/sort-by names (fn (name) [(if (library? name) 1 0) name])))
+    (refresh-packages (fold ordered
+                        (dissoc m :package-marks)
+                        (fn (acc name) (if (installed? name) (remove-package acc name) acc))))))
+
+(defcommand cmd-package-execute
+  (m key)
+  "Delete the packages marked with d (x, Emacs's `package-menu-execute`), after a y/n naming
+them. Says so when nothing is marked."
+  (let (marked (vec (sort (seq/filter (seq (package-marks m)) installed?))))
+    (cond
+      (empty? marked) (message m "No operations specified")
+      (or (:package-job m) (job-slot)) (busy-message m)
+      else
+        (ed-confirm m
+          (str "Delete "
+            (ed-count-noun (count marked) "package")
+            " ("
+            (string/join marked ", ")
+            ")? (y or n)")
+          (fn (asked) (delete-marked asked marked))
+          "nothing deleted"))))
 
 ;; ---- packages (the *Packages* browser — M-x package-list) -------------------
 (def packages-keymap
   (-> {}
-    (keymap-bind ["i"] 'packages/cmd-package-install) ; i — install the package under point
-    (keymap-bind ["d"] 'packages/cmd-package-remove) ; d — remove it
-    (keymap-bind ["u"] 'packages/cmd-package-update) ; u — update it to the newest version
+    (keymap-bind ["i"] 'packages/cmd-package-install) ; i — install the package under point, or update it
+    (keymap-bind ["d"] 'packages/cmd-package-mark-delete) ; d — mark it for deletion
+    (keymap-bind ["u"] 'packages/cmd-package-unmark) ; u — take the mark off
+    (keymap-bind ["x"] 'packages/cmd-package-execute) ; x — delete the marked, after asking
     (keymap-bind ["U"] 'packages/cmd-package-update-all) ; U — update every package, one review
     (keymap-bind ["g"] 'packages/cmd-package-refresh) ; g — re-fetch the list from the hive
     (keymap-bind [:enter] 'help/cmd-describe-package) ; RET — describe the package under point (C-h P)
@@ -1571,15 +1823,16 @@ C-c C-c applying it — and reload it live. Outside the browser, prompts."
 (def packages-mode-layer
   {:name 'packages
    :writable :toggle
-   :doc "Installed and available bedit packages — i installs, u updates, d removes."
+   :doc "Installed and available bedit packages — i installs or updates, d marks for deletion, x deletes."
    :keymap packages/packages-keymap
    ;; a table: a long description is cut at the window's edge, never wrapped under the columns
    :long-lines :truncate
-   ;; C-n/C-p and the arrows are rebound here to the ORDINARY line motions, and RET to C-h P's
-   ;; describe-package; claiming those would hide them from M-x in every other buffer, so
-   ;; they stay global
+   ;; C-n/C-p and the arrows are rebound here to the ORDINARY line motions, RET to C-h P's
+   ;; describe-package and i to M-x package-install (which prompts outside the browser);
+   ;; claiming those would hide them from M-x in every other buffer, so they stay global
    :commands (modes/layer-commands packages/packages-keymap
-               {:except ["next-line" "previous-line" "describe-package" "package-update-all"]})})
+               {:except ["next-line"
+                          "previous-line" "describe-package" "package-update-all" "package-install"]})})
 
 (modes/register-special-type :packages 'packages/packages-mode-layer)
 
@@ -1589,6 +1842,6 @@ C-c C-c applying it — and reload it live. Outside the browser, prompts."
    :type 'bool
    :model-key :package-review-updates
    :commented? true
-   :doc (str "true: a package update (u in *Packages*, M-x package-update) is fetched and shown\n"
-          "first — the versions, its changelog, the diff of its files — and applied with C-c C-c\n"
+   :doc (str "true: a package update (i on an installed package, M-x package-update) is fetched and\n"
+          "shown first — the versions, its changelog, the diff of its files — and applied with C-c C-c\n"
           "(C-c C-k drops it); false: applied as soon as it arrives")})

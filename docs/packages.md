@@ -285,12 +285,16 @@ Built on Part 1 and on the config registries from
    and its candidates arrive with the answer. An update reloads the plugin's files in load
    order (brood's `reflect/source-load-order`), so a changed macro reaches its callers on the
    one reload. **An update is shown before it is applied (2026-11-10, Emacs bug #74604's
-   wish):** `u` in `*Packages*` and `M-x package-update` stage the new version off the loop and
+   wish):** `i` on an installed package in `*Packages*`, `M-x package-install` of an installed
+   name and `M-x package-update` stage the new version off the loop — newer only, never a
+   downgrade — with the new libraries it needs staged beside it (not installed), and
    open `*Package Diff: NAME*` — `NAME old → new`, the package's own `CHANGELOG.md` (or `NEWS`)
    entries for the versions after the installed one up to the new one, then every file the
    new version adds, deletes or changes as hunk sections painted as every diff in bedit is
    (`src/packages/review.blsp` over `diffs/vcs-hunk-sections` and `diffs`; TAB folds).
-   `C-c C-c` moves the staged copy into place and applies it live; `C-c C-k` or `q` deletes
+   `C-c C-c` moves the staged copies into place (the old copy renamed aside first, so a failed
+   move puts it back) and applies it live — after a y/n naming the change when its signing key
+   changed, which holds even an unreviewed update for review; `C-c C-k` or `q` deletes
    the staged copy and keeps the installed one. Until `C-c C-c` the installed copy is never
    touched, so a failed fetch, a refusal, a C-g, a drop or a review left open all keep it. An
    open review's staging dir is noted in the runtime's `:packages/reviews` registry so the
@@ -359,7 +363,8 @@ Built on Part 1 and on the config registries from
 
 ## What removing or updating a package takes back (built)
 
-Removing a package (`packages/remove!`, `d` in *Packages*) and updating one
+Removing a package (`packages/remove!`, after a y/n — `M-x package-remove`, or `d` to mark and
+`x` to delete in *Packages*) and updating one
 (`packages/update-plugin!`) go through ONE retirement, `packages/ledger/retire-package`, and then
 put the open buffers right. Like Emacs's `unload-feature`, it leaves the editor as it was
 before the package loaded:

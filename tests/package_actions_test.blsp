@@ -1,0 +1,343 @@
+;; What the package manager does to the packages a person has: nothing is deleted without a
+;; y/n, an install never downgrades or keeps the old code running, an update under review
+;; installs nothing (its libraries included) until C-c C-c, a changed signing key asks first,
+;; and moving a new copy in never leaves the package missing. No network: `*registry*` is a stub
+;; and the package dir a scratch one (`*config-base*`).
+
+(defmodule package-actions-test
+  (:use test)
+  (:use testkit :only [press type-str said])
+  (:use-internals packages)
+  (:use config-paths :only [*config-base*]) ; a scratch config dir, never the user's packages
+  (:use minibuffer :only [mb-text])
+  (:use model)
+  (:use editor/buffer)
+  (:use packages :only [*registry*]))
+
+(defn- pa-write (dir name version body &optional (manifest-tail ""))
+  "Package `name`@`version` under `dir`, enhancing bedit, its module's body `body`."
+  (let (root (path/join dir name))
+    (os/cmd "mkdir" ["-p" (path/join root "src")])
+    (file/spit (path/join root "project.blsp")
+      (str "(project :name \""
+        name "\" :version \"" version "\" :enhances {bedit \">= 0.1\"}" manifest-tail ")\n"))
+    (file/spit (path/join root "src" (str name ".blsp")) (str "(defmodule " name ")\n" body "\n"))))
+
+(defn- pa-dir (base) (path/join base "bedit" "packages"))
+
+(defn- pa-registry (version &optional (overrides {}))
+  "A hive whose every package is at `version`, its install writing that package."
+  (merge {:enhancers (fn (_app) [])
+          :latest-version (fn (_name) version)
+          :install (fn (name dest-dir)
+                     (do
+                       (pa-write dest-dir name version "(defn bedit-plugin () {})")
+                       {:name name :version version :signature :unsigned}))}
+    overrides))
+
+(defn- pa-run (base registry thunk)
+  (binding (*config-base* base *registry* registry) (thunk)))
+
+(defn- pa-model () (ed-init (make-buffer "")))
+
+(defn- pa-text (m name)
+  (let (index (ed-buffer-index-by-name m name))
+    (if (nil? index) "" (buffer-text (nth (:buffers m) index)))))
+
+(defn- pa-installed (base name)
+  (binding (*config-base* base) (packages/store/installed-version name)))
+
+(defn- pa-stagings (base)
+  (seq/filter (file/ls (pa-dir base)) (fn (entry) (string/starts-with? entry ".staging-"))))
+
+(defn- pa-retire (base name)
+  (pa-run base
+    (pa-registry "1.0.0")
+    (fn () (%with-load-journal (fn () (packages/ledger/retire-package name))))))
+
+;; ---- 1. removing asks first ------------------------------------------------------
+
+(describe "removing a package asks first"
+  (test "M-x package-remove-prompt: an exact name, then a y/n; n keeps it, y deletes it"
+    (let (base (temp-dir "bedit-pkgs-")
+          _ (pa-write (pa-dir base) "pkgsuxrm" "1.0.0" "(defn bedit-plugin () {})")
+          registry (pa-registry "1.0.0")
+          asked (pa-run base
+                  registry
+                  (fn ()
+                    (press (type-str (packages/cmd-package-remove-prompt (pa-model) nil) "pkgsuxrm")
+                      [:enter])))
+          still-there? (file/exists? (path/join (pa-dir base) "pkgsuxrm"))
+          kept (pa-run base registry (fn () (press asked ["n"])))
+          removed (pa-run base registry (fn () (press asked ["y"]))))
+      (is (includes? (:prompt (:read-char asked)) "Delete package pkgsuxrm? (y or n)"))
+      (is still-there?)
+      (assert= (:echo kept) "pkgsuxrm kept")
+      (is (includes? (:echo removed) "removed pkgsuxrm"))
+      (refute (file/exists? (path/join (pa-dir base) "pkgsuxrm")))))
+  (test "a blank answer, or a fuzzy one, removes nothing and asks nothing"
+    (let (base (temp-dir "bedit-pkgs-")
+          _ (pa-write (pa-dir base) "pkgsuxkeep" "1.0.0" "(defn bedit-plugin () {})")
+          registry (pa-registry "1.0.0")
+          blank (pa-run base
+                  registry
+                  (fn () (press (packages/cmd-package-remove-prompt (pa-model) nil) [:enter])))
+          fuzzy (pa-run base
+                  registry
+                  (fn ()
+                    (press (type-str (packages/cmd-package-remove-prompt (pa-model) nil) "uxkeep")
+                      [:enter]))))
+      (assert= (said blank) "[No match]")
+      (is (:minibuffer blank))
+      (is (nil? (:read-char blank)))
+      (assert= (said fuzzy) "[No match]")
+      (is (nil? (:read-char fuzzy)))
+      (is (file/exists? (path/join (pa-dir base) "pkgsuxkeep")))))
+  (test "a y/n question re-asks on any other key, as Emacs's does"
+    (let (base (temp-dir "bedit-pkgs-")
+          _ (pa-write (pa-dir base) "pkgsuxask" "1.0.0" "(defn bedit-plugin () {})")
+          asked (pa-run base
+                  (pa-registry "1.0.0")
+                  (fn () (packages/cmd-package-remove (pa-model) nil)))
+          asked (pa-run base
+                  (pa-registry "1.0.0")
+                  (fn ()
+                    (press (type-str asked "pkgsuxask") [:enter "x"]))))
+      (is (string/starts-with? (:prompt (:read-char asked)) "Please answer y or n."))
+      (is (file/exists? (path/join (pa-dir base) "pkgsuxask")))))
+  :isolated (test "*Packages*: d marks, u unmarks, x deletes the marked after a y/n"
+    (let (base (temp-dir "bedit-pkgs-")
+          _ (pa-write (pa-dir base) "pkgsuxmark" "1.0.0" "(defn bedit-plugin () {})")
+          registry (pa-registry "1.0.0")
+          shown (pa-run base registry (fn () (packages/show-packages (pa-model))))
+          marked (pa-run base registry (fn () (press shown ["d"])))
+          ;; one row: the move to the next line stays on it
+          unmarked (pa-run base registry (fn () (press marked ["u"])))
+          nothing (pa-run base registry (fn () (press unmarked ["x"])))
+          marked-only? (file/exists? (path/join (pa-dir base) "pkgsuxmark"))
+          asked (pa-run base registry (fn () (press shown ["d" "x"])))
+          deleted (pa-run base registry (fn () (press asked ["y"]))))
+      (assert= (:name (packages/package-row-at shown)) "pkgsuxmark")
+      (is (any? (string/split (pa-text marked "*Packages*") "\n")
+            (fn (line) (string/starts-with? line "D "))))
+      (is marked-only?)
+      (refute (any? (string/split (pa-text unmarked "*Packages*") "\n")
+                (fn (line) (string/starts-with? line "D "))))
+      (assert= (:echo nothing) "No operations specified")
+      (is (includes? (:prompt (:read-char asked)) "Delete 1 package (pkgsuxmark)? (y or n)"))
+      (refute (file/exists? (path/join (pa-dir base) "pkgsuxmark")))
+      (is (empty? (packages/package-marks deleted))))))
+
+;; ---- 2. one install entry: install, or update newer only ---------------------------
+
+(describe "installing an installed package updates it, never downgrades"
+  (test "i, the prompt and M-x package-install all start the same job"
+    (let (base (temp-dir "bedit-pkgs-")
+          _ (pa-write (pa-dir base) "pkgsuxone" "1.0.0" "(defn bedit-plugin () {})"))
+      (pa-run base
+        (pa-registry "1.0.0")
+        (fn ()
+          (assert= (packages/install-job-for (pa-model) "pkgsuxnew")
+            {:kind :install :name "pkgsuxnew"})
+          (assert= (packages/install-job-for (pa-model) "pkgsuxone")
+            {:kind :update :name "pkgsuxone" :review true})))))
+  (test "an install job for an installed package with an OLDER hive copy leaves it as it is"
+    (let (base (temp-dir "bedit-pkgs-")
+          _ (pa-write (pa-dir base) "pkgsuxdown" "2.0.0" "(defn bedit-plugin () {})")
+          outcome (pa-run base
+                    (pa-registry "1.0.0")
+                    (fn ()
+                      (packages/run-package-job *registry* {:kind :install :name "pkgsuxdown"}))))
+      (is (:current outcome))
+      (assert= (pa-installed base "pkgsuxdown") "2.0.0")))
+  :isolated (test "M-x package-install over an installed package fetches its update for review"
+    (let (base (temp-dir "bedit-pkgs-")
+          _ (pa-write (pa-dir base) "pkgsuxup" "1.0.0" "(defn bedit-plugin () {})")
+          registry (pa-registry "1.1.0")
+          shown (pa-run base
+                  registry
+                  (fn ()
+                    (press (type-str (packages/cmd-package-install-prompt (pa-model) nil)
+                             "pkgsuxup")
+                      [:alt-enter]))))
+      (is (includes? (pa-text shown "*Package Diff: pkgsuxup*") "pkgsuxup 1.0.0 → 1.1.0"))
+      (assert= (pa-installed base "pkgsuxup") "1.0.0")
+      (pa-run base registry (fn () (packages/cmd-package-review-drop shown nil)))))
+  :isolated (test "M-x package-update-prompt takes an installed name and updates it"
+    (let (base (temp-dir "bedit-pkgs-")
+          _ (pa-write (pa-dir base) "pkgsuxupd" "1.0.0" "(defn bedit-plugin () {})")
+          registry (pa-registry "1.2.0")
+          done (pa-run base
+                 registry
+                 (fn ()
+                   (press (type-str (packages/cmd-package-update-prompt (assoc (pa-model)
+                                                                          :package-review-updates
+                                                                            false)
+                                      nil)
+                            "pkgsuxupd")
+                     [:enter]))))
+      (is (includes? (:echo done) "updated pkgsuxupd → 1.2.0"))
+      (assert= (pa-installed base "pkgsuxupd") "1.2.0")
+      (pa-retire base "pkgsuxupd")))
+  :isolated (test "package-install-directory: a new one installs, the same version reloads, an older one asks"
+    (let (base (temp-dir "bedit-pkgs-")
+          checkout (temp-dir "bedit-checkout-")
+          _ (pa-write checkout
+              "pkgsuxdir" "1.0.0" "(defn bedit-plugin () {})\n(defn generation () 1)")
+          source (path/join checkout "pkgsuxdir")
+          registry (pa-registry "1.0.0")
+          installed (pa-run base
+                      registry
+                      (fn () (packages/package-install-directory (pa-model) source)))
+          _ (file/spit (path/join source "src" "pkgsuxdir.blsp")
+              "(defmodule pkgsuxdir)\n(defn bedit-plugin () {})\n(defn generation () 2)\n")
+          reloaded (pa-run base
+                     registry
+                     (fn () (packages/package-install-directory (pa-model) source)))
+          _ (pa-write checkout
+              "pkgsuxdir" "0.9.0" "(defn bedit-plugin () {})\n(defn generation () 0)")
+          asked (pa-run base
+                  registry
+                  (fn () (packages/package-install-directory (pa-model) source)))
+          declined (pa-run base registry (fn () (press asked ["n"]))))
+      (is (includes? (:echo installed) "installed pkgsuxdir 1.0.0"))
+      (assert= ((reflect/eval 'pkgsuxdir/generation)) 2)
+      (is (includes? (:echo reloaded) "pkgsuxdir"))
+      (is (includes? (:prompt (:read-char asked)) "install the OLDER 0.9.0"))
+      (assert= (:echo declined) "pkgsuxdir 1.0.0 stays installed")
+      (assert= (pa-installed base "pkgsuxdir") "1.0.0")
+      (pa-retire base "pkgsuxdir"))))
+
+;; ---- 3. a reviewed update's libraries are staged, shown, and committed only on C-c C-c ----
+
+(defn- pa-lib-registry (overrides)
+  "A hive where `pkgsuxrev` 1.1.0 needs the new library `pkgsuxlib` 0.2.0."
+  (pa-registry "1.1.0"
+    (merge {:install (fn (name dest-dir)
+                       (if (= name "pkgsuxlib")
+                         (do
+                           (pa-write dest-dir name "0.2.0" "(defn answer () 42)")
+                           (file/spit (path/join dest-dir name "project.blsp")
+                             "(project :name \"pkgsuxlib\" :version \"0.2.0\")\n")
+                           {:name name :version "0.2.0"})
+                         (do
+                           (pa-write dest-dir
+                             name "1.1.0" "(defn bedit-plugin () {})"
+                             " :dependencies [[pkgsuxlib :version \"0.2.0\"]]")
+                           {:name name :version "1.1.0" :signature :unsigned})))}
+      overrides)))
+
+(defn- pa-review (base registry)
+  (pa-write (pa-dir base) "pkgsuxrev" "1.0.0" "(defn bedit-plugin () {})")
+  (pa-run base registry (fn () (packages/apply-plugin! "pkgsuxrev" true)))
+  (pa-run base
+    registry
+    (fn () (packages/launch-job (pa-model) {:kind :update :name "pkgsuxrev" :review true}))))
+
+(describe "a reviewed update's new libraries"
+  :isolated (test "are staged, not installed, and the review names them with their files"
+    (let (base (temp-dir "bedit-pkgs-")
+          registry (pa-lib-registry {})
+          shown (pa-review base registry)
+          text (pa-text shown "*Package Diff: pkgsuxrev*"))
+      (is (includes? text "New libraries (1)"))
+      (is (includes? text "pkgsuxlib 0.2.0"))
+      (is (includes? text "src/pkgsuxlib.blsp"))
+      (assert= (pa-installed base "pkgsuxlib") nil)
+      (assert= (count (pa-stagings base)) 2)
+      (pa-run base registry (fn () (packages/cmd-package-review-drop shown nil)))
+      (pa-retire base "pkgsuxrev")))
+  :isolated (test "C-c C-k deletes them with the package's staging"
+    (let (base (temp-dir "bedit-pkgs-")
+          registry (pa-lib-registry {})
+          shown (pa-review base registry)
+          _ (pa-run base registry (fn () (packages/cmd-package-review-drop shown nil))))
+      (is (empty? (pa-stagings base)))
+      (assert= (pa-installed base "pkgsuxlib") nil)
+      (assert= (pa-installed base "pkgsuxrev") "1.0.0")
+      (pa-retire base "pkgsuxrev")))
+  :isolated (test "C-c C-c installs them with the package"
+    (let (base (temp-dir "bedit-pkgs-")
+          registry (pa-lib-registry {})
+          shown (pa-review base registry)
+          applied (pa-run base registry (fn () (packages/cmd-package-review-apply shown nil))))
+      (is (includes? (:echo applied) "updated pkgsuxrev → 1.1.0 (with pkgsuxlib 0.2.0)"))
+      (assert= (pa-installed base "pkgsuxlib") "0.2.0")
+      (assert= (pa-installed base "pkgsuxrev") "1.1.0")
+      (is (empty? (pa-stagings base)))
+      (pa-retire base "pkgsuxrev"))))
+
+;; ---- 4. a changed signing key asks before an update is applied ------------------------
+
+(defn- pa-key-registry ()
+  (pa-registry "1.1.0"
+    {:install (fn (name dest-dir)
+                (do
+                  (pa-write dest-dir name "1.1.0" "(defn bedit-plugin () {})")
+                  {:name name
+                   :version "1.1.0"
+                   :signature :key-changed
+                   :warning (str name " 1.1.0 is signed by a DIFFERENT key than the one pinned.")}))}))
+
+(describe "an update whose signing key changed"
+  :isolated (test "C-c C-c asks, naming the change; n leaves it staged, y applies it"
+    (let (base (temp-dir "bedit-pkgs-")
+          registry (pa-key-registry)
+          _ (pa-write (pa-dir base) "pkgsuxkey" "1.0.0" "(defn bedit-plugin () {})")
+          shown (pa-run base
+                  registry
+                  (fn ()
+                    (packages/launch-job (pa-model) {:kind :update :name "pkgsuxkey" :review true})))
+          asked (pa-run base registry (fn () (packages/cmd-package-review-apply shown nil)))
+          declined (pa-run base registry (fn () (press asked ["n"])))
+          applied (pa-run base registry (fn () (press asked ["y"]))))
+      (is (includes? (pa-text shown "*Package Diff: pkgsuxkey*") "signing key CHANGED"))
+      (is (includes? (:prompt (:read-char asked)) "DIFFERENT key"))
+      (is (includes? (:echo declined) "not applied"))
+      (is (includes? (:echo applied) "updated pkgsuxkey → 1.1.0"))
+      (assert= (pa-installed base "pkgsuxkey") "1.1.0")
+      (pa-retire base "pkgsuxkey")))
+  :isolated (test "without review it is held for review instead of applied"
+    (let (base (temp-dir "bedit-pkgs-")
+          registry (pa-key-registry)
+          _ (pa-write (pa-dir base) "pkgsuxheld" "1.0.0" "(defn bedit-plugin () {})")
+          shown (pa-run base
+                  registry
+                  (fn ()
+                    (packages/launch-job (pa-model)
+                      {:kind :update :name "pkgsuxheld" :review false}))))
+      (is (includes? (:echo shown) "SIGNING KEY CHANGED"))
+      (assert= (pa-installed base "pkgsuxheld") "1.0.0")
+      (pa-run base registry (fn () (packages/cmd-package-review-drop shown nil))))))
+
+;; ---- 5. moving a new copy in never leaves the package missing ---------------------------
+
+(describe "commit-staged"
+  (test "a move that fails puts the installed copy back"
+    (let (base (temp-dir "bedit-pkgs-")
+          _ (pa-write (pa-dir base) "pkgsuxatom" "1.0.0" "(defn bedit-plugin () {})")
+          staging (path/join (pa-dir base) ".staging-broken")
+          _ (file/mkdir staging)
+          ;; the staging holds no copy to move in: the rename fails
+          raised (pa-run base
+                   (pa-registry "1.0.0")
+                   (fn ()
+                     (try
+                       (packages/commit-staged "pkgsuxatom" {:staging staging :result {}})
+                       (catch e :raised)))))
+      (assert= raised :raised)
+      (assert= (pa-installed base "pkgsuxatom") "1.0.0")))
+  (test "a move that works replaces the old copy and leaves nothing aside"
+    (let (base (temp-dir "bedit-pkgs-")
+          _ (pa-write (pa-dir base) "pkgsuxswap" "1.0.0" "(defn bedit-plugin () {})")
+          staging (path/join (pa-dir base) ".staging-good")
+          _ (pa-write staging "pkgsuxswap" "1.1.0" "(defn bedit-plugin () {})")
+          result (pa-run base
+                   (pa-registry "1.0.0")
+                   (fn ()
+                     (packages/commit-staged "pkgsuxswap"
+                       {:staging staging :result {:version "1.1.0"}}))))
+      (assert= (:version result) "1.1.0")
+      (assert= (pa-installed base "pkgsuxswap") "1.1.0")
+      (refute (file/exists? staging))
+      (is (empty? (seq/filter (file/ls (pa-dir base)) (fn (entry) (string/starts-with? entry "."))))))))

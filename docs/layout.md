@@ -2010,9 +2010,19 @@ src/packages.blsp
     not dropped), *Packages* and C-h P mark it. A package prompt (M-x
     package-install, C-h P) fetches the list itself when it has none,
     saying so (`package-prompt`); `package-info` is what C-h P shows.
+    Every install starts ONE job (`install-job-for`): an installed package
+    is UPDATED, newer only (an older copy from a directory after a y/n),
+    its modules loaded again. A copy moves in atomically (`commit-staged`:
+    the old one aside, the new in, then the old deleted, put back on a
+    failure). Nothing is deleted without a y/n (`confirm-remove`; the
+    remove prompt takes an exact name), and *Packages* marks: d marks,
+    u unmarks, x deletes the marked after asking.
     An update is SHOWN first (`:package-review-updates`, default on):
-    staged off the loop, *Package Diff: NAME* (package-review), C-c C-c
-    moves the staged copy in and applies it, C-c C-k / q deletes it;
+    staged off the loop with the new libraries it needs (`stage-dependencies`,
+    shown with their versions and files), *Package Diff: NAME*
+    (package-review), C-c C-c
+    moves the staged copies in and applies it — after a y/n when its signing
+    key changed, which holds even an unreviewed update — C-c C-k / q deletes them;
     an open review's staging dir is kept in `:packages/reviews`.
     M-x package-update-all (U in *Packages*): ONE job stages every
     outdated package side by side (`.staging-<id>-<name>`), ONE
