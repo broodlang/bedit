@@ -126,7 +126,7 @@ gives, *for free*:
 
 - **Validation** — `config-warnings` becomes a fold over the registry's `:type`s;
   delete `*fullscreen-values*` / `*cursor-values*`.
-- **The default init file** — `*init-default-source*` is *generated* from each
+- **The default init file** — `init-default-source` is *generated* from each
   setting's `:doc` + `:default`, never hand-maintained again.
 - **`apply-to-model`** — a fold over `:model`-scoped settings; adding a setting is
   **one `defsetting`**, not four edits.
