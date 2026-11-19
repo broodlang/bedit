@@ -1,0 +1,895 @@
+(defmodule corpus
+  "The language corpus: realistic sample files under `tests/corpus/<mode>/`, one directory per
+mode type (`rust`, `terraform`, `lisp`), and the checks every sample gets
+(`tests/language_corpus_test.blsp` registers them, one named test per file and check). A
+language is tested by DROPPING a file of it there, written in its formatter's style.
+
+A sample asserts its own colours with comment lines, Emacs's `ert-font-lock` carets in bedit's
+faces. Carets sit under the columns of the nearest line above that is not itself an assertion,
+each run followed by what those columns are painted:
+
+    let total = count(words);
+    // ^^^^^^^^^^^ plain  ^^^^^ function
+    //                          !keyword
+
+The marker is the mode's `:comment` (`//`, `#`, `;;`, `--`), or its `:comment-block` pair for a
+language with only block comments (`/* ^^^ keyword */`, `<!-- ^^^ string -->`). A face is a
+`:syntax/*` name without the prefix (`keyword string number constant comment special function
+definition doc symbol punctuation variable error`); `!name` asserts NOT that face, `plain` no face
+at all, and `<-` in place of carets is the column the marker itself starts at (for a token in
+column 0 or 1, where carets cannot reach). Columns count characters, a tab as one. An assertion
+line is skipped by the indent checks and left out of the golden listing.
+
+A line inside VERBATIM content — a heredoc's body, a raw string — is one whose indentation is
+its text, not the indenter's; it is found the way the indenter finds it, from the mode's
+`:indent :verbatim` kinds over the parse ([[verbatim-lines]]), so the sample carries no marker
+for it. The indent checks keep such a line as written.
+
+Each check answers a vector of PROBLEMS, readable sentences naming the line, and `[]` when the
+sample passes. Lives under tests/support beside `testkit`, whose sample-free helpers it builds on."
+  (:use model)
+  (:use testkit :only [file-model press indent-rows load-test-grammar])
+  (:use editor/buffer :only [buffer-text goto-char insert replace-region]))
+
+(def *corpus-root* "tests/corpus")
+
+;; ---- the corpus ------------------------------------------------------------------------------
+
+(defn golden-path (path)
+  "The golden face listing beside the sample at `path`: `counter.rs` → `counter.rs.faces`."
+  (str path ".faces"))
+
+(defn visit-path (path)
+  "The name the sample at `path` is visited as: a dotfile is kept as `dot.<name>` (`dot.gitignore`),
+so git and editors do not read the corpus's `.gitignore`, `.gitattributes` or `.editorconfig` as
+their own, and visited as `.<name>`, the name its mode matches.
+
+    (corpus/visit-path \"tests/corpus/gitignore/dot.gitignore\")   ;=> \"tests/corpus/gitignore/.gitignore\"
+    (corpus/visit-path \"tests/corpus/rust/counter.rs\")   ;=> \"tests/corpus/rust/counter.rs\""
+  (let (name (path/basename path))
+    (if (string/starts-with? name "dot.")
+      (path/join (path/dirname path) (string/substring name 3 (count name)))
+      path)))
+
+(defn- sample-file? (name)
+  ;; a sample, not its golden listing or an editor's leftover
+  (not (or (string/ends-with? name ".faces")
+         (string/ends-with? name "~")
+         (string/starts-with? name ".#"))))
+
+(defn corpus-files (&optional (language nil))
+  "Every sample of the corpus, sorted, as `{:language :name :path}` — the mode type its directory
+names, the file's name and its path — or only `language`'s."
+  (let (languages (if language [language] (sort (file/list-dirs *corpus-root*))))
+    (for (each languages
+           name
+           (sort (file/list-files (path/join *corpus-root* each)))
+           :when (sample-file? name)
+           :into [])
+      {:language each :name name :path (path/join *corpus-root* each name)})))
+
+(defn load-grammars ()
+  "Load every grammar a registered language declares, as a test does one
+(`testkit/load-test-grammar`): a sample's mode, its fallback and the languages it embeds all
+depend on them. Answers the set of the ones loaded."
+  (into #{} (seq/filter (languages/declared-grammars) load-test-grammar)))
+
+;; ---- a sample, read -----------------------------------------------------------------------
+
+(defn- line-starts (lines)
+  ;; the offset each line starts at
+  (reduce (range (dec (count lines)))
+    [0]
+    (fn (starts index) (conj starts (+ (last starts) (count (nth lines index "")) 1)))))
+
+(defn- leading (line)
+  "The leading whitespace of `line`."
+  (string/substring line 0 (- (count line) (count (string/trim-left line)))))
+
+(defn- blank? (line) (= (string/trim line) ""))
+
+(defn- markers (buffer)
+  ;; `[open close]` pairs an assertion line may be written in: the line comment, the block pair
+  (let (line-comment (ed-mode-service buffer :comment-syntax)
+        block (ed-mode-service buffer :comment-block))
+    (into []
+      (seq/keep [(when (string? line-comment) [(string/trim line-comment) ""])
+                  (when (vector? block) [(string/trim (first block)) (string/trim (second block))])]
+        identity))))
+
+(def- *face-names*
+  ;; the `:syntax/*` names an assertion may say, without the prefix
+  #{"keyword"
+    "string" "number" "constant" "comment" "special" "function" "definition" "doc" "symbol"
+    "punctuation" "variable" "error"})
+
+(defn- words (text column)
+  ;; the whitespace-separated words of `text`, which starts at `column`, as `[word column]`
+  (let (characters (vec (string/->list text))
+        total (count characters))
+    (letrec (walk (fn (index start acc)
+                    (cond
+                      (>= index total)
+                        (reverse (if start
+                                   (cons [(string/join (seq/subvec characters start index) "")
+                                           (+ column start)]
+                                     acc)
+                                   acc))
+                      (string/blank? (nth characters index))
+                        (walk (inc index)
+                          nil
+                          (if start
+                            (cons [(string/join (seq/subvec characters start index) "")
+                                    (+ column start)]
+                              acc)
+                            acc))
+                      else (walk (inc index) (or start index) acc))))
+      (walk 0 nil '()))))
+
+(defn- caret-run? (word) (every? (string/->list word) (fn (character) (= character "^"))))
+
+(defn- face-expression (word)
+  ;; `{:face name :negated bool}`, `{:plain true}`, or a failure naming the word
+  (let (negated (string/starts-with? word "!")
+        name (if negated (string/substring word 1 (count word)) word))
+    (cond
+      (and (= name "plain") (not negated)) {:plain true}
+      (contains? *face-names* name) {:face name :negated negated}
+      else (failure (str "unknown face `" word "`")))))
+
+(defn- parse-ranges (pairs marker-column)
+  ;; the `[[start end expression]]` a run of `range face` words says, or a failure
+  (letrec (walk (fn (rest-words acc)
+                  (cond
+                    (empty? rest-words) (vec (reverse acc))
+                    (empty? (rest rest-words))
+                      (failure (str "`" (first (first rest-words)) "` names no face"))
+                    else
+                      (let ([word column] (first rest-words)
+                            [face-word _] (second rest-words)
+                            expression (face-expression face-word)
+                            range (cond
+                                    (= word "<-") [marker-column (inc marker-column)]
+                                    (caret-run? word) [column (+ column (count word))]
+                                    else nil))
+                        (cond
+                          (nil? range) (failure (str "`" word "` is neither carets nor `<-`"))
+                          (failure? expression) expression
+                          else
+                            (walk (rest (rest rest-words))
+                              (cons [(first range) (second range) expression] acc)))))))
+    (walk pairs '())))
+
+(defn- parse-assertion (line marker-pairs)
+  "Nil when `line` is no assertion line; else `{:ranges [[start end expression]]}`, or
+`{:problem why}` for one that starts like an assertion and says something malformed."
+  (let (indentation (count (leading line))
+        trimmed (string/trim line))
+    (first (seq/keep marker-pairs
+             (fn ([open close])
+               (when (and (string/starts-with? trimmed open)
+                       (or (= close "") (string/ends-with? trimmed close)))
+                 (let (body (string/substring trimmed
+                              (count open)
+                              (- (count trimmed) (count close)))
+                       pairs (words body (+ indentation (count open)))
+                       head (first (first pairs)))
+                   (when (and (string? head) (or (string/starts-with? head "^") (= head "<-")))
+                     (let (ranges (parse-ranges pairs indentation))
+                       (if (failure? ranges)
+                         {:problem (error-message ranges)}
+                         {:ranges ranges :marker indentation}))))))))))
+
+(defn- spec-of (type)
+  ;; the registered language spec of the mode `type`, or nil
+  (let (spec-ref (registry/lookup :languages/specs type))
+    (when spec-ref (reflect/eval spec-ref))))
+
+(defn sample (entry)
+  "The corpus sample `entry` names ([[corpus-files]]), read: `{:language :name :path :id :text
+:lines :starts :buffer :type :spec :assertions :assertion-lines :problems}` — its buffer typed by
+the file's name as a visit types it, every assertion line parsed (`:assertions` each `{:line
+:target :ranges}`, its target the line it is about), and the malformed ones in `:problems`."
+  (let ({:keys [language name path]} entry
+        text (file/slurp path)
+        lines (vec (string/split text "\n"))
+        buffer (ed-current-buf (file-model text (visit-path path)))
+        marker-pairs (markers buffer)
+        parsed (for (index (range (count lines)) :into [])
+                 [index (parse-assertion (nth lines index "") marker-pairs)])
+        assertion-lines (into #{} (seq/keep parsed (fn ([index found]) (when found index))))
+        target-of (fn (index)
+                    (letrec (up (fn (at)
+                                  (cond
+                                    (< at 0) nil
+                                    (contains? assertion-lines at) (up (dec at))
+                                    else at)))
+                      (up (dec index))))
+        assertions (for ([index found] parsed :when (and found (:ranges found)) :into [])
+                     {:line index
+                      :target (target-of index)
+                      :ranges (:ranges found)
+                      :marker (:marker found)})
+        problems (into []
+                   (append (for ([index found] parsed :when (and found (:problem found)))
+                             (str "line " (inc index) ": malformed assertion: " (:problem found)))
+                     (for (each assertions :when (nil? (:target each)))
+                       (str "line " (inc (:line each)) ": an assertion with no line above it")))))
+    {:language language
+     :name name
+     :path path
+     :id (str language "/" name)
+     :text text
+     :lines lines
+     :starts (line-starts lines)
+     :buffer buffer
+     :type (:type buffer)
+     :spec (spec-of (:type buffer))
+     :assertions assertions
+     :assertion-lines assertion-lines
+     :problems problems}))
+
+(defn grammar (sample)
+  "The tree-sitter grammar `sample`'s mode parses with, or nil for a mode that parses none."
+  (ed-mode-service (:buffer sample) :ts-lang))
+
+(defn ready? (sample)
+  "Whether the runtime can run `sample`'s parsed checks: its mode parses with no grammar, or with
+one that is loaded."
+  (let (lang (grammar sample)) (or (nil? lang) (grammars/grammar-loaded? lang))))
+
+(defn indented? (sample)
+  "Whether `sample`'s mode INDENTS — has an `:indent` service that reads the code rather than the
+line's own content (YAML's `:indent :content`), so the indent checks apply."
+  (and (not (nil? (ed-mode-service (:buffer sample) :indent)))
+    (not (= (get (:spec sample) :indent) :content))))
+
+(defn- line-at (sample offset)
+  ;; the 0-based line holding `offset`
+  (let (starts (:starts sample))
+    (dec (count (seq/take-while starts (fn (start) (<= start offset)))))))
+
+;; ---- 1. the mode ---------------------------------------------------------------------------
+
+(defn mode-problems (sample)
+  "The sample's file name must type it to the mode its directory names."
+  (let (type (:type sample))
+    (if (= (->string type) (:language sample))
+      []
+      [(str (:name sample) " opens in " (pr-str type) ", not :" (:language sample))])))
+
+;; ---- 2. faces: the assertions, and the golden listing --------------------------------------
+
+(defn- face-names-of (face)
+  ;; the names a resolved face is painted by, sorted — several where a theme paints them alike
+  (sort (seq/filter (vec *face-names*)
+          (fn (name) (= (editor/face/face (keyword (str "syntax/" name))) face)))))
+
+(defn- treesit-labelled (sample)
+  "The `[start end [name]]` spans `sample`'s tree-sitter mode paints, each with the ONE face name
+its table gives it — the kernel's span query over the mode's own face table and injections, as
+`editor/treesit/fontify` asks it before it resolves the names — or nil for a mode that is not."
+  (let (buffer (:buffer sample)
+        lang (grammar sample)
+        faces (ed-mode-service buffer :ts-faces)
+        injections-of (ed-mode-service buffer :ts-injections))
+    (when (and lang (map? faces) (grammars/grammar-loaded? lang))
+      (let (injections (when injections-of (injections-of))
+            raw (%tree-sitter-spans (:text sample) lang faces true injections))
+        (seq/keep raw
+          (fn (span)
+            (let (raw-name (nth span 2)
+                  name (case raw-name
+                         :__keyword__ :syntax/keyword
+                         :__punctuation__ :syntax/punctuation
+                         raw-name))
+              (when (editor/face/face name)
+                [(nth span 0) (nth span 1) [(string/drop-prefix (->string name) "syntax/")]]))))))))
+
+(defn painted (sample)
+  "`{:spans :labelled :problems}`: the `[start end face]` spans `sample`'s mode paints (its
+`:fontify` service), the same spans with the face NAMES they were painted by, and why the two
+disagree. A tree-sitter mode names each span exactly ([[treesit-labelled]], checked against the
+service span for span); another mode's spans carry only a colour, named by every face the theme
+paints that colour (`keyword|symbol`)."
+  (let (fontify (ed-mode-service (:buffer sample) :fontify)
+        spans (vec (fontify (:text sample)))
+        exact (treesit-labelled sample)
+        resolved (when exact
+                   (vec (map exact
+                          (fn ([start end names])
+                            [start end (editor/face/face (keyword (str "syntax/" (first names))))])))))
+    (cond
+      (nil? exact)
+        {:spans spans
+         :labelled (vec (map spans (fn ([start end face]) [start end (face-names-of face)])))
+         :problems []}
+      (= resolved spans) {:spans spans :labelled (vec exact) :problems []}
+      else
+        {:spans spans
+         :labelled (vec (map spans (fn ([start end face]) [start end (face-names-of face)])))
+         :problems ["the face names read from the mode's table disagree with what its :fontify paints"]})))
+
+(defn- labels-at (labelled offset)
+  ;; the names painting `offset` — nil where nothing does
+  (let (hit (seq/find labelled (fn ([start end _]) (and (<= start offset) (< offset end)))))
+    (when hit (nth hit 2))))
+
+(defn- describe-expression (expression)
+  (cond
+    (:plain expression) "plain"
+    (:negated expression) (str "!" (:face expression))
+    else (:face expression)))
+
+(defn- column-holds? (expression names)
+  (cond
+    (:plain expression) (nil? names)
+    (:negated expression) (not (includes? (or names []) (:face expression)))
+    else (includes? (or names []) (:face expression))))
+
+(defn- assertion-problem (sample labelled assertion caret)
+  ;; why the caret range `caret` of `assertion` does not hold, or nil
+  (let (target (:target assertion)
+        line (nth (:lines sample) target)
+        line-start (nth (:starts sample) target)
+        [from to expression] caret
+        columns (range from to)
+        past (seq/find columns (fn (column) (>= column (count line))))
+        wrong (seq/find columns
+                (fn (column)
+                  (and (< column (count line))
+                    (not (column-holds? expression (labels-at labelled (+ line-start column)))))))
+        where (str "line "
+                (inc target)
+                " cols "
+                from
+                "-"
+                (dec to)
+                " `"
+                (string/substring line (math/min from (count line)) (math/min to (count line)))
+                "`, asserted on line "
+                (inc (:line assertion))))
+    (cond
+      past (str where ": column " past " is past the end of the line")
+      wrong
+        (str where
+          ": want "
+          (describe-expression expression)
+          ", column "
+          wrong
+          " is "
+          (let (names (labels-at labelled (+ line-start wrong)))
+            (if names (string/join names "|") "plain")))
+      else nil)))
+
+(defn- marker-problem (sample labelled assertion)
+  ;; why `assertion`'s line is no comment where it stands — a `//` line in a PHP file's HTML is
+  ;; page text — or nil
+  (let (names (labels-at labelled (+ (nth (:starts sample) (:line assertion)) (:marker assertion))))
+    (when (not (includes? (or names []) "comment"))
+      (str "line "
+        (inc (:line assertion))
+        ": this assertion line is no comment here (painted "
+        (if names (string/join names "|") "plain")
+        "), so it is code or text of the sample"))))
+
+(defn face-problems (sample &optional (painting nil))
+  "Every assertion line of `sample` must hold: each caret column painted as it says, the line
+itself painted as a comment — and a sample of a mode with a comment marker carries at least one.
+`painting` is [[painted]]'s answer when the caller has it."
+  (let (painting (or painting (painted sample))
+        labelled (:labelled painting)
+        bare (and (empty? (:assertions sample)) (not (empty? (markers (:buffer sample))))))
+    (into (into (into (into (:problems sample) (:problems painting))
+                  (if bare
+                    [(str (:name sample) " asserts no faces: add caret lines under its tokens")]
+                    []))
+            (seq/keep (:assertions sample)
+              (fn (assertion) (marker-problem sample labelled assertion))))
+      (seq/keep (for (assertion (:assertions sample)
+                       :when (:target assertion)
+                       caret
+                       (:ranges assertion))
+                  (assertion-problem sample labelled assertion caret))
+        identity))))
+
+(defn golden-lines (sample &optional (painting nil))
+  "The golden face listing of `sample`: one `LINE:COL \"text\" face` row for every painted piece
+of a line (a span over several lines is listed a line at a time), lines from 1 and columns
+from 0, assertion lines left out — what [[golden-problems]] compares and
+`tools/corpus-golden.blsp` writes."
+  (let (painting (or painting (painted sample))
+        text (:text sample)
+        starts (:starts sample)
+        skip (:assertion-lines sample))
+    (into []
+      (mapcat (:labelled painting)
+        (fn ([start end names])
+          (seq/keep (range (line-at sample start) (inc (line-at sample (dec end))))
+            (fn (line)
+              (let (line-start (nth starts line)
+                    line-end (+ line-start (count (nth (:lines sample) line)))
+                    from (math/max start line-start)
+                    to (math/min end line-end))
+                (when (and (< from to) (not (contains? skip line)))
+                  (str (inc line)
+                    ":"
+                    (- from line-start)
+                    " "
+                    (pr-str (string/substring text from to))
+                    " "
+                    (string/join names "|")))))))))))
+
+(defn golden-text (sample &optional (painting nil))
+  "The golden file's text for `sample`: a header naming the command that wrote it, then
+[[golden-lines]]."
+  (str ";; "
+    (:id sample)
+    " — the faces its mode paints. Rewrite with "
+    "`nest run tools/corpus-golden.blsp -- "
+    (:language sample)
+    "` and review the diff.\n"
+    (string/join (golden-lines sample painting) "\n")
+    "\n"))
+
+(defn golden-problems (sample &optional (painting nil))
+  "The golden listing beside `sample` must be what its mode paints now: a missing file, or the
+first rows that differ."
+  (let (path (golden-path (:path sample))
+        command (str "nest run tools/corpus-golden.blsp -- " (:language sample)))
+    (if (not (file/exists? path))
+      [(str "no golden listing " path " — write it with `" command "` and review it")]
+      (let (want (vec (string/split (file/slurp path) "\n"))
+            got (vec (string/split (golden-text sample painting) "\n"))
+            differing (seq/filter (range (math/max (count want) (count got)))
+                        (fn (index) (not (= (get want index) (get got index))))))
+        (if (empty? differing)
+          []
+          (into [(str path
+                   " is stale: "
+                   (count differing)
+                   " row(s) differ — if the change is "
+                   "deliberate, `"
+                   command
+                   "` and review the diff")]
+            (for (index (take differing 6) :into [])
+              (str "row "
+                (inc index)
+                ": want "
+                (pr-str (get want index))
+                "  got "
+                (pr-str (get got index))))))))))
+
+;; ---- verbatim content ----------------------------------------------------------------------
+
+(defn verbatim-lines (sample)
+  "The lines of `sample` whose indentation is CONTENT — inside a node of its mode's `:indent
+:verbatim` kinds that began on an earlier line, or that begins at the line's start inside a node
+an earlier line opened: the rule `editor/treesit/indent-column` keeps a line as written by."
+  (let (kinds (let (indent (get (:spec sample) :indent))
+                (if (map? indent) (get indent :verbatim #{}) #{}))
+        lang (grammar sample)
+        text (:text sample))
+    (if (or (empty? kinds) (nil? lang) (not (grammars/grammar-loaded? lang)))
+      #{}
+      (into #{}
+        (seq/filter (range (count (:lines sample)))
+          (fn (index)
+            (let (line (nth (:lines sample) index)
+                  bol (nth (:starts sample) index)
+                  nodes (vec (editor/treesit/node-chain text lang (+ bol (count (leading line))))))
+              (and (not (blank? line))
+                (any? (range (count nodes))
+                  (fn (position)
+                    (let (node (nth nodes position)
+                          start (get node :start)
+                          parent (when (> position 0) (nth nodes (dec position))))
+                      (and (contains? kinds (get node :kind))
+                        (or (< start bol)
+                          (and (= start bol) parent (< (get parent :start) bol)))))))))))))))
+
+;; ---- the known gaps: a ratchet ------------------------------------------------------------
+;; A line check (indent, re-indent, typing, restart) that finds a gap the language's indenter or
+;; restart cannot close yet names it in tests/corpus/known-gaps.blsp, with why: the check then
+;; fails only on a line NOT listed, and on a listed line that now passes, so the list can only
+;; shrink. A check that does not apply to a language at all (Python's indentation is its syntax,
+;; so nothing can re-indent it from scratch) is listed `:off` with the reason.
+
+(def *gaps-path* "tests/corpus/known-gaps.blsp")
+
+(defn- known-gaps ()
+  ;; `{sample-id {check {:lines [n …] :why "…"} | {:off "why"}}}`
+  (if (file/exists? *gaps-path*) (or (reflect/read-first (file/slurp *gaps-path*)) {}) {}))
+
+(defn gap (sample check)
+  "What tests/corpus/known-gaps.blsp says of `check` (`:indent` `:reindent` `:typing`
+`:restart`) for `sample`: `{:lines [1-based …] :why}`, `{:off why}`, or nil."
+  (map/get-in (known-gaps) [(:id sample) check]))
+
+(defn applies? (sample check)
+  "Whether `check` applies to `sample` — not listed `:off` in the known gaps."
+  (nil? (get (gap sample check) :off)))
+
+(defn- ratchet (sample check found)
+  ;; the messages of `found` (`[[line message] …]`, lines from 1) not listed as known gaps of
+  ;; `check`, then one for each listed line that now passes
+  (let (known (into #{} (get (gap sample check) :lines []))
+        failing (into #{} (map found first)))
+    (into (into [] (for ([line message] found :when (not (contains? known line))) message))
+      (for (line (sort (vec known)) :when (not (contains? failing line)) :into [])
+        (str "line "
+          line
+          " is listed in "
+          *gaps-path*
+          " as a "
+          (->string check)
+          " gap but now passes — remove it")))))
+
+;; ---- 3. indentation ------------------------------------------------------------------------
+
+(defn- kept-as-written (sample)
+  ;; the lines the indent checks do not judge: assertions and verbatim content
+  (set/union (:assertion-lines sample) (verbatim-lines sample)))
+
+(defn- quote-line (line) (pr-str (string/trim line)))
+
+(defn indent-problems (sample)
+  "(a) Every line, asked of the mode's `:indent` service as the sample stands, indents to the
+column it already has (`testkit/indent-rows`)."
+  (let (skip (kept-as-written sample))
+    (ratchet sample
+      :indent (for (row (indent-rows (:text sample)
+                  (visit-path (:path sample))
+                  (fn (index) (contains? skip index)))
+             :when (not (= (:got row) (:want row)))
+             :into [])
+        [(inc (:line row))
+          (str "line "
+            (inc (:line row))
+            " "
+            (quote-line (nth (:lines sample) (:line row)))
+            ": indents to "
+            (:got row)
+            ", written at "
+            (:want row))]))))
+
+(defn- strip-lines (sample keep)
+  ;; the sample's text with every line's leading whitespace removed, but those in `keep`
+  (string/join (for (index (range (count (:lines sample))) :into [])
+                 (let (line (nth (:lines sample) index))
+                   (if (contains? keep index) line (string/trim-left line))))
+    "\n"))
+
+(defn reindent-problems (sample)
+  "(b) Re-indented from scratch — every line's leading whitespace removed (verbatim content
+kept), then the whole buffer indented by the editor's own `indent-region` (C-x h C-M-\\, through
+the real dispatch) — the buffer must read as the sample does."
+  (let (verbatim (verbatim-lines sample)
+        skip (set/union verbatim (:assertion-lines sample))
+        lines (:lines sample)
+        indented (press (file-model (strip-lines sample verbatim) (visit-path (:path sample)))
+                   [:ctrl-x "h" (keyword "ctrl-meta-\\")])
+        got (vec (string/split (buffer-text (ed-current-buf indented)) "\n")))
+    (ratchet sample
+      :reindent (for (index (range (count lines))
+             :when (not (or (contains? skip index) (= (get got index) (nth lines index))))
+             :into [])
+        [(inc index)
+          (str "line "
+            (inc index)
+            ": re-indented to "
+            (pr-str (get got index))
+            ", written "
+            (pr-str (nth lines index)))]))))
+
+(defn- column-of (buffer line)
+  ;; the column `line`'s leading whitespace reaches, at the buffer's tab width
+  (string/display-width (leading line) 0 (conventions/tab-width buffer)))
+
+(defn- typed-line (sample index)
+  ;; the model after line `index` was typed below the lines above it: RET through the dispatch,
+  ;; then the line's text inserted a character at a time, each followed by electric indent
+  (let (prefix (string/join (seq/subvec (:lines sample) 0 index) "\n")
+        start (let (m (file-model prefix (visit-path (:path sample))))
+                (ed-set-buf m (goto-char (ed-current-buf m) (count prefix)))))
+    (fold (string/->list (string/trim-left (nth (:lines sample) index)))
+      (press start [:enter])
+      (fn (m character)
+        (indent/ed-electric-reindent (ed-set-buf m (insert (ed-current-buf m) character)))))))
+
+(defn typing-problems (sample)
+  "(c) Typed line by line, as a user does: below the lines above it, as written and with nothing
+after them — the half-built buffer, whose parse is still broken — RET through the editor's own
+dispatch (`newline-and-indent`), then the line's text without its indentation, each character
+followed by electric indent (`indent/ed-electric-reindent`: a closing bracket, a block word). The
+characters are inserted rather than typed so electric pairs and completion stay out of it. Each
+line must end up at the column it is written at."
+  (let (skip (kept-as-written sample)
+        lines (:lines sample))
+    (ratchet sample
+      :typing (into []
+        (seq/keep (range 1 (count lines))
+          (fn (index)
+            (let (line (nth lines index))
+              (when (not (or (blank? line) (contains? skip index)))
+                (let (buffer (ed-current-buf (typed-line sample index))
+                      got (column-of buffer
+                            (nth (vec (string/split (buffer-text buffer) "\n")) index ""))
+                      want (column-of buffer line))
+                  (when (not (= got want))
+                    [(inc index)
+                      (str "line "
+                        (inc index)
+                        " "
+                        (quote-line line)
+                        ": typed, lands at "
+                        got
+                        ", written at "
+                        want)]))))))))))
+
+;; ---- 4. the restart invariant --------------------------------------------------------------
+
+(defn- clip-from (spans from)
+  ;; `spans` from offset `from` on, a span across it cut there
+  (vec (seq/keep spans (fn ([start end face]) (when (> end from) [(math/max start from) end face])))))
+
+(sig excerpt (string int -> string))
+(defn- excerpt (text at)
+  ;; the twenty characters of `text` from `at`, for a message
+  (string/substring text at (math/min (count text) (+ at 20))))
+
+(def- *restart-positions*
+  ;; the most line starts a restart check asks about: every Nth line of a longer sample
+  80)
+
+(defn- restart-problem (sample fontify restart whole position)
+  ;; why fontifying from the restart for the line at `position` paints otherwise, or nil
+  (let (text (:text sample)
+        cut (restart text position)
+        line (inc (line-at sample position)))
+    (if (not (and (int? cut) (<= 0 cut position)))
+      [line
+        (str "line "
+          line
+          ": restart answered "
+          (pr-str cut)
+          ", not an offset at or before "
+          position)]
+      (let (window (editor/highlight/shift-spans (fontify (string/substring text cut (count text)))
+                     cut)
+            want (clip-from whole position)
+            got (clip-from (vec window) position))
+        (when (not (= want got))
+          (let (index (seq/find (range (math/max (count want) (count got)))
+                        (fn (i) (not (= (get want i) (get got i)))))
+                at (first (or (get want index) (get got index))))
+            [line
+              (str "line "
+                line
+                ": from the restart at line "
+                (inc (line-at sample cut))
+                ", the window paints "
+                (pr-str (get got index))
+                " where the whole text paints "
+                (pr-str (get want index))
+                " (at "
+                (pr-str (excerpt text at))
+                ")")]))))))
+
+(defn restart-problems (sample)
+  "At every line start (every Nth past `*restart-positions*` lines), fontifying from where
+the mode's `:fontify-restart` says a window may begin must paint what fontifying the whole text
+paints, from that line on — the property a windowed fontify relies on. A mode that declines to
+restart has nothing to prove."
+  (let (buffer (:buffer sample)
+        restart (ed-mode-service buffer :fontify-restart)
+        fontify (ed-mode-service buffer :fontify)
+        lines (:lines sample))
+    (if (nil? restart)
+      []
+      (let (whole (vec (fontify (:text sample)))
+            stride (math/max 1
+                     (math/quot (+ (count lines) (dec *restart-positions*)) *restart-positions*)))
+        (ratchet sample
+          :restart (into []
+            (seq/keep (range 0 (count lines) stride)
+              (fn (index)
+                (when (not (contains? (:assertion-lines sample) index))
+                  (restart-problem sample fontify restart whole (nth (:starts sample) index)))))))))))
+
+;; ---- 5. robustness under random edits ------------------------------------------------------
+
+(def- *edit-characters*
+  ["{"
+    "}" "(" ")" "[" "]" "\"" "'" "`" "\n" "#" "/" "*" "\\" "$" "<" ">" ";" ":" "=" "-" " " "x" "%"
+    "@" "|" "\t"])
+
+(defn- span-problems (spans length)
+  ;; why `spans` are not in bounds, ascending and apart — nil when they are
+  (letrec (walk (fn (rest-spans previous-end)
+                  (if (empty? rest-spans)
+                    nil
+                    (let (span (first rest-spans))
+                      (cond
+                        (not (and (vector? span)
+                               (= (count span) 3)
+                               (int? (nth span 0))
+                               (int? (nth span 1))))
+                          (str "malformed span " (pr-str span))
+                        (not (and (<= 0 (nth span 0))
+                               (<= (nth span 0) (nth span 1))
+                               (<= (nth span 1) length)))
+                          (str "span " (pr-str span) " out of bounds for " length " characters")
+                        (< (nth span 0) previous-end)
+                          (str "span " (pr-str span) " overlaps or precedes the one before it")
+                        else (walk (rest rest-spans) (nth span 1)))))))
+    (walk (vec spans) 0)))
+
+(defn- probe (what thunk)
+  ;; nil when `thunk` runs, else what raised
+  (check-allow :discarded-catch
+    (try
+      (do (thunk) nil)
+      (catch e (str what " raised: " (if (map? e) (or (:message e) (pr-str e)) (pr-str e)))))))
+
+(defn- draw-edit (buffer seed)
+  ;; `[buffer' description seed']`: one single-character insert or delete at a random offset
+  (let (length (count (buffer-text buffer))
+        [kind seed] (rand/int seed 2)
+        [offset seed] (rand/int seed (inc length))
+        [which seed] (rand/int seed (count *edit-characters*)))
+    (if (or (= kind 0) (= offset length))
+      (let (character (nth *edit-characters* which " "))
+        [(replace-region buffer offset offset character)
+          (str "insert " (pr-str character) " at " offset)
+          seed])
+      [(replace-region buffer offset (inc offset) "")
+        (str "delete "
+          (pr-str (string/substring (buffer-text buffer) offset (inc offset)))
+          " at "
+          offset)
+        seed])))
+
+(defn- edited-problems (buffer seed)
+  ;; what raised or misbehaved over the edited `buffer`, the probes placed from `seed`
+  (let (text (buffer-text buffer)
+        length (count text)
+        rope (text/string-> text)
+        line-count (text/line-count rope)
+        service (fn (key) (ed-mode-service buffer key))
+        [picks _] (fold (range 3)
+                    [[] seed]
+                    (fn ([acc at] _)
+                      (let ([value next] (rand/int at line-count)) [(conj acc value) next])))
+        bols (map picks (fn (line) (text/line->char rope line)))
+        fontify (service :fontify)
+        indent (service :indent)
+        restart (service :fontify-restart)
+        fold-extent (service :fold-extent)
+        breadcrumbs (service :breadcrumbs))
+    (seq/keep (append [(probe "fontify"
+                         (fn ()
+                           (let (bad (span-problems (fontify text) length))
+                             (when bad (error bad)))))]
+                (if indent
+                  (map bols
+                    (fn (bol)
+                      (probe (str "indent at " bol)
+                        (fn ()
+                          (let (column (indent text bol))
+                            (when (not (and (int? column) (>= column 0)))
+                              (error "answered " (pr-str column))))))))
+                  [])
+                (if restart
+                  (map bols
+                    (fn (bol)
+                      (probe (str "restart at " bol)
+                        (fn ()
+                          (let (cut (restart text bol))
+                            (when (not (and (int? cut) (<= 0 cut bol)))
+                              (error "answered " (pr-str cut))))))))
+                  [])
+                (if fold-extent
+                  (map picks
+                    (fn (line)
+                      (probe (str "fold-extent at line " line) (fn () (fold-extent rope line)))))
+                  [])
+                (if breadcrumbs
+                  (map bols
+                    (fn (bol)
+                      (probe (str "breadcrumbs at " bol)
+                        (fn () (breadcrumbs (goto-char buffer bol))))))
+                  []))
+      identity)))
+
+(defn robustness-problems (sample &optional (seed 1) (edits 20))
+  "From `seed`, `edits` single-character inserts and deletes at random offsets, one after
+another; after each, the mode's fontify, indent, restart, fold extent and breadcrumbs must not
+raise, and its spans must be in bounds, ascending and apart. Deterministic: `rand` is seeded. An
+EMPTY span (`[n n face]`, what the kernel answers for a node tree-sitter inserted as MISSING to
+recover a parse) paints nothing and is let through."
+  (letrec (walk (fn (buffer seed step acc)
+                  (if (>= step edits)
+                    (into [] (take (reverse acc) 8))
+                    (let ([edited description next] (draw-edit buffer seed)
+                          found (edited-problems edited next))
+                      (walk edited
+                        (first (rand/rng next))
+                        (inc step)
+                        (into acc
+                          (map found
+                            (fn (problem)
+                              (str "edit " (inc step) " (" description "): " problem)))))))))
+    (walk (:buffer sample) (rand/seed seed) 0 '())))
+
+;; ---- 7. across the languages ---------------------------------------------------------------
+
+(defn- registered-specs ()
+  ;; `[type spec]` for every registered language, sorted by type
+  (seq/sort-by (for ([type spec-ref] (registry/entries :languages/specs) :into [])
+                 [type (reflect/eval spec-ref)])
+    (fn (pair) (->string (first pair)))))
+
+(defn- claims (pairs)
+  ;; a problem for each word two types claim: `pairs` is `[[type word] …]`
+  (let (by-word (seq/group-by pairs second))
+    (for ([word claimants] (seq/sort-by (vec by-word) first)
+           :when (> (count (seq/distinct (map claimants first))) 1)
+           :into [])
+      (str (pr-str word)
+        " is claimed by "
+        (string/join (sort (map (seq/distinct (map claimants first)) pr-str)) " and ")))))
+
+(defn name-problems ()
+  "No two registered languages answer to the same name — their type's own or a `:names` entry —
+lowercased, as `modes/language-named` reads them."
+  (claims (for ([type spec] (registered-specs)
+                 word
+                 (cons (->string type) (get spec :names []))
+                 :into [])
+            [type (string/lower word)])))
+
+(defn interpreter-problems ()
+  "No two registered languages claim the same `#!` program."
+  (claims (for ([type spec] (registered-specs) program (get spec :interpreters []) :into [])
+            [type program])))
+
+(defn spec-problems ()
+  "Every registered spec passes its declaring macro's key check (`languages/spec-problem`)."
+  (into [] (seq/keep (registered-specs) (fn ([type spec]) (languages/spec-problem type spec)))))
+
+(defn lsp-problems ()
+  "Every registered language server row says its `:name`, `:commands` and `:root-markers`."
+  (into []
+    (seq/keep (model/lsp-server-rows)
+      (fn (row)
+        (let (missing (seq/filter [:name :commands :root-markers] (fn (key) (nil? (get row key)))))
+          (when (not (empty? missing))
+            (str (pr-str (:owner row))
+              "'s server "
+              (pr-str (:name row))
+              " lacks "
+              (string/join (map missing pr-str) " "))))))))
+
+(defn pattern-problems ()
+  "Every corpus file is claimed by at most one registered language's file pattern — the one its
+directory names (a file typed by its `#!` line alone is claimed by none)."
+  (let (specs (registered-specs))
+    (into []
+      (seq/keep (corpus-files)
+        (fn (entry)
+          (let (claimants (for ([type spec] specs
+                                 :when (modes/file-pattern-matches? (visit-path (:path entry))
+                                   (get spec :pattern))
+                                 :into [])
+                            (->string type)))
+            (when (or (> (count claimants) 1)
+                    (and (= (count claimants) 1)
+                      (not (= (first claimants) (:language entry)))))
+              (str (:path entry) " is claimed by " (string/join claimants " and ")))))))))
+
+(defn uncovered-languages ()
+  "The registered languages with no corpus directory — each wants at least one sample."
+  (let (covered (into #{} (file/list-dirs *corpus-root*)))
+    (for ([type _] (registered-specs) :when (not (contains? covered (->string type))) :into [])
+      (->string type))))

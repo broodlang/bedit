@@ -39,7 +39,7 @@ characters, so every column crosses [[lsp-column->units]] going out and
   (:use editor/highlight) ; symbol-prefix-at — the shared completion word boundary
   (:use lsp/protocol) ; what is said on the wire, and the state a connection folds
   (:use lsp/requests) ; the request-kind records
-  (:use memo)) ; defmemo-by — the specs a file extension has, worked out once per extension
+  (:use memo)) ; defmemo-by — the specs a file has, worked out once per mode and extension
 ;; ---- tunables (redefine live) -----------------------------------------------
 
 ;; How long the handshake waits for the `initialize` response before giving up on it.
@@ -55,14 +55,15 @@ characters, so every column crosses [[lsp-column->units]] going out and
 (def *lsp-init-timeout-ms* 180000)
 (defdyn *lsp-server-specs*
   ;; The language servers to consult, in priority order — nil for the registered ones
-  ;; (`model/register-lsp-server`: each language declares its own, `deflanguage`'s `:lsp`, so a
-  ;; language a package adds brings its server). A test binds a vector here to stand in its
-  ;; own. A file reaches EVERY spec whose `:extensions` hold its extension, so one file can
-  ;; have a main server and an add-on beside it (ruff next to pyright); the first is the one a
-  ;; lookup asks first.
+  ;; (`model/register-lsp-server`: each language declares its own, a language macro's `:lsp`, so
+  ;; a language a package adds brings its server). A test binds a vector here to stand in its
+  ;; own. A file reaches EVERY spec of its buffer's mode (`:owner`, which registration stamps)
+  ;; and every spec whose `:extensions` hold its extension, so one file can have a main server
+  ;; and an add-on beside it (ruff next to pyright); the first is the one a lookup asks first.
   ;;
   ;;   :name           how the server is shown and filed
-  ;;   :extensions     the file types it serves
+  ;;   :owner          the mode whose buffers it serves (stamped by `model/register-lsp-server`)
+  ;;   :extensions     instead of a mode, the file extensions it serves (a stand-in's, by hand)
   ;;   :commands       `[command args]` alternatives, the first installed one runs
   ;;   :root-markers   files that mark its project root, most decisive first: the root is
   ;;                   the nearest folder above the file holding the first marker found
@@ -437,39 +438,73 @@ costs every Tab on a big file."
     [(+ line-start start) prefix line]))
 
 (defn lsp-extension (path)
-  "The file extension of `path` (without the dot), or \"\" if none."
-  (let (dot (string/last-index-of path "."))
-    (if (< dot 0) "" (string/substring path (+ dot 1) (count path)))))
+  "The file extension of `path`'s name (without the dot), or \"\" if none — a dot in a folder
+name is not one.
 
-(defn lsp-language-id (path)
-  "The LSP languageId for `path`, from its extension (`model/register-lsp-language-id`, which
-each language's `deflanguage :lsp` fills); the bare
-extension when unmapped, or \"\" when there's none."
+    (lsp/client/lsp-extension \"/p/app.v2/main.rs\")   ;=> \"rs\"
+    (lsp/client/lsp-extension \"/p/app.v2/Gemfile\")   ;=> \"\""
+  (let (extension (path/extension path))
+    (if (= extension "") "" (string/substring extension 1 (count extension)))))
+
+;; ---- which servers serve a file: its MODE's ----------------------------------------
+;; A server belongs to the mode that registered it (`model/register-lsp-server`'s owner), so a
+;; file reaches the servers of the mode its buffer is in — however it got there: its name
+;; (`Gemfile`), its `#!` line (a `python3` script), or M-x ruby-mode. A row with `:extensions`
+;; (a test's `*lsp-server-specs*`, a server registered by hand) is reached by those instead.
+
+(defn lsp-path-type (path)
+  "The mode type a visit gives `path` by its NAME alone (`editor/layers/buffer-type-for`): no
+`#!` line is read, so a script with no telling name is `:fundamental` here — a caller holding
+its buffer asks [[lsp-file-type]] or passes the buffer's type."
+  (editor/layers/buffer-type-for {:file path}))
+
+(defn lsp-file-type (m file)
+  "The mode type of `file` on model `m`: the type of the buffer visiting it — what its name, its
+`#!` line or an M-x mode made it — else the type its name gives it ([[lsp-path-type]])."
+  (let (index (when (string? file) (ed-buffer-index-by-file m file)))
+    (if (nil? index)
+      (lsp-path-type file)
+      (editor/layers/buffer-type-for (nth (:buffers m) index)))))
+
+(defn lsp-language-id (path &optional (type nil))
+  "The LSP languageId for `path` in mode `type` (by default the mode its name gives it): the
+mode's override for its extension, else the mode's own `:id` (`model/register-lsp`, which a
+language's `:lsp` fills); the bare extension when the mode names none, or \"\" when there's
+none."
   (if (nil? path)
     ""
     (let (extension (lsp-extension path))
-      (or (model/lsp-language-id-of extension) extension))))
+      (or (model/lsp-language-id-of (or type (lsp-path-type path)) extension) extension))))
 
-(defn lsp-specs-for (path)
-  "The server specs ([[server-specs]]) that serve `path`'s extension, main servers
-first and add-ons after, each group in table order; `[]` for a file no server serves, or
-no file: a `.py` file has `python` and the `ruff` add-on. A file on another machine
-(`/ssh:…`) has none: a server here would read a path that does not exist here."
+(defn lsp-buffer-language-id (buffer)
+  "The LSP languageId of `buffer`'s file, in the buffer's own mode ([[lsp-language-id]])."
+  (lsp-language-id (buffer-file buffer) (editor/layers/buffer-type-for buffer)))
+
+(defn lsp-specs-for (path &optional (type nil))
+  "The server specs ([[server-specs]]) that serve `path` in mode `type` (by default the mode its
+name gives it, [[lsp-path-type]]): the mode's own, and any whose `:extensions` hold its
+extension, main servers first and add-ons after, each group in table order; `[]` for a file no
+server serves, or no file: a `.py` file has `python` and the `ruff` add-on, and so does a
+`#!/usr/bin/env python3` script in python mode. A file on another machine (`/ssh:…`) has none:
+a server here would read a path that does not exist here."
   (if (or (not (string? path)) (sshpath/remote? path))
     []
-    (specs-for-extension (lsp-extension path) (server-specs))))
+    (specs-serving (or type (lsp-path-type path)) (lsp-extension path) (server-specs))))
 
 ;; Asked by every stale check and request (`lsp-server-entries`), several times a turn: worked out
-;; once per extension (`defmemo-by`, brood ADR-741) against the table as it is — the table is
-;; the input, so a server registered live (or `*lsp-server-specs*` bound) is seen at once. One
-;; answer per extension: a recent-calls memo of 8 missed every call once a session had files
-;; of more extensions than that open (27 µs a call, against 0.4 µs a hit).
-(defmemo-by specs-for-extension 256 (extension) (specs)
-  "The `specs` serving files with `extension`, main servers first and add-ons after, a server
-named twice once (the first): a language that extends another may declare the parent's server
-again for its own files (TypeScript, JavaScript's)."
+;; once per mode and extension (`defmemo-by`, brood ADR-741) against the table as it is — the
+;; table is the input, so a server registered live (or `*lsp-server-specs*` bound) is seen at
+;; once. One answer per key: a recent-calls memo of 8 missed every call once a session had files
+;; of more kinds than that open (27 µs a call, against 0.4 µs a hit).
+(defmemo-by specs-serving 256 (type extension) (specs)
+  "The `specs` serving a file of mode `type` with `extension` — a spec with `:extensions` when
+they hold the extension, any other when the mode owns it — main servers first and add-ons after,
+a server named twice once (the first)."
   (let (serving (seq/distinct-by (seq/filter specs
-                                   (fn (spec) (includes? (:extensions spec) extension)))
+                                   (fn (spec)
+                                     (if (contains? spec :extensions)
+                                       (includes? (:extensions spec) extension)
+                                       (= (:owner spec) type))))
                   :name))
     (into []
       (append (seq/reject serving (fn (spec) (:add-on spec)))
@@ -483,7 +518,7 @@ again for its own files (TypeScript, JavaScript's)."
 ;; The model keeps every server it started, `:lsp-servers` — `{conn entry}`, an entry
 ;; `{:spec name :roots [root …] :conn pid :caps map :identity … :command}` filed under its
 ;; connection: one process, one entry, whatever projects it comes to serve. A server that
-;; serves several projects (`:shared`) has several roots. A file belongs to every entry whose spec serves its extension and one of
+;; serves several projects (`:shared`) has several roots. A file belongs to every entry whose spec serves it and one of
 ;; whose roots holds it.
 
 (defn lsp-under? (file root)
@@ -511,7 +546,7 @@ is cheap enough for every frame; whether a connection is still alive is `lsp-liv
 question."
   (let (pairs (%map-pairs (or (:lsp-servers m) {})))
     (into []
-      (seq/keep (lsp-specs-for file)
+      (seq/keep (lsp-specs-for file (lsp-file-type m file))
         (fn (spec)
           (let (known (lsp-known-root m (:name spec) file)
                 hits (seq/filter pairs
@@ -560,7 +595,7 @@ is not this buffer's (completion's prepare step normally synced it just before).
   (let (uri (lsp-path->uri file)
         synced (map/get-in m [:lsp-synced [(:key entry) uri] :buf])
         request {:uri uri
-                 :lang (lsp-language-id file)
+                 :lang (lsp-buffer-language-id buffer)
                  :line (buffer-current-line buffer)
                  :char (lsp-buffer-units buffer)})
     (if (and synced (= (buffer-rope synced) (buffer-rope buffer)))

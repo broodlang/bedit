@@ -6,7 +6,9 @@ YAML and Dockerfile are its clients, each a face table and an indent spec; the l
 keep their line lexer as the stand-in for a missing grammar (`:fallback`). `deflexer` is its
 sibling for the fontify-only layers over the `lex-*` modules. The languages themselves are one
 module each (`languages/rust`, `languages/hcl`, …; the line-lexed formats `languages/formats`); a
-macro here names the module it expands in (`reflect/current-ns`).")
+macro here names the module it expands in (`reflect/current-ns`). Every language macro — these
+two and `languages/lisps/deflisp` — checks its spec's keys (`check-spec`) and registers what a
+language is to the editor through one function, `register-language`.")
 ;; editor/treesit, editor/highlight and the std lexers are referenced qualified below —
 ;; each `mod/name` auto-loads its module.
 
@@ -106,6 +108,17 @@ registration like the face table.
 `:interpreters` lists the `#!` program names that select the mode for a file with no telling
 name, as `deflexer`'s does.
 
+`:type`, `:pattern`, `:comment`, `:interpreters`, `:names`, `:lsp` and `:snippets` are the facts
+every language macro takes (`deflexer`'s and `languages/lisps/deflisp`'s too), registered by the
+one path all three call, [[register-language]]: the mode type is `:type`, else `:lang`, else the
+macro's name ([[mode-type]]).
+
+The spec's keys are CHECKED at load ([[check-spec]]): a key this macro does not take —
+`:interpeters`, `:fold` — raises, naming the macro, the language, the key and the nearest
+known one, rather than being silently ignored. The keys are the ones this docstring names;
+a nested table keeps its own (`:hanging` is the `:indent` spec's, `:name-fields` the
+`:definitions`', `:aliases-from` an injection rule's).
+
 `:names` lists the other words people and other code NAME the language by — `[\"c++\" \"cpp\"
 \"cxx\"]`, `[\"sh\" \"bash\" \"zsh\"]` — besides its buffer type's own name (`cpp`, `shell`),
 which always counts. They are matched lowercased (`modes/language-named`): a Markdown fence's
@@ -118,6 +131,12 @@ to registration order.
 `:snippets` is the language's built-in snippet templates, `{key template}` in the LSP
 snippet syntax (`snippet`), under the user's init.blsp `:snippets` for the mode. A spec built
 on another inherits them — TypeScript writes JavaScript's.
+
+`:lsp` is the language's servers, routed by the MODE, not the extension: `{:id \"ruby\" :ids
+{\"jsx\" \"javascriptreact\"} :servers [{:name :commands :root-markers :shared :add-on}]}`. A
+buffer of the mode — by its name, its `#!` line or `M-x ruby-mode` — reaches every server
+listed (main ones first, add-ons after); `:id` is the LSP `languageId` its files are named by,
+and `:ids` only the extensions LSP names otherwise (`model/register-lsp`, `lsp/client/lsp-specs-for`).
 
 `:fontify-restart` says where a windowed fontify may cut its lead-in, and comes from one of
 three declarations. `:heredocs` (paired markers, Elixir's `\"\"\"`) restarts at a column-0 line
@@ -142,6 +161,7 @@ The spec is evaluated ONCE, into `<name>-spec`, so a spec built from a shared ba
         spec-ref (qualified "-spec"))
     `(do
        (def ~spec-name ~spec)
+       (languages/core/check-spec languages/core/deflanguage-kind '~name ~spec-ref)
        (defn ~(generated "-fontify") (text) (languages/core/spec-fontify ~spec-ref text))
        ;; the embedded languages' injection spec, built per call: an injected language's
        ;; faces are ITS spec's, and it may be registered after this one
@@ -184,15 +204,110 @@ The spec is evaluated ONCE, into `<name>-spec`, so a spec built from a shared ba
        ;; the line-lexer stand-in a buffer is typed as while the grammar is missing; nil
        ;; for a language with no `:fallback`
        (def ~(generated "-fallback-layer") (languages/core/fallback-layer '~name ~spec-ref))
-       (languages/core/declare-definitions ~spec-ref)
-       (languages/core/register-spec ~spec-ref '~spec-ref)
-       (languages/core/declare-grammar ~spec-ref)
-       (languages/core/expect-grammar-names ~spec-ref)
-       (languages/core/register-fallback ~spec-ref '~(qualified "-fallback-layer"))
-       (languages/core/register-lsp ~spec-ref)
-       (doseq (program (get ~spec-ref :interpreters []))
-         (modes/register-interpreter program (languages/core/spec-type ~spec-ref)))
-       (modes/register-prog-mode '~(qualified "-mode-layer") (languages/core/spec-type ~spec-ref)))))
+       (languages/core/declare-grammar-facts ~spec-ref '~(qualified "-fallback-layer"))
+       (languages/core/register-language languages/core/deflanguage-kind
+         '~name '~spec-ref '~(qualified "-mode-layer")))))
+
+;; ---- the facts every language macro registers, through ONE path ------------------------
+;; `deflanguage`, `deflexer` and `languages/lisps/deflisp` generate different services, but what a
+;; language IS to the rest of the editor — its mode type, the `#!` programs and words that name
+;; it, its servers, its spec in `:languages/specs` — is said the same way by all three and
+;; registered by [[register-language]]. A KIND is the macro's description: the spec keys it takes
+;; and the stack its mode registers on (`:prog`, the code modes' `C-M-*` motions, or `:text`).
+
+(def *registration-keys*
+  ;; the facts `register-language` reads, which every kind takes
+  #{:type :pattern :comment :interpreters :names :lsp :snippets})
+
+(def *convention-keys*
+  ;; a language's conventions and string syntax (`spec-conventions`), as both spec kinds take them
+  #{:indent-tabs :indent-width :tab-width :fill-column :pairs :strings})
+
+(def deflanguage-kind
+  {:macro 'deflanguage
+   :stack :prog
+   :keys (into (set/union *registration-keys* *convention-keys*)
+           #{:lang
+             :faces :indent :heredocs :restart :comment-block :format :definitions :folds
+             :grammar :fallback :fallback-above :injections :electric-indent})})
+
+(def deflexer-kind
+  {:macro 'deflexer
+   :stack :text
+   :keys (into (set/union *registration-keys* *convention-keys*) #{:lexer :completion-auto})})
+
+(def *lsp-keys*
+  ;; what a spec's `:lsp` says (`model/register-lsp`)
+  #{:id :ids :servers})
+
+(defn- unknown-key-problem (macro name what key allowed)
+  ;; the error for `key`, unknown to `allowed`, with the nearest known one by spelling
+  (let (meant (fuzzy/nearest (map allowed ->string) (->string key)))
+    (str macro
+      " "
+      name
+      ": unknown "
+      what
+      " key "
+      (pr-str key)
+      (if (empty? meant) "" (str " (did you mean :" (string/join meant " or :") "?)"))
+      " — it takes "
+      (string/join (sort (map allowed pr-str)) " "))))
+
+(defn check-spec (kind name spec)
+  "Raise when `spec`, declaring the language `name` with the macro `kind` describes, has a key
+the kind does not take — naming the macro, the language, the key and the nearest known one —
+or an `:lsp` with a key `model/register-lsp` does not read. A misspelt key would otherwise be
+ignored, and the fact it carried missed by someone opening a file much later. Answers `spec`.
+
+    (languages/core/check-spec languages/core/deflexer-kind 'ok {:pattern \"x\" :lexer 'l})   ;=> {:pattern \"x\" :lexer l}"
+  (let (allowed (:keys kind)
+        unknown (seq/sort-by (seq/reject (keys spec) (fn (key) (contains? allowed key))) pr-str)
+        lsp (get spec :lsp)
+        lsp-unknown (when (map? lsp)
+                      (seq/sort-by (seq/reject (keys lsp) (fn (key) (contains? *lsp-keys* key)))
+                        pr-str)))
+    (cond
+      (not (empty? unknown))
+        (error (unknown-key-problem (:macro kind) name "spec" (first unknown) allowed))
+      (not (empty? lsp-unknown))
+        (error (unknown-key-problem (:macro kind) name ":lsp" (first lsp-unknown) *lsp-keys*))
+      else spec)))
+
+(defn mode-type (name spec)
+  "The buffer type a language macro's mode registers as — the ONE rule all three kinds share:
+the spec's `:type`, else its `:lang` (a `deflanguage`'s grammar), else the macro's `name`.
+
+    (languages/core/mode-type 'csharp {:lang :c-sharp :type :csharp})   ;=> :csharp
+    (languages/core/mode-type 'makefile {:pattern \"Makefile\"})   ;=> :makefile"
+  (or (spec-type spec) (keyword name)))
+
+(defn register-language (kind name spec-ref layer-ref)
+  "Register the language `name` that the macro `kind` describes, whose spec is the global
+`spec-ref` and whose mode layer `layer-ref`: under its [[mode-type]], the `#!` programs that
+select it (`:interpreters`), its spec in `:languages/specs` (where its `:names` and faces are
+found: `modes/language-named`), its servers and `languageId`s (`:lsp`, `model/register-lsp`),
+and its mode — over the `prog` motions for a `:prog` kind, over text-mode for a `:text` one.
+Its snippets and conventions are its LAYER's, which the macro built. Every registration is
+claimed, so a package's language goes back with the package."
+  (let (spec (reflect/eval spec-ref)
+        type (mode-type name spec))
+    (doseq (program (get spec :interpreters [])) (modes/register-interpreter program type))
+    (register-spec type spec-ref)
+    (when (map? (get spec :lsp)) (model/register-lsp type (get spec :lsp)))
+    (if (= (:stack kind) :text)
+      (modes/register-language-mode layer-ref type)
+      (modes/register-prog-mode layer-ref type))))
+
+(defn declare-grammar-facts (spec fallback-ref)
+  "Declare what a `deflanguage` spec says of its GRAMMAR, which no other kind has: its
+definitions (`declare-definitions`), where the grammar lives (`declare-grammar`), the names its
+tables use of it (`expect-grammar-names`) and its line-lexer stand-in, the layer
+`fallback-ref` names (`register-fallback`)."
+  (declare-definitions spec)
+  (declare-grammar spec)
+  (expect-grammar-names spec)
+  (register-fallback spec fallback-ref))
 
 (defn spec-indent-width (spec)
   "The indent width a `deflanguage` or `deflexer` spec declares as its language's convention:
@@ -256,16 +371,11 @@ It keeps the language's formatter: `shfmt` formats a script whether or not it wa
 Nil without a `:fallback`."
   (when (get spec :fallback)
     (assoc (lexer-layer name
-             {:pattern (get spec :pattern)
-              :lexer (get spec :fallback)
-              :comment (get spec :comment)
-              ;; the language's conventions are the stand-in's too
-              :indent-tabs (get spec :indent-tabs)
-              :indent-width (spec-indent-width spec)
-              :tab-width (get spec :tab-width)
-              :fill-column (get spec :fill-column)
-              :pairs (get spec :pairs)
-              :strings (get spec :strings)})
+             ;; the language's comment, snippets and conventions are the stand-in's too: every
+             ;; key the two kinds share, and the indent width its `:indent` spec implies
+             (merge (map/select-keys spec
+                      (into [] (set/intersection (:keys deflanguage-kind) (:keys deflexer-kind))))
+               {:lexer (get spec :fallback) :indent-width (spec-indent-width spec)}))
       :wants-grammar (get spec :lang)
       :format-command (get spec :format))))
 
@@ -351,40 +461,30 @@ so the grammar installed is checked for them before it is used (`grammarcheck`, 
 ADR-583) — under the spec's buffer type, since one grammar may serve two modes."
   (grammarcheck/expect-names (get spec :lang) (spec-type spec) (spec-grammar-names spec)))
 
+(defn register-spec (type spec-ref)
+  "Record that `spec-ref` (the `<name>-spec` global's symbol) is the spec of the mode `type`,
+where `modes/language-faces` finds an embedded language's table, `modes/language-named` the
+words naming it and [[declared-grammars]] the grammars bedit's modes parse with. Every kind's
+spec is recorded — a Lisp's and a line lexer's are named too — and only a `deflanguage`'s has
+a grammar or faces. Keyed by the MODE, not the grammar: two modes over one grammar (HCL and
+Terraform, JSON and JSONL) are two specs, and keying by the grammar let the one registered last
+stand for both — and a package removing it change the other's colours. Stored as the symbol and
+resolved per lookup, so a re-evaluated spec is the one read."
+  (ownership/claim! :languages/specs type spec-ref))
+
+(defn declared-grammars ()
+  "The grammar (`:lang`) of every registered `deflanguage` spec, as a set: what bedit's modes parse
+with, a package's included while it is installed. A spec with no grammar (a Lisp's, a line
+lexer's) adds none."
+  (into #{}
+    (seq/keep (vals (registry/entries :languages/specs))
+      (fn (spec-ref) (get (reflect/eval spec-ref) :lang)))))
+
 ;; ---- injections: another language's code inside this one (brood ADR-489) ---------------
 ;; A spec's `:injections` is the RULES of an ADR-489 injection spec: which nodes hold which
 ;; language's text. The faces are not written there. Each embedded language colours with the
 ;; table its own `deflanguage` declares, looked up when a frame asks, so the shell inside a
 ;; Terraform heredoc follows shell-mode's table and a language registered later is found.
-
-(defn register-lsp (spec)
-  "Register the language servers and LSP `languageId`s a `deflanguage` spec's `:lsp` declares —
-`{:ids {\"rs\" \"rust\"} :servers [{:name … :extensions … :commands … :root-markers …}]}`, the
-servers in `lsp/client`'s row shape — for the spec's buffer type, so a language brings its own
-server and a package's goes back with the package. A spec with no `:lsp` registers nothing; one
-that extends another (`(merge javascript-spec …)`) says its own, or inherits the parent's
-servers under its own name, which `lsp/client` reads as the one server it is."
-  (let (lsp (get spec :lsp))
-    (when (map? lsp)
-      (doseq (pair (get lsp :ids {}))
-        (let ([extension id] pair) (model/register-lsp-language-id extension id)))
-      (doseq (server (get lsp :servers [])) (model/register-lsp-server (spec-type spec) server)))))
-
-(defn register-spec (spec spec-ref)
-  "Record that `spec-ref` (the `<name>-spec` global's symbol) is the spec of the mode
-`(spec-type spec)`, where `modes/language-faces` finds an embedded language's table and
-[[declared-grammars]] the grammars bedit's modes parse with. Keyed by the MODE, not the grammar:
-two modes over one grammar (HCL and Terraform, JSON and JSONL) are two specs, and keying by the
-grammar let the one registered last stand for both — and a package removing it change the other's
-colours. Stored as the symbol and resolved per lookup, so a re-evaluated spec is the one read."
-  (ownership/claim! :languages/specs (spec-type spec) spec-ref))
-
-(defn declared-grammars ()
-  "The grammar (`:lang`) of every registered `deflanguage` spec, as a set: what bedit's modes parse
-with, a package's included while it is installed."
-  (into #{}
-    (map (vals (registry/entries :languages/specs))
-      (fn (spec-ref) (get (reflect/eval spec-ref) :lang)))))
 
 (defn- rule-languages (rule)
   ;; every language a rule can name: its fixed `:lang`, or its aliases' targets
@@ -524,8 +624,6 @@ by someone opening a file."
                ;; the words that end a block, as a regexp over what precedes point on its line
                ;; (`indent/ed-electric-reindent`): typing one reindents the line
                :electric-indent (get spec :electric-indent)
-               ;; the language's built-in snippet templates (`snippet/mode-snippets`)
-               :snippets (get spec :snippets)
                ;; the line-lexer type a buffer stands in with while the grammar is missing,
                ;; or past `:fallback-above` characters (`model/ed-grammar-fallback`)
                :grammar-fallback (when (fallback-type spec)
@@ -570,19 +668,24 @@ by someone opening a file."
 
 `:lexer` names the lexer by its stem: the module defines `<stem>-spans`, the whole-text
 `:fontify`, and `<stem>-line-lexer`, the `:line-lexer` the pane's line cache threads.
-`:comment` is the comment token `M-;` writes. `:interpreters` lists the `#!` program names
-that select the mode for a file with no telling name (`modes/register-interpreter`).
+`:comment` is the comment token `M-;` writes. `:completion-auto` false makes completion wait
+for Tab (a commit message is prose). The facts every language macro takes — `:type`,
+`:interpreters`, `:names`, `:lsp`, `:snippets` — and the conventions (`:indent-tabs`,
+`:indent-width`, `:tab-width`, `:fill-column`, `:pairs`, `:strings`) mean what they mean in
+`deflanguage`, and are registered by the same path ([[register-language]]); any other key
+raises at load ([[check-spec]]).
 
 A spec's keys are the language's facts; the layer's are the editor's (`:comment` becomes
-`:comment-syntax`, which every reader asks for), and only this maps one to the other."
+`:comment-syntax`, which every reader asks for), and only this maps one to the other. The spec
+is evaluated once, into `<name>-spec`."
   (let (base (->string name)
-        layer (symbol (str base "-mode-layer"))
+        spec-ref (symbol (str (reflect/current-ns) "/" base "-spec"))
         layer-ref (symbol (str (reflect/current-ns) "/" base "-mode-layer")))
     `(do
-       (def ~layer (languages/core/lexer-layer '~name ~spec))
-       (doseq (program (get ~spec :interpreters []))
-         (modes/register-interpreter program (keyword '~name)))
-       (modes/register-language-mode '~layer-ref (keyword '~name)))))
+       (def ~(symbol (str base "-spec")) ~spec)
+       (languages/core/check-spec languages/core/deflexer-kind '~name ~spec-ref)
+       (def ~(symbol (str base "-mode-layer")) (languages/core/lexer-layer '~name ~spec-ref))
+       (languages/core/register-language languages/core/deflexer-kind '~name '~spec-ref '~layer-ref))))
 
 (defn lexer-layer (name spec)
   "The mode layer a `deflexer` spec declares: `:fontify` and `:line-lexer` from the `:lexer`
@@ -611,13 +714,15 @@ stem, the line restart, and `:comment-syntax`. Raises on a spec with no `:patter
 (defn- spec-conventions (spec)
   "The layer keys both spec kinds take from a spec as they stand: the language's conventions
 (`conventions` — each nil when the spec has no say), the electric pairs its strings and
-brackets open (`electric`, nil for the default brackets and double quote), and its strings
-and comments (`stringstate`, nil for its quote pairs as one-line strings)."
+brackets open (`electric`, nil for the default brackets and double quote), its strings
+and comments (`stringstate`, nil for its quote pairs as one-line strings) and its built-in
+snippet templates (`snippet/mode-snippets`)."
   {:indent-width (spec-indent-width spec)
    :tab-width (get spec :tab-width)
    :fill-column (get spec :fill-column)
    :electric-pairs (get spec :pairs)
-   :string-syntax (get spec :strings)})
+   :string-syntax (get spec :strings)
+   :snippets (get spec :snippets)})
 
 ;; ---- face-table helpers ------------------------------------------------------------------
 ;; Each returns face-table ENTRIES, to `merge` into a table beside its one-off rows: the shapes
@@ -735,13 +840,16 @@ JavaScript's calls are this shape.
 (def *triple-quote-heredocs* ["\"\"\"" "'''"])
 
 (defn- item-line-before (source position item-start)
-  ;; the nearest column-0 line at or before `position` that matches `item-start`, or 0
+  ;; the nearest column-0 line at or before `position` that is an item start, or 0: one
+  ;; `item-start` matches — a regex, or `{:match re :except re}` for a rule with an exception the
+  ;; regex engine (no lookahead) cannot spell, C++'s `public:` beside its column-0 declarations
   (let (candidate (editor/treesit/column0-before source position)
         line-end (let (newline (index-of source "\n" candidate))
                    (if (< newline 0) (count source) newline)))
     (cond
       (= candidate 0) 0
-      (regex/match? (string/substring source candidate line-end) item-start) candidate
+      (modes/file-pattern-matches? (string/substring source candidate line-end) item-start)
+        candidate
       else (item-line-before source (dec candidate) item-start))))
 
 ;; What a `:restart` rule's `:opaque` names: the constructs whose contents can be anything, so a
@@ -775,12 +883,12 @@ JavaScript's calls are this shape.
 
 (defn column0-item-restart (source position item-start opaque)
   "The fontify restart every brace language shares: the previous column-0 line that LOOKS like
-the start of an item (`item-start`, a regex over the line) — unless it sits inside something whose
-contents can be anything, an `opaque` construct (a block comment, a raw or template string, a
-heredoc: pairs, see `*block-comment-opaque*`) still open there, when the item line before THAT
-construct is tried. A construct that opened and closed above the line does not count: a closed
-`/** doc */` above every function is the ordinary case, and declining on it re-parsed the whole
-lead-in on every key. A language with nothing opaque passes nil.
+the start of an item (`item-start`, a regex over the line, or `{:match re :except re}`) — unless
+it sits inside something whose contents can be anything, an `opaque` construct (a block comment,
+a raw or template string, a heredoc: pairs, see `*block-comment-opaque*`) still open there,
+when the item line before THAT construct is tried. A construct that opened and closed above the
+line does not count: a closed `/** doc */` above every function is the ordinary case, and
+declining on it re-parsed the whole lead-in on every key. A language with nothing opaque passes nil.
 
     (languages/core/column0-item-restart \"/* a */\\nfn f\\n  x\" 13 \"^fn\" languages/core/*block-comment-opaque*)   ;=> 8"
   (let (candidate (item-line-before source position item-start))

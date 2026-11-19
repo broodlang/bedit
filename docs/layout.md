@@ -44,11 +44,11 @@ src/model.blsp              the ui-run model: buffer pool, panes, *Messages*,
                             C-x C-c asks (`register-exit-query`: a compile, a test run,
                             the app, a terminal, a push), what C-x k asks before a kill
                             (`register-kill-query`: an agent mid-turn), what follows a KILL
-                            (`register-slot-keeper`, `{:order :slots :drop}`, run in order
+                            (`register-slot-keeper`, `{:rank :slots :drop}`, run in order
                             by `ed-drop-slot`: everything kept by pool index goes through
                             one `shift-slots` — collab before hosted before the caches) and
                             what a VISIT passes through (`register-visit-step`, Emacs's
-                            find-file-hook, `{:order :run :instead :passing}`: save-place,
+                            find-file-hook, `{:rank :run :instead :passing}`: save-place,
                             so-long, the recovery note, which is said `:instead` of the open
                             notice) and the files reached ANOTHER WAY (`register-file-handler`,
                             Emacs's file-name-handler-alist: a row claims a typed path by
@@ -124,7 +124,8 @@ src/keypanel.blsp           the KEY PANEL — a transient menu (git's push, emba
                             the `:key-panel` setting — the editor's own `:echo` is Emacs's: a flat
                             strip in the echo area below the mode line, groups side by side, keys
                             in the accent colour; a package registers another. The echo area's
-                            height asks it (`minibuffer/ed-echo-rows`)
+                            height asks it (`minibuffer/ed-echo-rows`); a source names its `:deps`,
+                            and the panel is built once per change of them
 src/scroll.blsp             keeping point on screen: the scroll-margin clamp, horizontal scroll,
                             `ed-max-top`, and the snap that ends a glide on a line; in a
                             row-wise (wrapped) buffer the pane starts on a screen ROW of its top
@@ -324,7 +325,9 @@ src/sources.blsp            a SOURCE TABLE, the one mechanism behind every table
                             `turnprofile/timed-each`), `first-answer` (the first non-`blank?` row),
                             `deps` (the rows' `:deps`, a memo's key), and for hooks `call-hook`
                             (the package's claimant, timed; `model/ed-call-hook` is it) and
-                            `fold-hooks`. A new kind is a table id and a row shape
+                            `fold-hooks`. A new kind is a table id and a row shape, declared with
+                            `define-table` (required / optional keys): `register` raises on a row
+                            missing one or naming another, with a did-you-mean
 src/panegeometry.blsp       a pane body's geometry map and the named column spans every layer
                             measures with (the view's lowest layer); `:rows` is ALWAYS a row
                             table (`panes/ed-pane-rows`), `:row-wise` when wrap counted it
@@ -1745,7 +1748,8 @@ src/languages/brood.blsp
 src/languages/lisps.blsp
     the machinery of the other Lisps: `deflisp` (a special-form set + a
     file pattern over Brood's own reader, paredit's keys), `head-set`,
-    `lisp-indent-with` (Emacs's rule)
+    `lisp-indent-with` (Emacs's rule); a dialect's `:interpreters` `:names` `:lsp` register
+    through `languages/core/register-language`, as every language macro's do
 src/languages/elisp.blsp
     Emacs Lisp, with Emacs's indent rule (`elisp-indent`)
 src/languages/common-lisp.blsp
@@ -1763,7 +1767,9 @@ src/languages/core.blsp
     (faces, indent, heredocs, injections, formatter) and generates its
     whole service set — show-paren (`tsbrackets`) included — checked against
     editor/treesit/language-contract, so an incomplete language
-    fails at load rather than at the keypress that needed it. Each
+    fails at load rather than at the keypress that needed it — and so does
+    a spec key the macro does not take (`check-spec`, naming the nearest known one).
+    All three language macros register through one path (`register-language`). Each
     language is one module below, `languages/<language>` with its
     tests in tests/languages_<language>_test.blsp — the shape a
     standalone language package would have. A spec names where its

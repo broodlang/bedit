@@ -422,16 +422,20 @@ back with the rest of its rows.
 A language is one `deflanguage` spec (`src/languages/core.blsp`), and a package can declare one
 exactly as bedit's own `src/languages/*.blsp` do: the macro names what it generates by the module
 it expands in, and every table it writes is claimed for the package. One spec carries everything
-the editor knows of the language:
+the editor knows of the language — and a key it does not take (`:interpeters`) fails the load, naming
+the one meant. `deflexer` (a line-lexed format) and `deflisp` (an s-expression dialect) take the
+same `:pattern` `:interpreters` `:names` `:lsp` `:snippets`, registered by the same path:
 
 | spec key | what it gives the editor |
 |---|---|
 | `:pattern`, `:interpreters` | which files open in the mode: a name pattern, `#!` programs |
+| `:names` | the other words it is named by (a Markdown fence, a heredoc marker) |
 | `:grammar {:url :revision :fingerprint}` | where its tree-sitter grammar lives, pinned |
 | `:faces`, `:injections` | colours, and the code embedded in it |
 | `:indent`, `:restart`, `:definitions`, `:folds` | RET/TAB, the windowed fontify, C-M-a, folding |
 | `:format` | the formatter M-x format-buffer and format-on-save run |
-| `:lsp {:ids :servers}` | its LSP `languageId`s and language servers (`model/register-lsp-server`) |
+| `:lsp {:id :ids :servers}` | its language servers, reached by every buffer in the mode however it got there (name, `#!`, M-x), and its LSP `languageId` — `:ids` only for an extension LSP names apart (`jsx`) (`model/register-lsp`) |
+| `:snippets` | its built-in snippet templates |
 | `:fallback` | a line lexer to colour by while the grammar is missing |
 
 - **Install:** the package loads, the spec registers, and the grammars it declares that are not
@@ -443,6 +447,41 @@ the editor knows of the language:
   grammar library stays in `~/.config/bedit/grammars` (another language may parse with it).
 - **Name it** `bedit-lang-<language>`: a package's modules may not take a name of bedit's
   (`languages/...` included) or of a std module.
+
+### Testing a language
+
+A language is tested by its CORPUS: realistic files in `tests/corpus/<mode>/`, the directory
+named for the mode type, each written as the language's formatter writes it. A package ships the
+same `tests/corpus/<lang>/`, and in bedit's tree every file there gets each check
+`tests/language_corpus_test.blsp` runs (`tests/support/corpus.blsp`), a test named by the file and
+the check. A dotfile sample is kept as `dot.<name>` and visited as `.<name>`
+(`dot.gitignore`), so git and editors never take the corpus's `.gitignore`, `.gitattributes` or
+`.editorconfig` for their own:
+
+1. **mode** — the file's name opens it in the mode its directory names.
+2. **faces** — the sample's own caret assertions hold. A comment line whose text is carets puts
+   a face under the columns of the line above (`ert-font-lock`'s idea, in bedit's faces):
+   `// ^^^^ keyword  ^^^ function`, `!string` for NOT that face, `plain` for none, `<-` for the
+   column the comment marker starts at. The marker is the mode's `:comment`, or its
+   `:comment-block` pair for a language with only block comments (`<!-- ^^^ string -->`).
+3. **golden faces** — `<file>.faces` beside it lists every painted token (`LINE:COL "text"
+   face`); `nest run tools/corpus-golden.blsp -- <lang>` rewrites it after a deliberate change,
+   and the diff is what gets reviewed.
+4. **indentation, three ways** — every line indents to where it is written; the whole file,
+   its indentation stripped, re-indents (C-x h C-M-\) to the sample; and typed a line at a time
+   (RET, the text, electric indent) below a half-built buffer, every line lands at its column.
+   Lines of verbatim content (a heredoc's body) are found from the spec's `:indent :verbatim`
+   kinds and kept as written.
+5. **restart** — fontifying from the spec's `:restart` answer paints what the whole text paints,
+   at every line: the windowed fontify's one assumption, proven per sample.
+6. **robustness** — seeded random one-character edits: fontify, indent, restart, fold extent and
+   breadcrumbs raise nothing and the spans stay in bounds and in order.
+
+And every registered language is checked against the others: no shared `:names` word or `#!`
+program, no corpus file claimed by two patterns, every spec passes its macro's key check, every
+server row says `:name :commands :root-markers`. A gap the language cannot close yet — a line its
+indenter misplaces — goes in `tests/corpus/known-gaps.blsp` with why, which only shrinks: a
+listed line that starts passing fails the test until it is removed.
 
 ## A plugin's library dependencies (built)
 
