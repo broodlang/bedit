@@ -165,21 +165,20 @@ idea, kept separate from `:dependencies` because what it names is *present*, not
 ## 2. What a package author writes (the payoff)
 
 Because a package calls the same registration functions core does, there is *no plugin
-API to learn*. A whole syntax-highlighter package:
+API to learn*. A whole language package is one module written exactly as bedit's own
+languages are — `(:use languages)` and one spec ("A language package" below has the template):
 
 ```clojure
-(defmodule bedit-zig
-  "Zig syntax highlighting + structural nav for bedit."
-  (:use editor/layers) (:use editor/treesit))
+(defmodule bedit-lang-zig
+  "Zig for bedit."
+  (:use languages))
 
-(defn zig-fontify (text) (treesit/fontify text :zig bedit-zig/zig-face-of))
+(deflanguage zig
+  {:lang :zig :pattern "\\.zig$" :faces zig-face-table :indent zig-indent-spec
+   :grammar {:url "https://github.com/tree-sitter-grammars/tree-sitter-zig" :revision "b670c8d…"}
+   :comment "// "})
 
-(def zig-mode-layer
-  {:name 'zig :parser :tree-sitter :ts-lang :zig
-   :file-pattern "\\.zig$" :fontify 'bedit-zig/zig-fontify :comment-syntax "// "})
-
-(modes/register-prog-mode 'bedit-zig/zig-mode-layer :zig)   ; ← the same call core makes
-(provide 'bedit-zig)
+(defn bedit-plugin () {})
 ```
 
 `nest publish` from that directory puts it on hive. That's the entire package.
@@ -419,12 +418,73 @@ back with the rest of its rows.
 
 ## A language package (built)
 
-A language is one `deflanguage` spec (`src/languages/core.blsp`), and a package can declare one
-exactly as bedit's own `src/languages/*.blsp` do: the macro names what it generates by the module
-it expands in, and every table it writes is claimed for the package. One spec carries everything
-the editor knows of the language — and a key it does not take (`:interpeters`) fails the load, naming
-the one meant. `deflexer` (a line-lexed format) and `deflisp` (an s-expression dialect) take the
-same `:pattern` `:interpreters` `:names` `:lsp` `:snippets`, registered by the same path:
+**One template.** bedit's own languages (`src/languages/<lang>.blsp`) and a language package
+(`bedit-lang-<lang>`) are written the same way, against the same public module, and tested by
+the same harness. The built-in ones stay in bedit; a new one can be either, and moving one from
+bedit to a package (or back) is a rename of its module and nothing else. The sample package
+is `bedit-lang-zig` (Zig over tree-sitter-zig), kept beside bedit as `../bedit-lang-zig`.
+
+### The layout
+
+```
+bedit-lang-zig/
+  project.blsp                 :enhances {bedit ">= 0.12"}, :dev-dependencies [[bedit :path "../bedit"]]
+  src/bedit-lang-zig.blsp      the language: one spec, its toolchain row, a `bedit-plugin` entry
+  tests/corpus_test.blsp       (corpus/define-tests) — that line is the whole file
+  tests/corpus/zig/*.zig       realistic samples, with caret assertions …
+  tests/corpus/zig/*.zig.faces … and their golden face listings
+  tests/corpus/known-gaps.blsp the lines a check cannot get right yet, with why (optional)
+  README.md
+```
+
+In bedit's tree the same parts are `src/languages/zig.blsp` (module `languages/zig`),
+`tests/corpus/zig/` and an entry in `tests/corpus/known-gaps.blsp`; the corpus test file
+(`tests/language_corpus_test.blsp`) is the same one line, for every language at once.
+
+### The API: `(:use languages)`
+
+```clojure
+(defmodule bedit-lang-zig            ; bedit's own: (defmodule languages/zig …)
+  "Zig for bedit: …"
+  (:use languages))
+
+(def zig-face-table
+  (merge {:comment :syntax/comment :string :syntax/string :integer :syntax/number
+          {:parent :function_declaration :field :name} :syntax/definition}
+    (call-faces [{:kind :identifier :field :member :of :field_expression}])))
+
+(deflanguage zig
+  {:lang :zig
+   :pattern "\\.zig$"
+   :faces zig-face-table
+   :indent {:width 4 :brackets #{:block :struct_declaration …} :verbatim #{:multiline_string}}
+   :restart {:item-start "^((pub|const|var|fn|test)\\b|//|\\})" :opaque []}
+   :definitions {:kinds #{:function_declaration :test_declaration}}
+   :lsp {:id "zig" :servers [{:name "zls" :commands [["zls" []]] :root-markers ["build.zig"]}]}
+   :format ["zig" "fmt"]
+   :grammar {:url "https://github.com/tree-sitter-grammars/tree-sitter-zig"
+             :revision "b670c8df85a1568f498aa5c8cae42f51a90473c0"
+             :fingerprint "0f7a6572a2be7724af1f9986d123cf634f16b72773aebde1f860821527fc02dc"}
+   :comment "// "})
+
+(toolchain/register-toolchain        ; optional: the project type its manifest marks
+  {:id :zig :name "Zig" :markers ["build.zig"] :compile "zig build" :test "zig build test"})
+
+(defn bedit-plugin () {})            ; a package only: what bedit asks of it by name
+```
+
+`languages` (src/languages.blsp) is the whole authoring surface: the three macros —
+`deflanguage` (a tree-sitter grammar), `deflexer` (a line lexer) and `deflisp` (an s-expression
+dialect) — the face-table helpers (`call-faces`, `method-call-faces`, `field-faces`,
+`token-faces`), the Lisp helpers (`head-set`, `lisp-indent-with`) and the tables several
+languages share (`*quote-pairs*`, `*backtick-pairs*`, `*hash-strings*`, `*c-strings*`,
+`*block-comment-opaque*`, `*triple-quote-opaque*`, `*backtick-opaque*`,
+`*triple-quote-heredocs*`, `*prettier*`). Nothing under `languages/` is named by a language:
+that is the context's detail. A table one language uses is that language's own. The macro
+names what it generates by the module it expands in (`zig-spec`, `zig-fontify`, …), and every
+table it writes is claimed for the file that loads it, so a package's language goes back with
+the package. One spec carries everything the editor knows of the language, and a key it does not
+take (`:interpeters`) fails the load, naming the one meant:
 
 | spec key | what it gives the editor |
 |---|---|
@@ -436,27 +496,69 @@ same `:pattern` `:interpreters` `:names` `:lsp` `:snippets`, registered by the s
 | `:format` | the formatter M-x format-buffer and format-on-save run |
 | `:lsp {:id :ids :servers}` | its language servers, reached by every buffer in the mode however it got there (name, `#!`, M-x), and its LSP `languageId` — `:ids` only for an extension LSP names apart (`jsx`) (`model/register-lsp`) |
 | `:snippets` | its built-in snippet templates |
+| `:pairs`, `:strings` | electric pairs, and its strings and comments without a parse (`stringstate`) |
 | `:fallback` | a line lexer to colour by while the grammar is missing |
 
-- **Install:** the package loads, the spec registers, and the grammars it declares that are not
-  ready are fetched and built at their pins, off the loop, as `M-x grammar-install` does
-  (`grammars/missing-package-grammars`) — installing the package is the asking. It needs git
-  and a C compiler; a failure is said, and the language colours once `M-x grammar-install` runs.
-- **Remove:** the mode, its file patterns, its servers, its grammar declaration and its
-  generated globals go back with the package; an open buffer in the mode is re-typed. The
-  grammar library stays in `~/.config/bedit/grammars` (another language may parse with it).
-- **Name it** `bedit-lang-<language>`: a package's modules may not take a name of bedit's
-  (`languages/...` included) or of a std module.
+The rest of what a language has is registered by the same calls bedit's own make, from the
+same module: a toolchain row (`toolchain/register-toolchain` — a package's `build.zig` is a
+project root, and M-x compile, C-c t and M-x run ask it), keys for its mode (the plugin map's
+`:mode-keys`), anything else through `model/register-*`.
+
+**The pin.** `:revision` is the grammar commit the tables were written against; `:fingerprint`
+is that revision's SHAPE, `editor/treesit/grammar-fingerprint` — the sha256 of its ABI, its
+named and anonymous node kinds and its field names, sorted — so a library built by hand, with no
+install manifest, is still known to be the pinned one. Compute it from a build of the pin:
+
+```bash
+nest eval --test '(grammars/grammar-install-into :zig {:url "https://github.com/tree-sitter-grammars/tree-sitter-zig" :revision "b670c8d…"} "/tmp/g" "/tmp/g/src")'
+nest eval --test '(do (%tree-sitter-load-grammar "/tmp/g/libtree-sitter-zig.so" :zig) (editor/treesit/grammar-fingerprint (editor/treesit/grammar-info :zig)))'
+```
+
+### Installing and removing
+
+- **From the hive:** `M-x package-install` (or `i` in *Packages*).
+- **From a checkout:** `M-x package-install-directory` installs the package in a directory as
+  the hive's install would — copied into the package dir (its `.git` and `_deps` left out),
+  checked that it `:enhances` this bedit, applied live — so an author tries a package before
+  publishing it. Run it again after editing the checkout: it updates the installed copy (the
+  old version retired first, as an update is).
+- **Its grammar comes with it:** the grammars it declares that are not ready are fetched and
+  built at their pins, off the loop, as `M-x grammar-install` does
+  (`grammars/missing-package-grammars`) — installing the package is the asking. It needs git and
+  a C compiler; a failure is said, and the language colours once `M-x grammar-install` runs.
+- **Remove:** the mode, its file patterns, its servers, its toolchain row, its grammar
+  declaration and its generated globals go back with the package; an open buffer in the mode is
+  re-typed. The grammar library stays in `~/.config/bedit/grammars` (another language may parse
+  with it).
+- **Name it** `bedit-lang-<language>`, its main module the package's name: a package's modules
+  may not take a name of bedit's (`languages/...` included) or of a std module.
+
+`tests/language_package_test.blsp` pins this path: a package written to the template installed
+from its directory, a file of it opened in its mode — coloured, indented, its server and
+toolchain rows there — and removed with every row taken back.
 
 ### Testing a language
 
 A language is tested by its CORPUS: realistic files in `tests/corpus/<mode>/`, the directory
-named for the mode type, each written as the language's formatter writes it. A package ships the
-same `tests/corpus/<lang>/`, and in bedit's tree every file there gets each check
-`tests/language_corpus_test.blsp` runs (`tests/support/corpus.blsp`), a test named by the file and
-the check. A dotfile sample is kept as `dot.<name>` and visited as `.<name>`
-(`dot.gitignore`), so git and editors never take the corpus's `.gitignore`, `.gitattributes` or
-`.editorconfig` for their own:
+named for the mode type, each written as the language's formatter writes it. ONE harness checks
+bedit's languages and a package's — `corpus` (src/corpus.blsp), in bedit's `src/` so a package
+reaches it through its dev dependency on bedit — and its one entry point is a test file of one
+line:
+
+```clojure
+(defmodule corpus-test (:use test))
+(corpus/define-tests)
+```
+
+`nest test` in the package (or bedit) then gives every sample each check below, a test named by
+the file and the check. The paths are the project's own (`tests/corpus/`,
+`tests/corpus/known-gaps.blsp`), and the languages a run answers for are the ones the project
+registers (`corpus/own-languages`). A sample whose grammar is not loadable here is SKIPPED, and
+said so: the grammar comes from `$BROOD_TEST_GRAMMARS` (CI's directory of every pinned grammar,
+`tools/ci/install-grammars.blsp`), else the user's `~/.config/bedit/grammars`, read and never
+written. A dotfile sample is kept as `dot.<name>` and visited as `.<name>` (`dot.gitignore`), so
+git and editors never take the corpus's `.gitignore`, `.gitattributes` or `.editorconfig` for
+their own:
 
 1. **mode** — the file's name opens it in the mode its directory names.
 2. **faces** — the sample's own caret assertions hold. A comment line whose text is carets puts
@@ -465,8 +567,9 @@ the check. A dotfile sample is kept as `dot.<name>` and visited as `.<name>`
    column the comment marker starts at. The marker is the mode's `:comment`, or its
    `:comment-block` pair for a language with only block comments (`<!-- ^^^ string -->`).
 3. **golden faces** — `<file>.faces` beside it lists every painted token (`LINE:COL "text"
-   face`); `nest run tools/corpus-golden.blsp -- <lang>` rewrites it after a deliberate change,
-   and the diff is what gets reviewed.
+   face`); `corpus/write-golden` rewrites it after a deliberate change — `nest run
+   tools/corpus-golden.blsp -- <lang>` in bedit, `nest eval --test '(corpus/write-golden
+   ["zig"])'` in a package — and the diff is what gets reviewed.
 4. **indentation, three ways** — every line indents to where it is written; the whole file,
    its indentation stripped, re-indents (C-x h C-M-\) to the sample; and typed a line at a time
    (RET, the text, electric indent) below a half-built buffer, every line lands at its column.
@@ -477,11 +580,12 @@ the check. A dotfile sample is kept as `dot.<name>` and visited as `.<name>`
 6. **robustness** — seeded random one-character edits: fontify, indent, restart, fold extent and
    breadcrumbs raise nothing and the spans stay in bounds and in order.
 
-And every registered language is checked against the others: no shared `:names` word or `#!`
-program, no corpus file claimed by two patterns, every spec passes its macro's key check, every
-server row says `:name :commands :root-markers`. A gap the language cannot close yet — a line its
-indenter misplaces — goes in `tests/corpus/known-gaps.blsp` with why, which only shrinks: a
-listed line that starts passing fails the test until it is removed.
+And the project's languages are checked against every registered one — bedit's own included, which
+a package's run loads first (`corpus/load-languages`): no shared `:names` word or `#!` program, no
+corpus file claimed by two patterns, every spec passes its macro's key check, every server row
+says `:name :commands :root-markers`, every language the project registers has a sample. A gap the
+language cannot close yet — a line its indenter misplaces — goes in `tests/corpus/known-gaps.blsp`
+with why, which only shrinks: a listed line that starts passing fails the test until it is removed.
 
 ## A plugin's library dependencies (built)
 

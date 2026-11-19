@@ -1,8 +1,17 @@
 (defmodule corpus
   "The language corpus: realistic sample files under `tests/corpus/<mode>/`, one directory per
-mode type (`rust`, `terraform`, `lisp`), and the checks every sample gets
-(`tests/language_corpus_test.blsp` registers them, one named test per file and check). A
-language is tested by DROPPING a file of it there, written in its formatter's style.
+mode type (`rust`, `terraform`, `lisp`), and the checks every sample gets ([[define-tests]]
+registers them, one named test per file and check). A language is tested by DROPPING a file of
+it there, written in its formatter's style.
+
+ONE harness for bedit's languages and a language package's: the paths are the project's own
+(`tests/corpus/`, `tests/corpus/known-gaps.blsp`, under the directory `nest test` runs in), so
+a `bedit-lang-*` package with bedit as a dev dependency runs the very checks bedit's own
+languages get, over its own samples, with a test file of one line — `(corpus/define-tests)`,
+as `tests/language_corpus_test.blsp` is — and rewrites its golden listings with
+[[write-golden]]. The languages a run answers for are the ones the project itself registers
+([[own-languages]]); the checks across languages hold them against every registered one, so a
+package's language may not take a name, a `#!` program or a file pattern of bedit's.
 
 A sample asserts its own colours with comment lines, Emacs's `ert-font-lock` carets in bedit's
 faces. Carets sit under the columns of the nearest line above that is not itself an assertion,
@@ -26,12 +35,63 @@ its text, not the indenter's; it is found the way the indenter finds it, from th
 for it. The indent checks keep such a line as written.
 
 Each check answers a vector of PROBLEMS, readable sentences naming the line, and `[]` when the
-sample passes. Lives under tests/support beside `testkit`, whose sample-free helpers it builds on."
+sample passes. Lives in src/ (not tests/support) for the package's sake: a dependency puts bedit's src/ alone on
+its load path. `testkit` delegates the helpers both share to it ([[load-test-grammar]], [[indent-rows]])."
+  (:use test) ; describe / test — define-tests registers the checks as tests
   (:use model)
-  (:use testkit :only [file-model press indent-rows load-test-grammar])
-  (:use editor/buffer :only [buffer-text goto-char insert replace-region]))
+  (:use input :only []) ; ed-update — a key folded as the loop folds it
+  (:use editor/buffer :only [make-buffer buffer-text goto-char insert replace-region]))
 
 (def *corpus-root* "tests/corpus")
+
+;; ---- the runtime a check runs in -----------------------------------------------------------
+;; What the checks need of a model: a buffer visiting a sample as a visit types it, keys pressed
+;; through the editor's own dispatch, and the grammars a test run's scratch home lacks. Here, in
+;; src/, so a language package's tests reach them through bedit as a dependency (which puts
+;; bedit's src/ alone on its load path); bedit's own tests reach the last two through `testkit`.
+
+(defn- sample-model (text file)
+  ;; a model over one buffer holding `text`, visiting `file`, point at its start
+  (ed-init (make-buffer text file file)))
+
+(defn- pressed (m keys)
+  ;; `m` after each of `keys` went through the editor's own dispatch, at an 80×24 frame
+  (fold keys m (fn (acc key) (input/ed-update acc key 80 24))))
+
+(defn load-test-grammar (lang)
+  "Whether `lang`'s grammar is loaded in this process, loading it first when it can be: one the
+runtime was not built with is the user's, and a test run's scratch home has none, so it comes
+from `$BROOD_TEST_GRAMMARS`, else the real config the runner kept aside (read, never written).
+Loaded for the whole process — what a test that needs a grammar ABSENT has to expect beside it."
+  (or (grammars/grammar-loaded? lang)
+    (let (dir (or (os/env "BROOD_TEST_GRAMMARS")
+                (let (base (os/env "BROOD_USER_CONFIG_HOME"))
+                  (when base (path/join base "bedit" "grammars"))))
+          file (when dir (path/join dir (str "libtree-sitter-" (->string lang) ".so"))))
+      (and file
+        (file/exists? file)
+        (check-allow :discarded-catch
+          (try (do (%tree-sitter-load-grammar file lang) true) (catch _ false)))))))
+
+(defn- indent-width (line)
+  ;; the columns `line`'s leading whitespace spans, a tab reaching the next multiple of 8
+  (fold (string/->list (string/substring line 0 (- (count line) (count (string/trim-left line)))))
+    0
+    (fn (column character) (if (= character "\t") (* 8 (inc (math/quot column 8))) (inc column)))))
+
+(defn indent-rows (src file &optional (skip? nil))
+  "`[{:line :got :want}]` for every non-blank line of `src` — but those whose 0-based index
+`skip?` answers true for: the column the mode of `file` indents it to, and the column it already
+has (a tab reaching the next multiple of 8)."
+  (let (indent (ed-mode-service (ed-current-buf (sample-model src file)) :indent)
+        lines (vec (string/split src "\n"))
+        bols (reduce (range (dec (count lines)))
+               [0]
+               (fn (acc i) (conj acc (+ (last acc) (count (nth lines i "")) 1)))))
+    (for (i (range (count lines))
+           :when (not (or (= (string/trim (nth lines i "")) "") (and skip? (skip? i))))
+           :into [])
+      {:line i :got (indent src (nth bols i)) :want (indent-width (nth lines i ""))})))
 
 ;; ---- the corpus ------------------------------------------------------------------------------
 
@@ -70,7 +130,7 @@ names, the file's name and its path — or only `language`'s."
 
 (defn load-grammars ()
   "Load every grammar a registered language declares, as a test does one
-(`testkit/load-test-grammar`): a sample's mode, its fallback and the languages it embeds all
+([[load-test-grammar]]): a sample's mode, its fallback and the languages it embeds all
 depend on them. Answers the set of the ones loaded."
   (into #{} (seq/filter (languages/declared-grammars) load-test-grammar)))
 
@@ -193,7 +253,7 @@ the file's name as a visit types it, every assertion line parsed (`:assertions` 
   (let ({:keys [language name path]} entry
         text (file/slurp path)
         lines (vec (string/split text "\n"))
-        buffer (ed-current-buf (file-model text (visit-path path)))
+        buffer (ed-current-buf (sample-model text (visit-path path)))
         marker-pairs (markers buffer)
         parsed (for (index (range (count lines)) :into [])
                  [index (parse-assertion (nth lines index "") marker-pairs)])
@@ -425,14 +485,20 @@ from 0, assertion lines left out — what [[golden-problems]] compares and
                     " "
                     (string/join names "|")))))))))))
 
+(defn- golden-command (language)
+  ;; what rewrites `language`'s listings: bedit's tool in bedit's tree, else — a language
+  ;; package, which has no copy of it — the function the tool calls ([[write-golden]])
+  (if (file/exists? "tools/corpus-golden.blsp")
+    (str "nest run tools/corpus-golden.blsp -- " language)
+    (str "nest eval --test '(corpus/write-golden [\"" language "\"])'")))
+
 (defn golden-text (sample &optional (painting nil))
   "The golden file's text for `sample`: a header naming the command that wrote it, then
 [[golden-lines]]."
   (str ";; "
     (:id sample)
-    " — the faces its mode paints. Rewrite with "
-    "`nest run tools/corpus-golden.blsp -- "
-    (:language sample)
+    " — the faces its mode paints. Rewrite with `"
+    (golden-command (:language sample))
     "` and review the diff.\n"
     (string/join (golden-lines sample painting) "\n")
     "\n"))
@@ -441,7 +507,7 @@ from 0, assertion lines left out — what [[golden-problems]] compares and
   "The golden listing beside `sample` must be what its mode paints now: a missing file, or the
 first rows that differ."
   (let (path (golden-path (:path sample))
-        command (str "nest run tools/corpus-golden.blsp -- " (:language sample)))
+        command (golden-command (:language sample)))
     (if (not (file/exists? path))
       [(str "no golden listing " path " — write it with `" command "` and review it")]
       (let (want (vec (string/split (file/slurp path) "\n"))
@@ -480,8 +546,8 @@ an earlier line opened: the rule `editor/treesit/indent-column` keeps a line as 
       (into #{}
         (seq/filter (range (count (:lines sample)))
           (fn (index)
-            (let (line (nth (:lines sample) index)
-                  bol (nth (:starts sample) index)
+            (let (line (nth (:lines sample) index "")
+                  bol (nth (:starts sample) index 0)
                   nodes (vec (editor/treesit/node-chain text lang (+ bol (count (leading line))))))
               (and (not (blank? line))
                 (any? (range (count nodes))
@@ -540,7 +606,7 @@ an earlier line opened: the rule `editor/treesit/indent-column` keeps a line as 
 
 (defn indent-problems (sample)
   "(a) Every line, asked of the mode's `:indent` service as the sample stands, indents to the
-column it already has (`testkit/indent-rows`)."
+column it already has ([[indent-rows]])."
   (let (skip (kept-as-written sample))
     (ratchet sample
       :indent (for (row (indent-rows (:text sample)
@@ -552,7 +618,7 @@ column it already has (`testkit/indent-rows`)."
           (str "line "
             (inc (:line row))
             " "
-            (quote-line (nth (:lines sample) (:line row)))
+            (quote-line (nth (:lines sample) (:line row) ""))
             ": indents to "
             (:got row)
             ", written at "
@@ -561,7 +627,7 @@ column it already has (`testkit/indent-rows`)."
 (defn- strip-lines (sample keep)
   ;; the sample's text with every line's leading whitespace removed, but those in `keep`
   (string/join (for (index (range (count (:lines sample))) :into [])
-                 (let (line (nth (:lines sample) index))
+                 (let (line (nth (:lines sample) index ""))
                    (if (contains? keep index) line (string/trim-left line))))
     "\n"))
 
@@ -572,7 +638,7 @@ the real dispatch) — the buffer must read as the sample does."
   (let (verbatim (verbatim-lines sample)
         skip (set/union verbatim (:assertion-lines sample))
         lines (:lines sample)
-        indented (press (file-model (strip-lines sample verbatim) (visit-path (:path sample)))
+        indented (pressed (sample-model (strip-lines sample verbatim) (visit-path (:path sample)))
                    [:ctrl-x "h" (keyword "ctrl-meta-\\")])
         got (vec (string/split (buffer-text (ed-current-buf indented)) "\n")))
     (ratchet sample
@@ -595,10 +661,10 @@ the real dispatch) — the buffer must read as the sample does."
   ;; the model after line `index` was typed below the lines above it: RET through the dispatch,
   ;; then the line's text inserted a character at a time, each followed by electric indent
   (let (prefix (string/join (seq/subvec (:lines sample) 0 index) "\n")
-        start (let (m (file-model prefix (visit-path (:path sample))))
+        start (let (m (sample-model prefix (visit-path (:path sample))))
                 (ed-set-buf m (goto-char (ed-current-buf m) (count prefix)))))
-    (fold (string/->list (string/trim-left (nth (:lines sample) index)))
-      (press start [:enter])
+    (fold (string/->list (string/trim-left (nth (:lines sample) index "")))
+      (pressed start [:enter])
       (fn (m character)
         (indent/ed-electric-reindent (ed-set-buf m (insert (ed-current-buf m) character)))))))
 
@@ -615,7 +681,7 @@ line must end up at the column it is written at."
       :typing (into []
         (seq/keep (range 1 (count lines))
           (fn (index)
-            (let (line (nth lines index))
+            (let (line (nth lines index ""))
               (when (not (or (blank? line) (contains? skip index)))
                 (let (buffer (ed-current-buf (typed-line sample index))
                       got (column-of buffer
@@ -700,7 +766,7 @@ restart has nothing to prove."
             (seq/keep (range 0 (count lines) stride)
               (fn (index)
                 (when (not (contains? (:assertion-lines sample) index))
-                  (restart-problem sample fontify restart whole (nth (:starts sample) index)))))))))))
+                  (restart-problem sample fontify restart whole (nth (:starts sample) index 0)))))))))))
 
 ;; ---- 5. robustness under random edits ------------------------------------------------------
 
@@ -893,8 +959,111 @@ directory names (a file typed by its `#!` line alone is claimed by none)."
                       (not (= (first claimants) (:language entry)))))
               (str (:path entry) " is claimed by " (string/join claimants " and ")))))))))
 
+(defn own-languages ()
+  "The mode types of the languages THIS project registers — a spec claimed from a file under the
+directory the run is in (`ownership/claims-under`): every one of bedit's in bedit's tree, a
+package's own in a package's, never the bedit a package names as a dev dependency. Sorted."
+  (sort (for ([kind key] (ownership/claims-under (file/cwd))
+               :when (= kind :languages/specs)
+               :into [])
+          (->string key))))
+
 (defn uncovered-languages ()
-  "The registered languages with no corpus directory — each wants at least one sample."
-  (let (covered (into #{} (file/list-dirs *corpus-root*)))
-    (for ([type _] (registered-specs) :when (not (contains? covered (->string type))) :into [])
-      (->string type))))
+  "The languages this project registers ([[own-languages]]) with no corpus directory — each
+wants at least one sample."
+  (let (covered (into #{} (if (file/dir? *corpus-root*) (file/list-dirs *corpus-root*) [])))
+    (vec (seq/reject (own-languages) (fn (type) (contains? covered type))))))
+
+;; ---- the tests: one entry point, for bedit's languages and a package's ------------------------
+
+(defn- checks (sample)
+  ;; `[name applies? thunk]` for every check of `sample`; the indent ones only for a mode that
+  ;; indents from the code, and not where the known gaps turn them off
+  (let (indented (indented? sample)
+        painting (fn () (painted sample)))
+    [["mode" true (fn () (mode-problems sample))]
+      ["faces: every caret assertion holds" true (fn () (face-problems sample (painting)))]
+      ["faces: the golden listing is what the mode paints"
+        true
+        (fn () (golden-problems sample (painting)))]
+      ["indent: every line as written"
+        (and indented (applies? sample :indent))
+        (fn () (indent-problems sample))]
+      ["indent: re-indented from scratch"
+        (and indented (applies? sample :reindent))
+        (fn () (reindent-problems sample))]
+      ["indent: typed line by line"
+        (and indented (applies? sample :typing))
+        (fn () (typing-problems sample))]
+      ["restart: a window from the restart paints as the whole text does"
+        (applies? sample :restart)
+        (fn () (restart-problems sample))]
+      ["robustness: random edits raise nothing, spans stay in order"
+        true
+        (fn () (robustness-problems sample))]]))
+
+(defn load-languages ()
+  "Load every module of bedit's `languages` context, so each of bedit's languages is registered
+— what bedit's project image does before a test runs, and nothing does for a package that has
+bedit as a dependency, whose run would otherwise hold its language against itself alone.
+Answers how many modules there are."
+  (let (core-file (first (reflect/source-location 'languages/core/check-spec))
+        directory (path/dirname core-file)
+        stems (for (name (sort (file/list-files directory))
+                     :when (string/ends-with? name ".blsp")
+                     :into [])
+                (string/substring name 0 (- (count name) 5))))
+    (doseq (stem stems)
+      (require-one (symbol (str "languages/" stem))))
+    (count stems)))
+
+(defn define-tests ()
+  "Register the corpus's tests: for every sample under `tests/corpus/<mode>/`, each check that
+applies to it as a test of its own, named by the file and the check — SKIPPED, and named so,
+when its language's grammar is not loadable here ([[load-test-grammar]]:
+`$BROOD_TEST_GRAMMARS`, else the user's) — and the checks across the languages. What a corpus
+test file calls, bedit's (`tests/language_corpus_test.blsp`) and a language package's alike."
+  (load-languages)
+  (load-grammars)
+  (doseq (entry (corpus-files))
+    (let (sample (sample entry)
+          ready (ready? sample))
+      (describe (str "corpus " (:id sample))
+        (doseq ([name applies thunk] (checks sample))
+          (when applies
+            (test name
+              :skip-unless ready
+              (str "no " (->string (grammar sample)) " grammar")
+              (assert= (thunk) [])))))))
+  (describe "the languages, against each other"
+    (test "no two languages answer to the same name"
+      (assert= (name-problems) []))
+    (test "no two languages claim the same #! program"
+      (assert= (interpreter-problems) []))
+    (test "every corpus file is claimed by its own language's file pattern alone"
+      (assert= (pattern-problems) []))
+    (test "every registered spec passes its macro's key check"
+      (assert= (spec-problems) []))
+    (test "every language server row says its name, commands and root markers"
+      (assert= (lsp-problems) []))
+    (test "every language this project registers has a corpus sample"
+      (assert= (uncovered-languages) []))))
+
+(defn write-golden (&optional (languages nil))
+  "Write the golden face listing (`<file>.faces`, [[golden-text]]) beside every sample of the
+corpus — only `languages`' (a vector of mode type names) when given — and answer a line per
+sample: `wrote`, `unchanged`, or `skipped` with why (its grammar is not loadable). Run after a
+deliberate change to a face table or a grammar, then READ the diff: a keyword that turned into a
+string is a regression the listing caught, not a change to bless. `tools/corpus-golden.blsp`
+calls it in bedit's tree; a package calls it with `nest eval --test`."
+  (load-grammars)
+  (vec (map (if (empty? languages) (corpus-files) (mapcat languages corpus-files))
+         (fn (entry)
+           (let (sample (sample entry)
+                 path (golden-path (:path sample)))
+             (if (ready? sample)
+               (let (text (golden-text sample)
+                     before (when (file/exists? path) (file/slurp path)))
+                 (when (not (= text before)) (file/spit path text))
+                 (str (if (= text before) "unchanged " "wrote     ") path))
+               (str "skipped   " (:id sample) " — no " (->string (grammar sample)) " grammar")))))))

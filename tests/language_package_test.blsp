@@ -1,0 +1,174 @@
+;; A language package, end to end: one written to the template bedit's own languages follow
+;; (docs/packages.md "A language package" — `(:use languages)`, one `deflanguage` spec, a
+;; toolchain row, a `bedit-plugin` entry) is installed from its directory with
+;; `M-x package-install-directory`, as its author tries it before publishing. A file of it opens
+;; in its mode, coloured and indented; its server row and its toolchain row are there; removing
+;; it takes every row back. The sample language parses with the Lua grammar under a mode of its
+;; own (`:type`), so CI runs this from `$BROOD_TEST_GRAMMARS` with no network, and it is SKIPPED
+;; where that grammar is not loadable. The grammar a package brings is built at install with the
+;; network and the compiler stood in for (`grammars/*grammar-installer*`). Against a scratch
+;; config dir (`config-paths/*config-base*`), never the user's own packages.
+(defmodule language-package-test
+  (:use test)
+  (:use model) ; ed-init / ed-current-buf / ed-mode-service
+  (:use editor/buffer :only [make-buffer])
+  (:use config-paths :only [*config-base*])
+  (:use packages :only [*registry*]))
+
+(purge-stale-temp "bedit-langpkg-")
+
+(def- *package* "bedit-lang-pkgsample")
+
+(def- *module*
+  ;; the package's one module, written as a bedit language is: the spec and the toolchain row
+  "(defmodule bedit-lang-pkgsample
+  \"A sample language package.\"
+  (:use languages))
+
+(deflanguage pkgsample
+  {:lang :lua
+   :type :pkgsample
+   :pattern \"\\\\.pkgsample$\"
+   :lsp {:id \"pkgsample\"
+         :servers [{:name \"pkgsample-ls\"
+                    :commands [[\"pkgsample-ls\" []]]
+                    :root-markers [\"pkgsample.toml\"]}]}
+   :pairs *quote-pairs*
+   :faces {:comment :syntax/comment :string :syntax/string :number :syntax/number}
+   :indent {:width 2 :blocks #{:block} :dedent {\"end\" 0} :opens #{\"then\" \"do\"}}
+   :definitions {:kinds #{:function_declaration}}
+   :format [\"pkgsample-fmt\"]
+   :comment \"-- \"})
+
+(toolchain/register-toolchain
+  {:id :pkgsample :name \"Pkgsample\" :markers [\"pkgsample.toml\"] :compile \"pkgsample build\"})
+
+(defn bedit-plugin () {})
+")
+
+(defn- write-package (directory)
+  ;; the package's checkout: a manifest that enhances bedit, its module, and a `.git` and a
+  ;; `_deps` an install must not copy
+  (file/mkdir directory)
+  (file/mkdir (path/join directory "src"))
+  (file/mkdir (path/join directory ".git"))
+  (file/mkdir (path/join directory "_deps"))
+  (file/spit (path/join directory "project.blsp")
+    (str "(project :name \"" *package* "\" :version \"0.1.0\" :enhances {bedit \">= 0.1\"})\n"))
+  (file/spit (path/join directory "src" (str *package* ".blsp")) *module*))
+
+(defn- unreachable-registry ()
+  ;; the hive, unreachable: a directory install must not need it
+  {:enhancers (fn (_app) (error "no network in a test"))
+   :latest-version (fn (_name) (error "no network in a test"))
+   :install (fn (_name _dest) (error "no network in a test"))})
+
+(defn- in-scratch (base thunk)
+  (binding (*config-base* base *registry* (unreachable-registry)) (thunk)))
+
+(defn- retire (base)
+  ;; journalled, so an `:isolated` test's restore does not bring the package back (see
+  ;; tests/packages_test.blsp, `pk-retire`)
+  (in-scratch base
+    (fn () (%with-load-journal (fn () (packages/ledger/retire-package *package*))))))
+
+(def- *sample* "function area(r)\n  local x = 3 -- pi, near enough\n  return x * r * r\nend\n")
+
+(defn- sample-buffer ()
+  (ed-current-buf (ed-init (make-buffer *sample* "/tmp/shapes.pkgsample" "/tmp/shapes.pkgsample"))))
+
+(defn- server-rows ()
+  (seq/filter (model/lsp-server-rows) (fn (row) (= (:name row) "pkgsample-ls"))))
+
+(defn- toolchain-row ()
+  (seq/find (toolchain/toolchains) (fn (row) (= (:id row) :pkgsample))))
+
+(describe "a language package installed from its directory"
+  :isolated (test "its files open in its mode, coloured and indented, and removing it takes every row back"
+    :skip-unless (corpus/load-test-grammar :lua)
+    "no lua grammar ($BROOD_TEST_GRAMMARS)"
+    (let (base (temp-dir "bedit-langpkg-")
+          source (path/join base "checkout")
+          _ (write-package source)
+          installed (in-scratch base
+                      (fn ()
+                        (packages/package-install-directory (ed-init (make-buffer ""))
+                          source)))
+          package-dir (in-scratch base (fn () (packages/store/package-dir *package*)))
+          buffer (sample-buffer)
+          spans ((ed-mode-service buffer :fontify) *sample*)
+          indent (ed-mode-service buffer :indent))
+      ;; installed through the package manager, from the checkout, live
+      (is (includes? (:echo installed) (str "installed " *package* " 0.1.0 from ")))
+      (is (includes? (:echo installed) "applied live"))
+      (assert= (:status (packages/package-status *package*)) :loaded)
+      ;; the checkout's files, not its `.git` or `_deps`
+      (assert= (vec (sort (file/ls package-dir))) ["project.blsp" "src"])
+      ;; a file of it opens in its mode, coloured and indented
+      (assert= (:type buffer) :pkgsample)
+      (is (any? spans (fn (span) (= (nth span 2) (editor/face/face :syntax/comment)))))
+      (is (any? spans (fn (span) (= (nth span 2) (editor/face/face :syntax/number)))))
+      (assert= (indent *sample* (index-of *sample* "  local")) 2)
+      (assert= (indent *sample* (index-of *sample* "end")) 0)
+      ;; its server and its toolchain, as bedit's own languages have them
+      (assert= (vec (map (server-rows) :owner)) [:pkgsample])
+      (assert= (:compile (toolchain-row)) "pkgsample build")
+      (assert= (registry/lookup :languages/specs :pkgsample)
+        (quote bedit-lang-pkgsample/pkgsample-spec))
+      ;; removed: every row it registered goes back
+      (let (removed (in-scratch base
+                      (fn () (packages/remove! (ed-init (make-buffer "")) *package*))))
+        (is (second removed))
+        (assert= (registry/lookup :languages/specs :pkgsample) nil)
+        (assert= (vec (server-rows)) [])
+        (assert= (toolchain-row) nil)
+        (assert= (in-scratch base (fn () (ownership/claims-under package-dir))) [])
+        (refute (bound? 'bedit-lang-pkgsample/pkgsample-spec))
+        (assert= (:type (sample-buffer)) :fundamental))
+      (retire base)))
+  :isolated (test "installing it again from the checkout updates it"
+    (let (base (temp-dir "bedit-langpkg-")
+          source (path/join base "checkout")
+          _ (write-package source)
+          install (fn ()
+                    (in-scratch base
+                      (fn ()
+                        (packages/package-install-directory (ed-init (make-buffer "")) source))))
+          _ (install)
+          again (install))
+      (is (includes? (:echo again) (str "updated " *package* " → 0.1.0")))
+      (assert= (:status (packages/package-status *package*)) :loaded)
+      (retire base)))
+  (test "a directory with no package in it is said, and nothing is installed"
+    (let (base (temp-dir "bedit-langpkg-")
+          said (in-scratch base
+                 (fn () (packages/package-install-directory (ed-init (make-buffer "")) base))))
+      (is (includes? (:echo said) "holds no package"))
+      (refute (in-scratch base (fn () (packages/store/installed? *package*)))))))
+
+;; The grammar a language package declares comes with it from a directory install too: the one
+;; not ready is fetched and built at its pin (the network and the compiler stood in for).
+(describe "a language package's grammar"
+  :isolated (test "is built when it is installed from its directory"
+    (let (base (temp-dir "bedit-langpkg-")
+          source (path/join base "checkout")
+          _ (file/mkdir source)
+          _ (file/mkdir (path/join source "src"))
+          _ (file/spit (path/join source "project.blsp")
+              "(project :name \"bedit-lang-pkgsgrammar\" :version \"0.1.0\" :enhances {bedit \">= 0.1\"})\n")
+          _ (file/spit (path/join source "src" "bedit-lang-pkgsgrammar.blsp")
+              (str "(defmodule bedit-lang-pkgsgrammar (:use languages))\n"
+                "(deflanguage pkgsgrammar {:lang :pkgsgrammar :pattern \"\\\\.pkgsgrammar$\" :faces {}"
+                " :indent :content :comment \"# \""
+                " :grammar {:url \"https://example.invalid/tree-sitter-pkgsgrammar\""
+                " :revision \"0123456789abcdef0123456789abcdef01234567\"}})\n"
+                "(defn bedit-plugin () {})\n"))
+          done (binding (grammars/*grammar-installer* (fn (_url lang _out _work _options)
+                                                        {:error (str "stub built " (->string lang))}))
+                 (in-scratch base
+                   (fn ()
+                     (packages/package-install-directory (ed-init (make-buffer "")) source)))))
+      (is (includes? (:echo done) "building its pkgsgrammar grammar"))
+      (%with-load-journal (fn ()
+                            (in-scratch base
+                              (fn () (packages/ledger/retire-package "bedit-lang-pkgsgrammar"))))))))

@@ -944,8 +944,9 @@ src/workings.blsp           the "show me how it actually ran" pane over `aside`:
 src/toolchain.blsp          the project TYPE as data: marker file -> which commands compile,
                             test, run and REPL here (mix / nest / cargo / npm / go /
                             terraform / make),
-                            and which tasks it can list. projects.blsp derives its root
-                            markers from this table, so a language is ONE edit
+                            and which tasks it can list — a registered table (`register-toolchain`),
+                            so a language package adds its own (`build.zig`). projects.blsp derives its root
+                            markers from it, so a language is ONE row
 src/results.blsp            the results-buffer abstraction behind *Tests* / *Run* / *compilation* /
                             *Occur* / *git-status*: the `file:line[:col]` location vocabulary, the
                             `location-jump-layer` that makes every such row navigable, and
@@ -1013,6 +1014,13 @@ src/guest.blsp              a guest's session (brood ADR-415): editing what it w
                             more — the allowlist (`ed-guest-allows?`, the `:guest` command trait)
                             that tests/guest_allowed.txt pins
 tests/*_test.blsp           pure model/view tests, one suite per area (no window needed)
+src/corpus.blsp             the language corpus harness: every sample under tests/corpus/<mode>/ checked —
+                            its mode, caret assertions and golden faces, indentation three ways, restart,
+                            random edits — and the languages against each other (`define-tests`, the one
+                            entry point; `write-golden`). In src/ rather than tests/support because a
+                            language package runs it too, with bedit as a dev dependency (whose src/ alone
+                            is on the package's load path); `testkit` delegates `load-test-grammar` and
+                            `indent-rows` to it
 tests/support/testkit.blsp  what the tests share: `m-of`, `cur`, `press` (keys through the real dispatch at
                             80×24), `type-str`, `after`, and `said` (the message shown, beside a standing
                             prompt or on the echo line) — `(:use testkit :only [...])`; tests/support is
@@ -1735,7 +1743,11 @@ src/collab/commands.blsp
 
 ```
 src/languages.blsp
-    the context's API: Brood's indenter, eldoc and completion (for the project shell and the
+    the context's API, and THE language authoring surface: `deflanguage`, `deflexer` and
+    `deflisp` (each expanding to the core's), the face-table helpers and the shared string,
+    pair, restart and formatter tables — what bedit's `languages/<lang>` modules and a
+    `bedit-lang-*` package's module alike `(:use languages)` (docs/packages.md "A language
+    package"). Also Brood's indenter, eldoc and completion (for the project shell and the
     tutor), a buffer's definitions from its parse; the modes themselves register by file type
 src/languages/crumbs.blsp
     the header line's crumbs for code: the definitions around point by name, off the
@@ -1772,7 +1784,7 @@ src/languages/core.blsp
     All three language macros register through one path (`register-language`). Each
     language is one module below, `languages/<language>` with its
     tests in tests/languages_<language>_test.blsp — the shape a
-    standalone language package would have. A spec names where its
+    language package has (it `(:use languages)`, not this module). A spec names where its
     grammar lives AND the commit its tables were written against
     (`:grammar {:url :revision}`, for M-x grammar-install — each pin the
     commit the installed library was rebuilt byte-identical from), its
