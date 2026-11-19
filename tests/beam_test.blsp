@@ -202,90 +202,91 @@
 
 ;; ---- the live node ----------------------------------------------------------------------
 
-(when (elixir-sandbox/elixir-available?)
-  (describe "observing a real node"
-    :isolated (test "OBSERVE comes back with the processes actually running in the VM"
-      (let (_ (proc/register :editor (self))
-            _ (elixir-sandbox/elixir-start "/tmp")
-            _ (receive
-                ((record session/session-ready {}) :ready)
-                (after 60000 :timed-out))
-            _ (elixir-sandbox/elixir-observe 1 "processes")
-            reply (receive
+(describe "observing a real node"
+  :skip-unless (elixir-sandbox/elixir-available?)
+  "no elixir on PATH"
+  :isolated (test "OBSERVE comes back with the processes actually running in the VM"
+    (let (_ (proc/register :editor (self))
+          _ (elixir-sandbox/elixir-start "/tmp")
+          _ (receive
+              ((record session/session-ready {}) :ready)
+              (after 60000 :timed-out))
+          _ (elixir-sandbox/elixir-observe 1 "processes")
+          reply (receive
+                  ((record session/session-reply {:reply r}) :when
+                    (= (get r :id) 1)
+                    r)
+                  (after 30000 nil)))
+      (is (not (nil? reply)))
+      (assert= (get reply :ok) true)
+      (let (rows (get reply :processes))
+        ;; a bare VM runs dozens; the exact number is the VM's business
+        (is (> (count rows) 10))
+        ;; every row carries what the renderer reads
+        (is (every? rows (fn (p) (string/starts-with? (get p :pid "") "#PID<"))))
+        (is (every? rows (fn (p) (int? (get p :reductions)))))
+        ;; and the names are OTP's own, not `:proc_lib` for everything it started
+        (is (any? rows (fn (p) (= (get p :name) ":init")))))
+      (elixir-sandbox/elixir-shutdown)))
+
+  ;; The expression is built for Elixir's parser, so only Elixir can say whether it is
+  ;; right. It was not: the first version sent `inspect`'s `#PID<…>` straight through and
+  ;; could not kill anything at all.
+  :isolated (test "the kill expression actually kills a process in the node"
+    (let (_ (proc/register :editor (self))
+          _ (elixir-sandbox/elixir-start "/tmp")
+          _ (receive
+              ((record session/session-ready {}) :ready)
+              (after 60000 :timed-out))
+          await (fn (id)
+                  (receive
                     ((record session/session-reply {:reply r}) :when
-                      (= (get r :id) 1)
+                      (= (get r :id) id)
                       r)
                     (after 30000 nil)))
-        (is (not (nil? reply)))
-        (assert= (get reply :ok) true)
-        (let (rows (get reply :processes))
-          ;; a bare VM runs dozens; the exact number is the VM's business
-          (is (> (count rows) 10))
-          ;; every row carries what the renderer reads
-          (is (every? rows (fn (p) (string/starts-with? (get p :pid "") "#PID<"))))
-          (is (every? rows (fn (p) (int? (get p :reductions)))))
-          ;; and the names are OTP's own, not `:proc_lib` for everything it started
-          (is (any? rows (fn (p) (= (get p :name) ":init")))))
-        (elixir-sandbox/elixir-shutdown)))
+          ;; something long-lived to kill, named so it can be looked up again
+          _ (elixir-sandbox/elixir-eval 1
+              "victim = spawn(fn -> :timer.sleep(120_000) end); Process.register(victim, :bt_victim); inspect(victim)"
+              10000)
+          printed (get (await 1) :value))
+      ;; `inspect` inside the node produced `"#PID<0.x.0>"`, which arrives quoted
+      (is (includes? printed "#PID<"))
+      (let (pid (string/replace printed "\"" "")
+            _ (elixir-sandbox/elixir-eval 2 (beam/beam-kill-expr pid) 10000)
+            killed (await 2))
+        (assert= (get killed :ok) true)
+        (elixir-sandbox/elixir-eval 3 "Process.whereis(:bt_victim) == nil" 10000)
+        (assert= (get (await 3) :value) "true"))
+      (elixir-sandbox/elixir-shutdown)))
 
-    ;; The expression is built for Elixir's parser, so only Elixir can say whether it is
-    ;; right. It was not: the first version sent `inspect`'s `#PID<…>` straight through and
-    ;; could not kill anything at all.
-    :isolated (test "the kill expression actually kills a process in the node"
-      (let (_ (proc/register :editor (self))
-            _ (elixir-sandbox/elixir-start "/tmp")
-            _ (receive
-                ((record session/session-ready {}) :ready)
-                (after 60000 :timed-out))
-            await (fn (id)
-                    (receive
-                      ((record session/session-reply {:reply r}) :when
-                        (= (get r :id) id)
-                        r)
-                      (after 30000 nil)))
-            ;; something long-lived to kill, named so it can be looked up again
-            _ (elixir-sandbox/elixir-eval 1
-                "victim = spawn(fn -> :timer.sleep(120_000) end); Process.register(victim, :bt_victim); inspect(victim)"
-                10000)
-            printed (get (await 1) :value))
-        ;; `inspect` inside the node produced `"#PID<0.x.0>"`, which arrives quoted
-        (is (includes? printed "#PID<"))
-        (let (pid (string/replace printed "\"" "")
-              _ (elixir-sandbox/elixir-eval 2 (beam/beam-kill-expr pid) 10000)
-              killed (await 2))
-          (assert= (get killed :ok) true)
-          (elixir-sandbox/elixir-eval 3 "Process.whereis(:bt_victim) == nil" 10000)
-          (assert= (get (await 3) :value) "true"))
-        (elixir-sandbox/elixir-shutdown)))
-
-    ;; A timeout kills the evaluating process, which never gets to tell its trace collector
-    ;; to stand down — so an unlinked collector waits in its receive forever and the node
-    ;; leaks one process per timed-out evaluation. Measured at 58 → 61 over three.
-    :isolated (test "a timed-out evaluation leaves no process behind"
-      (let (_ (proc/register :editor (self))
-            _ (elixir-sandbox/elixir-start "/tmp")
-            _ (receive
-                ((record session/session-ready {}) :ready)
-                (after 60000 :timed-out))
-            await (fn (id)
-                    (receive
-                      ((record session/session-reply {:reply r}) :when
-                        (= (get r :id) id)
-                        r)
-                      (after 30000 nil)))
-            count-of (fn (id)
-                       (do
-                         (elixir-sandbox/elixir-eval id "length(Process.list())" 10000)
-                         (string/->number (get (await id) :value))))
-            before (count-of 1)
-            _ (doseq (i (range 3))
-                (do
-                  (elixir-sandbox/elixir-eval (+ 10 i) ":timer.sleep(30_000)" 300)
-                  (is (get (await (+ 10 i)) :timeout))))
-            after-count (count-of 2))
-        ;; exactly equal is the contract; a margin would let the leak back in one at a time
-        (assert= after-count before)
-        (elixir-sandbox/elixir-shutdown)))))
+  ;; A timeout kills the evaluating process, which never gets to tell its trace collector
+  ;; to stand down — so an unlinked collector waits in its receive forever and the node
+  ;; leaks one process per timed-out evaluation. Measured at 58 → 61 over three.
+  :isolated (test "a timed-out evaluation leaves no process behind"
+    (let (_ (proc/register :editor (self))
+          _ (elixir-sandbox/elixir-start "/tmp")
+          _ (receive
+              ((record session/session-ready {}) :ready)
+              (after 60000 :timed-out))
+          await (fn (id)
+                  (receive
+                    ((record session/session-reply {:reply r}) :when
+                      (= (get r :id) id)
+                      r)
+                    (after 30000 nil)))
+          count-of (fn (id)
+                     (do
+                       (elixir-sandbox/elixir-eval id "length(Process.list())" 10000)
+                       (string/->number (get (await id) :value))))
+          before (count-of 1)
+          _ (doseq (i (range 3))
+              (do
+                (elixir-sandbox/elixir-eval (+ 10 i) ":timer.sleep(30_000)" 300)
+                (is (get (await (+ 10 i)) :timeout))))
+          after-count (count-of 2))
+      ;; exactly equal is the contract; a margin would let the leak back in one at a time
+      (assert= after-count before)
+      (elixir-sandbox/elixir-shutdown))))
 
 ;; ---- attaching to a node bedit did not start ----------------------------------------
 ;; The feature that turns this from a view of a project into a view of a RUNNING system,
@@ -666,52 +667,53 @@
 ;; said "no such module". And RESUME never worked anywhere — only the process that
 ;; suspended another may resume it, and that is the tracer, not the agent.
 
-(when (elixir-sandbox/elixir-available?)
-  (describe "the debugger acts on the node the session is attached to"
-    :isolated (test "a break on the target stops its process, and a resume lets it run on"
-      (let (host (os/cmd-out (os/cmd "hostname" ["-s"]))
-            name (str "bedit_bt_" (os/cmd-out (os/cmd "date" ["+%s%N"])))
-            ;; the target: a module ONLY it defines, called in a loop
-            target (os/spawn "elixir"
-                     ["--sname"
-                       name "--cookie" "btsecret" "-e"
-                       "defmodule OnlyThere do\n  def ping(x), do: x + 1\nend\nIO.puts(\"up\")\nStream.repeatedly(fn -> OnlyThere.ping(1); :timer.sleep(100) end) |> Stream.run()"])
-            up (receive
-                 ([:proc ^target out] :when (includes? out "up") :up)
-                 (after 30000 :timed-out))
-            _ (proc/register :editor (self))
-            _ (elixir-sandbox/elixir-start "/tmp")
-            _ (receive
-                ((record session/session-ready {}) :ready)
-                (after 60000 :timed-out))
-            await (fn (id)
-                    (receive
-                      ((record session/session-reply {:reply r}) :when
-                        (= (get r :id) id)
-                        r)
-                      (after 30000 nil)))
-            ;; the next break on the stream, skipping the returns between
-            await-break (fn ()
-                          (receive
-                            ((record session/session-reply {:reply r}) :when
-                              (and (= (get r :id) 99) (= (map/get-in r [:spy :kind]) "break"))
-                              (get r :spy))
-                            (after 30000 nil))))
-        (assert= up :up)
-        (assert= (get (do (elixir-sandbox/elixir-attach 1 (str name "@" host) "btsecret") (await 1))
-                   :ok)
-          true)
-        (let (armed (do (elixir-sandbox/elixir-trace 2 99 "OnlyThere.ping/1" "break") (await 2)))
-          (assert= (get armed :error) nil)
-          (assert= (get armed :ok) true))
-        (let (stop (await-break))
-          (assert= (get stop :stopped) true)
-          (let (resumed (do (elixir-sandbox/elixir-resume 3 (get stop :pid)) (await 3)))
-            (assert= (get resumed :ok) true)
-            (assert= (get resumed :gone) nil))
-          ;; it ran on — into the breakpoint again
-          (is (not (nil? (await-break)))))
-        (elixir-sandbox/elixir-detach 4)
-        (await 4)
-        (elixir-sandbox/elixir-shutdown)
-        (os/close target)))))
+(describe "the debugger acts on the node the session is attached to"
+  :skip-unless (elixir-sandbox/elixir-available?)
+  "no elixir on PATH"
+  :isolated (test "a break on the target stops its process, and a resume lets it run on"
+    (let (host (os/cmd-out (os/cmd "hostname" ["-s"]))
+          name (str "bedit_bt_" (os/cmd-out (os/cmd "date" ["+%s%N"])))
+          ;; the target: a module ONLY it defines, called in a loop
+          target (os/spawn "elixir"
+                   ["--sname"
+                     name "--cookie" "btsecret" "-e"
+                     "defmodule OnlyThere do\n  def ping(x), do: x + 1\nend\nIO.puts(\"up\")\nStream.repeatedly(fn -> OnlyThere.ping(1); :timer.sleep(100) end) |> Stream.run()"])
+          up (receive
+               ([:proc ^target out] :when (includes? out "up") :up)
+               (after 30000 :timed-out))
+          _ (proc/register :editor (self))
+          _ (elixir-sandbox/elixir-start "/tmp")
+          _ (receive
+              ((record session/session-ready {}) :ready)
+              (after 60000 :timed-out))
+          await (fn (id)
+                  (receive
+                    ((record session/session-reply {:reply r}) :when
+                      (= (get r :id) id)
+                      r)
+                    (after 30000 nil)))
+          ;; the next break on the stream, skipping the returns between
+          await-break (fn ()
+                        (receive
+                          ((record session/session-reply {:reply r}) :when
+                            (and (= (get r :id) 99) (= (map/get-in r [:spy :kind]) "break"))
+                            (get r :spy))
+                          (after 30000 nil))))
+      (assert= up :up)
+      (assert= (get (do (elixir-sandbox/elixir-attach 1 (str name "@" host) "btsecret") (await 1))
+                 :ok)
+        true)
+      (let (armed (do (elixir-sandbox/elixir-trace 2 99 "OnlyThere.ping/1" "break") (await 2)))
+        (assert= (get armed :error) nil)
+        (assert= (get armed :ok) true))
+      (let (stop (await-break))
+        (assert= (get stop :stopped) true)
+        (let (resumed (do (elixir-sandbox/elixir-resume 3 (get stop :pid)) (await 3)))
+          (assert= (get resumed :ok) true)
+          (assert= (get resumed :gone) nil))
+        ;; it ran on — into the breakpoint again
+        (is (not (nil? (await-break)))))
+      (elixir-sandbox/elixir-detach 4)
+      (await 4)
+      (elixir-sandbox/elixir-shutdown)
+      (os/close target))))
