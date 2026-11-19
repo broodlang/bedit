@@ -248,21 +248,90 @@ together are folded into one ([[ed-lsp-merge-into-host]])."
         conn)
       m)))
 
-(defn ed-ev-lsp-apply-edit (m input textrows cols rows)
-  "A server asking to change files itself (`[:lsp-apply-edit wsedit]`) — what a code
-action's `workspace/executeCommand` produces instead of carrying its edits inline.
+;; ---- what a server may change --------------------------------------------------------
+;; A server's edit names its files itself: a rename's, a code action's, the edit a
+;; `workspace/applyEdit` brings unasked. So before one is applied, every file it names must
+;; be a plain local file (never one a file handler claims: `/sudo::/etc/hosts` would be
+;; opened as root) inside the server's workspace — the roots it was started for. An edit
+;; outside them is REFUSED, saying which file, rather than asked about: no real server
+;; edits outside its workspace (a rename into a dependency's source is one it refuses
+;; itself), and a y/n would have to hold the edit while the buffers it was computed against
+;; go on changing. The file can still be opened and edited by hand.
 
-Applied to whatever those files are, because that is the whole request: unlike a rename,
-nothing here was computed against a buffer we can rope-guard — the action was chosen from
-a list the server offered, and the server is the one that decided what it means. Files not
-already open are opened to receive it, and every touched buffer is left modified for you
-to read before saving."
+(defn ed-lsp-edit-refusal (m conn wsedit)
+  "Why server `conn`'s workspace edit `wsedit` (`{path -> edits}`,
+`lsp/protocol/lsp-workspace-edit`) must not be applied in `m`, or nil when it may: a uri that
+names no local file, a path a file handler claims (`model/ed-path-handler`), or one outside
+the roots `conn` serves (`:roots` of its entry in `:lsp-servers`; none when it is not filed)."
+  (let (paths (keys wsedit)
+        roots (or (map/get-in m [:lsp-servers conn :roots]) [])
+        foreign (seq/find paths (fn (path) (or (not (string? path)) (ed-path-handler path))))
+        outside (seq/filter (seq/filter paths string?)
+                  ;; normalized: a `..` must not walk out of a root it appears to be under
+                  (fn (path)
+                    (not (any? roots (fn (root) (lsp/client/lsp-under? (path/normalize path) root)))))))
+    (cond
+      foreign
+        (str "lsp: edit refused — "
+          (if (vector? foreign) (nth foreign 1 "") (str foreign))
+          " is not a local file")
+      (not (empty? outside))
+        (str "lsp: edit refused — outside the server's workspace: " (string/join outside ", "))
+      else nil)))
+
+(defn- ed-lsp-edit-moved (m conn wsedit tokens)
+  "The first file of `wsedit` whose open buffer is no longer the text server `conn` computed
+the edit against, or nil. One the connection has synced (`tokens`, per path, the token naming
+the text it holds) must still be what the editor last pushed there (`:lsp-synced`): the same
+token, the same rope — a nil token names nothing to compare, so that file counts as moved.
+One it never synced must be unmodified, as the server read it from disk."
+  (seq/find (seq/filter (keys wsedit) string?)
+    (fn (path)
+      (let (index (ed-buffer-index-by-file m path))
+        (when index
+          (let (buffer (ed-buf-at m index)
+                token (get tokens path)
+                synced (map/get-in m [:lsp-synced [conn (lsp/protocol/lsp-path->uri path)]]))
+            (if (contains? tokens path)
+              (not (and token
+                     synced
+                     (= token (:token synced))
+                     (= (buffer-rope buffer) (buffer-rope (:buf synced)))))
+              (buffer-modified? buffer))))))))
+
+(defn ed-ev-lsp-apply-edit (m input textrows cols rows)
+  "A server asking to change files itself (`[:lsp-apply-edit wsedit conn tokens]`) — what a
+code action's `workspace/executeCommand` produces instead of carrying its edits inline.
+
+Guarded twice. Where: every file must be a local one inside server `conn`'s workspace
+([[ed-lsp-edit-refusal]]); an edit with no connection to name is refused whole. When: the
+connection already refused an edit naming a document version it no longer holds
+(`lsp/protocol/lsp-stale-edit-paths`), and here every open file it touches must still be the
+text the server computed against ([[ed-lsp-edit-moved]]) — typing while the action ran moves
+the offsets, and the edit is dropped, saying so, rather than landing in the wrong place.
+Files not already open are opened to receive it, and every touched buffer is left modified
+for you to read before saving."
   (let (wsedit (nth input 1)
+        conn (nth input 2 nil)
+        tokens (or (nth input 3 nil) {})
         paths (keys wsedit))
-    (if (empty? paths)
-      m
-      (message (fold paths m (fn (mm path) (ed-lsp-apply-file-edits mm path (get wsedit path))))
-        (str "applied edits in " (count paths) " file(s)")))))
+    (cond
+      (empty? paths) m
+      (nil? conn) (message m "lsp: edit refused — it names no server")
+      else
+        (let (refusal (ed-lsp-edit-refusal m conn wsedit)
+              moved (when (nil? refusal) (ed-lsp-edit-moved m conn wsedit tokens)))
+          (cond
+            refusal (message m refusal)
+            moved
+              (message m
+                (str "lsp: edit dropped — "
+                  moved " changed while the server worked; run the action again"))
+            else
+              (message (fold paths
+                         m
+                         (fn (mm path) (ed-lsp-apply-file-edits mm path (get wsedit path))))
+                (str "applied edits in " (count paths) " file(s)")))))))
 
 (defn- ed-lsp-here (m feature)
   "The LSP request context for the current buffer at point:
@@ -396,12 +465,15 @@ a title — an ordinal on every row would be noise on the common case of one or 
 run the command it names. An action may be both (LSP allows it, and `organize imports`
 often is), so neither arm excludes the other."
   (let (edit (:edit action)
-        edited (if (or (nil? edit) (empty? edit))
-                 m
-                 (message (fold (keys edit)
-                            m
-                            (fn (mm path) (ed-lsp-apply-file-edits mm path (get edit path))))
-                   (str (:title action) " — " (count (keys edit)) " file(s)"))))
+        refusal (when (and edit (not (empty? edit))) (ed-lsp-edit-refusal m conn edit))
+        edited (cond
+                 (or (nil? edit) (empty? edit)) m
+                 refusal (message m refusal)
+                 else
+                   (message (fold (keys edit)
+                              m
+                              (fn (mm path) (ed-lsp-apply-file-edits mm path (get edit path))))
+                     (str (:title action) " — " (count (keys edit)) " file(s)"))))
     (if (nil? (:command action))
       edited
       (ed-lsp-ask-server edited
@@ -462,11 +534,13 @@ often is), so neither arm excludes the other."
 (impl LspRequest
   lsp/requests/lsp-rename
   (lsp-request-fold (pending m payload)
-    (cond
-      (empty? payload) (message m "lsp: rename produced no changes")
-      (nil? (ed-lsp-origin m pending))
-        (message m "lsp: buffer changed while rename ran — dropped (re-run C-c C-r)")
-      else (ed-lsp-apply-rename m pending payload))))
+    (let (refusal (ed-lsp-edit-refusal m (:conn pending) payload))
+      (cond
+        (empty? payload) (message m "lsp: rename produced no changes")
+        (nil? (ed-lsp-origin m pending))
+          (message m "lsp: buffer changed while rename ran — dropped (re-run C-c C-r)")
+        refusal (message m refusal)
+        else (ed-lsp-apply-rename m pending payload)))))
 
 (defcommand cmd-goto-definition
   (m key)

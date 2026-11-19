@@ -538,7 +538,37 @@ directory — saying `caps`. What `M-x lsp-connect` files, without spawning anyt
       (is (includes? (first (:outbox st2)) "\"applied\":true"))
       (is (includes? (first (:outbox st2)) "\"id\":4"))
       (assert= (into [] (:edits st2))
-        [{"/a.ex" (list {:start-line 0 :start-char 0 :end-line 0 :end-char 1 :text "N"})}])))
+        [{:edit {"/a.ex" (list {:start-line 0 :start-char 0 :end-line 0 :end-char 1 :text "N"})}
+          :tokens {}}])))
+
+  ;; an edit computed against a version this connection no longer holds was made before
+  ;; the typing that followed it: its offsets would land in the wrong place
+  (test "workspace/applyEdit naming a version not the last one sent is refused"
+    (let (sync (fn (state text token)
+                 (first (lsp/protocol/lsp-sync-document state
+                          "file:///a.ex"
+                          "elixir"
+                          {:text text :token token})))
+          ;; opened (version 1), then changed twice (versions 3 and 4, the connection counter)
+          state (sync (sync (sync {:proc :fake :buf "" :next-id 8 :pending {} :opened {} :version 2}
+                              "a" :t1)
+                        "ab" :t2)
+                  "abc" :t3)
+          ask (fn (version)
+                (jsonrpc/frame (json/encode {:jsonrpc "2.0"
+                                             :id 4
+                                             :method "workspace/applyEdit"
+                                             :params {:edit {:documentChanges [{:textDocument {:uri "file:///a.ex"
+                                                                                               :version version}
+                                                                                :edits []}]}}})))
+          [stale _] (lsp/protocol/lsp-ingest state (ask 3))
+          [current _] (lsp/protocol/lsp-ingest state (ask 4)))
+      (assert= (get (:versions state) "file:///a.ex") 4)
+      (is (empty? (or (:edits stale) [])))
+      (is (includes? (first (:outbox stale)) "\"applied\":false"))
+      (is (includes? (:line (first (:notices stale))) "changed while the server worked"))
+      (assert= (into [] (:edits current)) [{:edit {"/a.ex" '()} :tokens {"/a.ex" :t3}}])
+      (is (includes? (first (:outbox current)) "\"applied\":true"))))
 
   (test "a notification is still nothing to answer"
     ;; :method with no :id — publishDiagnostics, logMessage. Answering one would be a
@@ -851,8 +881,19 @@ directory — saying `caps`. What `M-x lsp-connect` files, without spawning anyt
 
 (describe "lsp: location / hover / edit shapes (goto, refs, hover, rename, format)"
   (test "uri->path strips the file:// scheme"
-    (assert= (lsp/protocol/lsp-uri->path "file:///x/y.rb") "/x/y.rb")
-    (assert= (lsp/protocol/lsp-uri->path "/x/y.rb") "/x/y.rb"))
+    (assert= (lsp/protocol/lsp-uri->path "file:///x/y.rb") "/x/y.rb"))
+  ;; a server names files in what it sends: only a file: uri names one, normalized — a bare
+  ;; `/sudo::/etc/hosts` would otherwise reach the file handler that opens it as root
+  (test "uri->path reads only a file: uri, and normalizes it"
+    (is (nil? (lsp/protocol/lsp-uri->path "/x/y.rb")))
+    (is (nil? (lsp/protocol/lsp-uri->path "/sudo::/etc/hosts")))
+    (is (nil? (lsp/protocol/lsp-uri->path "jdt://contents/x.class")))
+    (assert= (lsp/protocol/lsp-uri->path "file:///p/src/../../etc/passwd") "/etc/passwd")
+    (assert= (lsp-locations [{:uri "/sudo::/etc/hosts" :range {:start {:line 0 :character 0}}}
+                              {:uri "file:///a" :range {:start {:line 1 :character 0}}}])
+      (list {:path "/a" :line 1 :char 0}))
+    (assert= (keys (lsp-workspace-edit {:changes {"/sudo::/etc/hosts" []}}))
+      (list [:not-a-file "/sudo::/etc/hosts"])))
   (test "a single Location normalises to a one-element {:path :line :char} list"
     (assert= (lsp-locations {:uri "file:///a.rb" :range {:start {:line 4 :character 2}}})
       (list {:path "/a.rb" :line 4 :char 2})))
@@ -1194,18 +1235,86 @@ directory — saying `caps`. What `M-x lsp-connect` files, without spawning anyt
   (test "a server's own applyEdit lands on the buffers it names"
     ;; what a chosen action's `workspace/executeCommand` produces: edits arriving as a
     ;; request TO us, not as the reply to anything
-    (let (path (str (temp-dir "bedit-applyedit-") ".ex")
+    (let (dir (temp-dir "bedit-applyedit-")
+          _ (file/mkdir dir)
+          path (path/join dir "a.ex")
           _ (file/spit path "abc\n")
-          m (pool/ed-find-file (model/ed-init (editor/buffer/make-buffer "x")) path)
+          conn (self)
+          m (serving (pool/ed-find-file (model/ed-init (editor/buffer/make-buffer "x")) path) conn)
           m2 (lsp/commands/ed-ev-lsp-apply-edit m
                [:lsp-apply-edit
-                 {path (list {:start-line 0 :start-char 0 :end-line 0 :end-char 3 :text "zzz"})}]
+                 {path (list {:start-line 0 :start-char 0 :end-line 0 :end-char 3 :text "zzz"})}
+                 conn
+                 {}]
                24
                80
                24))
       (assert= (editor/buffer/buffer-text (model/ed-current-buf m2)) "zzz\n")
-      (is (includes? (:echo m2) "applied edits"))
-      (file/rm path)))
+      (is (includes? (:echo m2) "applied edits"))))
+
+  ;; …but only on files the server may name: local ones, inside the workspace it serves
+  (test "a server's applyEdit outside its workspace, or not a plain file, opens nothing"
+    (let (dir (temp-dir "bedit-applyedit-")
+          _ (file/mkdir dir)
+          path (path/join dir "a.ex")
+          _ (file/spit path "abc\n")
+          elsewhere (temp-dir "bedit-applyedit-")
+          _ (file/mkdir elsewhere)
+          outside (path/join elsewhere "b.ex")
+          _ (file/spit outside "keep\n")
+          conn (self)
+          m (serving (pool/ed-find-file (model/ed-init (editor/buffer/make-buffer "x")) path) conn)
+          edit (list {:start-line 0 :start-char 0 :end-line 0 :end-char 0 :text "X"})
+          apply (fn (wsedit &optional (from conn))
+                  (lsp/commands/ed-ev-lsp-apply-edit m [:lsp-apply-edit wsedit from {}] 24 80 24))
+          beyond (apply {(path/join dir "../" (path/basename elsewhere) "b.ex") edit})
+          parent (apply {outside edit})
+          sudo (apply {"/sudo::/etc/hosts" edit})
+          scheme (apply {[:not-a-file "jdt://x"] edit})
+          nameless (apply {path edit} nil))
+      (doseq (refused [beyond parent sudo scheme nameless])
+        (is (includes? (:echo refused) "edit refused"))
+        (assert= (count (:buffers refused)) (count (:buffers m))))
+      (is (includes? (:echo parent) outside))
+      (is (includes? (:echo sudo) "/sudo::/etc/hosts"))
+      (assert= (file/slurp outside) "keep\n")
+      (assert= (editor/buffer/buffer-text (model/ed-current-buf nameless)) "abc\n")))
+
+  ;; the edit was computed against the text the server holds: typed-over text moves it
+  (test "a server's applyEdit over a buffer changed since the server saw it is dropped"
+    (let (dir (temp-dir "bedit-applyedit-")
+          _ (file/mkdir dir)
+          path (path/join dir "a.ex")
+          _ (file/spit path "abc\n")
+          conn (self)
+          m (serving (pool/ed-find-file (model/ed-init (editor/buffer/make-buffer "x")) path) conn)
+          uri (lsp/protocol/lsp-path->uri path)
+          edit {path (list {:start-line 0 :start-char 0 :end-line 0 :end-char 3 :text "zzz"})}
+          typed (model/ed-set-buf m (editor/buffer/insert (model/ed-current-buf m) "Q"))
+          synced (assoc typed
+                   :lsp-synced {[conn uri] {:buf (model/ed-current-buf m) :token :pushed}})
+          apply (fn (model tokens)
+                  (lsp/commands/ed-ev-lsp-apply-edit model
+                    [:lsp-apply-edit edit conn tokens]
+                    24
+                    80
+                    24))
+          ;; never synced, so the server read the file: typed over since, it is dropped
+          unsynced (apply typed {})
+          ;; synced, then typed over before the next push
+          stale (apply synced {path :pushed})
+          ;; the connection holds another push than the one the editor recorded
+          other (apply (assoc m
+                         :lsp-synced {[conn uri] {:buf (model/ed-current-buf m) :token :pushed}})
+                  {path :older})
+          ;; and the text it was computed against, still there: applied
+          current (apply (assoc m
+                           :lsp-synced {[conn uri] {:buf (model/ed-current-buf m) :token :pushed}})
+                    {path :pushed}))
+      (doseq (dropped [unsynced stale other])
+        (is (includes? (:echo dropped) "changed while the server worked")))
+      (assert= (editor/buffer/buffer-text (model/ed-current-buf stale)) "Qabc\n")
+      (assert= (editor/buffer/buffer-text (model/ed-current-buf current)) "zzz\n")))
 
   ;; A server says what it can do, and bedit has to read it: Expert advertises code
   ;; actions, hover, definition and references and does NOT advertise signature help. The
