@@ -345,3 +345,95 @@ whitespace and not a closer — `def`, `(defn`, `fn main`, a key — as Emacs's
   (and (> (count text) 0)
     (let (first-char (string/char-at text 0))
       (and (not (string/blank? first-char)) (not (contains? (:closers data) first-char))))))
+
+;; ---- across lines: the string a rope offset sits inside ----------------------------------------
+;; The windowed fontify asks, once per slice, whether a multi-line string is open at a window's
+;; edge (`languages/core/open-string-around`). Counting each marker's matches on its own is fooled
+;; by a marker inside another string or a comment (a `'''` in a `"""` docstring, a `"""` in C#'s
+;; `@"…""hi"""`), so the text above is read as the line lexer reads it: one native pass over the
+;; whole text, a match per string or comment, which no marker inside one can start.
+
+(defn- text-string-alternative (entry)
+  ;; one string as a whole match over a text: a `:multiline` one runs on across lines to its
+  ;; closer, or to the text's end when none comes; another stops at its line's end
+  (let (open (regex/escape (:open entry))
+        close (regex/escape (entry-close entry))
+        raw? (:raw entry))
+    (if (:multiline entry)
+      (str open (if raw? "[\\s\\S]" "(?:\\\\[\\s\\S]|[^\\\\])") "*?" close "|" open "[\\s\\S]*")
+      (str open (if raw? "[^\\n]" "(?:\\\\.|[^\\\\\\n])") "*?(?:" close "|$)"))))
+
+(defn text-pattern (syntax)
+  "The regex whose leftmost matches over a whole TEXT (a rope searched by line, `regex/rope-count`)
+are `syntax`'s tokens, as [[fast-pattern]]'s are over one line — except that a block comment or
+a `:multiline` string runs on across lines, to its closer or to the text's end.
+
+    (regex/rope-count (text/string-> \"'''a\\n\\\"\\\"\\\"\\n'''\\n\") (stringlex/text-pattern {:strings [{:open \"'''\" :multiline true} {:open \"\\\"\\\"\\\"\" :multiline true}]}) 0 3)   ;=> [1 12]"
+  (let (strings (seq/sort-by (or (:strings syntax) [])
+                  (fn (entry) (- 0 (count (:open entry)))))
+        blocks (map (or (:block-comments syntax) [])
+                 (fn (pair)
+                   (let (open (regex/escape (first pair)))
+                     (str open "[\\s\\S]*?" (regex/escape (second pair)) "|" open "[\\s\\S]*"))))
+        char-quote (:char-literal syntax)
+        chars (if (string? char-quote)
+                (let (escaped-quote (regex/escape char-quote))
+                  [(str escaped-quote
+                     "(?:\\\\.[^" escaped-quote "\\n]*|[^\\\\" escaped-quote "\\n])" escaped-quote)])
+                [])
+        word-start? (= true (:comment-word-start syntax))
+        lines (map (or (:comments syntax) [])
+                (fn (token)
+                  (str (if word-start? "(?:^|[ \t;|&(`])" "") (regex/escape token) ".*"))))
+    (string/join (append blocks chars (map strings text-string-alternative) lines) "|")))
+
+(defn text-state (pattern rope offset &optional (known nil))
+  "`[offset end]`: the tokens of `pattern` (a [[text-pattern]]) read from the top of `rope` to char
+`offset` — `end` where the token still in progress at `offset` ends (the text's end for one that
+never closes), or `offset` itself when none is. One native pass whose cost is `offset`; `known`, a
+state for an offset at or before this one, resumes from there instead, at the cost of the distance.
+At the text's end nothing is in progress: what follows is nothing.
+
+    (stringlex/text-state \"'[^']*'\" (text/string-> \"a 'b\\nc' d\") 4)   ;=> [4 7]"
+  (let (length (count rope)
+        [from end] (if (and known (<= (first known) offset)) known [0 0]))
+    (cond
+      (or (<= offset 0) (>= offset length)) [offset offset]
+      (> end offset) [offset end]
+      (= pattern "") [offset offset]
+      else
+        (let ([_ resume] (regex/rope-count rope pattern (math/max from end) offset))
+          [offset (if (nil? resume) length resume)]))))
+
+(def- *open-string-candidates*
+  ;; how many of an opener's occurrences above an offset [[open-string]] tries as the start of the
+  ;; token in progress there before deciding it is not that string
+  8)
+
+(defn open-string (syntax pattern rope state)
+  "`[open close]`: the `:multiline` string of `syntax` that is open at the offset of `state` (a
+[[text-state]] of `pattern`, `syntax`'s [[text-pattern]]) — its opener and what closes it — or nil
+when the token in progress there is none (code, a block comment). The token's start is the
+occurrence of an opener above the offset from which `pattern` matches exactly up to the token's end.
+
+    (let (syntax {:strings [{:open \"'''\" :multiline true}]} pattern (stringlex/text-pattern syntax) rope (text/string-> \"'''a\\nb\\n'''\\n\")) (stringlex/open-string syntax pattern rope (stringlex/text-state pattern rope 5)))   ;=> [\"'''\" \"'''\"]"
+  (let ([offset end] state)
+    (when (> end offset)
+      (let (entries (seq/sort-by (seq/filter (or (:strings syntax) []) :multiline)
+                      (fn (entry) (- 0 (count (:open entry)))))
+            starts-token? (fn (start)
+                            (let (found (regex/rope-find rope pattern start))
+                              (and found (= (:start found) start) (= (:end found) end))))
+            entry (seq/find entries
+                    (fn (candidate)
+                      (letrec (attempt (fn (before tries)
+                                         (let (found (when (> tries 0)
+                                                       (regex/rope-find-backward rope
+                                                         (regex/escape (:open candidate))
+                                                         before)))
+                                           (cond
+                                             (nil? found) false
+                                             (starts-token? (:start found)) true
+                                             else (attempt (dec (:end found)) (dec tries))))))
+                        (attempt offset *open-string-candidates*)))))
+        (when entry [(:open entry) (entry-close entry)])))))
