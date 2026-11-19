@@ -1,0 +1,240 @@
+;; Elixir (src/languages/elixir.blsp): a `deflanguage` over tree-sitter-elixir — its mode, its
+;; fontify restart, its keywords, its indentation against `mix format`, and its `~H` sigil as HEEx
+;; (whose half needs the heex grammar: `testkit/load-test-grammar`, and SKIPS without it).
+(defmodule languages-elixir-test
+  (:use test)
+  (:use model)
+  (:use view :only [ed-view])
+  (:use testkit :only [cur file-model face-at text-ops-where indents]))
+(describe "elixir-mode: a tree-sitter language mode"
+
+  (test "a .ex buffer is in elixir-mode and a string literal is coloured"
+    (assert= (ed-buf-mode-name (cur (file-model "x = \"hi\"\n" "x.ex"))) "elixir")
+    (let (ops (text-ops-where (ed-view (file-model "x = \"hi\"\n" "x.ex") 80 24)
+                (fn (s) (includes? s "hi"))))
+      (is (> (count ops) 0))
+      (is (not (nil? (nth (first ops) 4 nil))))))
+  (test "a .exs script is also elixir-mode"
+    (assert= (ed-buf-mode-name (cur (file-model "IO.puts(1)\n" "run.exs"))) "elixir"))
+  (test "mix.lock and an elixir script are elixir-mode"
+    (assert= (ed-buf-mode-name (cur (file-model "%{}\n" "/p/mix.lock"))) "elixir")
+    (assert= (ed-buf-mode-name (cur (file-model "#!/usr/bin/env elixir\nIO.puts(1)\n" "/p/run")))
+      "elixir")))
+
+;; ---- the windowed-fontify restart (elixir only, and why) ---------------------
+;; Without a `:fontify-restart` a tree-sitter mode re-parses the whole windowed lead-in on
+;; every keystroke — 245 lines for a 44-row viewport, five times what is on screen, 18 ms of
+;; a 25 ms keystroke on a 10k-line file. Elixir cuts that at the previous column-0 line,
+;; which is only safe where a heredoc is not open: measured against a WHOLE-FILE parse
+;; (the only honest baseline — comparing against the windowed status quo made a broken
+;; alternative look merely different), the restart is right everywhere the lead-in is.
+;; Asks the MODE for its `:fontify-restart` rather than naming the function: which
+;; function provides it is the language's business (Elixir gets a generated one from its
+;; heredoc markers, Ruby writes its own), and a test that names the function breaks when
+;; that changes — as it did the moment `deflanguage` started generating them.
+(defn elixir-restart-svc (src pos)
+  ((model/ed-mode-service (cur (file-model "x = 1\n" "x.ex")) :fontify-restart) src pos))
+
+(describe "elixir-mode's fontify restart"
+  (test "cuts the lead-in at the previous top-level form"
+    (let (src "defmodule A do\n  def a, do: 1\nend\ndefmodule B do\n  def b, do: 2\nend\n"
+          pos (index-of src "defmodule B"))
+      (assert= (elixir-restart-svc src pos) pos)))
+
+  ;; the case that makes the naive version wrong: prose inside @moduledoc that looks like
+  ;; code. Restarting there colours the prose as Elixir; the guard declines instead.
+  (test "declines inside an open heredoc, keeping the full window"
+    (let (src "defmodule A do\n  @moduledoc \"\"\"\ndef looks_like_code(x) do\nstill prose\n"
+          pos (index-of src "still prose"))
+      (assert= (elixir-restart-svc src pos) 0)))
+
+  (test "accepts again below a closed heredoc"
+    (let (src "defmodule A do\n  @moduledoc \"\"\"\nprose\n  \"\"\"\nend\ndefmodule B do\n"
+          pos (index-of src "defmodule B"))
+      (assert= (elixir-restart-svc src pos) pos)))
+
+  (test "the mode answers one"
+    (is (not (nil? (model/ed-mode-service (cur (file-model "x = 1\n" "x.ex")) :fontify-restart))))))
+
+;; ---- indentation ------------------------------------------------------------------
+;; The `:indent` service reaches an `.ex` buffer through the same seam brood-mode uses, so `TAB`
+;; and the newline-and-indent commands work with no dispatch change. The
+;; assertion worth making about an indenter is that it agrees with hand-written code: every
+;; line of a real-looking module, re-indented from scratch, lands where it already is.
+(describe "elixir-mode indentation"
+
+  (test "a .ex buffer has an indent service, and it agrees with real Elixir"
+    (let (text "defmodule App.Worker do\n  use GenServer\n\n  def handle_call({:add, n}, _from, state) do\n    case state do\n      %{count: c} ->\n        {:reply, c + n, state}\n\n      _ ->\n        {:noreply, state}\n    end\n  end\nend\n"
+          m (file-model text "worker.ex"))
+      (refute (nil? (model/ed-mode-service (cur m) :indent)))
+      (let ([got want] (indents text "worker.ex"))
+        (is (> (count want) 8)) ; the sample is worth asserting about
+        (assert= got want))))
+
+  ;; the service must answer a column for anything, including text mid-typing
+  (test "half-written source still yields a column rather than raising"
+    (let (m (file-model "defmodule A do\n  def f(\n" "x.ex"))
+      (is (int? (indent/ed-indent-target (cur m)))))))
+
+(describe "elixir's def / if / case are keywords, though the grammar parses them as calls"
+  (let (src "defmodule M do\n  def main(x) do\n    if x, do: foo(x)\n  end\nend\n"
+        spans ((model/ed-mode-service (cur (file-model src "x.ex")) :fontify) src)
+        keyword (editor/face/face :syntax/keyword))
+    (test "the macros take the keyword colour"
+      (assert= (face-at spans src "defmodule") keyword)
+      (assert= (face-at spans src "def main") keyword)
+      (assert= (face-at spans src "if x") keyword))
+    (test "a call and a definition's name stay functions"
+      (assert= (face-at spans src "foo(") (editor/face/face :syntax/function))
+      (assert= (face-at spans src "main(") (editor/face/face :syntax/function)))))
+
+;; ---- the whole file, from flush left -----------------------------------------
+;; The tests above indent lines of a file that is ALREADY indented, which is the easy half:
+;; the indenter slices the enclosing top-level form by the column-0 convention, and in an
+;; indented file that convention is true. In a flush-left file it degenerates — every line
+;; starts at column 0, so the slice is the previous line — and the failure is not an error
+;; but a wrong answer, because `def run do / :ok / end` parses perfectly on its own and
+;; reports one enclosing block where the file has two. That is the state you are in when you
+;; paste unindented code or type a module from scratch, so it gets a whole realistic module
+;; rather than a snippet: nested do-blocks, `with`/else, a `case` with arrows, a pipeline,
+;; a heredoc @moduledoc and a comment.
+(describe "elixir-mode re-indents a whole module, from any starting indentation"
+  (def ex-module
+    "defmodule App.Ledger do\n  @moduledoc \"\"\"\n  Posts entries.\n  \"\"\"\n\n  use GenServer\n  require Logger\n\n  # the public face\n  def post(account, amount) when is_integer(amount) do\n    with {:ok, acct} <- fetch(account) do\n      GenServer.call(__MODULE__, {:post, acct, amount})\n    else\n      {:error, reason} ->\n        {:error, reason}\n    end\n  end\n\n  @impl true\n  def handle_call({:post, acct, amount}, _from, state) do\n    case Map.fetch(state, acct.id) do\n      {:ok, balance} ->\n        {:reply, {:ok, balance + amount}, state}\n\n      :error ->\n        {:reply, {:error, :no_account}, state}\n    end\n  end\n\n  defp validate(acct, amount) do\n    acct.limits\n    |> Enum.filter(fn l -> l.active end)\n    |> Enum.all?(fn l -> amount <= l.max end)\n  end\nend\n")
+
+  ;; Re-indent every line top down, feeding each answer back in — what holding TAB down the
+  ;; buffer does, and the reason a wrong early line would cascade into every line below it.
+  (defn reindent (svc text)
+    (fold (range (count (string/split text "\n")))
+      text
+      (fn (acc i)
+        (let (ls (into [] (string/split acc "\n")) ; `assoc` wants a vector; split gives a list
+              l (nth ls i ""))
+          (if (= (string/trim l) "")
+            acc
+            (let (bol (fold (range i) 0 (fn (a k) (+ a (count (nth ls k "")) 1)))
+                  col (svc acc bol))
+              (string/join (assoc ls
+                             i
+                               (str (string/join (map (range col) (fn (_) " ")) "")
+                                 (string/trim-left l)))
+                "\n")))))))
+
+  (def ex-svc (model/ed-mode-service (cur (file-model ex-module "ledger.ex")) :indent))
+
+  (test "re-indenting the file it already agrees with changes nothing"
+    (assert= (reindent ex-svc ex-module) ex-module))
+
+  (test "re-indenting it from FLUSH LEFT reproduces the original exactly"
+    (let (flat (string/join (map (string/split ex-module "\n") string/trim-left) "\n"))
+      (refute (= flat ex-module)) ; the input really is flat
+      (assert= (reindent ex-svc flat) ex-module)))
+
+  (test "and from over-indented, which is the other direction of the same mistake"
+    (let (deep (string/join (map (string/split ex-module "\n")
+                              (fn (l) (if (= (string/trim l) "") l (str "        " l))))
+                 "\n"))
+      (assert= (reindent ex-svc deep) ex-module)))
+
+  ;; The ceiling, asserted rather than left to be discovered. `indent-column` is structural:
+  ;; a line's column is how many block nodes enclose it, which is the shape every
+  ;; block-structured language shares. A CONTINUATION line — the second clause of a `with`,
+  ;; a wrapped argument list — is not a new block, and real Elixir aligns it under the
+  ;; column its opener happens to sit at. That needs the opener's column, i.e. the
+  ;; bracket-alignment rule `indent-column`'s own docstring rules out. So the indenter puts
+  ;; such a line at its block level, which is stable and wrong by the formatter's lights.
+  ;; Recorded here so the boundary is a decision and not a surprise.
+  (test "a continuation line lands at block level — no alignment to an open bracket"
+    (let (src "defmodule A do\n  def f do\n    with {:ok, a} <- one(),\n         {:ok, b} <- two(a) do\n      {a, b}\n    end\n  end\nend\n"
+          bol (inc (index-of src "\n         {:ok, b}")))
+      (assert= (ex-svc src bol) 4)))) ; Elixir's formatter would say 9
+
+;; ---- the whole of a real module, against `mix format` ------------------------
+;; The sample below is a real Elixir module that `mix format` leaves untouched — so its
+;; own indentation IS Elixir's answer, and every line can be checked against it. Written
+;; this way because a hand-picked snippet is a weak gate: the previous sample here
+;; round-tripped perfectly while the indenter was wrong on six lines, for the simple
+;; reason that it happened to contain no multi-line list and no `fn` clause.
+;;
+;; What that found, and what each line here now guards:
+;;   * a multi-line list/map/tuple did not indent its contents at all
+;;   * an `fn` clause inside a call lost a level — the `Enum.reduce(xs, %{}, fn … end)`
+;;     shape, which Elixir is full of
+;;   * `end)` did not dedent, because the token scan split on whitespace and `end)`
+;;     is not `end`
+
+(def ex-real-module
+  (string/join ["defmodule App.Ledger do"
+                 "  @moduledoc \"\"\"" "  Posts entries." "  \"\"\"" "" "  use GenServer"
+                 "  require Logger" "" "  @type entry :: %{id: integer(), amount: integer()}" ""
+                 "  def start_link(opts) do"
+                 "    GenServer.start_link(__MODULE__, opts, name: __MODULE__)" "  end" ""
+                 "  @impl true" "  def init(opts) do"
+                 "    {:ok, %{entries: [], limit: Keyword.get(opts, :limit, 100)}}" "  end" ""
+                 "  def post(account, amount) when is_integer(amount) and amount > 0 do"
+                 "    case Map.fetch(accounts(), account) do" "      {:ok, acct} ->" "        acct"
+                 "        |> Map.update(:balance, amount, &(&1 + amount))"
+                 "        |> tap(fn a -> Logger.info(\"balance #{a.balance}\") end)" ""
+                 "      :error ->" "        {:error, :no_account}" "    end" "  end" ""
+                 "  defp accounts do" "    for {k, v} <- load(), into: %{} do" "      {k, v}"
+                 "    end" "  end" "" "  defp load do" "    [" "      {:a, 1}," "      {:b, 2}"
+                 "    ]" "  end" "" "  def run(list) do" "    Enum.reduce(list, %{}, fn"
+                 "      {k, v}, acc when is_atom(k) ->" "        Map.put(acc, k, v)" ""
+                 "      _, acc ->" "        acc" "    end)" "  end" "" "  if Mix.env() == :test do"
+                 "    def debug, do: :on" "  end" "end" ""]
+    "\n"))
+
+(describe "elixir indents a real module exactly as mix format does"
+  (defn ex-indent-mismatches (text file)
+    "`[line :want w :got g trimmed]` for every line the indenter disagrees with, so a
+failure names the line rather than answering false."
+    (let (svc (model/ed-mode-service (cur (file-model text file)) :indent)
+          lines (into [] (string/split text "\n"))
+          bol-of (fn (i) (fold (range i) 0 (fn (a k) (+ a (count (nth lines k "")) 1)))))
+      (into []
+        (seq/keep (range (count lines))
+          (fn (i)
+            (let (l (nth lines i ""))
+              (when (not (= (string/trim l) ""))
+                (let (want (- (count l) (count (string/trim-left l)))
+                      got (svc text (bol-of i)))
+                  (when (not (= want got)) [(inc i) :want want :got got (string/trim l)])))))))))
+
+  (test "every line of it"
+    (assert= (ex-indent-mismatches ex-real-module "real.ex") []))
+
+  ;; and from flush left, which is the state you are in pasting code or typing a module
+  (test "and re-indenting it from flush left reproduces it"
+    (let (flat (string/join (map (string/split ex-real-module "\n") string/trim-left) "\n"))
+      (refute (= flat ex-real-module))
+      (assert= (reindent (model/ed-mode-service (cur (file-model ex-real-module "real.ex")) :indent)
+                 flat)
+        ex-real-module))))
+
+;; ---- Elixir's ~H sigil is HEEx (brood ADR-489) -------------------------------------
+(def heex-src
+  "defmodule W do\n  def r(assigns) do\n    ~H\"\"\"\n    <p class=\"a\">{@x}</p>\n    \"\"\"\n  end\n\n  def s, do: ~s(<p>)\nend\n")
+
+(when (testkit/load-test-grammar :heex)
+  (describe "an Elixir ~H sigil is coloured as HEEx"
+    (test "the tag, the attribute and its string take heex-mode's faces"
+      (let (spans (languages/elixir/elixir-fontify heex-src))
+        (assert= (editor/highlight/face-at spans (index-of heex-src "p class"))
+          (editor/face/face :syntax/keyword))
+        (assert= (editor/highlight/face-at spans (index-of heex-src "class"))
+          (editor/face/face :syntax/special))
+        (assert= (editor/highlight/face-at spans (index-of heex-src "{@x}"))
+          (editor/face/face :syntax/special))
+        ;; another sigil keeps Elixir's own colour
+        (assert= (editor/highlight/face-at spans (index-of heex-src "<p>)"))
+          (editor/highlight/face-at (languages/elixir/elixir-fontify "~s(<p>)") 3))))))
+
+(describe "an Elixir ~H sigil without the heex grammar keeps Elixir's colours"
+  (test "an injection naming a language the runtime cannot parse changes nothing"
+    (let (spec (languages/core/injection-spec [{:content {:kind :quoted_content :parent :sigil}
+                                                :lang-from :sigil_name
+                                                :aliases {"H" :no-such-grammar}}]
+                 (fn (_lang) languages/heex/heex-face-table)))
+      (assert= (editor/treesit/fontify heex-src
+                 :elixir languages/elixir/elixir-face-table true spec)
+        (editor/treesit/fontify heex-src :elixir languages/elixir/elixir-face-table)))))

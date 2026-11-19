@@ -1,0 +1,103 @@
+;; YAML (src/languages/yaml.blsp): a `deflanguage` over tree-sitter-yaml that keeps its line lexer
+;; as the `:fallback`; its indentation is content.
+;; Two halves: the STAND-IN, its line lexer, tested whatever is installed (`model/*grammar-ready?*`
+;; answers "missing"), and the parsed mode, which needs the grammar (`testkit/load-test-grammar`:
+;; `$BROOD_TEST_GRAMMARS`, else `~/.config/bedit/grammars`) and SKIPS without it.
+(defmodule languages-yaml-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use testkit :only [cur file-model file-buffer press face-at fontified indents]))
+
+(defn- face-of (name) (editor/face/face name))
+
+;; ---- YAML, parsed by tree-sitter-yaml -----------------------------------------------
+(describe "yaml-mode declares its grammar, and a stand-in's fallback layer"
+  (test "where tree-sitter-yaml lives, and prettier"
+    (assert= (:url (model/grammar-source :yaml))
+      "https://github.com/tree-sitter-grammars/tree-sitter-yaml")
+    (assert= (first (ed-mode-service (file-buffer "" "ci.yml") :format-command)) "prettier"))
+  (test "the stand-in's layer is the lexer's, by the deflexer stem"
+    (let (layer languages/yaml/yaml-fallback-layer)
+      (assert= (:fontify layer) 'languages/lex-configs/yaml-spans)
+      (assert= (:line-lexer layer) 'languages/lex-configs/yaml-line-lexer)
+      (assert= (:fontify-restart layer) 'editor/highlight/line-restart)
+      (assert= (:wants-grammar layer) :yaml))))
+
+(def yaml-src
+  (string/join ["# CI"
+                 "name: ci" "on:" "  push:" "    branches: [main, \"release/*\"]" "jobs:" "  test:"
+                 "    runs-on: ubuntu-latest" "    steps:" "      - uses: actions/checkout@v4"
+                 "      - name: run" "        run: |" "          nest test"
+                 "              # kept as written" "        env:" "          N: 3"
+                 "          ON: true" "          NIL: null" "    defaults: &base" "      a: 1.5"
+                 "    copy: *base" "    flow: {a: 1, 'b': 'x'}" "---" "- plain" "- key: value" ""]
+    "\n"))
+
+(when (testkit/load-test-grammar :yaml)
+  (describe "yaml, parsed"
+    (def yaml-spans (fontified yaml-src "ci.yml"))
+
+    (test "a key holding a nested block, and a list item, fold (`:folds`); a scalar does not"
+      (let (rope (text/string-> "a:\n  b: 1\n  c:\n    - x\n    - y:\n        z: 1\nd: 2\n"))
+        (assert= (vec (map (range 0 8) (fn (line) (languages/yaml/yaml-fold-extent rope line))))
+          [5 nil 5 nil 5 nil nil nil])))
+
+    (test "a key is a keyword — nested, in a list item, in a flow mapping, quoted"
+      (assert= (face-at yaml-spans yaml-src "runs-on") (face-of :syntax/keyword))
+      (assert= (face-at yaml-spans yaml-src "uses") (face-of :syntax/keyword))
+      (assert= (face-at yaml-spans yaml-src "a: 1,") (face-of :syntax/keyword))
+      (assert= (face-at yaml-spans yaml-src "'b'") (face-of :syntax/keyword)))
+    (test "a plain value is data and stays uncoloured; a quoted one is a string"
+      (is (nil? (face-at yaml-spans yaml-src "ubuntu-latest")))
+      (assert= (face-at yaml-spans yaml-src "\"release/*\"") (face-of :syntax/string))
+      (assert= (face-at yaml-spans yaml-src "'x'") (face-of :syntax/string)))
+    ;; the lexer coloured a block scalar's lines as keys and comments
+    (test "a block scalar is a string to its last line"
+      (assert= (face-at yaml-spans yaml-src "|\n") (face-of :syntax/string))
+      (is (nil? (face-at yaml-spans yaml-src "# kept"))))
+    (test "numbers, booleans, null, anchors, aliases and the document marker"
+      (assert= (face-at yaml-spans yaml-src "1.5") (face-of :syntax/number))
+      (assert= (face-at yaml-spans yaml-src "true") (face-of :syntax/special))
+      (assert= (face-at yaml-spans yaml-src "null") (face-of :syntax/special))
+      (assert= (face-at yaml-spans yaml-src "&base") (face-of :syntax/special))
+      (assert= (face-at yaml-spans yaml-src "*base") (face-of :syntax/special))
+      (assert= (face-at yaml-spans yaml-src "---") (face-of :syntax/special))
+      (assert= (face-at yaml-spans yaml-src "# CI") (face-of :syntax/comment)))
+    ;; The columns are the structure: the indenter leaves every line where it is
+    (test "TAB leaves every line where it is written"
+      (let ([got want] (indents yaml-src "ci.yml"))
+        (is (> (count want) 20))
+        (assert= got want)))
+    (test "a line TAB cannot place is left alone rather than moved under the line above"
+      (let (text "a:\n  b:\n    c: 1\nd: 2\n"
+            m (file-model text "x.yml")
+            on (ed-set-buf m (goto-char (ed-current-buf m) (index-of text "d: 2"))))
+        (assert= (buffer-text (ed-current-buf (press on [:tab]))) text)))
+    (test "RET carries the previous line's indentation, at the end of the file too"
+      (let (text "a:\n  b: 1"
+            m (file-model text "x.yml")
+            entered (press (ed-set-buf m (goto-char (ed-current-buf m) (count text)))
+                      [:enter]))
+        (assert= (buffer-text (ed-current-buf entered)) (str text "\n  "))))
+    (test "C-M-a goes to the key point is under"
+      (assert= (editor/treesit/point-defun-start yaml-src :yaml (index-of yaml-src "nest test"))
+        (index-of yaml-src "run: |")))))
+
+(describe "yaml-mode, among the configuration formats"
+  (test "a ci.yml routes to yaml"
+    (assert= (ed-buf-mode-name (cur (file-model "a: 1" "ci.yml"))) "yaml"))
+  (test "the mode's :fontify is the std table's, and M-; knows the comment syntax"
+    (let (m (file-model "name: bedit # x" "a.yaml")
+          spans ((model/ed-mode-service (cur m) :fontify) "name: bedit # x"))
+      (is (any? spans (fn ([_s _e f]) (= f (editor/face/face :syntax/comment)))))
+      (assert= (model/ed-mode-service (cur m) :comment-syntax) "# "))))
+
+(describe "yaml, found by review"
+
+  (test "YAML: every line keeps its own indentation, the first content line too"
+    (assert= (languages/core/content-indent "\n\n  a: 1\n  b: 2\n" 2) 2)
+    (assert= (languages/core/content-indent "a:\n    b: 1\n" 3) 4)
+    ;; a blank line (RET) continues the previous non-blank line's
+    (assert= (languages/core/content-indent "a:\n  b: 1\n\n" 10) 2)
+    (assert= (languages/core/content-indent (text/string-> "a:\n  b: 1\n\n") 10) 2)))

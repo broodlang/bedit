@@ -171,6 +171,14 @@ DLL built on the runner and quarantined both ways (vetting child, crashed runtim
 halves run on Linux too, for a look before a push: `XDG_STATE_HOME=/tmp/s nest run
 tools/ci/windows-proofs.blsp -- grammar cc` and `… -- replace /tmp/somewhere`.
 
+`ci/install-grammars.blsp` fetches every grammar a `deflanguage` declares at its pin and builds
+it into one directory (`nest run tools/ci/install-grammars.blsp -- DIR`; needs git and a C/C++
+compiler, a few minutes cold), failing on any it could not install. CI's `parsed-languages` job
+caches that directory and points `$BROOD_TEST_GRAMMARS` at it, so the parsed half of every
+language test runs there (`testkit/load-test-grammar`); a local run into a scratch directory,
+then `BROOD_TEST_GRAMMARS=DIR nest test tests/<file>`, tests against the pinned grammars rather
+than whatever `~/.config/bedit/grammars` holds.
+
 Open the PNG with anything that shows images — an agent's file reader does. For an assertion
 rather than a look, write a test over `gui/render-frame` instead (`tests/window_paint_test.blsp`).
 

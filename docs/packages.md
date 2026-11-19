@@ -417,6 +417,33 @@ package's key away. C-h k and where-is report them as they run. A key that does 
 a command that is not one, is logged naming the package. Retiring the package takes its keys
 back with the rest of its rows.
 
+## A language package (built)
+
+A language is one `deflanguage` spec (`src/languages/core.blsp`), and a package can declare one
+exactly as bedit's own `src/languages/*.blsp` do: the macro names what it generates by the module
+it expands in, and every table it writes is claimed for the package. One spec carries everything
+the editor knows of the language:
+
+| spec key | what it gives the editor |
+|---|---|
+| `:pattern`, `:interpreters` | which files open in the mode: a name pattern, `#!` programs |
+| `:grammar {:url :revision :fingerprint}` | where its tree-sitter grammar lives, pinned |
+| `:faces`, `:injections` | colours, and the code embedded in it |
+| `:indent`, `:restart`, `:definitions`, `:folds` | RET/TAB, the windowed fontify, C-M-a, folding |
+| `:format` | the formatter M-x format-buffer and format-on-save run |
+| `:lsp {:ids :servers}` | its LSP `languageId`s and language servers (`model/register-lsp-server`) |
+| `:fallback` | a line lexer to colour by while the grammar is missing |
+
+- **Install:** the package loads, the spec registers, and the grammars it declares that are not
+  ready are fetched and built at their pins, off the loop, as `M-x grammar-install` does
+  (`grammars/missing-package-grammars`) — installing the package is the asking. It needs git
+  and a C compiler; a failure is said, and the language colours once `M-x grammar-install` runs.
+- **Remove:** the mode, its file patterns, its servers, its grammar declaration and its
+  generated globals go back with the package; an open buffer in the mode is re-typed. The
+  grammar library stays in `~/.config/bedit/grammars` (another language may parse with it).
+- **Name it** `bedit-lang-<language>`: a package's modules may not take a name of bedit's
+  (`languages/...` included) or of a std module.
+
 ## A plugin's library dependencies (built)
 
 A plugin with code may use a library that is not bedit's: bedit-agent uses `agentkit`, which

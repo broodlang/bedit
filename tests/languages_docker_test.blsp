@@ -1,0 +1,129 @@
+;; Dockerfile (src/languages/docker.blsp): a `deflanguage` over tree-sitter-dockerfile that keeps
+;; its line lexer (src/languages/lex-dockerfile.blsp) as the `:fallback`; a `RUN` line is shell.
+;; Two halves: the STAND-IN, its line lexer, tested whatever is installed (`model/*grammar-ready?*`
+;; answers "missing"), and the parsed mode, which needs the grammar (`testkit/load-test-grammar`:
+;; `$BROOD_TEST_GRAMMARS`, else `~/.config/bedit/grammars`) and SKIPS without it.
+(defmodule languages-docker-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use view :only [ed-view])
+  (:use testkit
+    :only [cur file-model file-buffer press without-grammars face-at fontified indents text-ops-where]))
+
+(defn- face-of (name) (editor/face/face name))
+
+;; ---- Dockerfile, parsed by tree-sitter-dockerfile ------------------------------------
+(describe "docker-mode declares its grammar, and no formatter"
+  (test "a NAME.Dockerfile is docker-mode; a Dockerfile's own .dockerignore is an ignore file"
+    (assert= (ed-buf-mode-name (file-buffer "" "/p/x.Dockerfile")) "docker")
+    (assert= (ed-buf-mode-name (file-buffer "" "/p/prod.Dockerfile")) "docker")
+    (assert= (ed-buf-mode-name (file-buffer "" "/p/Dockerfile.prod")) "docker")
+    (assert= (ed-buf-mode-name (file-buffer "" "/p/Dockerfile.dockerignore")) "gitignore")
+    (is (not (modes/file-pattern-matches? "/p/Dockerfile.dockerignore"
+               (modes/file-type-pattern :docker)))))
+  (test "where tree-sitter-dockerfile lives"
+    (assert= (:url (model/grammar-source :dockerfile))
+      "https://github.com/camdencheek/tree-sitter-dockerfile"))
+  (test "Docker ships no formatter, so the mode names none"
+    (is (nil? (ed-mode-service (file-buffer "" "Dockerfile") :format-command))))
+  (test "without the grammar a Dockerfile is the lexer's docker-mode"
+    (let (buf (without-grammars (fn () (file-buffer "FROM alpine\n" "Containerfile"))))
+      (assert= (:type buf) :docker-lexer)
+      (assert= (ed-buf-mode-name buf) "docker"))))
+
+(def docker-src
+  (string/join ["# syntax=docker/dockerfile:1"
+                 "ARG VERSION=1.2" "FROM rust:${VERSION} AS build" "WORKDIR /src"
+                 "ENV PATH=\"/x:$PATH\" \\" "    MODE=release" "COPY --from=deps /a /b"
+                 "RUN apt-get update \\" "    && apt-get install -y curl \\"
+                 "    && rm -rf /var/lib/apt/lists/*" "RUN <<EOT" "  echo kept as written" "EOT"
+                 "EXPOSE 8080/tcp" "CMD [\"app\", \"--port\", \"8080\"]" ""]
+    "\n"))
+
+(when (testkit/load-test-grammar :dockerfile)
+  (describe "dockerfile, parsed"
+    (def docker-spans (fontified docker-src "Dockerfile"))
+
+    (test "the instructions are keywords, AS too"
+      (assert= (face-at docker-spans docker-src "FROM") (face-of :syntax/keyword))
+      (assert= (face-at docker-spans docker-src "RUN apt") (face-of :syntax/keyword))
+      (assert= (face-at docker-spans docker-src "AS build") (face-of :syntax/keyword)))
+    (test "an image's name is a function, its tag and alias by place"
+      (assert= (face-at docker-spans docker-src "rust:") (face-of :syntax/function))
+      (assert= (face-at docker-spans docker-src ":${VERSION}") (face-of :syntax/special))
+      (assert= (face-at docker-spans docker-src "build\n") (face-of :syntax/function)))
+    (test "strings, a heredoc's body, a port, a flag, a variable's name and a comment"
+      (assert= (face-at docker-spans docker-src "\"/x:$PATH\"") (face-of :syntax/string))
+      (assert= (face-at docker-spans docker-src "\"--port\"") (face-of :syntax/string))
+      ;; a heredoc's body is shell when bash is installed (`a RUN line is coloured as shell`)
+      (when (not (grammars/grammar-loaded? :bash))
+        (assert= (face-at docker-spans docker-src "\n  echo kept") (face-of :syntax/string)))
+      (assert= (face-at docker-spans docker-src "8080/tcp") (face-of :syntax/number))
+      (assert= (face-at docker-spans docker-src "--from=deps") (face-of :syntax/special))
+      (assert= (face-at docker-spans docker-src "MODE") (face-of :syntax/special))
+      (assert= (face-at docker-spans docker-src "# syntax") (face-of :syntax/comment)))
+    (test "it indents a continued instruction four in, a heredoc as written"
+      (let ([got want] (indents docker-src "Dockerfile"))
+        (is (> (count want) 14))
+        (assert= got want)))
+    (test "RET after a `\\` continues the instruction four in"
+      (let (text "RUN make \\"
+            m (file-model text "Dockerfile")
+            entered (press (ed-set-buf m (goto-char (ed-current-buf m) (count text)))
+                      [:enter]))
+        (assert= (buffer-text (ed-current-buf entered)) (str text "\n    "))))
+    (test "C-M-a goes to the first line of the instruction point is in"
+      (assert= (editor/treesit/point-defun-start docker-src
+                 :dockerfile (index-of docker-src "rm -rf"))
+        (index-of docker-src "RUN apt")))))
+
+;; a `RUN` line is shell (brood ADR-489), its `\` continuations one document
+(when (and (testkit/load-test-grammar :dockerfile) (testkit/load-test-grammar :bash))
+  (describe "a RUN line is coloured as shell"
+    (test "every command of a continued chain is a command, by shell-mode's table"
+      (let (spans (fontified docker-src "Dockerfile"))
+        (assert= (face-at spans docker-src "apt-get update") (face-of :syntax/function))
+        (assert= (face-at spans docker-src "apt-get install") (face-of :syntax/function))
+        (assert= (face-at spans docker-src "rm -rf") (face-of :syntax/function))
+        ;; the instruction is still Docker's, and a heredoc's body is left to it (its
+        ;; `<<EOT` marker is the RUN's shell, which reads a marker with no body as a redirect)
+        (assert= (face-at spans docker-src "RUN apt") (face-of :syntax/keyword))))
+    (test "a RUN heredoc's marker and end stay Docker's string; its body is shell, line by line"
+      ;; the marker and the end are left out of the shell (brood ADR-496 `:exclude`): given to
+      ;; bash, a lone `<<EOT` was an ERROR and lost the string colour
+      (let (src "RUN <<EOT\n  echo a\n  ls -la\nEOT\nRUN cat <<EOF > /x\nhi\nEOF\n"
+            spans (fontified src "Dockerfile"))
+        (assert= (face-at spans src "<<EOT") (face-of :syntax/string))
+        (assert= (face-at spans src "EOT\nRUN") (face-of :syntax/string))
+        (assert= (face-at spans src "<<EOF") (face-of :syntax/string))
+        (assert= (face-at spans src "echo a") (face-of :syntax/function))
+        ;; the body's second line is a command of its own, not an argument of the first
+        (assert= (face-at spans src "ls -la") (face-of :syntax/function))))
+    (test "the held tree a pane colours from agrees with the text path"
+      (let (buf (file-buffer docker-src "Dockerfile")
+            tree (editor/treesit/open-tree docker-src :dockerfile)
+            held (syntaxtree/tree-spans tree
+                   (ed-mode-service buf :ts-faces)
+                   0
+                   (count docker-src)
+                   (syntaxtree/buffer-injections buf)))
+        (editor/treesit/free-tree tree)
+        (assert= held (into [] (fontified docker-src "Dockerfile")))))))
+
+(describe "a RUN line without the dockerfile grammar is the lexer's, as before"
+  (test "the stand-in colours the instruction and nothing inside the command"
+    (let (buf (without-grammars (fn () (file-buffer docker-src "Dockerfile")))
+          spans ((ed-mode-service buf :fontify) docker-src))
+      (is (not (nil? (face-at spans docker-src "RUN apt"))))
+      (is (nil? (face-at spans docker-src "apt-get update"))))))
+
+(describe "docker-mode, by name"
+  (test "a Dockerfile buffer is in docker-mode and FROM is coloured"
+    (assert= (ed-buf-mode-name (cur (file-model "FROM alpine" "Dockerfile"))) "docker")
+    (let (ops (text-ops-where (ed-view (file-model "FROM alpine" "Dockerfile") 80 24)
+                (fn (s) (includes? s "FROM"))))
+      (is (> (count ops) 0))
+      (is (not (nil? (nth (first ops) 4 nil))))))
+  (test "a *.dockerfile name is also docker-mode"
+    (assert= (ed-buf-mode-name (cur (file-model "RUN x" "build.dockerfile"))) "docker")))

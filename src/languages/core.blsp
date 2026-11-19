@@ -4,8 +4,9 @@ from ONE spec (faces, indent, heredocs, formatter) and generates its whole servi
 Python, Rust, the brace languages, C#, CSS, HTML, go.mod, HCL / Terraform, shell, JSON, TOML,
 YAML and Dockerfile are its clients, each a face table and an indent spec; the last five
 keep their line lexer as the stand-in for a missing grammar (`:fallback`). `deflexer` is its
-sibling for the fontify-only layers over the `lex-*` modules. The languages themselves are the
-`lang-*` family files; a macro here names the module it expands in (`reflect/current-ns`).")
+sibling for the fontify-only layers over the `lex-*` modules. The languages themselves are one
+module each (`languages/rust`, `languages/hcl`, …; the line-lexed formats `languages/formats`); a
+macro here names the module it expands in (`reflect/current-ns`).")
 ;; editor/treesit, editor/highlight and the std lexers are referenced qualified below —
 ;; each `mod/name` auto-loads its module.
 
@@ -25,6 +26,11 @@ A language supplies DATA and gets the whole service set — a `-fontify`, a rest
 is missing. Written out by hand per language, a mode is the place a service could be
 forgotten, and a forgotten service is invisible until someone presses the key.
 
+`:pattern` is the file-name regex that selects the mode, or `{:match re :except re}` for one
+with an exception the regex engine (no lookahead) cannot spell — HCL's `.hcl` except
+Terraform's `.tftest.hcl` (`modes/file-pattern-matches?`), so which mode wins never rests on
+registration order.
+
 The services are generated as named globals rather than closures because
 `model/ed-mode-service` resolves a service SYMBOL late (`reflect/eval`) — which is what
 lets a redefined fontify take effect on the next frame without reloading the mode. A
@@ -40,6 +46,14 @@ format-buffer` and format-on-save consult, so neither names a language.
 `{:kinds #{:function_item …}}`, or `:calls` for a language that defines with a call
 (`editor/treesit/register-definitions`). Ruby and Elixir are declared by std, whose
 grammars they are; a language that declares nothing moves by top-level form.
+
+`:folds` is the node kinds a fold (`C-c @`, `codefold`) covers, when they are not the indent
+spec's: `#{:block_mapping_pair}` folds each such node from its own first line, and
+`{:blocks :brackets}` says it as the indent spec does. Without it the indent spec's level
+openers fold — wrong for a language whose indent reads content (YAML's, which would never
+fold) or one that indents a continuation as a bracket (R's `binary_operator`, shell's
+`command`), which is no block to hide. Its kinds are registered with the others for
+`grammarcheck`.
 
 `:grammar` is where the language's grammar lives and WHICH revision — `{:url … :revision …}`,
 with `:subdir` for a repository holding several — so `M-x grammar-install` can fetch and build
@@ -72,18 +86,38 @@ that had one before it had a grammar. The grammar is a separate download, and a 
 without it colours nothing; with a fallback, a buffer opened while the grammar is missing is
 typed as the lexer's mode instead (`model/ed-grammar-fallback`), and becomes the parsed mode
 when `M-x grammar-install` or `grammar-reload` brings the grammar (`model/ed-grammars-arrived`).
+What the grammar adds is what a line cannot know — where a multi-line string or a heredoc ends,
+which block a line is in (indentation, C-M-a / C-M-e) and which bracket a bracket closes.
 `:fallback-above` is a size in characters past which the lexer serves even with the grammar —
 JSON's, where a held tree of a large machine-written file costs more than it buys.
 
 `:injections` is the code EMBEDDED in the language (brood ADR-489): a vector of injection
 rules, `[{:content {:kind :template_literal :parent :heredoc_template} :lang-from
-:heredoc_identifier :aliases {\"BASH\" :bash}}]` — which nodes hold another language's text
-and how its language is named. The embedded language's faces are its own `deflanguage`'s,
-found when a frame asks (`spec-injections`); one with no spec or no grammar keeps this
-language's colours. Checked at registration like the face table.
+:heredoc_identifier :aliases {\"SH\" :bash}}]` — which nodes hold another language's text
+and how its language is named. `:aliases-from #{:bash :python}` reads the word through those
+languages' `:names` too, lowercase or uppercase (`spec-injections`): HCL's `<<-SH`. The
+embedded language's faces are its own `deflanguage`'s, found when a frame asks
+(`spec-injections`); one with no spec or no grammar keeps this language's colours. Checked at
+registration like the face table.
+
+`:indent` is `editor/treesit/indent-column`'s spec — `{:width :brackets :blocks :dedent :opens
+:verbatim …}`, where a missing `:blocks` or `:dedent` is none — or `:content`.
 
 `:interpreters` lists the `#!` program names that select the mode for a file with no telling
 name, as `deflexer`'s does.
+
+`:names` lists the other words people and other code NAME the language by — `[\"c++\" \"cpp\"
+\"cxx\"]`, `[\"sh\" \"bash\" \"zsh\"]` — besides its buffer type's own name (`cpp`, `shell`),
+which always counts. They are matched lowercased (`modes/language-named`): a Markdown fence's
+info string (`languages/markdown/fence-language`) and a heredoc's marker (an `:injections`
+rule's `:aliases-from`) find the language through them, so a new language is named from
+its own spec rather than from a table in every module that reads a name. A spec built on
+another (`(merge c-spec {…})`) says its own: two specs sharing a name leave which one it means
+to registration order.
+
+`:snippets` is the language's built-in snippet templates, `{key template}` in the LSP
+snippet syntax (`snippet`), under the user's init.blsp `:snippets` for the mode. A spec built
+on another inherits them — TypeScript writes JavaScript's.
 
 `:fontify-restart` says where a windowed fontify may cut its lead-in, and comes from one of
 three declarations. `:heredocs` (paired markers, Elixir's `\"\"\"`) restarts at a column-0 line
@@ -155,6 +189,7 @@ The spec is evaluated ONCE, into `<name>-spec`, so a spec built from a shared ba
        (languages/core/declare-grammar ~spec-ref)
        (languages/core/expect-grammar-names ~spec-ref)
        (languages/core/register-fallback ~spec-ref '~(qualified "-fallback-layer"))
+       (languages/core/register-lsp ~spec-ref)
        (doseq (program (get ~spec-ref :interpreters []))
          (modes/register-interpreter program (languages/core/spec-type ~spec-ref)))
        (modes/register-prog-mode '~(qualified "-mode-layer") (languages/core/spec-type ~spec-ref)))))
@@ -296,13 +331,19 @@ file of the language opened without one can say how to get it."
 (defn spec-grammar-names (spec)
   "The node kinds and fields of its grammar a `deflanguage` spec's tables name, as
 `{:kinds :fields}` (std's `editor/treesit/language-names`): its face table, injection rules,
-indent spec and definitions.
+indent spec and definitions, and the kinds its own `:folds` names.
 
-    (languages/core/spec-grammar-names {:faces {:comment :syntax/comment} :indent :content})   ;=> {:kinds #{:comment} :fields #{}}"
-  (editor/treesit/language-names {:faces (get spec :faces)
-                                  :injections (get spec :injections)
-                                  :indent (get spec :indent)
-                                  :definitions (get spec :definitions)}))
+    (languages/core/spec-grammar-names {:faces {:comment :syntax/comment} :indent :content})   ;=> {:kinds #{:comment} :fields #{}}
+    (languages/core/spec-grammar-names {:indent :content :folds #{:pair}})   ;=> {:kinds #{:pair} :fields #{}}"
+  (let (names (editor/treesit/language-names {:faces (get spec :faces)
+                                              :injections (get spec :injections)
+                                              :indent (get spec :indent)
+                                              :definitions (get spec :definitions)})
+        folds (get spec :folds))
+    (if (nil? folds)
+      names
+      (let (kinds (spec-fold-kinds spec))
+        (update names :kinds set/union (set/union (:blocks kinds) (:brackets kinds)))))))
 
 (defn expect-grammar-names (spec)
   "Record the names a `deflanguage` spec's tables use of its grammar (`spec-grammar-names`),
@@ -316,11 +357,34 @@ ADR-583) — under the spec's buffer type, since one grammar may serve two modes
 ;; table its own `deflanguage` declares, looked up when a frame asks, so the shell inside a
 ;; Terraform heredoc follows shell-mode's table and a language registered later is found.
 
+(defn register-lsp (spec)
+  "Register the language servers and LSP `languageId`s a `deflanguage` spec's `:lsp` declares —
+`{:ids {\"rs\" \"rust\"} :servers [{:name … :extensions … :commands … :root-markers …}]}`, the
+servers in `lsp/client`'s row shape — for the spec's buffer type, so a language brings its own
+server and a package's goes back with the package. A spec with no `:lsp` registers nothing; one
+that extends another (`(merge javascript-spec …)`) says its own, or inherits the parent's
+servers under its own name, which `lsp/client` reads as the one server it is."
+  (let (lsp (get spec :lsp))
+    (when (map? lsp)
+      (doseq (pair (get lsp :ids {}))
+        (let ([extension id] pair) (model/register-lsp-language-id extension id)))
+      (doseq (server (get lsp :servers [])) (model/register-lsp-server (spec-type spec) server)))))
+
 (defn register-spec (spec spec-ref)
-  "Record that `spec-ref` (the `<name>-spec` global's symbol) is the spec of the tree-sitter
-language `(:lang spec)`, where `modes/language-faces` finds an embedded language's table. Stored
-as the symbol and resolved per lookup, so a re-evaluated spec is the one read."
-  (ownership/claim! :languages/specs (get spec :lang) spec-ref))
+  "Record that `spec-ref` (the `<name>-spec` global's symbol) is the spec of the mode
+`(spec-type spec)`, where `modes/language-faces` finds an embedded language's table and
+[[declared-grammars]] the grammars bedit's modes parse with. Keyed by the MODE, not the grammar:
+two modes over one grammar (HCL and Terraform, JSON and JSONL) are two specs, and keying by the
+grammar let the one registered last stand for both — and a package removing it change the other's
+colours. Stored as the symbol and resolved per lookup, so a re-evaluated spec is the one read."
+  (ownership/claim! :languages/specs (spec-type spec) spec-ref))
+
+(defn declared-grammars ()
+  "The grammar (`:lang`) of every registered `deflanguage` spec, as a set: what bedit's modes parse
+with, a package's included while it is installed."
+  (into #{}
+    (map (vals (registry/entries :languages/specs))
+      (fn (spec-ref) (get (reflect/eval spec-ref) :lang)))))
 
 (defn- rule-languages (rule)
   ;; every language a rule can name: its fixed `:lang`, or its aliases' targets
@@ -350,26 +414,64 @@ alias to it removed. Nil when no rule is left, which a fontify reads as no injec
                    else rule))))
     (when (not (empty? kept)) {:rules (vec kept) :faces faces})))
 
+(defn name-aliases (names languages)
+  "The `:aliases` an injection rule's `:aliases-from languages` stands for: every word in
+`names` (`{word lang}`, `modes/language-name-table`) naming one of `languages`, lowercase and
+uppercase, as a heredoc's marker is written (`<<-SH`). The kernel lowercases a word no alias
+names, so the uppercase is the case it would miss.
+
+    (languages/core/name-aliases {\"sh\" :bash \"py\" :python} #{:bash})   ;=> {\"sh\" :bash \"SH\" :bash}"
+  (fold names
+    {}
+    (fn (aliases [word lang])
+      (if (contains? languages lang) (assoc aliases word lang (string/upper word) lang) aliases))))
+
+(defn- resolve-names (rules names-of)
+  ;; `rules` with each `:aliases-from` read into `:aliases` through `(names-of)` — the name
+  ;; table, asked once and only when a rule needs it
+  (if (any? rules (fn (rule) (get rule :aliases-from)))
+    (let (names (names-of))
+      (map rules
+        (fn (rule)
+          (let (languages (get rule :aliases-from))
+            (if languages
+              (assoc (dissoc rule :aliases-from)
+                :aliases (merge (get rule :aliases {}) (name-aliases names languages)))
+              rule)))))
+    rules))
+
 (defn spec-injections (spec)
   "The injection spec a `deflanguage` spec's `:injections` rules make with the registered
-languages' tables (`injection-spec`), or nil for a language that embeds none."
+languages' tables (`injection-spec`) — a rule's `:aliases-from` read through the registered
+languages' names ([[name-aliases]]) — or nil for a language that embeds none."
   (let (rules (get spec :injections))
-    (when (not (empty? rules)) (injection-spec rules modes/language-faces))))
+    (when (not (empty? rules))
+      (injection-spec (resolve-names rules modes/language-name-table) modes/language-faces))))
 
 (defn injection-rule-problems (rules)
   "What is malformed in a `deflanguage`'s `:injections` rules (`editor/treesit/injection-problems`),
 each named language given an empty table: whether the language has a real one is a question
-for the frame, when every language has registered."
-  (let (placeholder (into {} (map (mapcat rules rule-languages) (fn (language) [language {}]))))
+for the frame, when every language has registered — and so is which words `:aliases-from`
+reads."
+  (let (rules (resolve-names rules (fn () {}))
+        placeholder (into {} (map (mapcat rules rule-languages) (fn (language) [language {}]))))
     (editor/treesit/injection-problems {:rules rules :faces placeholder})))
 
 (defn spec-fold-kinds (spec)
-  "The node kinds a fold in `spec`'s language covers: its indent spec's `{:blocks :brackets}`, the
-nodes that open a level — nil for a language whose indent reads content (`:indent :content`).
+  "The node kinds a fold in `spec`'s language covers, as `{:blocks :brackets}` (`codefold`): its
+`:folds` when it says (a set is folded from each node's own first line, as `:brackets`; a map is
+taken as given), else its indent spec's, the nodes that open a level — nil for a language whose
+indent reads content (`:indent :content`) and says no `:folds`.
 
-    (languages/core/spec-fold-kinds {:indent {:blocks #{:block} :brackets #{:list}}})   ;=> {:blocks #{:block} :brackets #{:list}}"
-  (let (indent (get spec :indent))
-    (when (map? indent) {:blocks (get indent :blocks #{}) :brackets (get indent :brackets #{})})))
+    (languages/core/spec-fold-kinds {:indent {:blocks #{:block} :brackets #{:list}}})   ;=> {:blocks #{:block} :brackets #{:list}}
+    (languages/core/spec-fold-kinds {:indent :content :folds #{:pair}})   ;=> {:blocks #{} :brackets #{:pair}}"
+  (let (folds (get spec :folds)
+        indent (get spec :indent))
+    (cond
+      (set? folds) {:blocks #{} :brackets folds}
+      (map? folds) {:blocks (get folds :blocks #{}) :brackets (get folds :brackets #{})}
+      (map? indent) {:blocks (get indent :blocks #{}) :brackets (get indent :brackets #{})}
+      else nil)))
 
 (defn language-layer (name spec refs)
   "The mode layer for a `deflanguage`, checked against `editor/treesit/language-contract`.
@@ -422,6 +524,8 @@ by someone opening a file."
                ;; the words that end a block, as a regexp over what precedes point on its line
                ;; (`indent/ed-electric-reindent`): typing one reindents the line
                :electric-indent (get spec :electric-indent)
+               ;; the language's built-in snippet templates (`snippet/mode-snippets`)
+               :snippets (get spec :snippets)
                ;; the line-lexer type a buffer stands in with while the grammar is missing,
                ;; or past `:fallback-above` characters (`model/ed-grammar-fallback`)
                :grammar-fallback (when (fallback-type spec)
@@ -485,8 +589,11 @@ A spec's keys are the language's facts; the layer's are the editor's (`:comment`
 stem, the line restart, and `:comment-syntax`. Raises on a spec with no `:pattern` or
 `:lexer`, which would register a mode no file reaches or one that colours nothing."
   (let ({:keys [pattern lexer comment]} spec)
-    (when (not (and (string? pattern) (symbol? lexer)))
-      (error "deflexer " name ": needs a :pattern string and a :lexer symbol: " (pr-str spec)))
+    (when (not (and (or (string? pattern) (map? pattern)) (symbol? lexer)))
+      (error "deflexer "
+        name
+        ": needs a :pattern (a regex, or `{:match :except}`) and a :lexer symbol: "
+        (pr-str spec)))
     (merge
       {:name name
        :file-pattern pattern
@@ -513,6 +620,8 @@ and comments (`stringstate`, nil for its quote pairs as one-line strings)."
    :string-syntax (get spec :strings)})
 
 ;; ---- face-table helpers ------------------------------------------------------------------
+;; Each returns face-table ENTRIES, to `merge` into a table beside its one-off rows: the shapes
+;; most languages' tables share, said once.
 
 (defn token-faces (tokens face)
   "Face-table entries colouring each ANONYMOUS token in `tokens` (their text, as strings)
@@ -521,6 +630,38 @@ as C's `#include` and CSS's `@media`.
 
     (get (languages/core/token-faces [\"#if\"] :syntax/keyword) (keyword \"#if\"))   ;=> :syntax/keyword"
   (into {} (map tokens (fn (token) [(keyword token) face]))))
+
+(defn field-faces (kinds field face)
+  "Face-table entries colouring the node filling `field` of each node kind in `kinds` `face` —
+the names a language's declarations declare: `(field-faces [:class_declaration
+:enum_declaration] :name :syntax/special)` colours both type names as specials.
+
+    (languages/core/field-faces [:method_declaration] :name :syntax/definition)   ;=> {{:parent :method_declaration :field :name} :syntax/definition}"
+  (into {} (map kinds (fn (kind) [{:parent kind :field field} face]))))
+
+(defn method-call-faces (members)
+  "Face-table entries colouring the name a MEMBER call calls `:syntax/function`, each of
+`members` a `{:kind :field :of}`: the `:kind` node filling the `:field` field of an `:of` node
+that is itself a call's `function` — `s.bar()`'s `bar` is `{:kind :field_identifier :field
+:field :of :field_expression}` — told by that grandparent from a plain member read (`p.x`),
+which stays uncoloured (brood ADR-487).
+
+    (languages/core/method-call-faces [{:kind :identifier :field :attribute :of :attribute}])   ;=> {{:kind :identifier :field :attribute :parent {:kind :attribute :field :function}} :syntax/function}"
+  (into {}
+    (map members
+      (fn (member)
+        [{:kind (:kind member) :field (:field member) :parent {:kind (:of member) :field :function}}
+          :syntax/function]))))
+
+(defn call-faces (members)
+  "Face-table entries colouring a CALLED function `:syntax/function` in a grammar whose call
+names its callee in a `function` field (brood ADR-486): the identifier there — `print(x)` —
+and the member calls in `members` ([[method-call-faces]]). Rust's, Go's, C's, Python's and
+JavaScript's calls are this shape.
+
+    (languages/core/call-faces [])   ;=> {{:field :function :kind :identifier} :syntax/function}
+    (count (languages/core/call-faces [{:kind :field_identifier :field :field :of :field_expression}]))   ;=> 2"
+  (merge {{:field :function :kind :identifier} :syntax/function} (method-call-faces members)))
 
 ;; ---- electric pairs: what each language's strings open ----------------------------------
 ;; A spec's `:pairs` is its `electric` pairs, the syntax table's string delimiters in Emacs's
@@ -582,6 +723,11 @@ as C's `#include` and CSS's `@media`.
 (def *html-strings* {:strings [{:open "\""} {:open "'"}] :block-comments [["<!--" "-->"]]})
 (def *hcl-strings* {:strings [{:open "\""}] :comments ["#" "//"] :block-comments [["/*" "*/"]]})
 
+;; ---- the formatters more than one language runs ------------------------------------------
+;; A spec's `:format`. prettier formats JavaScript, CSS, HTML, JSON and YAML alike — in place,
+;; and saying nothing unless something is wrong.
+(def *prettier* ["prettier" "--write" "--log-level" "warn"])
+
 ;; ---- the restarts more than one language shares ---------------------------------------------
 
 ;; Paired multi-line string markers — what the restart counts to decide whether a column-0
@@ -598,12 +744,52 @@ as C's `#include` and CSS's `@media`.
       (regex/match? (string/substring source candidate line-end) item-start) candidate
       else (item-line-before source (dec candidate) item-start))))
 
-(defn column0-item-restart (source position item-start opaque-opener)
-  "The fontify restart every brace language shares: the previous column-0 line that
-LOOKS like the start of an item (`item-start`, a regex over the line), unless something
-whose contents can be anything — a block comment, a raw or template string
-(`opaque-opener`) — opens above it in this window; then the whole lead-in. A language with
-no such thing passes nil."
-  (let (candidate (item-line-before source position item-start)
-        opener (when opaque-opener (regex/find source opaque-opener)))
-    (if (and opener (< (get opener :start) candidate)) 0 candidate)))
+;; What a `:restart` rule's `:opaque` names: the constructs whose contents can be anything, so a
+;; column-0 line inside one is not code. Each is a pair — `{:open re :close re}`, or `:symmetric`
+;; when the same marker closes it (counted for parity) — or `{:open re}` alone when the closer is
+;; text the opener chose (a heredoc's word), which is then taken as still open.
+(def *block-comment-opaque* {:open "/\\*" :close "\\*/"})
+(def *triple-quote-opaque* {:open "\"\"\"" :symmetric true})
+(def *backtick-opaque* {:open "`" :symmetric true})
+
+(defn- opaque-pairs (opaque)
+  ;; `:opaque` as a vector of pairs: a regex alone is an opener with no closer (a heredoc's)
+  (cond
+    (nil? opaque) []
+    (string? opaque) [{:open opaque}]
+    (map? opaque) [opaque]
+    else (vec opaque)))
+
+(defn- unclosed-opener (lead pair)
+  ;; where `pair`'s construct still open at the end of `lead` began, or nil when none is
+  (let (opens (regex/find-all lead (:open pair)))
+    (cond
+      (empty? opens) nil
+      (:symmetric pair) (when (math/odd? (count opens)) (:start (last opens)))
+      else
+        (let (opener (last opens)
+              close (:close pair))
+          (when (or (nil? close)
+                  (nil? (regex/find (string/substring lead (:end opener) (count lead)) close)))
+            (:start opener))))))
+
+(defn column0-item-restart (source position item-start opaque)
+  "The fontify restart every brace language shares: the previous column-0 line that LOOKS like
+the start of an item (`item-start`, a regex over the line) — unless it sits inside something whose
+contents can be anything, an `opaque` construct (a block comment, a raw or template string, a
+heredoc: pairs, see `*block-comment-opaque*`) still open there, when the item line before THAT
+construct is tried. A construct that opened and closed above the line does not count: a closed
+`/** doc */` above every function is the ordinary case, and declining on it re-parsed the whole
+lead-in on every key. A language with nothing opaque passes nil.
+
+    (languages/core/column0-item-restart \"/* a */\\nfn f\\n  x\" 13 \"^fn\" languages/core/*block-comment-opaque*)   ;=> 8"
+  (let (candidate (item-line-before source position item-start))
+    (if (= candidate 0)
+      0
+      (let (lead (string/substring source 0 candidate)
+            open-at (fold (opaque-pairs opaque)
+                      nil
+                      (fn (earliest pair)
+                        (let (start (unclosed-opener lead pair))
+                          (if (and start (or (nil? earliest) (< start earliest))) start earliest)))))
+        (if (nil? open-at) candidate (column0-item-restart source open-at item-start opaque))))))

@@ -1,0 +1,147 @@
+(defmodule languages/elixir
+  "Elixir: a tree-sitter mode over tree-sitter-elixir, its `~H` sigil HEEx (`languages/heex`)."
+  (:use languages/core))
+
+;; ---- elixir-mode, and the shape of a tree-sitter mode (Ruby's too) --------------
+;; A `.rb`/`.ex` buffer gets syntax colouring AND structural navigation from a tree-sitter
+;; grammar via `editor/treesit` — the foreign-language analogue of brood-mode's
+;; `highlight`+`sexp`. Because the parse yields the SAME positioned-node shape Brood's
+;; reader does, the editor's `:fontify` service and the `C-M-f/b/u/d/a` structural commands
+;; run over a Ruby or Elixir tree unchanged — the modes are pure data: a face table, a
+;; `:ts-lang`, and an indent spec naming the node kinds that open a level
+;; (`elixir-indent-spec`), which `editor/treesit/indent-column` walks the tree with.
+;;
+;; `:fontify-restart` says where the windowed lead-in may be CUT. Without one the mode
+;; parses the whole lead-in every keystroke — 245 lines for a 44-row viewport, five times
+;; what is on screen. Elixir's counts paired heredoc markers (`editor/treesit/column0-restart`);
+;; Ruby's heredoc terminator is arbitrary text (`<<~EOS`), so it has a guard of its own
+;; (`languages/ruby/ruby-fontify-restart`).
+
+;; (The `C-M-*` structural motions come from the shared `prog-mode-layer` — ruby and
+;; elixir stack it via `register-prog-mode`, and the commands dispatch on `:ts-lang`.)
+
+;; Per-language face tables name only the *named* nodes to colour, by kind or by a kind in
+;; its context (`{:parent … :field … :nth …}`, brood ADR-486); keywords (anonymous
+;; alphabetic tokens — `def`/`end`/`do`/`fn`/…) come free, and the table is passed straight
+;; to `editor/treesit/fontify`. Refine one by inspecting `(%tree-sitter-parse …)` — and a
+;; field name by trying a `{:field …}` selector against `%tree-sitter-spans`.
+;; ---- indentation for the tree-sitter modes ----------------------------------
+;; `editor/treesit/indent-column` is the mechanism (walk the tree, count enclosing blocks);
+;; these four entries are the whole per-language policy. The kinds were read off real parses
+;; rather than guessed, and each spec is checked line-for-line against hand-written source —
+;; every line of a sample module must re-indent to the column it already has.
+;;
+;; `:dedent-levels` differs because the grammars do: Elixir's `do_block` spans its own `end`,
+;; so a closing line measured at the line start is still inside the block and backs out one;
+;; Ruby's `body_statement` stops before `end`, so the closer is already outside and backs out
+;; none.
+
+(def elixir-indent-spec
+  {:width 2
+   :blocks #{:do_block :body} ; `do … end`, and a `->` clause's body
+   ;; The bracketed openers — a multi-line list/map/tuple/binary/`fn` indents its
+   ;; contents exactly as a block does, but must NOT indent its own opening line, which
+   ;; is what `:brackets` means. `:arguments` is deliberately absent: Elixir does not add
+   ;; a level for a call's argument list when the last argument is an `fn`, which is the
+   ;; common shape (`Enum.reduce(xs, %{}, fn … end)`), and counting it put every such
+   ;; clause one level too deep.
+   :brackets #{:anonymous_function :list :map :tuple :bitstring}
+   ;; keywords only; the closing delimiters decide for themselves
+   :dedent #{"end" "else" "catch" "rescue" "after"}
+   :dedent-levels 1})
+
+;; Elixir: def/defmodule/if/case are macros, parsed as calls, so only their TEXT tells
+;; them from `foo(x)`: a call target named one of `elixir-keyword-calls` takes the keyword
+;; colour (brood ADR-487), as `do`/`end`/`fn`/`when`/… do. Module aliases read as `:special`,
+;; an atom (`:ok`, `do:`) as a constant (`:syntax/constant`, brood ADR-616). A call's name — the
+;; identifier in its `target` field — is a function: `foo(x)`. The name a `def` defines is a
+;; DEFINITION (`:syntax/definition`): `def main(x)` is a call inside a call, told from
+;; `foo(bar(x))` by what its `arguments` come right after — an identifier reading `def`
+;; (`:after`, brood ADR-614). A REMOTE call's name is a function too — `Enum.map`'s `map`,
+;; `:lists.reverse`'s `reverse` — when what is before the dot is a module (an alias or an atom:
+;; the right side's `:after`), so every call head reads alike. After a variable the right side is
+;; left alone: `user.name` is a map's field, parsed as the same call-of-a-dot as `mod.fun()`, and
+;; only the value tells them apart.
+(def- elixir-keyword-calls
+  #{"def"
+    "defp" "defmodule" "defmacro" "defmacrop" "defstruct" "defprotocol" "defimpl" "defdelegate"
+    "defguard" "defguardp" "defexception" "defoverridable" "if" "unless" "case" "cond" "with" "for"
+    "receive" "try" "quote" "unquote" "use" "import" "alias" "require"})
+
+;; the heads whose first argument names what they define
+(def- elixir-definers
+  #{"def" "defp" "defmacro" "defmacrop" "defguard" "defguardp" "defdelegate"})
+
+;; where that first argument sits: `def main(x)`, `def main, do: …` / `def main do`, and each
+;; with a guard (`def main(x) when …`, whose call is the `when`'s left side)
+(def- elixir-definition-selectors
+  (let (definer-arguments {:kind :arguments :after {:text elixir-definers}}
+        guarded {:kind :binary_operator :nth 0 :parent definer-arguments})
+    [{:kind :identifier :field :target :parent {:kind :call :nth 0 :parent definer-arguments}}
+      {:kind :identifier :nth 0 :parent definer-arguments}
+      {:kind :identifier :field :target :parent {:kind :call :field :left :parent guarded}}
+      {:kind :identifier :field :left :parent guarded}]))
+
+(def elixir-face-table
+  ;; a definition's name `:syntax/definition`, beside the table's other entries
+  (into (into {} (map elixir-definition-selectors (fn (selector) [selector :syntax/definition])))
+    {{:parent :call :field :target :kind :identifier} :syntax/function
+     ;; a remote call's name, after a module: `Enum.map(…)`, `IO.puts "x"`, `:lists.reverse(…)`
+     {:kind :identifier
+      :field :right
+      :after {:kind :alias}
+      :parent {:kind :dot :field :target :parent :call}} :syntax/function
+     {:kind :identifier
+      :field :right
+      :after {:kind :atom}
+      :parent {:kind :dot :field :target :parent :call}} :syntax/function
+     {:parent :call :field :target :kind :identifier :text elixir-keyword-calls} :syntax/keyword
+     :comment :syntax/comment
+     :string :syntax/string
+     :charlist :syntax/string
+     :sigil :syntax/string
+     :integer :syntax/number
+     :float :syntax/number
+     :atom :syntax/constant
+     :alias :syntax/special
+     :keyword :syntax/constant}))
+
+;; `~H"""…"""` in an Elixir file is HEEx: the sigil's content, named by its sigil letter
+(def elixir-injections
+  [{:content {:kind :quoted_content :parent :sigil} :lang-from :sigil_name :aliases {"H" :heex}}])
+
+(deflanguage elixir
+  {:lang :elixir
+   ;; Expert (expert-lsp.org) — the official Elixir language server, and the one the
+   ;; ElixirLS, Lexical and Next LS efforts converged into. `--stdio` because that is this
+   ;; client's only transport. Not shared: it builds the project with that project's mix.
+   :lsp {:ids {"ex" "elixir" "exs" "elixir"}
+         :servers [{:name "expert"
+                    :extensions ["ex" "exs"]
+                    :commands [["expert" ["--stdio"]]]
+                    :root-markers ["mix.lock" "mix.exs"]}]}
+   :pairs *quote-pairs*
+   :strings *elixir-strings*
+   :pattern "\\.(ex|exs)$|(^|/)mix\\.lock$"
+   :snippets {"def" "def ${1:name}(${2:args}) do\n  $0\nend"
+              "defp" "defp ${1:name}(${2:args}) do\n  $0\nend"
+              "defmodule" "defmodule ${1:Name} do\n  $0\nend"
+              "fn" "fn ${1:args} -> $0 end"
+              "if" "if ${1:condition} do\n  $0\nend"
+              "case" "case ${1:value} do\n  ${2:pattern} ->\n    $0\nend"
+              "describe" "describe \"${1:subject}\" do\n  $0\nend"
+              "test" "test \"${1:does something}\" do\n  $0\nend"}
+   :names ["ex" "exs"]
+   :interpreters ["elixir"]
+   :faces elixir-face-table
+   :indent elixir-indent-spec
+   :electric-indent "^(end|else|rescue|catch|after)$"
+   :heredocs *triple-quote-heredocs*
+   :injections elixir-injections
+   :format ["mix" "format"]
+   ;; the runtime is built with an Elixir grammar; this is the one a user's grammar
+   ;; directory overrides it with (M-x grammar-update), at the revision the tables fit
+   :grammar {:url "https://github.com/elixir-lang/tree-sitter-elixir"
+             :revision "4b0c7118760af58a2e7081bbc8396e136f820b37"
+             :fingerprint "197f0015e41d0669c27b96b8b2bb7863f375ea977753b15c640a57b49419e7b4"}
+   :comment "# "})

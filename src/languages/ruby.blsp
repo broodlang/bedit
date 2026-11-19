@@ -1,0 +1,133 @@
+(defmodule languages/ruby
+  "Ruby: a tree-sitter mode over tree-sitter-ruby, with a fontify restart of its own (heredocs, `=begin`)."
+  (:use languages/core))
+
+;; ---- ruby-mode (tree-sitter-ruby, Emacs's ruby-ts-mode) --------------------------------
+;; The tree-sitter modes' shape (`languages/elixir` says it at length): a face table, an indent
+;; spec naming the node kinds that open a level, and a fontify restart. Ruby's
+;; `body_statement` stops before `end`, so a closing line is already outside its block and
+;; backs out none (Elixir's `do_block` spans its `end`: there it backs out one).
+
+(def ruby-indent-spec
+  {:width 2
+   ;; a method/class body, an if/else arm, and a BRACE block's body — `{ |x| … }` spanning
+   ;; lines indents its contents like any block, and `:block_body` is the kind the grammar
+   ;; gives it. Without it every multi-line `{ |t| … }` body sat a level too shallow, which
+   ;; is 44 of the 46 lines the Ruby stdlib disagreed with.
+   :blocks #{:body_statement :then :else :block_body}
+   ;; the bracketed openers, which must not indent their own opening line
+   :brackets #{:array :hash :argument_list}
+   ;; Per token, because the grammar disagrees per token: a `body_statement` stops before
+   ;; its `end`, so `end` is already outside it and backs out nothing — but it SPANS its
+   ;; own `ensure`/`rescue`/`else`, so those must back out one. A single `:dedent-levels`
+   ;; cannot say both, and with one number Ruby's `ensure` sat a level too deep in every
+   ;; method that had one.
+   ;; Keywords only — a closing delimiter decides for itself (see `ts-dedent-levels`),
+   ;; because the same `}` closes a hash whose node encloses the closing line AND a
+   ;; `{ |x| … }` block whose body ended before it. Read off the grammar, one token at a
+   ;; time, against the Ruby stdlib:
+   ;;   `end`                  a `body_statement` stops before it — already outside
+   ;;   `else` `elsif` `when`  the arm ends before the keyword — already outside
+   ;;   `rescue` `ensure`      children of the `body_statement`, which SPANS them
+   :dedent {"end" 0 "else" 0 "elsif" 0 "when" 0 "rescue" 1 "ensure" 1}})
+
+(def ruby-face-table
+  {:comment :syntax/comment
+   :string :syntax/string
+   :heredoc_body :syntax/string
+   :regex :syntax/string
+   :simple_symbol :syntax/constant
+   :hash_key_symbol :syntax/constant
+   :delimited_symbol :syntax/constant
+   :integer :syntax/number
+   :float :syntax/number
+   :constant :syntax/special
+   :instance_variable :syntax/function
+   :global_variable :syntax/function
+   :class_variable :syntax/function
+   ;; a call's method (`foo(x)`, `s.bar`, `puts`) and a definition's name: Ruby has no
+   ;; field access, so every `x.y` IS a call and colouring its method never lies
+   {:parent :call :field :method :kind :identifier} :syntax/function
+   {:parent :method :field :name} :syntax/definition
+   {:parent :singleton_method :field :name} :syntax/definition})
+
+;; ---- ruby's fontify restart ---------------------------------------------------
+;; Elixir decides restart safety by counting PAIRED heredoc markers; Ruby has no pair to
+;; count — `<<~EOS` ends at a line holding whatever identifier the opener named. So Ruby
+;; asks a weaker question with a safe answer: is there any heredoc opener, or any `=begin`
+;; block comment, above the candidate at all? If so it declines and keeps the full lead-in.
+;; Over-declining costs speed in files that open a heredoc near the viewport and nothing
+;; else; guessing would colour heredoc prose as code.
+;;
+;; Bare `<<EOS` is recognised by the uppercase/underscore that conventionally follows,
+;; because `<<` alone is `Array#<<` and left-shift — searching for it would decline
+;; everywhere and buy nothing.
+
+(defn- ruby-upper? (character)
+  ;; an uppercase ASCII letter, tested by case-folding (Brood's `<` is numeric-only)
+  (and (not (= (string/upper character) (string/lower character)))
+    (= character (string/upper character))))
+
+(sig ruby-heredoc-open-at? (string int -> bool))
+(defn- ruby-heredoc-open-at? (source offset)
+  ;; `offset` is where a `<<` starts — does it open a heredoc rather than shift or append?
+  (let (after (+ offset 2))
+    (and (< after (count source))
+      (let (character (string/char-at source after))
+        (or (= character "~")
+          (= character "-")
+          (= character "'")
+          (= character "\"")
+          (= character "_")
+          (ruby-upper? character))))))
+
+(defn- ruby-heredoc-above? (source upto from)
+  ;; any heredoc opener in `source` before `upto`
+  (let (offset (index-of source "<<" from))
+    (cond
+      (or (< offset 0) (>= offset upto)) false
+      (ruby-heredoc-open-at? source offset) true
+      else (ruby-heredoc-above? source upto (+ offset 2)))))
+
+(defn- ruby-block-comment-above? (source upto)
+  ;; `=begin` / `=end` are column-0 only, so a newline-prefixed match (or offset 0) is one
+  (or (string/starts-with? source "=begin")
+    (let (offset (index-of source "\n=begin")) (and (>= offset 0) (< offset upto)))))
+
+(defn ruby-fontify-restart (source position)
+  "Ruby's `:fontify-restart`: the previous column-0 line, unless a heredoc or `=begin` block
+opens above it in this window — in which case keep the whole lead-in."
+  (let (candidate (editor/treesit/column0-before source position))
+    (if (or (ruby-heredoc-above? source candidate 0) (ruby-block-comment-above? source candidate))
+      0
+      candidate)))
+
+(deflanguage ruby
+  {:lang :ruby
+   :lsp {:ids {"rb" "ruby" "rake" "ruby" "gemspec" "ruby"}
+         :servers [{:name "ruby-lsp"
+                    :extensions ["rb" "rake" "gemspec"]
+                    :commands [["ruby-lsp" []] ["solargraph" ["stdio"]]]
+                    :root-markers ["Gemfile.lock" "Gemfile"]}]}
+   :pairs *backtick-pairs*
+   :strings *ruby-strings*
+   ;; Bundler's, Rake's, Guard's and Rack's files are Ruby too
+   :pattern "\\.(rb|rake|gemspec|ru)$|(^|/)(Gemfile|Rakefile|Guardfile)$"
+   :snippets {"def" "def ${1:name}\n  $0\nend"
+              "class" "class ${1:Name}\n  $0\nend"
+              "if" "if ${1:condition}\n  $0\nend"
+              "case" "case ${1:value}\nwhen ${2:pattern}\n  $0\nend"
+              "each" "each do |${1:item}|\n  $0\nend"
+              "describe" "describe ${1:Subject} do\n  $0\nend"
+              "it" "it \"${1:does something}\" do\n  $0\nend"}
+   :names ["rb"]
+   :interpreters ["ruby"]
+   :faces ruby-face-table
+   :indent ruby-indent-spec
+   ;; the words that close or continue a block reindent their line as they are typed
+   :electric-indent "^(end|else|elsif|when|rescue|ensure)$"
+   ;; its own: a heredoc terminator is arbitrary text, and `=begin` blocks count too
+   :restart 'languages/ruby/ruby-fontify-restart
+   ;; the community standard, and what a Ruby project has if it has anything
+   :format ["rubocop" "-a" "--stderr" "--format" "quiet"]
+   :comment "# "})

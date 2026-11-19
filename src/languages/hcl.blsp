@@ -1,0 +1,112 @@
+(defmodule languages/hcl
+  "HCL and Terraform: two tree-sitter modes over ONE grammar, told apart by `:type`."
+  (:use languages/core))
+
+;; ---- HCL and Terraform: one grammar, two modes ----------------------------------------
+;; tree-sitter-grammars/tree-sitter-hcl builds the grammar twice — the root and
+;; `dialects/terraform` — from ONE `make_grammar.js`, differing only in the name the library
+;; exports. So one `:hcl` grammar parses `.tf`, `.tfvars` and `.hcl` alike, and the two
+;; modes below share it, told apart by `:type`: Terraform files format with `terraform fmt`,
+;; which refuses any other extension, and a plain `.hcl` file (Packer, Nomad, Vault
+;; config) has no formatter here.
+;;
+;; Every name in HCL is an `identifier` — a block's type (`resource`), an attribute's name
+;; and a function's name alike — so the three are told apart by where the identifier sits:
+;; context selectors (brood ADR-486). A block's type is its FIRST named child (its labels
+;; follow, as `string_lit`s); an attribute's name and a call's function are the identifiers
+;; directly under an `attribute` and a `function_call`. A traversal (`var.environment`,
+;; `aws_s3_bucket.logs.arn`) stays uncoloured: it is the code, as inside `${…}`.
+(def hcl-face-table
+  {{:parent :block :kind :identifier :nth 0} :syntax/keyword
+   {:parent :attribute :kind :identifier} :syntax/special
+   {:parent :function_call :kind :identifier} :syntax/function
+   :comment :syntax/comment
+   ;; a block label, or a string with no template in it — painted whole
+   :string_lit :syntax/string
+   ;; a template string's own text and quotes; what is inside `${…}` stays code
+   :template_literal :syntax/string
+   :quoted_template_start :syntax/string
+   :quoted_template_end :syntax/string
+   :heredoc_start :syntax/string
+   :heredoc_identifier :syntax/string
+   :template_interpolation_start :syntax/special
+   :template_interpolation_end :syntax/special
+   :template_directive_start :syntax/special
+   :template_directive_end :syntax/special
+   :numeric_lit :syntax/number
+   :bool_lit :syntax/constant
+   :null_lit :syntax/constant})
+
+;; `terraform fmt`'s layout: two spaces, one level per block, object, tuple and argument
+;; list. Every one is a `{` / `[` / `(` node that spans its own closer, so they are all
+;; `:brackets` — and a block is one too, though it begins at its type rather than at `{`:
+;; the opening line is the block's own, and its closing `}` backs out by itself.
+(def hcl-indent-spec
+  {:width 2
+   :brackets #{:block :object :tuple :function_call :for_tuple_expr :for_object_expr}
+   ;; while a block is being typed nothing parses, and a line ending in an opener is the
+   ;; one hint left that the next line goes a level deeper
+   :opens #{"{" "[" "("}
+   ;; a heredoc's body and its closing marker are text: TAB on one of their lines keeps
+   ;; the indentation it has (brood ADR-486) — a `<<-` body is the writer's layout
+   :verbatim #{:heredoc_template}})
+
+;; a block or an attribute starts at column 0; a heredoc's body or a block comment may hold
+;; anything there
+(def hcl-restart-rule
+  {:item-start "^([A-Za-z_]|#|//|\\})"
+   ;; a heredoc closes on a word it chose, so it counts as open
+   :opaque [*block-comment-opaque* {:open "<<"}]})
+
+;; every block is a definition — `resource "aws_s3_bucket" "logs" { … }`, and a nested
+;; `lifecycle { … }` is the deepest one, as a Rust `fn` inside an `impl` is
+(def hcl-definitions {:kinds #{:block}})
+
+;; a heredoc whose marker names a language is that language's code (brood ADR-489): a
+;; `user_data = <<-BASH` script is shell, coloured with shell-mode's table, its pieces
+;; between `${…}` interpolations ONE document. The marker is the heredoc's
+;; `heredoc_identifier`, a sibling of its `template_literal` pieces, read through the
+;; embedded languages' own `:names` (`SH`, `PY`) — the scripts and data a Terraform file
+;; carries; a marker naming none of them (`EOT`) keeps the string colour. The kernel takes
+;; every named language's table on each fontify, so this names the languages a heredoc holds
+;; rather than every language there is
+(def hcl-injections
+  [{:content {:kind :template_literal :parent :heredoc_template}
+    :lang-from :heredoc_identifier
+    :aliases-from #{:bash :json :yaml :python}}])
+
+;; a `.tftest.hcl` (or `.tofutest.hcl`) file is Terraform's test file, not plain HCL: the
+;; exception says so, rather than which mode registered last
+(deflanguage hcl
+  {:lang :hcl
+   :strings *hcl-strings*
+   :pattern {:match "\\.hcl$" :except "\\.(tf|tofu)test\\.hcl$"}
+   :faces hcl-face-table
+   :indent hcl-indent-spec
+   :restart hcl-restart-rule
+   :definitions hcl-definitions
+   :injections hcl-injections
+   :grammar {:url "https://github.com/tree-sitter-grammars/tree-sitter-hcl"
+             :revision "64ad62785d442eb4d45df3a1764962dafd5bc98b"
+             :fingerprint "721ba6c5fa67cbdf99c4645817bfd5d6bef26d0fba59d6e518ee43bad9e6b79a"}
+   :comment "# "})
+
+(deflanguage terraform
+  (merge hcl-spec
+    {:type :terraform
+     ;; HashiCorp's terraform-ls, or OpenTofu's fork of it — `serve` is stdio. A root module is
+     ;; the folder `terraform init` ran in (its lock file, its `.terraform`); without one the
+     ;; server starts in the project, which it indexes whole. Shared: one process indexes
+     ;; many root modules, each a workspace folder. Both accept HashiCorp's ids; `-vars` is a
+     ;; variables file.
+     :lsp {:ids {"tf" "terraform" "tofu" "terraform" "tfvars" "terraform-vars"}
+           :servers [{:name "terraform-ls"
+                      :extensions ["tf" "tfvars" "tofu"]
+                      :commands [["terraform-ls" ["serve"]] ["tofu-ls" ["serve"]]]
+                      :root-markers [".terraform.lock.hcl" ".terraform"]
+                      :shared true}]}
+     ;; `.tftest.hcl` is a Terraform test file; OpenTofu adds `.tofu` and `.tofutest.hcl`
+     :pattern "\\.(tf|tfvars|tofu)$|\\.(tf|tofu)test\\.hcl$"
+     :names ["tf" "tofu"]
+     ;; HashiCorp's, else OpenTofu's — the same layout from either
+     :format [["terraform" "fmt"] ["tofu" "fmt"]]}))

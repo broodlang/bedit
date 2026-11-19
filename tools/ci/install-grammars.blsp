@@ -1,0 +1,98 @@
+;; tools/ci/install-grammars.blsp — every tree-sitter grammar bedit declares, fetched at its
+;; pinned revision and compiled into one directory, so the parsed half of the language tests
+;; runs where no user ever ran `M-x grammar-install` (CI: .github/workflows/ci.yml,
+;; `parsed-languages`, which points `$BROOD_TEST_GRAMMARS` at that directory —
+;; `testkit/load-test-grammar`).
+;;
+;;     nest run tools/ci/install-grammars.blsp -- DIR
+;;
+;; The languages are every grammar a `deflanguage` parses with
+;; (`languages/core/declared-grammars`), each fetched from where its spec declared it lives
+;; (`model/grammar-source`), so a new language needs no edit here. One the runtime was built
+;; with (Ruby, Elixir) and that declares no source is said and passed by. Each is fetched into
+;; `DIR/src/<lang>` and built into `DIR/libtree-sitter-<lang>.so` with its manifest beside it
+;; (`grammars/grammar-install-into`, the fetch and build `M-x grammar-install` runs), then
+;; loaded once to prove the library opens. A library already in DIR whose manifest says it is
+;; the pinned revision, and is still the library that install built, is kept, and said so.
+;;
+;; Needs git and a C/C++ compiler. Prints a line per language; a declaration with no pinned
+;; revision, a fetch, a build or a load that fails is printed as FAIL and the run exits 1
+;; after trying the rest, so one log names every grammar that did not install.
+
+(def *args* (let (all (system/argv) at (index-of all "--")) (if (>= at 0) (vec (drop all (inc at))) [])))
+
+;; the project, as tools/ci/lsp-rust.blsp loads it: each `deflanguage` declares its grammar at load
+(require-one 'project)
+(project/load-config)
+(let (root (project/find-root (file/cwd)))
+  (when root (project/setup root) (project/load-sources root)))
+
+(defn- say (& parts) (io/puts (apply str "install-grammars: " parts)))
+
+(defn- halt-with (& parts)
+  (do
+    (io/puts (apply str "install-grammars: FAIL: " parts) :to *err*)
+    (system/halt 1)))
+
+(defn- library-path (dir lang)
+  (path/join dir (editor/grammar-install/grammar-library-name lang)))
+
+(defn- at-pin-already? (dir lang revision)
+  ;; whether DIR holds `lang`'s library built at `revision` by an install, unchanged since
+  (let (library (library-path dir lang)
+        manifest (editor/grammar-install/grammar-manifest library))
+    (and (grammars/at-pin? manifest revision)
+      (= (get manifest :sha256) (editor/grammar-install/grammar-file-hash library)))))
+
+(defn- load-error (dir lang)
+  ;; nil when `lang`'s library in DIR loads, else why not
+  (check-allow :discarded-catch
+    (try
+      (do (%tree-sitter-load-grammar (library-path dir lang) lang) nil)
+      (catch e (error-message e)))))
+
+(defn- install-one (dir lang)
+  "Install `lang`'s declared grammar into `dir`: nil when it is there and loads, else the
+reason it is not."
+  (let (source (model/grammar-source lang)
+        revision (when (map? source) (get source :revision)))
+    (cond
+      (and (nil? source) (grammars/grammar-built-in? lang))
+        (do (say (->string lang) " is built into the runtime — nothing to install") nil)
+      (nil? source) "its deflanguage declares no :grammar to install it from"
+      (nil? revision) (str "declared with no pinned revision: " (pr-str source))
+      (at-pin-already? dir lang revision)
+        (or (load-error dir lang) (do (say (->string lang) " already at " revision) nil))
+      else
+        (let (result (grammars/grammar-install-into lang source dir (path/join dir "src")))
+          (if (contains? result :error)
+            (get result :error)
+            (or (load-error dir lang)
+              (do (say (->string lang) " built at " (get result :commit)) nil)))))))
+
+(defn- install-all (dir langs)
+  ;; every language of `langs` tried in turn: the `[lang reason]` of each that failed
+  (seq/keep langs
+    (fn (lang)
+      (let (reason (install-one dir lang))
+        (when reason
+          (io/puts (str "install-grammars: FAIL " (->string lang) ": " reason) :to *err*)
+          [lang reason])))))
+
+(let (dir (first *args*))
+  (when (or (nil? dir) (not (= (count *args*) 1)))
+    (halt-with "usage: nest run tools/ci/install-grammars.blsp -- DIR"))
+  (let (dir (path/absolute dir)
+        langs (seq/sort-by (languages/core/declared-grammars) ->string))
+    (when (empty? langs)
+      (halt-with "no grammar is declared — the project's languages did not load"))
+    (file/mkdir (path/join dir "src"))
+    (say (count langs) " declared grammars into " dir)
+    (let (failed (install-all dir langs))
+      (if (empty? failed)
+        (say "ok — " (count langs) " grammars")
+        (halt-with (count failed)
+          " of "
+          (count langs)
+          " grammars did not install: "
+          (string/join (map failed (fn ([lang _]) (->string lang))) ", "))))))

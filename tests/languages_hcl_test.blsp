@@ -1,18 +1,15 @@
-;; Terraform and HCL (src/languages/config.blsp): two modes over ONE tree-sitter grammar
+;; Terraform and HCL (src/languages/hcl.blsp): two modes over ONE tree-sitter grammar
 ;; (tree-sitter-grammars/tree-sitter-hcl), plus Terraform's language server row
-;; (src/lsp/client.blsp) and toolchain row (src/toolchain.blsp). The parsed half needs
-;; `~/.config/bedit/grammars/libtree-sitter-hcl.so` (M-x grammar-install hcl) and SKIPS
-;; without it, as every runtime-loaded language's tests do.
-(defmodule terraform-test
+;; (src/lsp/client.blsp) and toolchain row (src/toolchain.blsp). The parsed half needs the hcl
+;; grammar (`testkit/load-test-grammar`: `$BROOD_TEST_GRAMMARS`, which CI fills, else the
+;; user's `~/.config/bedit/grammars`) and SKIPS without it, as every parsed language's tests do.
+(defmodule languages-hcl-test
   (:use test)
   (:use model)
   (:use projects) ; *project-markers*
   (:use editor/buffer))
 
 (purge-stale-temp "bedit-tf-")
-
-;; loaded here, at file load, so the `when`s below see what is installed
-(grammars/load-user-grammars)
 
 (defn- tf-model (text file) (ed-init (make-buffer text file file)))
 (defn- tf-buffer (text file) (ed-current-buf (tf-model text file)))
@@ -34,6 +31,10 @@
     (assert= (ed-buf-mode-name (tf-buffer "" "packer.pkr.hcl")) "hcl")
     (assert= (ed-buf-mode-name (tf-buffer "" "nomad.hcl")) "hcl")
     (assert= (ed-buf-mode-name (tf-buffer "" "main.tf.json")) "json"))
+  (test "HCL's own pattern refuses a test file, so no registration order decides it"
+    (is (modes/file-pattern-matches? "nomad.hcl" (modes/file-type-pattern :hcl)))
+    (is (not (modes/file-pattern-matches? "tests/s3.tftest.hcl" (modes/file-type-pattern :hcl))))
+    (is (not (modes/file-pattern-matches? "s3.tofutest.hcl" (modes/file-type-pattern :hcl)))))
   (test "both parse with the one grammar, which says where it lives"
     (assert= (ed-mode-service (tf-buffer "" "main.tf") :ts-lang) :hcl)
     (assert= (ed-mode-service (tf-buffer "" "x.hcl") :ts-lang) :hcl)
@@ -66,19 +67,19 @@
 (describe "the fontify restart"
   (test "the previous column-0 line that starts a block"
     (let (src "locals {\n  a = 1\n}\n\nresource \"x\" \"y\" {\n  b = 2\n}\n")
-      (assert= (languages/config/hcl-restart src (index-of src "  b"))
+      (assert= (languages/hcl/hcl-restart src (index-of src "  b"))
         (index-of src "resource"))))
   (test "a heredoc opened above declines the cut — its body may hold anything at column 0"
     (let (src "a = <<EOT\nresource \"x\" \"y\" {\nEOT\nb = {\n  c = 2\n}\n")
-      (assert= (languages/config/hcl-restart src (index-of src "  c")) 0))))
+      (assert= (languages/hcl/hcl-restart src (index-of src "  c")) 0))))
 
 ;; terraform-fmt-clean (`terraform fmt -check`)
 (def tf-src
   "# The log bucket.\nterraform {\n  required_providers {\n    aws = {\n      source  = \"hashicorp/aws\"\n      version = \"~> 5.0\"\n    }\n  }\n}\n\nvariable \"environment\" {\n  type    = string\n  default = \"staging\"\n\n  validation {\n    condition     = contains([\"staging\", \"production\"], var.environment)\n    error_message = \"Must be staging or production.\"\n  }\n}\n\nlocals {\n  // tags every resource carries\n  tags = {\n    Environment = var.environment\n    Count       = 3\n    Enabled     = true\n    Owner       = null\n  }\n  names = [for name in var.names : upper(name) if name != \"\"]\n  zones = [\n    \"a\",\n    \"b\",\n  ]\n}\n\n/* the bucket itself */\nresource \"aws_s3_bucket\" \"logs\" {\n  bucket = \"logs-${var.environment}-${local.tags.Count}\"\n  tags = merge(\n    local.tags,\n    { Name = \"logs\" },\n  )\n\n  lifecycle {\n    prevent_destroy = true\n  }\n}\n\nresource \"aws_iam_policy\" \"read\" {\n  policy = <<-EOT\n    {\n      \"Bucket\": \"${aws_s3_bucket.logs.id}\"\n    }\n  EOT\n}\n\noutput \"bucket_arn\" {\n  value = aws_s3_bucket.logs.arn\n}\n")
 
-(when (grammars/grammar-loaded? :hcl)
+(when (testkit/load-test-grammar :hcl)
   (describe "terraform, parsed"
-    (def tf-spans (languages/config/terraform-fontify tf-src))
+    (def tf-spans (languages/hcl/terraform-fontify tf-src))
 
     (test "comments, all three spellings"
       (assert= (face-at tf-spans tf-src "# The log") (face-of :syntax/comment))
@@ -121,7 +122,7 @@
     (test "the held tree colours a name as the text path does"
       (let (tree (editor/treesit/open-tree tf-src :hcl)
             held (editor/treesit/fontify-tree tree
-                   languages/config/hcl-face-table
+                   languages/hcl/hcl-face-table
                    0
                    (count tf-src)))
         (editor/treesit/free-tree tree)
@@ -221,10 +222,22 @@
 (def heredoc-src
   "resource \"aws_instance\" \"web\" {\n  user_data = <<-BASH\n    echo \"booting ${var.name}\"\n    export HOME=/root\n  BASH\n  policy = <<-EOT\n    echo plain\n  EOT\n}\n")
 
-(when (and (grammars/grammar-loaded? :hcl) (grammars/grammar-loaded? :bash))
+(describe "a heredoc's marker is read through the embedded languages' own names"
+  (test "shell's and Python's `:names`, in either case, and only the languages a heredoc holds"
+    (let (aliases (get (first (:rules (languages/core/spec-injections languages/hcl/terraform-spec)))
+                    :aliases))
+      (assert= (get aliases "SH") :bash)
+      (assert= (get aliases "sh") :bash)
+      (assert= (get aliases "SHELL") :bash)
+      (assert= (get aliases "PY") :python)
+      (assert= (get aliases "YML") :yaml)
+      ;; Ruby is a language, but not one a Terraform heredoc carries
+      (is (nil? (get aliases "RB"))))))
+
+(when (and (testkit/load-test-grammar :hcl) (testkit/load-test-grammar :bash))
   (describe "a BASH heredoc is coloured as shell"
     (test "the text path: shell's faces inside, the interpolation stays HCL's"
-      (let (spans (languages/config/terraform-fontify heredoc-src))
+      (let (spans (languages/hcl/terraform-fontify heredoc-src))
         (assert= (face-at spans heredoc-src "echo \"booting") (face-of :syntax/function))
         (assert= (face-at spans heredoc-src "HOME=") (face-of :syntax/special))
         (assert= (face-at spans heredoc-src "${var.name}") (face-of :syntax/special))
@@ -239,7 +252,7 @@
                    (count heredoc-src)
                    (syntaxtree/buffer-injections buf)))
         (editor/treesit/free-tree tree)
-        (assert= held (into [] (languages/config/terraform-fontify heredoc-src)))))
+        (assert= held (into [] (languages/hcl/terraform-fontify heredoc-src)))))
     (test "an edit inside the heredoc marks the whole heredoc changed"
       (let (buf (tf-buffer heredoc-src "main.tf")
             tree (editor/treesit/open-tree heredoc-src :hcl)
@@ -253,7 +266,7 @@
               (fn ([start end])
                 (and (<= start (index-of edited "echo \"")) (>= end (index-of edited "export"))))))))))
 
-(when (grammars/grammar-loaded? :hcl)
+(when (testkit/load-test-grammar :hcl)
   (describe "a heredoc whose language has no grammar keeps the host's colours"
     (test "a table for a language the runtime cannot parse changes nothing"
       (let (spec (languages/core/injection-spec [{:content {:kind :template_literal
@@ -261,5 +274,5 @@
                                                   :lang-from :heredoc_identifier
                                                   :aliases {"BASH" :no-such-grammar}}]
                    (fn (_lang) {:command_name :syntax/function})))
-        (assert= (editor/treesit/fontify heredoc-src :hcl languages/config/hcl-face-table true spec)
-          (editor/treesit/fontify heredoc-src :hcl languages/config/hcl-face-table))))))
+        (assert= (editor/treesit/fontify heredoc-src :hcl languages/hcl/hcl-face-table true spec)
+          (editor/treesit/fontify heredoc-src :hcl languages/hcl/hcl-face-table))))))

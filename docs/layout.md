@@ -737,7 +737,7 @@ src/snippet.blsp            SNIPPETS (Emacs's yasnippet / tempel): templates in 
                             syntax (`$1`, `${2:default}`, `$0`, a number twice is a mirror,
                             `${1|a,b|}`, `$TM_FILENAME_BASE`), parsed here (no second caller for a
                             std parser: std's `template` is `{{var}}` rendering). Per mode: a small
-                            built-in set (Brood, Elixir, Ruby, JS/TS, Rust, Python) under init.blsp's
+                            built-in set (a language spec's `:snippets`, brood-mode's) under init.blsp's
                             `:snippets`. C-c & (M-x snippet-expand) expands the key before point or
                             asks; the keys are completion candidates (`:rank :after`); an LSP item
                             with `insertTextFormat` 2 expands too (`snippetSupport true`, the cut
@@ -1743,50 +1743,117 @@ src/languages/brood.blsp
     its services — eldoc, doc-at, completion against the live
     image, the CST indenter, the checker as `:diagnostics`
 src/languages/lisps.blsp
-    the other Lisps: `deflisp` (a special-form set + a file
-    pattern over Brood's own reader) for elisp, Common Lisp,
-    Clojure, Scheme, Fennel; `lisp-indent-with` (Emacs's rule);
-    wos kernel source
-src/languages/scripts.blsp
-    Ruby, Elixir, HEEx, Python
-src/languages/systems.blsp
-    Rust, Go, go.mod, C, C#
-src/languages/web.blsp
-    JavaScript, TypeScript, TSX (each extending the last), CSS, HTML
-src/languages/config.blsp
-    HCL + Terraform, shell, JSON, TOML, YAML, Dockerfile, and the line-lexed
-    formats. All four are `languages/core` specs, one file a family
+    the machinery of the other Lisps: `deflisp` (a special-form set + a
+    file pattern over Brood's own reader, paredit's keys), `head-set`,
+    `lisp-indent-with` (Emacs's rule)
+src/languages/elisp.blsp
+    Emacs Lisp, with Emacs's indent rule (`elisp-indent`)
+src/languages/common-lisp.blsp
+    Common Lisp (the `lisp` mode), Emacs's lisp-mode indent rule
+src/languages/clojure.blsp
+    Clojure, ClojureScript, EDN, Babashka
+src/languages/scheme.blsp
+    Scheme and Racket, the Lisp indent rule
+src/languages/fennel.blsp
+    Fennel
+src/languages/wos.blsp
+    wos kernel source: Brood's structure, wos's keywords, nothing that evaluates
 src/languages/core.blsp
     `deflanguage` declares a tree-sitter language from ONE spec
     (faces, indent, heredocs, injections, formatter) and generates its
     whole service set — show-paren (`tsbrackets`) included — checked against
     editor/treesit/language-contract, so an incomplete language
-    fails at load rather than at the keypress that needed it.
-    Ruby / Elixir / Python / Rust / JavaScript / TypeScript / TSX /
-    Go / C / Terraform + HCL (two modes over one `:hcl` grammar,
-    told apart by `:type`; only Terraform's files take `terraform
-    fmt`), shell (bash), JSON, TOML, YAML and Dockerfile, each naming
-    where its grammar lives AND the commit its tables were written
-    against (`:grammar {:url :revision}`, for M-x grammar-install —
-    each pin the commit the installed library was rebuilt
-    byte-identical from), its names registered for `grammarcheck` — a
-    spec may extend another's (TypeScript is JavaScript's, Terraform
-    HCL's). A language that had a line lexer first keeps it as its
-    `:fallback`: a buffer opened while the grammar is missing is typed
-    as the lexer's stand-in (`model/ed-grammar-fallback`) and becomes
-    the parsed mode when the grammar arrives (`ed-grammars-arrived`);
-    JSON stays lexed past a megabyte (`:fallback-above`). A language with
-    no stand-in (Rust, Go, C) stays its parsed mode without its grammar,
-    and its services answer without one (`spec-grammar?`): no colours, RET
-    keeps the line's indentation, nothing folds — never a parse that
-    raises into the view's `render error`. `:injections`
-    (brood ADR-489) is the code embedded in a language — a Terraform
-    heredoc named BASH / JSON / PY, a Dockerfile `RUN` line as shell,
-    Elixir's `~H` as HEEx (heex-mode) — coloured with the embedded
-    language's OWN spec's faces, found per frame (`modes/language-faces`), so
-    a missing language or grammar keeps the host's colours. `deflexer`
-    is its sibling for the line-lexer languages (a pattern + a `lex-*`
-    stem): env, JSON5, Makefile / INI / commit
+    fails at load rather than at the keypress that needed it. Each
+    language is one module below, `languages/<language>` with its
+    tests in tests/languages_<language>_test.blsp — the shape a
+    standalone language package would have. A spec names where its
+    grammar lives AND the commit its tables were written against
+    (`:grammar {:url :revision}`, for M-x grammar-install — each pin the
+    commit the installed library was rebuilt byte-identical from), its
+    names registered for `grammarcheck`; a spec may extend another's,
+    qualified (`languages/cpp` is `languages/c`'s, TypeScript
+    JavaScript's, TSX TypeScript's, Terraform HCL's). A language that
+    had a line lexer first keeps it as its `:fallback`: a buffer opened
+    while the grammar is missing is typed as the lexer's stand-in
+    (`model/ed-grammar-fallback`) and becomes the parsed mode when the
+    grammar arrives (`ed-grammars-arrived`); JSON stays lexed past a
+    megabyte (`:fallback-above`). A language with no stand-in (Rust,
+    Go, C) stays its parsed mode without its grammar, and its services
+    answer without one (`spec-grammar?`): no colours, RET keeps the
+    line's indentation, nothing folds — never a parse that raises into
+    the view's `render error`. `:injections` (brood ADR-489) is the
+    code embedded in a language — a Terraform heredoc named BASH /
+    JSON / PY, a Dockerfile `RUN` line as shell, Elixir's `~H` as HEEx,
+    PHP's HTML — coloured with the embedded language's OWN spec's
+    faces, found per frame (`modes/language-faces`), so a missing
+    language or grammar keeps the host's colours. `deflexer` is its
+    sibling for the line-lexer languages (a pattern + a `lex-*` stem)
+src/languages/c.blsp
+    C (clangd, clang-format); its spec is C++'s base
+src/languages/cpp.blsp
+    C++: C's spec and tables extended (`.h` stays C, as in Emacs)
+src/languages/csharp.blsp
+    C# (the `c-sharp` grammar): Allman braces, verbatim and raw strings, csharp-ls
+src/languages/css.blsp
+    CSS: selectors as functions, at-rules by token, prettier
+src/languages/docker.blsp
+    Dockerfile: a `RUN` line and a heredoc's body injected as shell; lexed without its grammar
+src/languages/elixir.blsp
+    Elixir: def / if / case as keywords, `~H` injected as HEEx, `mix format`; the shape every
+    tree-sitter mode shares, said once
+src/languages/formats.blsp
+    the line-lexed formats with no grammar (`deflexer`s): env, Makefile, INI, git's commit
+    messages, ignore and attributes files — their lexers live in `languages/lex-*`, shared
+    with the parsed modes' fallbacks, so the small specs sit together rather than beside them
+src/languages/go.blsp
+    Go: gofmt's tabs, a `case` at its switch's level, gopls
+src/languages/gomod.blsp
+    go.mod (the `gomod` grammar): a `require ( … )` block one tab in, `go mod edit -fmt`
+src/languages/hcl.blsp
+    HCL and Terraform: two modes over one `:hcl` grammar, told apart by `:type`; only
+    Terraform's files take `terraform fmt`; a heredoc named BASH / JSON / PY is that language
+src/languages/heex.blsp
+    HEEx (and .eex / .leex): Phoenix templates, Expert as server
+src/languages/html.blsp
+    HTML: a `<style>` injected as CSS, a `<script>` as JavaScript
+src/languages/java.blsp
+    Java: google-java-format --aosp, a text block opaque to the restart
+src/languages/javascript.blsp
+    JavaScript and JSX; TypeScript extends its spec (its JSX nodes public for TSX)
+src/languages/json.blsp
+    JSON (and JSONC), JSON Lines over the same grammar without the formatter, and JSON5
+    as a `deflexer` over JSON's lexer; lexed past a megabyte
+src/languages/julia.blsp
+    Julia: `end`-closed blocks, a module's body not indented, interpolations injected back
+src/languages/kotlin.blsp
+    Kotlin: soft keywords, string templates injected back, ktfmt / ktlint
+src/languages/lua.blsp
+    Lua: `end`-closed blocks, long brackets opaque to the restart, StyLua
+src/languages/perl.blsp
+    Perl: heredocs, interpolations, perltidy
+src/languages/php.blsp
+    PHP: the HTML around it injected, PSR-12 via php-cs-fixer
+src/languages/python.blsp
+    Python: a grammar the runtime was never built with; black, basedpyright / pyright / pylsp + ruff
+src/languages/r.blsp
+    R: a continued pipe (`|>`, `%>%`, `+`) one level in, styler's layout (no formatter command)
+src/languages/ruby.blsp
+    Ruby: its own fontify restart (a heredoc's terminator is any word, `=begin`), rubocop
+src/languages/rust.blsp
+    Rust: every level a `{` bracket, a raw string opaque to the restart, rustfmt
+src/languages/scala.blsp
+    Scala: Scala 3's indentation-based bodies, scalafmt
+src/languages/shell.blsp
+    shell (bash / sh / zsh) by extension, name or `#!` line; shfmt; lexed without its grammar
+src/languages/toml.blsp
+    TOML: a table's header a definition, taplo; lexed without its grammar
+src/languages/tsx.blsp
+    TSX: TypeScript's spec over the `tsx` grammar, JSX's nodes put back
+src/languages/typescript.blsp
+    TypeScript: JavaScript's spec with its own grammar, faces, indent and definitions
+src/languages/yaml.blsp
+    YAML: its indentation is content (TAB keeps a line where it is), prettier; lexed without
+    its grammar
 src/languages/lex-gitignore.blsp
     .gitignore-style ignore files and .gitattributes (Emacs git-modes)
 src/languages/lex-*.blsp
