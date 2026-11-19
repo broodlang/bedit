@@ -4,7 +4,8 @@
 ;; how a line is walked (`editor/lexer` owns that) — and a `<fmt>-spans` fn in the
 ;; `highlight-spans` shape, so an editor mode is `{:fontify 'languages/lex-configs/json-spans}`.
 ;; Line-oriented like every lexical mode here: a JSON string never spans lines anyway; a
-;; YAML block scalar or a TOML multi-line string colours its first line only.
+;; YAML block scalar or a TOML multi-line string colours its first line only. JSON5's block comment
+;; and the commit message's subject carry a fact from line to line (`line-lexer-spans`).
 
 (defmodule languages/lex-configs
   "Lexical highlighting for the everyday configuration formats — `json-spans`,
@@ -17,6 +18,23 @@
 ;; the two string rules the formats share: a `"…"` string with `\` escapes, a raw `'…'` one
 (def- double-quoted-rule ["\"(?:[^\"\\\\]|\\\\.)*\"" :string])
 (def- single-quoted-rule ["'[^']*'" :string])
+
+(defn- line-lexer-spans (lexer src)
+  ;; the colour spans of the whole of `src` through `lexer`, a stateful `editor/line-cache` line
+  ;; lexer: each line lexed in the state the one above left, its spans in document offsets — so a
+  ;; format whose pane threads that lexer through its line cache fontifies the same way whole
+  (let (lex (:lex lexer)
+        [_ _ spans] (fold (string/split src "\n")
+                      [0 (:initial lexer) '()]
+                      (fn ([base state acc] line)
+                        (let ([line-spans after] (lex line state))
+                          [(+ base (count line) 1)
+                            after
+                            (fold line-spans
+                              acc
+                              (fn (spans-so-far [start end face])
+                                (cons [(+ base start) (+ base end) face] spans-so-far)))]))))
+    (reverse spans)))
 
 ;; ---- JSON ---------------------------------------------------------------------------
 ;; A key is a string followed by `:`; it paints as a symbol (a name written as data, brood
@@ -41,8 +59,9 @@
 ;; ---- JSON5 --------------------------------------------------------------------------
 ;; JSON's table, and what JSON5 adds: a key may be a bare identifier or single-quoted, a string
 ;; single-quoted, a number hexadecimal, signed or with a bare point (`.5`, `5.`), `Infinity` and
-;; `NaN` numbers, and a `/* … */` comment — one line's, or from an unclosed `/*` to the line's
-;; end, as no token here crosses a line.
+;; `NaN` numbers (signed too), and a `/* … */` comment, which may span lines: the grammar reads one
+;; line's, or an unclosed `/*` to its line's end, and the line lexer carries the comment on
+;; (`json5-line-lexer`).
 
 (def json5-grammar
   (lexer-grammar {:structured [["\"(?:[^\"\\\\]|\\\\.)*\"\\s*:" :symbol]
@@ -50,24 +69,67 @@
                                 ["[A-Za-z_$][A-Za-z0-9_$]*\\s*:" :symbol]
                                 double-quoted-rule
                                 ["'(?:[^'\\\\]|\\\\.)*'" :string]
+                                ["[-+]?(?:Infinity|NaN)\\b" :number]
                                 ["[-+]?0[xX][0-9A-Fa-f]+" :number]
                                 ["[-+]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][-+]?\\d+)?" :number]
                                 ["//.*" :comment]
                                 ["/\\*.*?\\*/" :comment]
                                 ["/\\*.*" :comment]]
                   :words "[A-Za-z_$][A-Za-z0-9_$]*"
-                  :classes {"true" :constant
-                            "false" :constant
-                            "null" :constant
-                            "Infinity" :number
-                            "NaN" :number}}))
+                  :classes {"true" :constant "false" :constant "null" :constant}}))
+
+(defn- json5-line (grammar-lex comment line inside?)
+  ;; `[spans inside-after?]` for one line, given whether it starts inside a `/* … */`: the text up
+  ;; to its `*/` is comment, the rest the grammar's; the line ends inside a comment when the
+  ;; grammar's last span there is a `/*` that did not close
+  (let (close (if inside? (index-of line "*/") 0)
+        from (cond
+               (not inside?) 0
+               (< close 0) (count line)
+               else (+ close 2))
+        lead (if (> from 0) [[0 from comment]] [])
+        rest (string/substring line from (count line))
+        [rest-spans _] (grammar-lex rest nil)
+        spans (into lead
+                (map rest-spans (fn ([start end face]) [(+ start from) (+ end from) face])))
+        tail (last rest-spans)
+        opened? (and tail
+                  (let (text (string/substring rest (first tail) (second tail)))
+                    (and (string/starts-with? text "/*")
+                      (or (< (count text) 4) (not (string/ends-with? text "*/")))))))
+    [spans (if (and inside? (< close 0)) true (= true opened?))]))
+
+(defn json5-line-lexer ()
+  "`json5-grammar` as a line lexer — json5-mode's `:line-lexer` — whose state is whether a line
+starts inside a `/* … */` comment (brood ADR-471): its text up to the `*/` is comment, and an
+unclosed `/*` carries the comment to the next line.
+
+    (:initial (languages/lex-configs/json5-line-lexer))   ;=> false"
+  (let (grammar-lex (:lex (lexer-line-lexer json5-grammar))
+        comment (editor/face/face :syntax/comment))
+    (editor/line-cache/line-lexer (fn (line inside?) (json5-line grammar-lex comment line inside?))
+      false)))
 
 (defn json5-spans (src)
   "JSON5 colour spans: JSON's, and bare and single-quoted keys, single-quoted strings, hex and
-signed numbers, `Infinity`/`NaN` and `/* */` comments.
+signed numbers, `Infinity`/`NaN` and `/* */` comments, over lines too — the whole document
+through [[json5-line-lexer]], so a pane's line cache and this agree by construction.
 
     (languages/lex-configs/json5-spans \"{a: 0x1F}\")   ;=> ([1 3 {:fg :magenta}] [4 8 {:fg :yellow}])"
-  (lexer-spans json5-grammar src))
+  (line-lexer-spans (json5-line-lexer) src))
+
+(defn json5-restart (src position)
+  "JSON5's `:fontify-restart`: any line start, as for every line-lexed format, except inside a
+`/* … */` comment still open there — then the start of the line it opened on, so the window is
+read in the comment rather than as code.
+
+    (languages/lex-configs/json5-restart \"{\\n/* a\\nb\\n*/\\nc: 1\\n}\" 7)   ;=> 2
+    (languages/lex-configs/json5-restart \"{\\n/* a\\nb\\n*/\\nc: 1\\n}\" 12)   ;=> 12"
+  (let (closed (string/last-index-of src "*/" position)
+        opener (index-of src "/*" (if (< closed 0) 0 (+ closed 2))))
+    (if (or (< opener 0) (>= opener position))
+      position
+      (inc (string/last-index-of src "\n" opener)))))
 
 ;; ---- YAML ---------------------------------------------------------------------------
 
@@ -225,18 +287,7 @@ document through [[gitcommit-line-lexer]], so a pane's line cache and this agree
 construction.
 
     (languages/lex-configs/gitcommit-spans \"# c\")   ;=> ([0 3 {:fg :dark-grey}])"
-  (let (lex (:lex (gitcommit-line-lexer))
-        [_ _ spans] (fold (string/split src "\n")
-                      [0 false '()]
-                      (fn ([base subject-seen? acc] line)
-                        (let ([line-spans seen-after] (lex line subject-seen?))
-                          [(+ base (count line) 1)
-                            seen-after
-                            (fold line-spans
-                              acc
-                              (fn (spans-so-far [start end face])
-                                (cons [(+ base start) (+ base end) face] spans-so-far)))]))))
-    (reverse spans)))
+  (line-lexer-spans (gitcommit-line-lexer) src))
 
 (defn- subject-start (src from)
   ;; the offset of the first line at or after `from` that is neither commentary nor blank — the
@@ -271,10 +322,6 @@ a window that began below the subject would read its first line of prose as the 
 
     (:stateless? (languages/lex-configs/json-line-lexer))   ;=> true"
   (lexer-line-lexer json-grammar))
-
-(defn json5-line-lexer ()
-  "`json5-grammar` as a line lexer — json5-mode's `:line-lexer`."
-  (lexer-line-lexer json5-grammar))
 
 (defn yaml-line-lexer ()
   "`yaml-grammar` as a line lexer — yaml-mode's `:line-lexer`."
