@@ -99,10 +99,10 @@ A finer hierarchy, if ever needed, is: **subtle** `*surface0*` · **default** `*
    `:inset` / `:gap` names a token; `ui-space` raises on a raw number, and
    `tests/spacing_ratchet_test.blsp` fails on one in a spacing position anywhere in src/.
    A card pads 1 row to 2 cells because a cell is about half as wide as a row is tall, so
-   that is what looks equal — a DEFAULT for cards, not a law: a menu card frames a
-   full-width selection pill, so its card is 1 row : 1 cell and the room goes inside the
-   pill (2 cells), the label 3 cells from the border; 2 cells of card outside the pill
-   left the text cramped in it. **Text moves by whole rows and cells** (`ui-space-cells`
+   that is what looks equal — a DEFAULT for cards, not a law: the `:popup` style's candidate
+   card frames a full-width selection pill, so the card pads only a cell at each side
+   (`:popup`) and the room goes inside the pill (2 cells), the label 3 cells from the border;
+   2 cells of card outside the pill left the text cramped in it. **Text moves by whole rows and cells** (`ui-space-cells`
    refuses `:half`); the sub-cell steps only decorate inside a row — the mode line's hover
    block, a scrollbar thumb's gap from the edge.
 8. **A floating card keeps its distance from the chrome.** Every card that floats — under the `:popup`
@@ -121,8 +121,8 @@ A finer hierarchy, if ever needed, is: **subtle** `*surface0*` · **default** `*
 | pane divider   | `view/ed-divider-ops`             | centred hairline `frect`     | solid `rect` bar |
 | status bar     | `modeline/ed-pane-modeline` → `statusbar/statusbar-layout` | `mantle` fill + segments (+ rules in the bar's colour) | `mantle` fill + segments |
 | segment hover  | `statusbar/sb--hover-block`       | bordered inset `frect` block (surface0 fill + surface1 rim, Emacs `mouse-face`) | solid highlight band |
-| completion card| `completion/completion-menu-ops` → `display/card-surface`+`card-pill` | rounded `frect` + pill | flat `rect` card |
-| tooltip        | `statusbar/statusbar-tooltip-ops` → `display/tooltip` | rounded bordered card | flat bordered card |
+| completion card| `popups/list-card` → `ui-kit/ui-panel` + `ui-list` (`display/card-surface` + `card-pill`) | rounded `frect` + pill | flat `rect` card |
+| tooltip        | `popups/tooltip-card-ops` → `display/tooltip` | rounded bordered card | flat bordered card |
 | scrollbar      | `scrollbar/ed-scrollbar-ops`           | rounded `frect` pill         | (none)           |
 
 ## The status bar is a segment model (extensible chrome)
