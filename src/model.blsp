@@ -1963,55 +1963,126 @@ narrowed pane hides is not edited or found behind its back."
   "`[from to]` a replace acts on: `region` (an active region, or nil) clipped to the accessible
 part ([[ed-accessible]]), else point to the accessible end — Emacs's rule, from point on,
 within the narrowing."
-  (let ([lo hi] (ed-accessible m)
-        clip (fn (position) (math/max lo (math/min hi position))))
+  (let (clip (fn (position) (ed-clamp-to-accessible m position)))
     (if (nil? region)
-      [(clip (buffer-point (ed-current-buf m))) hi]
+      [(clip (buffer-point (ed-current-buf m))) (second (ed-accessible m))]
       [(clip (first region)) (clip (second region))])))
+
+;; A pane's narrowing is `:restrict [lo hi]` on its payload — what the renderer, the scroll
+;; clamp and the mode line read — kept in step with the text by two markers in the BUFFER
+;; (`:restrict-id` names them): `lo` with left gravity and `hi` advancing, so text typed at
+;; either edge lands inside, Emacs's BEGV/ZV. An edit made anywhere — another pane on the
+;; buffer, a process, an undo — moves the markers, and [[ed-sync-restrictions]] copies them
+;; back to every pane after the turn.
+
+(defn- restrict-markers (id) [[id :lo] [id :hi]])
 
 (sig ed-set-restrict (model int int -> model))
 (defn ed-set-restrict (m lo hi)
   "Narrow the selected pane to the char range `[lo hi]`: it renders and scrolls only those
-lines, and point is confined to them. Other panes are untouched."
-  (assoc m :layout (pane-update-selected (:layout m) (fn (w) (assoc w :restrict [lo hi])))))
+lines, and point is confined to them. Other panes are untouched. The range is kept as two
+markers in the buffer, so it follows edits made from anywhere."
+  (let (id (reflect/gensym "restrict")
+        [lo-marker hi-marker] (restrict-markers id)
+        buf (ed-current-buf m)
+        marked (buffer-marker-set (buffer-marker-set buf lo-marker lo false) hi-marker hi true))
+    (assoc (ed-set-buf-at m (ed-current-index m) marked)
+      :layout
+        (pane-update-selected (:layout m)
+          (fn (w) (assoc w :restrict [lo hi] :restrict-id id))))))
+
+(defn- restrict-id-shown? (m id)
+  ;; whether some pane still narrows by the markers `id` names — a split copies them
+  (any? (pane-leaf-paths (:layout m))
+    (fn (path) (= id (get (pane-payload-at (:layout m) path) :restrict-id)))))
 
 (sig ed-clear-restrict (model -> model))
 (defn ed-clear-restrict (m)
-  "Widen the selected pane — drop its narrowing, so all of the buffer is in view again."
-  (assoc m :layout (pane-update-selected (:layout m) (fn (w) (dissoc w :restrict)))))
+  "Widen the selected pane — drop its narrowing, so all of the buffer is in view again. Its
+markers leave the buffer unless another pane (a split of this one) still narrows by them."
+  (let (id (get (ed-current-pane m) :restrict-id)
+        widened (assoc m
+                  :layout
+                    (pane-update-selected (:layout m) (fn (w) (dissoc w :restrict :restrict-id)))))
+    (if (or (nil? id) (restrict-id-shown? widened id))
+      widened
+      (let ([lo-marker hi-marker] (restrict-markers id))
+        (ed-set-buf-at widened
+          (ed-current-index widened)
+          (buffer-marker-delete (buffer-marker-delete (ed-current-buf widened) lo-marker) hi-marker))))))
 
-(sig ed-adjust-restriction (model model -> model))
-(defn ed-adjust-restriction (m-before m-after)
-  "Grow or shrink the selected pane's narrowing by an edit made inside it — outward gravity,
-so typing at the end of a narrowed defun keeps the new text in view rather than clipping it
-at a fixed `hi`. Compares the selected buffer's length before and after the just-dispatched
-key: while narrowed and still on the same buffer, the region's `hi` moves by that delta
-(`lo` is the region start, which an edit at point — always `>= lo` — never precedes). A
-no-op in a wide pane, or when nothing was inserted or deleted."
-  (let (restrict (ed-selected-restrict m-after))
-    (if (or (nil? restrict) (not (= (ed-current-index m-before) (ed-current-index m-after))))
-      m-after
-      (let ([lo hi] restrict
-            delta (- (buffer-length (ed-current-buf m-after))
-                    (buffer-length (ed-current-buf m-before))))
-        (if (= delta 0)
-          m-after
-          (ed-set-restrict m-after lo (math/max lo (+ hi delta))))))))
+(defn- synced-restrict (m payload)
+  ;; the `[lo hi]` `payload`'s markers hold now, or nil when it has none or they are gone
+  ;; (the buffer was replaced, or the pane shows another buffer): it keeps the range it had
+  (let (id (get payload :restrict-id)
+        index (get payload :buffer)
+        buf (when (and id (int? index)) (nth (:buffers m) index)))
+    (when buf
+      (let ([lo-marker hi-marker] (restrict-markers id)
+            lo (buffer-marker buf lo-marker)
+            hi (buffer-marker buf hi-marker))
+        (when (and (int? lo) (int? hi)) [lo (math/max lo hi)])))))
+
+(defn ed-sync-restrictions (m)
+  "Every narrowed pane's `:restrict` read back from its markers, so a narrowing follows the
+edits made since — in this pane (text typed at its end stays in view), in another pane on
+the same buffer, or by a process. `m` itself when nothing moved."
+  (let (layout (:layout m))
+    (fold (pane-leaf-paths layout)
+      m
+      (fn (acc path)
+        (let (payload (pane-payload-at layout path)
+              synced (when (and (map? payload) (get payload :restrict-id))
+                       (synced-restrict m payload)))
+          (if (or (nil? synced) (= synced (get payload :restrict)))
+            acc
+            (assoc acc
+              :layout (pane-update-path (:layout acc) path (fn (w) (assoc w :restrict synced))))))))))
+
+(register-post-step :restrictions {:rank 5 :run 'model/ed-sync-restrictions})
 
 (defn ed-clamp-restriction (m)
-  "Keep point inside the selected pane's narrowing — the per-key confinement that makes a
-narrowed pane behave like a small buffer: a motion that would leave the region stops at its
-edge. A no-op in a wide pane, or when point is already inside. Runs after dispatch, before
-the scroll clamp (a confined point is what the viewport then centres on)."
+  "Keep point and mark inside the selected pane's narrowing — the per-key confinement that
+makes a narrowed pane behave like a small buffer: a motion that would leave the region stops
+at its edge, and a mark left outside it comes to the edge, so no region reaches hidden text.
+A no-op in a wide pane, or when both are already inside. Runs after dispatch, before the
+scroll clamp (a confined point is what the viewport then centres on)."
   (let (restrict (ed-selected-restrict m))
     (if (nil? restrict)
       m
       (let ([lo hi] restrict
-            p (buffer-point (ed-current-buf m)))
-        (if (and (>= p lo) (<= p hi))
+            buf (ed-current-buf m)
+            p (buffer-point buf)
+            mark (buffer-mark buf)
+            clamped-mark (when (int? mark) (math/max lo (math/min hi mark)))
+            clamped-point (math/max lo (math/min hi p)))
+        (if (and (= p clamped-point) (= mark clamped-mark))
           m
-          (ed-set-buf m (goto-char (ed-current-buf m) (math/max lo (math/min hi p)))))))))
+          (ed-set-buf m (assoc buf :point clamped-point :mark clamped-mark)))))))
 
+(defn ed-clamp-to-accessible (m position)
+  "`position` brought inside the selected pane's accessible part ([[ed-accessible]])."
+  (let ([lo hi] (ed-accessible m)) (math/max lo (math/min hi position))))
+
+(defn ed-edit-outside-restriction? (m before after)
+  "Whether the edit that made `after` from `before` (the current buffer) touched text the
+selected pane's narrowing hides: each splice, positioned against the text the one before it
+left, must lie inside the range as the splices before it moved it. Nil in a wide pane."
+  (let (restrict (ed-selected-restrict m))
+    (when restrict
+      (let (splices (or (buffer-splices-since before after)
+                      (map (buffer-edits-between before after) (fn (edit) (take edit 3)))))
+        (= :outside
+          (fold splices
+            restrict
+            (fn (range splice)
+              (if (= range :outside)
+                range
+                (let ([lo hi] range
+                      [start end text] splice)
+                  (if (and (>= start lo) (<= end hi))
+                    [lo (+ hi (- (count text) (- end start)))]
+                    :outside))))))))))
 (sig ed-top-showing (model int -> int))
 (defn ed-top-showing (m i)
   "A scroll offset for pool buffer `i` that actually SHOWS its stored point — the point's
@@ -2636,12 +2707,17 @@ you CAN edit — the buffer's own `:read-only-hint`, else a neutral line."
 [buffer extra]`, and the result is `[m' true extra]` when it ran, `[m' false nil]` when the
 buffer refused it. What an edit hands back that the model must keep — a held syntax tree it
 brought up to the edited text as it went (`indent/ed-edit-following-tree`) — leaves the
-edit through here rather than through a buffer key."
+edit through here rather than through a buffer key. An edit reaching text the selected pane's
+narrowing hides is refused too ([[ed-edit-outside-restriction?]]): a narrowed pane edits only
+what it shows."
   (if (read-only? (ed-current-buf m))
     [(ed-ding (message m "buffer is read-only")) false nil]
     (try
-      (let ([edited extra] (f (ed-current-buf m)))
-        [(assoc (ed-set-buf m edited) :status "modified") true extra])
+      (let (before (ed-current-buf m)
+            [edited extra] (f before))
+        (if (ed-edit-outside-restriction? m before edited)
+          [(ed-ding (message m "Text outside the narrowing (C-x n w widens)")) false nil]
+          [(assoc (ed-set-buf m edited) :status "modified") true extra]))
       (catch e
         ;; a partial read-only span refused the edit: the whole op is abandoned (immutable);
         ;; any other error re-raises untouched
