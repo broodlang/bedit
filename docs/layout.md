@@ -1031,7 +1031,8 @@ src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclien
                             again (`ed-collab-reopen`)
 src/guest.blsp              a guest's session (brood ADR-415): editing what it was given, nothing
                             more — the allowlist (`ed-guest-allows?`, the `:guest` command trait)
-                            that tests/guest_allowed.txt pins
+                            that tests/guest_allowed.txt pins, and what such a session folds at all
+                            (`ed-guest-admits?`: keys, window events, its own timers and traffic)
 tests/*_test.blsp           pure model/view tests, one suite per area (no window needed)
 src/corpus.blsp             the language corpus harness: every sample under tests/corpus/<mode>/ checked —
                             its mode, caret assertions and golden faces, indentation three ways, restart,

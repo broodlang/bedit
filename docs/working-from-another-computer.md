@@ -122,6 +122,13 @@ bedit --attach ed@HOST:7457 --cookie-file ~/.config/bedit/state/ed.cookie
   reach your other Brood nodes. `--invite alice,bob` mints one per person with the name
   bound, so the daemon knows who attached rather than taking `--as` on trust. The machine
   cookie still links two of your own machines with full trust; never hand it out.
+- **A guest's session edits what it was given.** It runs only the commands on an allowlist
+  (`tests/guest_allowed.txt`): no opening files, shells, eval or git. And it folds only
+  what a guest could have sent that is safe whoever sent it: keys, a window's mouse, resize
+  and text events, timers it armed itself, and its own background traffic
+  (`guest/ed-guest-admits?`). A guest link can ship any value as a "key", and it can send
+  plain data to the session's loop. So an input shaped like a language server's edit or
+  another frame's event is dropped unread.
 - **Pass the cookie in the environment (`BEDIT_COOKIE`) or a file (`--cookie-file PATH`,
   mode 0600), not as `--cookie VALUE`.** A command line is visible to every user on the
   machine through `ps`; a process's environment is readable only by its owner (and root).
