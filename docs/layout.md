@@ -553,8 +553,9 @@ src/stringstate.blsp        where a buffer's strings and comments are (Emacs's s
                             close; electric pairs ask it to open, close or skip, M-q for the string
 src/stringlex.blsp          the line lexer a string syntax becomes: what a line leaves the next one
                             inside, its fast path. Pure, so the warm task shares it
-src/stringwarm.blsp         stringstate's cache built off the loop: at once on a large visit or a
-                            guess (a post-step, order 60), and on the idle beat (order 95)
+src/stringwarm.blsp         stringstate's cache built off the loop: at once on visiting a buffer longer
+                            than a key may lex (`stringstate/*key-lines*`) or on a guess (a post-step,
+                            order 60), and on the idle beat (order 95)
 src/fill.blsp               M-q and auto-fill over std's `string/fill` / `string/fill-prefixes`
                             (brood ADR-589, Emacs's adaptive fill): the first line keeps its
                             prefix, the rest the paragraph's continuation — a list item HANGS under
