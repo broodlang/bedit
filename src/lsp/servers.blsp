@@ -417,11 +417,21 @@ serving the file and what to say about it, or a nil connection and why not."
     (seq/reject (lsp/client/lsp-specs-for file (lsp/client/lsp-file-type m file))
       (fn (spec) (includes? live (:name spec))))))
 
+(defn- ed-lsp-untrusted (m file specs)
+  ;; the first of `specs`, installed, whose project root may not run its code
+  ;; (`trust/allowed?`), or nil — one not installed is said as missing, not asked about
+  (seq/find specs
+    (fn (spec)
+      (let (root (lsp/client/lsp-known-root m (:name spec) file))
+        (and (string? root) (ed-lsp-command spec) (not (trust/allowed? m root)))))))
+
 (defn ed-lsp-start (m)
   "Start every language server the current buffer's file type names that is not already
 serving it, and register the completion source — `[model connection]`, `connection` the main connection
 now serving the file, nil with an explanatory message on `model` when nothing could start: the
-buffer has no file, no server is configured for its mode, or none is installed.
+buffer has no file, no server is configured for its mode, or none is installed. In a project
+not trusted to run its code (`trust`) nothing starts yet: the trust question is asked at once,
+and the servers start on a yes.
 
 Every message says `lsp:`, whichever feature asked — completion, imenu, goto, references,
 hover and rename share these servers, and what went wrong is the server's, not theirs;
@@ -433,7 +443,8 @@ connection PROCESS, and that answered a goto-definition with a crash trace."
         file (buffer-file buffer)
         ;; first: which servers serve the file depends on its project root
         m (ed-lsp-learn-roots m file)
-        specs (when file (ed-lsp-unserved m file)))
+        specs (when file (ed-lsp-unserved m file))
+        untrusted (when file (ed-lsp-untrusted m file specs)))
     (cond
       (nil? file) [(message m "lsp: the buffer has no file") nil]
       (empty? (lsp/client/lsp-specs-for file (lsp/client/lsp-file-type m file)))
@@ -443,6 +454,14 @@ connection PROCESS, and that answered a goto-definition with a crash trace."
              " mode"))
           nil]
       (empty? specs) [m (lsp/client/lsp-conn m file)]
+      ;; a project not trusted to run its code: asked now, since the reader asked for the
+      ;; server; it starts on a yes ([[ed-lsp-untrusted]])
+      untrusted
+        [(trust/ask m
+           (lsp/client/lsp-known-root m (:name untrusted) file)
+           (ed-lsp-trust-reason untrusted)
+           (fn (trusted) (first (ed-lsp-start trusted))))
+          nil]
       else
         (let ([with-servers lines] (fold specs
                                      [m []]
@@ -532,6 +551,10 @@ uses, marked `*` (M-x lsp-servers — eglot's `eglot-list-connections`)."
 ;; startup is heavy enough to want on demand — Expert compiles the whole mix project before
 ;; it answers anything, which is a real cost to pay unasked. A setting, because init.blsp is
 ;; read as data and never evaluated.
+;;
+;; And only in a project trusted to run its code (`trust`, init.blsp's `:project-trust`): a
+;; server can run the project as it starts — rust-analyzer `build.rs`, R `.Rprofile` — so in an
+;; untrusted one nothing starts and the trust question is queued; the answer's yes starts it.
 
 (defn ed-lsp-close-gone (m)
   "`m` with every document pushed to a server whose buffer is no longer open closed on that
@@ -636,8 +659,25 @@ every idle beat. The root is the one [[ed-lsp-learn-roots]] found for the folder
             ;; makes a new user think the editor cannot do it
             (nil? (ed-lsp-command spec)) (ed-lsp-say-missing marked spec)
             else
-              (let ([started _ line] (ed-lsp-start-spec marked spec file root))
-                (message started (str "lsp: " line))))))))
+            ;; a server can run the project's code as it starts: only in a trusted project,
+            ;; the question queued otherwise — and nothing marked tried, so the next beat
+            ;; after a yes starts it
+              (let ([gated allowed?] (trust/gate m
+                                       root
+                                       (ed-lsp-trust-reason spec)
+                                       'lsp/servers/ed-lsp-autostart))
+                (if allowed?
+                  (let ([started _ line] (ed-lsp-start-spec marked spec file root))
+                    (message started (str "lsp: " line)))
+                  gated)))))))
+
+(defn ed-lsp-trust-reason (spec)
+  "What a trust question says starting `spec`'s server would do.
+
+    (lsp/servers/ed-lsp-trust-reason {:name :x :commands [[\"sh\" []]]})   ;=> \"Its language server (sh) can run the project's code.\""
+  (str "Its language server ("
+    (first (or (ed-lsp-command spec) (first (:commands spec))))
+    ") can run the project's code."))
 
 (defn ed-lsp-missing-note (spec)
   "What is said when none of `spec`'s server commands is installed: the commands looked for,

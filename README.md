@@ -136,6 +136,30 @@ A command of your own lives in a package under `~/.config/bedit/packages` (see
 [`packages.md`](docs/packages.md)); [`configurability.md`](docs/configurability.md) has what
 the init file can and cannot say.
 
+### Trusting a project
+
+Some language servers run the project's own code as they start (rust-analyzer runs
+`build.rs` and proc macros, R runs `.Rprofile`, Gradle `build.gradle`), and so does
+`mix format`. So bedit asks before running a project's code by itself, as VS Code's workspace
+trust does. The first time a file of an untrusted project would start one, and once you have
+paused, the echo area asks:
+
+```text
+Trust ~/src/foo? Its language server (rust-analyzer) can run the project's code.  y yes · n no · ! always
+```
+
+`y` trusts it for the session, `!` for good (kept in `~/.config/bedit/state/trusted-projects.blsp`),
+and `n` (or C-g) leaves it untrusted for the session without asking again. Until you answer, nothing
+of it runs: no server autostart, no format on save, no Brood checker loading its modules. Any other
+key is not taken as an answer: the question steps aside and the key works as usual. Starting a
+server yourself (`M-x lsp-connect`, or a lookup such as `M-.`) asks at once. A project is its
+repository's top (else its project root), so trusting a repository covers the projects inside it.
+`M-x project-trust`, `M-x project-untrust` and `M-x list-trusted-projects` manage the list.
+`:project-trust :always` in init.blsp turns the questions off (the old behaviour), and `:never`
+runs only projects you trusted with `M-x project-trust`. A project's `.bedit-locals.blsp` cannot
+change this setting. Commands you run yourself (`M-x compile`, the test runner, `M-x format-buffer`)
+are never asked about.
+
 ## Contributing
 
 The prime directive: when the editor needs a core abstraction Brood doesn't yet

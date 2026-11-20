@@ -1008,6 +1008,16 @@ src/compile.blsp            M-x compile: run a build in the project root, C-x ` 
                             needed brood's regex captures to be expressible at all
 src/projects.blsp           project root + file walk (find-file-in-project); a VCS checkout (git,
                             mur — std's `vcs`) is a root and lists its own files
+src/trust.blsp              per-project trust (VS Code's workspace trust, `:project-trust` :ask /
+                            :always / :never): `gate` before a feature runs a project's code on
+                            its own (an LSP autostart, format-on-save, the Brood check's project
+                            child) — allowed, or nothing runs and the question is queued and
+                            asked on an idle beat with the keys free (`ask-timer`); `ask` for a
+                            command the reader ran (lsp-connect, a lookup starting a server).
+                            y the session, ! for good (`state/trusted-projects.blsp`), n quiet
+                            for the session; another key steps the question aside and runs.
+                            A root is the checkout top, else the project root, never `~` or
+                            above. M-x project-trust / project-untrust / list-trusted-projects
 src/beam.blsp               the BEAM, from the editor. C-c b p processes · C-c b s the SUPERVISION
                             TREE (indented by depth, supervisors marked) · C-c b e ETS
                             (biggest first — where the memory went) · C-c b t trace a named

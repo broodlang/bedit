@@ -1,0 +1,270 @@
+;; Per-project trust (src/trust.blsp): a project's own code — a language server's autostart,
+;; a format on save — runs only once the project is trusted. Each test has a project of its
+;; own under /tmp and a trust file of its own (`trust/*trust-file*`), so no decision leaks into
+;; another test, and the user's own list is never read.
+(defmodule trust-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use input :only [ed-update])
+  (:use lsp/client :only [*lsp-server-specs* *lsp-shutdown-ms*])
+  (:use formatter :only [*format-on-save*]))
+
+(purge-stale-temp "bedit-trust-")
+
+;; one Elixir server that is a program that only waits: it can be started and filed, and
+;; answers nothing — what these tests need is whether it STARTED
+(def- *waiting-server*
+  [{:name "elixir-test" :extensions ["ex"] :commands [["sleep" ["30"]]] :root-markers ["mix.exs"]}])
+
+(defn- project ()
+  "A fresh Elixir project under /tmp: its root."
+  (let (root (projects/project-path (temp-dir "bedit-trust-")))
+    (file/mkdir (path/join root "lib"))
+    (file/spit (path/join root "mix.exs") "")
+    root))
+
+(defn- project-model (root &optional (settings {}))
+  "A model on `lib/m.ex` in project `root`, init.blsp's `settings` applied."
+  (config/apply-to-model (ed-init (make-buffer "defmodule M do\nend\n"
+                                    "m.ex"
+                                    (path/join root "lib/m.ex")))
+    settings))
+
+(defn- with-project (body)
+  "`(body root)` in a fresh project, with its own trust file, the waiting server, and a loop
+bound (headless, an autostart does nothing). A test stops the servers it started."
+  (let (root (project))
+    (binding (trust/*trust-file* (path/join root "trusted.blsp")
+              *lsp-server-specs* *waiting-server*
+              *lsp-shutdown-ms* 50
+              editor/ui/*loop* (self))
+      (body root))))
+
+(defn- with-headless-project (body)
+  "`(body root)` in a fresh project with its own trust file, and no loop: a save writes inline."
+  (let (root (project)) (binding (trust/*trust-file* (path/join root "trusted.blsp")) (body root))))
+
+(defn- servers (m) (or (:lsp-servers m) {}))
+
+(defn- stop-servers (m)
+  (doseq (connection (keys (servers m))) (lsp/client/lsp-shutdown connection))
+  m)
+
+(defn- press-key (m key) (ed-update m key 80 24))
+
+(defn- asked (m)
+  ;; `m` once the queued question's timer fires
+  (trust/ask-next m))
+
+(describe "an untrusted project runs nothing on its own"
+  (test "opening a file starts no server, and queues one question about the project"
+    (with-project
+      (fn (root)
+        (let (m (lsp/servers/ed-lsp-autostart (project-model root)))
+          (is (empty? (servers m)))
+          (assert= (into [] (map (:trust-queue m) :root)) [root])
+          ;; asked once the editor is idle and the keys are free
+          (is (:idle? (trust/ask-timer m)))
+          ;; another beat asks nothing more
+          (assert= (:trust-queue (lsp/servers/ed-lsp-autostart m)) (:trust-queue m))
+          (let (question (asked m))
+            (is (trust/asking? question))
+            (is (includes? (:echo question) (str "Trust " (path/abbreviate root) "?")))
+            (is (includes? (:echo question) "language server (sleep)"))
+            (is (includes? (:echo question) "! always")))))))
+
+  (test "the question waits while a prompt or a chord holds the keys"
+    (with-project (fn (root)
+                    (let (m (assoc (lsp/servers/ed-lsp-autostart (project-model root)) :pending {}))
+                      (is (nil? (trust/ask-timer m)))
+                      (refute (trust/asking? (asked m)))))))
+
+  (test "y trusts the project for the session, and its server starts"
+    (with-project
+      (fn (root)
+        (let (m (press-key (asked (lsp/servers/ed-lsp-autostart (project-model root))) "y"))
+          (stop-servers m)
+          (assert= (count (servers m)) 1)
+          (is (trust/trusted? m (path/join root "lib")))
+          (is (empty? (:trust-queue m)))
+          ;; for the session only: nothing written
+          (assert= (trust/persisted-roots) [])))))
+
+  (test "! trusts it from now on: written, and a later session starts the server unasked"
+    (with-project (fn (root)
+                    (let (m (press-key (asked (lsp/servers/ed-lsp-autostart (project-model root)))
+                              "!"))
+                      (stop-servers m)
+                      (assert= (count (servers m)) 1)
+                      (assert= (projects/persist-read (trust/trust-file)) [root])
+                      (let (later (lsp/servers/ed-lsp-autostart (project-model root)))
+                        (stop-servers later)
+                        (assert= (count (servers later)) 1)
+                        (is (empty? (or (:trust-queue later) []))))))))
+
+  (test "n declines it quietly for the session: nothing starts and nothing is asked again"
+    (with-project (fn (root)
+                    (let (m (press-key (asked (lsp/servers/ed-lsp-autostart (project-model root)))
+                              "n"))
+                      (is (includes? (:echo m) "not trusting"))
+                      (let (again (lsp/servers/ed-lsp-autostart m))
+                        (is (empty? (servers again)))
+                        (is (empty? (:trust-queue again)))
+                        (is (nil? (trust/ask-timer again))))))))
+
+  (test "C-g declines it too"
+    (with-project (fn (root)
+                    (let (m (press-key (asked (lsp/servers/ed-lsp-autostart (project-model root)))
+                              :ctrl-g))
+                      (is (trust/declined? m root))
+                      (refute (trust/asking? m))))))
+
+  (test "a key that is no answer does what it would, and the question steps aside a while"
+    (with-project (fn (root)
+                    (let (m (press-key (asked (lsp/servers/ed-lsp-autostart (project-model root)))
+                              "x"))
+                      (refute (trust/asking? m))
+                      (is (string/starts-with? (buffer-text (ed-current-buf m)) "x"))
+                      (assert= (into [] (map (:trust-queue m) :root)) [root])
+                      (is (> (or (:after (trust/ask-timer m)) 0) trust/*ask-quiet-ms*)))))))
+
+(describe "the :project-trust setting"
+  (test ":always starts the server without asking, as before"
+    (with-project (fn (root)
+                    (let (m (lsp/servers/ed-lsp-autostart (project-model root
+                                                            {:project-trust :always})))
+                      (stop-servers m)
+                      (assert= (count (servers m)) 1)
+                      (is (empty? (or (:trust-queue m) [])))))))
+
+  (test ":never starts nothing and asks nothing; an explicit start says how to trust it"
+    (with-project (fn (root)
+                    (let (m (lsp/servers/ed-lsp-autostart (project-model root
+                                                            {:project-trust :never})))
+                      (is (empty? (servers m)))
+                      (is (empty? (or (:trust-queue m) [])))
+                      (let (connected (lsp/servers/cmd-lsp-connect m nil))
+                        (is (empty? (servers connected)))
+                        (refute (trust/asking? connected))
+                        (is (includes? (:echo connected) "M-x project-trust")))))))
+
+  (test ":never still runs a project trusted by hand"
+    (with-project (fn (root)
+                    (let (m (trust/cmd-project-trust (project-model root {:project-trust :never})
+                              nil)
+                          started (lsp/servers/ed-lsp-autostart m))
+                      (stop-servers started)
+                      (assert= (count (servers started)) 1)))))
+
+  (test "a project's .bedit-locals.blsp cannot set it: the setting is not safe"
+    (refute (:safe (settings/spec-of config/*settings* :project-trust)))))
+
+(describe "starting a server by hand in an untrusted project asks"
+  (test "M-x lsp-connect asks at once, and starts the server on a yes"
+    (with-project (fn (root)
+                    (let (m (lsp/servers/cmd-lsp-connect (project-model root) nil))
+                      (is (trust/asking? m))
+                      (is (empty? (servers m)))
+                      (let (answered (press-key m "y"))
+                        (stop-servers answered)
+                        (assert= (count (servers answered)) 1))))))
+
+  (test "it asks even after a no"
+    (with-project (fn (root)
+                    (let (declined (press-key (asked (lsp/servers/ed-lsp-autostart (project-model root)))
+                                     "n")
+                          m (lsp/servers/cmd-lsp-connect declined nil))
+                      (is (trust/asking? m))))))
+
+  (test "asked by hand, a key that is no answer asks again"
+    (with-project (fn (root)
+                    (let (m (press-key (lsp/servers/cmd-lsp-connect (project-model root) nil) "x"))
+                      (is (trust/asking? m))
+                      (is (includes? (:echo m) "Please answer")))))))
+
+(describe "the trust commands"
+  (test "project-trust trusts the current project for good, and what waited on it runs"
+    (with-project (fn (root)
+                    (let (waiting (lsp/servers/ed-lsp-autostart (project-model root))
+                          m (trust/cmd-project-trust waiting nil))
+                      (stop-servers m)
+                      (assert= (trust/persisted-roots) [root])
+                      (assert= (count (servers m)) 1)
+                      (is (empty? (:trust-queue m)))))))
+
+  (test "project-untrust forgets it and declines it for the session"
+    (with-project
+      (fn (root)
+        (let (trusted (trust/cmd-project-trust (project-model root) nil)
+              m (trust/untrust trusted root))
+          (assert= (projects/persist-read (trust/trust-file)) [])
+          (refute (trust/trusted? m root))
+          ;; nothing starts again unasked, and nothing is asked
+          (let (again (lsp/servers/ed-lsp-autostart m))
+            (is (empty? (servers again)))
+            (is (empty? (or (:trust-queue again) []))))))))
+
+  (test "project-untrust offers the trusted roots, the current one first"
+    (with-project (fn (root)
+                    (let (m (trust/cmd-project-untrust (trust/cmd-project-trust (project-model root)
+                                                         nil)
+                              nil))
+                      (is (not (nil? (:minibuffer m))))))))
+
+  (test "list-trusted-projects says those for good and those for the session"
+    (with-project (fn (root)
+                    (let (m (project-model root))
+                      (assert= (trust/trusted-line m) "no project is trusted")
+                      (let (session (press-key (lsp/servers/cmd-lsp-connect m nil) "y"))
+                        (stop-servers session)
+                        (is (includes? (trust/trusted-line session) "this session"))
+                        (is (includes? (trust/trusted-line session) (path/abbreviate root)))))))))
+
+(describe "the root a question names"
+  (test "a checkout's top, so a nested project is covered by trusting the repository"
+    (let (top (projects/project-path (temp-dir "bedit-trust-"))
+          nested (path/join top "apps/web"))
+      (file/mkdir (path/join top ".git"))
+      (file/mkdir nested)
+      (file/spit (path/join nested "mix.exs") "")
+      (assert= (trust/root-for nested) top)))
+
+  (test "a folder in no project is its own root"
+    (let (folder (projects/project-path (temp-dir "bedit-trust-")))
+      (file/mkdir folder)
+      (assert= (trust/root-for folder) folder))))
+
+(describe "format on save in an untrusted project"
+  (test "the save is plain and says why; the question is queued"
+    (with-headless-project (fn (root)
+                             (let (file (path/join root "lib/m.ex")
+                                   _ (file/spit file "abc")
+                                   opened (pool/ed-find-file (ed-init (make-buffer "")) file)
+                                   typed (ed-edit opened (fn (b) (insert (end-of-buffer b) "x")))
+                                   m (ed-set-buf typed
+                                       (editor/layers/push-layer (ed-current-buf typed)
+                                         {:name :test-fmt
+                                          :format-command ["sh" "-c" "echo formatted > \"$0\""]}))
+                                   saved (binding (*format-on-save* true)
+                                           (lifecycle/cmd-save m nil)))
+                               (assert= (file/slurp file) "abcx")
+                               (is (includes? (:echo saved) "not formatted"))
+                               (assert= (into [] (map (:trust-queue saved) :root)) [root]))))))
+
+(describe "Brood's checker in an untrusted project"
+  (test "the project's child, which loads its modules, is not used: the text is checked in-image"
+    (let (root (projects/project-path (temp-dir "bedit-trust-"))
+          path (path/join root "src/a.blsp"))
+      (file/mkdir (path/join root "src"))
+      (file/spit (path/join root "project.blsp") "(project :name \"trusttest\")\n")
+      (file/spit path "(def a 1)\n")
+      (binding (trust/*trust-file* (path/join root "trusted.blsp")
+                editor/ui/*loop* (self))
+        (let (m (diagnostics/check/ed-launch-diag (pool/ed-find-file (ed-init (make-buffer ""))
+                                                    path)))
+          (is (nil? (:diag-req m)))
+          (is (not (nil? (:diag-proc m))))
+          (assert= (into [] (map (:trust-queue m) :root)) [root])
+          ;; trusting it checks again, in the project's own child this time
+          (is (nil? (:diag-rope (diagnostics/check/ed-check-again m)))))))))

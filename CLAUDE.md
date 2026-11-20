@@ -109,7 +109,7 @@ must not take a std module's name (`vcs` shadowed std's: hence `vc`).
 | files | `file-save` `lifecycle` `autosave` `backup` `sidecar` `autorevert` `recover` `filecoding` `hexl` `imageview` `docview` `sshpath` `fileperm` `lastsession` `saveplace` `reopen` `solong` `sibling` `thingatpt` |
 | buffer kinds | `section` `sectionbuf` `formbuf` `aside` |
 | config | `config-paths` `config` `display-rules` `hooks` `ownership` `grammars` `grammarcheck` `about` `bugreport` `slowlog` `turnprofile` |
-| projects + build | `projects` `project-commands` `project-search` `toolchain` `compile` `results` `formatter` `projectdiag` `editspans` `searchedit` `apprun` |
+| projects + build | `projects` `trust` `project-commands` `project-search` `toolchain` `compile` `results` `formatter` `projectdiag` `editspans` `searchedit` `apprun` |
 | eval + sessions | `eval-command` `eval-commands` `shell-command` `session` `sandbox` `sandbox-events` `elixir-sandbox` `liveeval` `playground-core` `playground` `elixir-playground` `workings` `debugger` `beam` `process-list` `attach` `eldoc` |
 | multi-frame + remote | `hosted` `guest` `frames` `tabbar` `winner` `remote` `web` |
 | tests + tools | `corpus` (the language corpus harness over `tests/corpus/<mode>/`), `tests/support/testkit.blsp` (shared helpers: `press`, `source-files` …), `tests/guards_test` `tests/strict_ratchet_test` `tests/layout_doc_test`, `tools/drive-*.blsp` (live pty drivers), `tools/screenshot.blsp`, `tools/affected-tests.sh`, `tools/ci/*` |

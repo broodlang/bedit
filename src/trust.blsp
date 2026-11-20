@@ -1,0 +1,349 @@
+(defmodule trust
+  "Per-project trust (VS Code's workspace trust): whether bedit may run a project's OWN code
+without being asked. Opening a file autostarts its language server, and several servers run
+the project as they start — R its `.Rprofile`, rust-analyzer `build.rs` and the proc macros,
+Gradle `build.gradle`, solargraph the Gemfile — so a cloned repo would get code execution by
+being opened. Formatting on save (`mix format` loads the project; rubocop and php-cs-fixer
+their config's code) and Brood's project-rooted checker (which loads the project's modules)
+are the same.
+
+A feature that is about to do that on its own asks [[gate]] first: allowed in a trusted
+project (or with `:project-trust :always`); otherwise nothing runs and, under `:ask` (the
+default), the question is queued and asked once the editor has been idle a moment
+([[*ask-quiet-ms*]]) with nothing else holding the keys — never mid-chord, never over a
+prompt:
+
+    Trust ~/src/foo? Its language server (rust-analyzer) can run the project's code.  y yes · n no · ! always
+
+`y` trusts the project for the session, `!` for good (kept in
+`state/trusted-projects.blsp` under the config folder), `n` (or C-g) declines it for the
+session, quietly. Any other key is not an answer: the question steps aside for a while
+([[*snooze-ms*]]) and the key does what it would have done. A command the reader runs
+(M-x lsp-connect, a lookup that would start a server) asks at once instead ([[ask]]).
+
+A project is the root a question names ([[root-for]]): its checkout's top, else its project
+root, else the folder — never the home folder or above, so a dotfiles checkout at `~` does
+not make every project one. A trusted root covers everything under it. M-x project-trust,
+project-untrust and list-trusted-projects manage the list."
+  (:use model) ; message / ed-read-char / ed-prompt-free? / ed-yes-key? / register-timer-client
+  (:use interactive) ; defcommand
+  (:use keyhelp :only [ed-cancel-key?]) ; C-g / ESC decline the question
+  (:use pool :only [ed-name-prompt ed-default-dir])) ; the untrust prompt, where you are
+
+(defdyn *trust-file* nil)
+;; The file the roots trusted for good are kept in; nil is the editor's own,
+;; `trusted-projects.blsp` in its state folder. A test binds one of its own.
+
+(def *ask-quiet-ms* 1500)
+;; How long the editor must be idle before a queued question is asked: a typist's pause is
+;; well under it, so a question does not land on the key you were about to press.
+
+(def *snooze-ms* 30000)
+;; How long a question waits after a key that was not an answer to it.
+
+(def- *header*
+  "the project roots bedit runs code in without asking (M-x project-untrust removes one; deleting this file untrusts them all)")
+
+;; ---- the roots trusted for good ---------------------------------------------------
+
+(defn trust-file ()
+  "Where the roots trusted for good are kept: [[*trust-file*]], else `trusted-projects.blsp`
+in the editor's state folder."
+  (or *trust-file* (path/join (projects/editor-state-dir) "trusted-projects.blsp")))
+
+;; file -> the roots it holds, read once: a gate is asked on every idle beat while a question
+;; waits, and this module is the only writer of the file
+(def- *persisted* (table/new))
+
+(defn persisted-roots ()
+  "The roots trusted for good, as [[trust-file]] holds them (a vector of folders)."
+  (let (file (trust-file))
+    (if (table/contains? *persisted* file)
+      (table/get *persisted* file [])
+      (let (roots (into [] (seq/filter (projects/persist-read file) string?)))
+        (table/put *persisted* file roots)
+        roots))))
+
+(defn- write-persisted! (roots)
+  ;; `roots` written as the file's whole list, and remembered
+  (let (file (trust-file)
+        kept (into [] (seq/distinct roots)))
+    (projects/persist-write! file kept *header*)
+    (table/put *persisted* file kept)
+    kept))
+
+;; ---- which root a question names ------------------------------------------------
+
+(defn- home-folder ()
+  ;; the home folder in project spelling, or nil when there is none worth the name
+  (let (home (path/home))
+    (when (and (string? home) (not (includes? ["" "/"] home))) (projects/project-path home))))
+
+(defn root-for (dir)
+  "The project root a question about `dir` names: its checkout's top (`vcs/root`), else its
+project root (`projects/project-root`), else `dir` itself — whichever is first and lies
+below the home folder, so trusting a repository covers its nested projects, and a dotfiles
+checkout at `~` never stands for every project in it.
+
+    (trust/root-for \"/\")   ;=> \"/\""
+  (let (folder (projects/project-path dir)
+        home (home-folder)
+        fits? (fn (root)
+                (and (string? root)
+                  (not (and home (projects/path-within? home (projects/project-path root)))))))
+    (projects/project-path (or (seq/find [(vcs/root folder) (projects/project-root folder)] fits?)
+                             folder))))
+
+;; ---- what has been decided --------------------------------------------------------
+
+(defn trust-mode (m)
+  "The init file's `:project-trust`: `:always`, `:never`, or `:ask` (the default, and what
+anything else reads as)."
+  (let (mode (:project-trust m)) (if (includes? [:always :never] mode) mode :ask)))
+
+(defn- covering (roots dir)
+  ;; the first of `roots` that `dir` lies in (or is), else nil
+  (seq/find roots (fn (root) (projects/path-within? dir root))))
+
+(defn- session-roots (m decision)
+  ;; the roots decided `decision` (`:trusted` / `:declined`) this session
+  (into []
+    (seq/keep (or (:trust-decided m) {})
+      (fn ([root decided]) (when (= decided decision) root)))))
+
+(defn trusted? (m dir)
+  "Whether `dir` lies in a trusted project: one trusted for good ([[persisted-roots]]) or for
+this session — whatever `:project-trust` says."
+  (let (folder (projects/project-path dir))
+    (not (nil? (or (covering (persisted-roots) folder) (covering (session-roots m :trusted) folder))))))
+
+(defn allowed? (m dir)
+  "Whether a feature may run `dir`'s project code on its own now: always under
+`:project-trust :always`, else only in a [[trusted?]] project."
+  (or (= (trust-mode m) :always) (trusted? m dir)))
+
+(defn declined? (m dir)
+  "Whether `dir`'s project was declined this session (`n` to its question, or untrusted)."
+  (not (nil? (covering (session-roots m :declined) (projects/project-path dir)))))
+
+(defn asking? (m)
+  "Whether a trust question holds the keys right now."
+  (not (nil? (map/get-in m [:read-char :trust]))))
+
+;; ---- the queue of questions --------------------------------------------------------
+
+(defn- queue (m) (or (:trust-queue m) []))
+
+(defn- enqueue (m dir reason on-trust)
+  ;; `dir`'s question queued — or, when one already covers it, `on-trust` added to that one
+  (let (folder (projects/project-path dir)
+        waiting (queue m)
+        hooks (if (nil? on-trust) #{} #{on-trust})
+        covers? (fn (entry) (projects/path-within? folder (:root entry))))
+    (if (any? waiting covers?)
+      (assoc m
+        :trust-queue
+          (into []
+            (map waiting
+              (fn (entry)
+                (if (covers? entry)
+                  (assoc entry :on-trust (set/union (or (:on-trust entry) #{}) hooks))
+                  entry)))))
+      (assoc m :trust-queue (conj waiting {:root (root-for folder) :reason reason :on-trust hooks})))))
+
+(defn gate (m dir reason &optional (on-trust nil))
+  "`[model allowed?]` for a feature about to run `dir`'s project code ON ITS OWN — a server's
+autostart, a format on save. Allowed: `[m true]`, go ahead. Otherwise `[m' false]`: run
+nothing; under `:ask` the question is queued on `m'` (once a session for a project, and not
+after a no), with `reason` — one sentence on what would run — and `on-trust`, a `(model) ->
+model` symbol called once the project is trusted, so the feature need not wait for its next
+chance. Cheap enough for every idle beat."
+  (cond
+    (allowed? m dir) [m true]
+    (not (= (trust-mode m) :ask)) [m false]
+    (declined? m dir) [m false]
+    else [(enqueue m dir reason on-trust) false]))
+
+(defn ask-timer (m)
+  "The question's timer (`model/register-timer-client`): an idle one-shot while one is queued
+and nothing holds the keys ([[*ask-quiet-ms*]] of quiet, longer while it is snoozed)."
+  (when (and (not (empty? (queue m))) (ed-prompt-free? m))
+    {:after (math/max *ask-quiet-ms* (- (or (:trust-snoozed-until m) 0) (os/now))) :idle? true}))
+
+(defn ask-next (m)
+  "The timer's firing: the first queued question asked, if the keys are still free."
+  (let (entry (first (queue m)))
+    (if (or (nil? entry) (not (ed-prompt-free? m)) (< (os/now) (or (:trust-snoozed-until m) 0)))
+      m
+      (ask-entry m entry false))))
+
+;; ---- asking -------------------------------------------------------------------------
+
+(def- *keys-hint* "  y yes · n no · ! always")
+(def- *answer-please* "Please answer y, n or !.  ")
+
+(defn prompt-text (entry)
+  "The question for queued `entry` (`{:root :reason}`).
+
+    (trust/prompt-text {:root \"/srv/foo\" :reason \"Its language server can run the project's code.\"})   ;=> \"Trust /srv/foo? Its language server can run the project's code.  y yes · n no · ! always\""
+  (str "Trust " (path/abbreviate (:root entry)) "? " (:reason entry) *keys-hint*))
+
+(defn- ask-entry (m entry explicit? &optional (prefix ""))
+  ;; `entry`'s question on the echo row, the next key its answer
+  (map/assoc-in (ed-read-char m
+                  (str prefix (prompt-text entry))
+                  (fn (answered key) (answer answered entry key explicit?))
+                  {:takes-cancel true})
+    [:read-char :trust]
+    (:root entry)))
+
+(defn- answer (m entry key explicit?)
+  ;; the key the question read: an answer, or — asked by itself — a key meant for the buffer
+  (let (root (:root entry)
+        shown (path/abbreviate root))
+    (cond
+      (or (ed-yes-key? key) (= key " "))
+        (trust-root m entry (str "trusting " shown " for this session"))
+      (= key "!")
+        (do
+          (write-persisted! (conj (persisted-roots) root))
+          (trust-root m entry (str "trusting " shown " from now on (M-x project-untrust to stop)")))
+      (or (ed-no-key? key) (ed-cancel-key? key))
+        (message (decline m root)
+          (str "not trusting "
+            shown " this session: none of its code runs (M-x project-trust to trust it)"))
+      explicit? (ask-entry m entry true *answer-please*)
+      ;; not an answer, and nobody asked: the question steps aside and the key does what it would
+      else
+        ((reflect/eval 'input/ed-dispatch) (assoc m :trust-snoozed-until (+ (os/now) *snooze-ms*))
+          key))))
+
+(defn- dequeue (m root)
+  ;; `m` without the queued questions `root` covers, and the hooks they were waiting with
+  (let (waiting (queue m)
+        covered? (fn (entry) (projects/path-within? (:root entry) root))
+        hooks (fold (seq/filter waiting covered?)
+                #{}
+                (fn (acc entry) (set/union acc (or (:on-trust entry) #{})))))
+    [(assoc m :trust-queue (into [] (seq/reject waiting covered?))) hooks]))
+
+;; check-allow: the hooks and `then` are the waiting features' own folds, called late, so the
+;; checker cannot see what they answer; each is a `(model) -> model` (the contract holds it)
+(check-allow :trusted
+  (sig trust-root (model map string -> model))
+  (defn- trust-root (m entry note)
+    ;; `entry`'s root trusted for the session, its waiting features told, and `note` said
+    (let (root (:root entry)
+          [dequeued hooks] (dequeue m root)
+          decided (message (map/assoc-in dequeued [:trust-decided root] :trusted) note)
+          hooked (fold (set/union hooks (or (:on-trust entry) #{}))
+                   decided
+                   (fn (acc hook) (ed-call-deferred acc hook acc)))
+          then (:then entry))
+      (if (fn? then) (then hooked) hooked))))
+
+(defn- decline (m root)
+  ;; `root` declined for the session, its queued questions gone
+  (map/assoc-in (first (dequeue m root)) [:trust-decided root] :declined))
+
+(defn ask (m dir reason then)
+  "For something the reader asked for — a command, a lookup — that would run `dir`'s project
+code: `(then m)` when that is allowed now; else the question asked AT ONCE, even if it was
+declined before, and `(then m')` once it is answered yes. Under `:project-trust :never` it
+is not asked: said, with how to trust the project."
+  (cond
+    (allowed? m dir) (then m)
+    (= (trust-mode m) :never)
+      (message m
+        (str (path/abbreviate (root-for dir))
+          " is not trusted and :project-trust is :never (M-x project-trust trusts it)"))
+    else (ask-entry m {:root (root-for dir) :reason reason :then then} true)))
+
+;; ---- the commands --------------------------------------------------------------------
+
+(defn trust-for-good (m root)
+  "`m` with `root` trusted from now on — written to [[trust-file]] — and whatever was waiting
+on it run."
+  (do
+    (write-persisted! (conj (persisted-roots) root))
+    (trust-root m
+      {:root root}
+      (str "trusting " (path/abbreviate root) " from now on (M-x project-untrust to stop)"))))
+
+(defn untrust (m root)
+  "`m` with `root` no longer trusted — out of [[trust-file]] and declined for the session, so
+nothing of it starts again unasked. What already runs keeps running."
+  (do
+    (write-persisted! (seq/reject (persisted-roots) (fn (kept) (= kept root))))
+    (message (decline m root)
+      (str "no longer trusting "
+        (path/abbreviate root)
+        " — what already runs keeps running (M-x lsp-disconnect stops a server)"))))
+
+(defcommand cmd-project-trust
+  (m key)
+  "Trust the current buffer's project from now on (M-x project-trust): its language servers
+may start, and its code run, without asking. Kept in `state/trusted-projects.blsp`."
+  (trust-for-good m (root-for (ed-default-dir m))))
+
+(defn- trusted-roots (m)
+  ;; every trusted root, for good and for the session, once
+  (into [] (seq/distinct (append (persisted-roots) (session-roots m :trusted)))))
+
+(defcommand cmd-project-untrust
+  (m key)
+  "Stop trusting a project (M-x project-untrust): one of the trusted roots, the current
+buffer's first. Nothing of it starts again without asking; what runs keeps running."
+  (let (roots (trusted-roots m)
+        here (covering roots (projects/project-path (ed-default-dir m)))
+        by-name (into {} (map roots (fn (root) [(path/abbreviate root) root]))))
+    (if (empty? roots)
+      (message m "no project is trusted")
+      (assoc m
+        :minibuffer
+          (assoc (ed-name-prompt "Untrust project: "
+                   (keys by-name)
+                   (fn (mm text)
+                     (let (root (get by-name text))
+                       (if (nil? root)
+                         (message mm (str "not a trusted project: " text))
+                         (untrust mm root))))
+                   20
+                   (if here [(path/abbreviate here)] []))
+            :require-match true)))))
+
+(defn trusted-line (m)
+  "The trusted roots in one line — those for good, then those for this session — or a line
+saying there are none."
+  (let (for-good (persisted-roots)
+        session (seq/reject (session-roots m :trusted) (fn (root) (includes? for-good root)))
+        shown (fn (roots) (string/join (map roots path/abbreviate) ", ")))
+    (cond
+      (and (empty? for-good) (empty? session)) "no project is trusted"
+      (empty? session) (str "trusted: " (shown for-good))
+      (empty? for-good) (str "trusted this session: " (shown session))
+      else (str "trusted: " (shown for-good) " · this session: " (shown session)))))
+
+(defcommand cmd-list-trusted-projects
+  (m key)
+  "Say which projects are trusted to run their code (M-x list-trusted-projects): those
+trusted for good, then those for this session."
+  (message m (trusted-line m)))
+
+;; ---- registration ---------------------------------------------------------------------
+
+;; a queued question is asked once the keys are free and the editor idle
+(register-timer-client :trust-ask 'trust/ask-timer 'trust/ask-next)
+
+;; the init file's setting for this feature, declared beside it (config's registry). Not
+;; `:safe`, so a project's `.bedit-locals.blsp` cannot set it
+(settings/define config/*settings*
+  :project-trust {:default :ask
+   :rank (config/topic-rank :languages)
+   :type '(or :ask :always :never)
+   :model-key :project-trust
+   :commented? true
+   :doc (str "whether a project's own code may run without asking — a language server that\n"
+          "runs build.rs or .Rprofile, a format on save, Brood's checker loading its modules:\n"
+          ":ask (once per project; ! remembers it), :always, or :never (only projects\n"
+          "trusted with M-x project-trust)")})
