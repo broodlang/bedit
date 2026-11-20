@@ -165,12 +165,14 @@ src/scroll.blsp             keeping point on screen: the scroll-margin clamp, ho
                             the mode's `:long-lines` facet, the setting's `:default`. What lays a
                             row out besides is registered (`model/register-row-extra`: folds'
                             hidden lines, inlinetext's annotations); the settings it reads are
-                            `display-settings`'
+                            `display-settings`'. `ed-follow-point` is the per-key clamp, both ways,
+                            over one read of the row extras
 src/display-settings.blsp   the init file's per-mode DISPLAY settings, as globals config re-binds:
                             `:line-numbers` (code numbered, prose and special buffers not, by
                             default), `:long-lines` + `:truncation-ellipsis`, `:wrap-prefix`, and
                             the per-mode lookup (`ed-mode-setting`, a directory file's first:
-                            `ed-local-setting`) every per-mode switch reaches a buffer through
+                            `ed-local-setting`) every per-mode switch reaches a buffer through,
+                            remembered per setting and buffer while its inputs are the same cells
 src/autosave.blsp           `#file#` auto-save sidecars written (owner-only, on the idle beat, order
                             110, and a timer of their own). Only a MODIFIED buffer is ever written
 src/backup.blsp             backup files (Emacs make-backup-files, `:make-backup-files`, on): the first
