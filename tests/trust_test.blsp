@@ -268,3 +268,61 @@ bound (headless, an autostart does nothing). A test stops the servers it started
           (assert= (into [] (map (:trust-queue m) :root)) [root])
           ;; trusting it checks again, in the project's own child this time
           (is (nil? (:diag-rope (diagnostics/check/ed-check-again m)))))))))
+
+;; A repository's `.git/config` can name programs git runs (`core.fsmonitor` on a status,
+;; `diff.external` / textconv on a diff, `core.sshCommand` / `credential.helper` on a fetch).
+;; An unpacked archive can ship one; a clone cannot.
+(describe "git in an untrusted project"
+  (test "reads switch the repo's own programs off: fsmonitor, and external diffs and textconv"
+    (binding (trust/*untrusted* true)
+      (let (status (vc/gitcore/git-argv "/r" ["status" "--porcelain"])
+            diff (vc/gitcore/git-argv "/r" ["-c" "diff.autoRefreshIndex=false" "diff" "--numstat"]))
+        (is (includes? status "core.fsmonitor=false"))
+        (refute (includes? status "--no-ext-diff"))
+        (is (includes? diff "core.fsmonitor=false"))
+        ;; after the subcommand, where git takes them
+        (assert= (into [] (drop diff (index-of diff "diff")))
+          ["diff" "--no-ext-diff" "--no-textconv" "--numstat"]))))
+
+  (test "a trusted project's reads keep them: a builtin fsmonitor is what makes status fast"
+    (let (diff (vc/gitcore/git-argv "/r" ["diff" "--numstat"]))
+      (refute (includes? diff "core.fsmonitor=false"))
+      (refute (includes? diff "--no-ext-diff"))))
+
+  (test "the mode line's summary does not run the repo's fsmonitor until the project is trusted"
+    (let (root (projects/project-path (temp-dir "bedit-trust-"))
+          marker (path/join root "ran")
+          hook (path/join root "hook.sh")
+          file (path/join root "a.txt")
+          git (fn (args) (os/cmd "git" (into ["-C" root] args))))
+      (file/mkdir root)
+      (file/spit file "a\n")
+      (git ["init" "-q"])
+      (git ["-c" "user.name=t" "-c" "user.email=t@t" "add" "a.txt"])
+      (git ["-c" "user.name=t" "-c" "user.email=t@t" "commit" "-qm" "init"])
+      (file/spit hook (str "#!/bin/sh\necho ran >> " marker "\nexit 1\n"))
+      (file/chmod hook 493)
+      (git ["config" "core.fsmonitor" hook])
+      (is (fn? vc/gitbar/git-summary)) ; git's row in the summary table, loaded
+      (binding (trust/*trust-file* (path/join root "trusted.blsp"))
+        (let (m (pool/ed-find-file (ed-init (make-buffer "")) file)
+              key (vc/vcscore/vcs-summary-key m))
+          (is (vc/vcscore/vcs-untrusted? m key))
+          (is (= (:branch (vc/vcscore/vcs-summary-as m key)) (:branch (vc/gitbar/git-summary root))))
+          (when (file/exists? marker) (file/rm marker))
+          (vc/vcscore/vcs-summary-as m key)
+          (refute (file/exists? marker))
+          ;; trusted: the repo's fsmonitor is the reader's to run
+          (vc/vcscore/vcs-summary-as (assoc m :project-trust :always) key)
+          (is (file/exists? marker))))))
+
+  (test "no background fetch: its timer does not tick and its firing runs nothing"
+    (let (root (projects/project-path (temp-dir "bedit-trust-")))
+      (file/mkdir root)
+      (binding (trust/*trust-file* (path/join root "trusted.blsp")
+                editor/ui/*loop* (self))
+        (let (m (assoc (ed-init (make-buffer "")) :git-root root))
+          (is (nil? (vc/gitfetch/git-fetch-timer m)))
+          (is (nil? (:git-fetch-proc (vc/gitfetch/git-background-fetch m))))
+          ;; trusted, it watches as before
+          (is (:every (vc/gitfetch/git-fetch-timer (assoc m :project-trust :always)))))))))
