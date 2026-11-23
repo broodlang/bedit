@@ -1020,9 +1020,9 @@ src/trust.blsp              per-project trust (VS Code's workspace trust, `:proj
                             for the session; another key steps the question aside and runs.
                             A root is the checkout top, else the project root, never `~` or
                             above. M-x project-trust / project-untrust / list-trusted-projects
-                            Git there: no background fetch (`vc/gitfetch`), and reads under
-                            `*untrusted*` (bound by `vc/vcscore`) with `core.fsmonitor`, external
-                            diffs and textconv off (`vc/gitcore/git-argv`)
+                            Git there: no background fetch (`vc/gitfetch`), and reads under std's
+                            `vcs/*untrusted*` (bound by `vc/vcscore`, C-x p f) with `core.fsmonitor`,
+                            external diffs and textconv off (`vc/gitcore/git-argv`)
 src/beam.blsp               the BEAM, from the editor. C-c b p processes · C-c b s the SUPERVISION
                             TREE (indented by depth, supervisors marked) · C-c b e ETS
                             (biggest first — where the memory went) · C-c b t trace a named

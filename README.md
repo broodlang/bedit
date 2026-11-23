@@ -149,11 +149,15 @@ Trust ~/src/foo? Its language server (rust-analyzer) can run the project's code.
 ```
 
 `y` trusts it for the session, `!` for good (kept in `~/.config/bedit/state/trusted-projects.blsp`),
-and `n` (or C-g) leaves it untrusted for the session without asking again. Until you answer, nothing
-of it runs: no server autostart, no format on save, no Brood checker loading its modules, no background
-`git fetch` (which would run the repo's `core.sshCommand` or `credential.helper`). The git summary on
-the mode line still works, read with the repo's own `core.fsmonitor`, external diff and textconv
-programs switched off, since an unpacked archive can ship a `.git/config` naming them. Any other
+and `n` (or C-g) leaves it untrusted for the session without asking again. An answer holds in every
+frame. Until you answer, nothing of it runs: no server autostart, no format on save, no Brood checker
+loading its modules, no background `git fetch` (which would run the repo's `core.sshCommand` or
+`credential.helper`). Say yes and the buffer it saved unformatted is formatted then, if it is still
+the one in front of you and unchanged. Servers that only
+read the files (clangd, ruff, the HTML and CSS servers: `:runs-project-code false` in a server's
+spec) start without asking. The git summary on the mode line and `C-x p f` still work, reading git
+with the repo's own `core.fsmonitor`, external diff and textconv programs switched off, since an
+unpacked archive can ship a `.git/config` naming them. Any other
 key is not taken as an answer: the question steps aside and the key works as usual. Starting a
 server yourself (`M-x lsp-connect`, or a lookup such as `M-.`) asks at once. A project is its
 repository's top (else its project root), so trusting a repository covers the projects inside it.

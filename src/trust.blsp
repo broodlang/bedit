@@ -19,7 +19,8 @@ prompt:
 `state/trusted-projects.blsp` under the config folder), `n` (or C-g) declines it for the
 session, quietly. Any other key is not an answer: the question steps aside for a while
 ([[*snooze-ms*]]) and the key does what it would have done. A command the reader runs
-(M-x lsp-connect, a lookup that would start a server) asks at once instead ([[ask]]).
+(M-x lsp-connect, a lookup that would start a server) asks at once instead ([[ask]]). An
+answer holds in every frame: a project trusted in one window is trusted in all of them.
 
 A project is the root a question names ([[root-for]]): its checkout's top, else its project
 root, else the folder — never the home folder or above, so a dotfiles checkout at `~` does
@@ -33,12 +34,6 @@ project-untrust and list-trusted-projects manage the list."
 (defdyn *trust-file* nil)
 ;; The file the roots trusted for good are kept in; nil is the editor's own,
 ;; `trusted-projects.blsp` in its state folder. A test binds one of its own.
-
-(defdyn *untrusted* false)
-;; True while code runs FOR a project not trusted to run its code, where no model is at hand
-;; to ask (a task reading git for the mode line): a tool that reads the project's own config
-;; must not run what it names — `vc/gitcore` turns off `core.fsmonitor`, external diffs and
-;; textconv drivers under it. Bound by whoever launched the work, from [[allowed?]] on the loop.
 
 (def *ask-quiet-ms* 1500)
 ;; How long the editor must be idle before a queued question is asked: a typist's pause is
@@ -111,17 +106,26 @@ anything else reads as)."
   ;; the first of `roots` that `dir` lies in (or is), else nil
   (seq/find roots (fn (root) (projects/path-within? dir root))))
 
-(defn- session-roots (m decision)
+;; trust file -> `{root decision}`, this session's answers (`:trusted` / `:declined`). Not on the
+;; model: every frame has a model of its own, and a project trusted in one window is trusted
+;; in all of them. Keyed by the trust file, so a test's answers stay in its own.
+(def- *session* (table/new))
+
+(defn- session-decisions () (table/get *session* (trust-file) {}))
+
+(defn- decide! (root decision)
+  ;; `root` decided `decision` for the rest of the session, in every frame
+  (table/put *session* (trust-file) (assoc (session-decisions) root decision)))
+
+(defn- session-roots (decision)
   ;; the roots decided `decision` (`:trusted` / `:declined`) this session
-  (into []
-    (seq/keep (or (:trust-decided m) {})
-      (fn ([root decided]) (when (= decided decision) root)))))
+  (into [] (seq/keep (session-decisions) (fn ([root decided]) (when (= decided decision) root)))))
 
 (defn trusted? (m dir)
   "Whether `dir` lies in a trusted project: one trusted for good ([[persisted-roots]]) or for
 this session — whatever `:project-trust` says."
   (let (folder (projects/project-path dir))
-    (not (nil? (or (covering (persisted-roots) folder) (covering (session-roots m :trusted) folder))))))
+    (not (nil? (or (covering (persisted-roots) folder) (covering (session-roots :trusted) folder))))))
 
 (defn allowed? (m dir)
   "Whether a feature may run `dir`'s project code on its own now: always under
@@ -130,7 +134,7 @@ this session — whatever `:project-trust` says."
 
 (defn declined? (m dir)
   "Whether `dir`'s project was declined this session (`n` to its question, or untrusted)."
-  (not (nil? (covering (session-roots m :declined) (projects/project-path dir)))))
+  (not (nil? (covering (session-roots :declined) (projects/project-path dir)))))
 
 (defn asking? (m)
   "Whether a trust question holds the keys right now."
@@ -177,11 +181,15 @@ and nothing holds the keys ([[*ask-quiet-ms*]] of quiet, longer while it is snoo
     {:after (math/max *ask-quiet-ms* (- (or (:trust-snoozed-until m) 0) (os/now))) :idle? true}))
 
 (defn ask-next (m)
-  "The timer's firing: the first queued question asked, if the keys are still free."
+  "The timer's firing: the first queued question asked, if the keys are still free. One
+answered meanwhile — in another frame, which shares this session's answers — is not asked:
+trusted, what waited on it runs; declined, it is dropped."
   (let (entry (first (queue m)))
-    (if (or (nil? entry) (not (ed-prompt-free? m)) (< (os/now) (or (:trust-snoozed-until m) 0)))
-      m
-      (ask-entry m entry false))))
+    (cond
+      (or (nil? entry) (not (ed-prompt-free? m)) (< (os/now) (or (:trust-snoozed-until m) 0))) m
+      (trusted? m (:root entry)) (trust-root m entry nil)
+      (declined? m (:root entry)) (first (dequeue m (:root entry)))
+      else (ask-entry m entry false))))
 
 ;; ---- asking -------------------------------------------------------------------------
 
@@ -236,12 +244,13 @@ and nothing holds the keys ([[*ask-quiet-ms*]] of quiet, longer while it is snoo
 ;; check-allow: the hooks and `then` are the waiting features' own folds, called late, so the
 ;; checker cannot see what they answer; each is a `(model) -> model` (the contract holds it)
 (check-allow :trusted
-  (sig trust-root (model map string -> model))
+  (sig trust-root (model map (or string nil) -> model))
   (defn- trust-root (m entry note)
-    ;; `entry`'s root trusted for the session, its waiting features told, and `note` said
+    ;; `entry`'s root trusted for the session, its waiting features told, and `note` said (nil
+    ;; says nothing)
     (let (root (:root entry)
           [dequeued hooks] (dequeue m root)
-          decided (message (map/assoc-in dequeued [:trust-decided root] :trusted) note)
+          decided (do (decide! root :trusted) (if note (message dequeued note) dequeued))
           hooked (fold (set/union hooks (or (:on-trust entry) #{}))
                    decided
                    (fn (acc hook) (ed-call-deferred acc hook acc)))
@@ -250,7 +259,7 @@ and nothing holds the keys ([[*ask-quiet-ms*]] of quiet, longer while it is snoo
 
 (defn- decline (m root)
   ;; `root` declined for the session, its queued questions gone
-  (map/assoc-in (first (dequeue m root)) [:trust-decided root] :declined))
+  (do (decide! root :declined) (first (dequeue m root))))
 
 (defn ask (m dir reason then)
   "For something the reader asked for — a command, a lookup — that would run `dir`'s project
@@ -294,7 +303,7 @@ may start, and its code run, without asking. Kept in `state/trusted-projects.bls
 
 (defn- trusted-roots (m)
   ;; every trusted root, for good and for the session, once
-  (into [] (seq/distinct (append (persisted-roots) (session-roots m :trusted)))))
+  (into [] (seq/distinct (append (persisted-roots) (session-roots :trusted)))))
 
 (defcommand cmd-project-untrust
   (m key)
@@ -322,7 +331,7 @@ buffer's first. Nothing of it starts again without asking; what runs keeps runni
   "The trusted roots in one line — those for good, then those for this session — or a line
 saying there are none."
   (let (for-good (persisted-roots)
-        session (seq/reject (session-roots m :trusted) (fn (root) (includes? for-good root)))
+        session (seq/reject (session-roots :trusted) (fn (root) (includes? for-good root)))
         shown (fn (roots) (string/join (map roots path/abbreviate) ", ")))
     (cond
       (and (empty? for-good) (empty? session)) "no project is trusted"

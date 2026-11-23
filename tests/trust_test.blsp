@@ -57,6 +57,24 @@ bound (headless, an autostart does nothing). A test stops the servers it started
   ;; `m` once the queued question's timer fires
   (trust/ask-next m))
 
+(defn- fsmonitor-repository ()
+  "A fresh git repository with one commit whose `.git/config` names an fsmonitor that writes
+a marker file when git runs it: `[root marker]`."
+  (let (root (projects/project-path (temp-dir "bedit-trust-"))
+        marker (path/join root "ran")
+        hook (path/join root "hook.sh")
+        git (fn (args)
+              (os/cmd "git" (into ["-C" root "-c" "user.name=t" "-c" "user.email=t@t"] args))))
+    (file/mkdir root)
+    (file/spit (path/join root "a.txt") "a\n")
+    (git ["init" "-q"])
+    (git ["add" "a.txt"])
+    (git ["commit" "-qm" "init"])
+    (file/spit hook (str "#!/bin/sh\necho ran >> " marker "\nexit 1\n"))
+    (file/chmod hook 493)
+    (git ["config" "core.fsmonitor" hook])
+    [root marker]))
+
 (describe "an untrusted project runs nothing on its own"
   (test "opening a file starts no server, and queues one question about the project"
     (with-project
@@ -119,6 +137,38 @@ bound (headless, an autostart does nothing). A test stops the servers it started
                               :ctrl-g))
                       (is (trust/declined? m root))
                       (refute (trust/asking? m))))))
+
+  (test "a server that only reads the files (`:runs-project-code false`) starts unasked"
+    (with-project (fn (root)
+                    (binding (*lsp-server-specs* [(assoc (first *waiting-server*)
+                                                    :runs-project-code false)])
+                      (let (m (lsp/servers/ed-lsp-autostart (project-model root)))
+                        (stop-servers m)
+                        (assert= (count (servers m)) 1)
+                        (is (empty? (or (:trust-queue m) []))))))))
+
+  (test "an answer holds in every frame: another frame's question is not asked, its server starts"
+    (with-project (fn (root)
+                    (let (other (lsp/servers/ed-lsp-autostart (project-model root))
+                          answered (press-key (asked (lsp/servers/ed-lsp-autostart (project-model root)))
+                                     "y")
+                          caught-up (asked other))
+                      (stop-servers answered)
+                      (stop-servers caught-up)
+                      (is (trust/trusted? (project-model root) root))
+                      (refute (trust/asking? caught-up))
+                      (is (empty? (:trust-queue caught-up)))
+                      (assert= (count (servers caught-up)) 1)))))
+
+  (test "a no in one frame drops the other frame's question"
+    (with-project (fn (root)
+                    (let (other (lsp/servers/ed-lsp-autostart (project-model root))
+                          _ (press-key (asked (lsp/servers/ed-lsp-autostart (project-model root)))
+                              "n")
+                          caught-up (asked other))
+                      (refute (trust/asking? caught-up))
+                      (is (empty? (:trust-queue caught-up)))
+                      (is (empty? (servers caught-up)))))))
 
   (test "a key that is no answer does what it would, and the question steps aside a while"
     (with-project (fn (root)
@@ -236,21 +286,27 @@ bound (headless, an autostart does nothing). A test stops the servers it started
       (assert= (trust/root-for folder) folder))))
 
 (describe "format on save in an untrusted project"
-  (test "the save is plain and says why; the question is queued"
-    (with-headless-project (fn (root)
-                             (let (file (path/join root "lib/m.ex")
-                                   _ (file/spit file "abc")
-                                   opened (pool/ed-find-file (ed-init (make-buffer "")) file)
-                                   typed (ed-edit opened (fn (b) (insert (end-of-buffer b) "x")))
-                                   m (ed-set-buf typed
-                                       (editor/layers/push-layer (ed-current-buf typed)
-                                         {:name :test-fmt
-                                          :format-command ["sh" "-c" "echo formatted > \"$0\""]}))
-                                   saved (binding (*format-on-save* true)
-                                           (lifecycle/cmd-save m nil)))
-                               (assert= (file/slurp file) "abcx")
-                               (is (includes? (:echo saved) "not formatted"))
-                               (assert= (into [] (map (:trust-queue saved) :root)) [root]))))))
+  (test "the save is plain and says why; trusting the project then formats it"
+    (with-headless-project
+      (fn (root)
+        (let (file (path/join root "lib/m.ex")
+              _ (file/spit file "abc")
+              opened (pool/ed-find-file (ed-init (make-buffer "")) file)
+              typed (ed-edit opened (fn (b) (insert (end-of-buffer b) "x")))
+              m (ed-set-buf typed
+                  (editor/layers/push-layer (ed-current-buf typed)
+                    {:name :test-fmt
+                     :format-command ["sh" "-c" "echo formatted > \"$0\""]}))
+              saved (binding (*format-on-save* true)
+                      (lifecycle/cmd-save m nil)))
+          (assert= (file/slurp file) "abcx")
+          (is (includes? (:echo saved) "not formatted"))
+          (assert= (into [] (map (:trust-queue saved) :root)) [root])
+          ;; trusting it formats the buffer whose save was held back
+          (let (trusted (press-key (asked saved) "y"))
+            (assert= (file/slurp file) "formatted\n")
+            (assert= (buffer-text (ed-current-buf trusted)) "formatted\n")
+            (refute (:format-skipped (ed-current-buf trusted)))))))))
 
 (describe "Brood's checker in an untrusted project"
   (test "the project's child, which loads its modules, is not used: the text is checked in-image"
@@ -274,7 +330,7 @@ bound (headless, an autostart does nothing). A test stops the servers it started
 ;; An unpacked archive can ship one; a clone cannot.
 (describe "git in an untrusted project"
   (test "reads switch the repo's own programs off: fsmonitor, and external diffs and textconv"
-    (binding (trust/*untrusted* true)
+    (binding (vcs/*untrusted* true)
       (let (status (vc/gitcore/git-argv "/r" ["status" "--porcelain"])
             diff (vc/gitcore/git-argv "/r" ["-c" "diff.autoRefreshIndex=false" "diff" "--numstat"]))
         (is (includes? status "core.fsmonitor=false"))
@@ -290,19 +346,8 @@ bound (headless, an autostart does nothing). A test stops the servers it started
       (refute (includes? diff "--no-ext-diff"))))
 
   (test "the mode line's summary does not run the repo's fsmonitor until the project is trusted"
-    (let (root (projects/project-path (temp-dir "bedit-trust-"))
-          marker (path/join root "ran")
-          hook (path/join root "hook.sh")
-          file (path/join root "a.txt")
-          git (fn (args) (os/cmd "git" (into ["-C" root] args))))
-      (file/mkdir root)
-      (file/spit file "a\n")
-      (git ["init" "-q"])
-      (git ["-c" "user.name=t" "-c" "user.email=t@t" "add" "a.txt"])
-      (git ["-c" "user.name=t" "-c" "user.email=t@t" "commit" "-qm" "init"])
-      (file/spit hook (str "#!/bin/sh\necho ran >> " marker "\nexit 1\n"))
-      (file/chmod hook 493)
-      (git ["config" "core.fsmonitor" hook])
+    (let ([root marker] (fsmonitor-repository)
+          file (path/join root "a.txt"))
       (is (fn? vc/gitbar/git-summary)) ; git's row in the summary table, loaded
       (binding (trust/*trust-file* (path/join root "trusted.blsp"))
         (let (m (pool/ed-find-file (ed-init (make-buffer "")) file)
@@ -314,6 +359,15 @@ bound (headless, an autostart does nothing). A test stops the servers it started
           (refute (file/exists? marker))
           ;; trusted: the repo's fsmonitor is the reader's to run
           (vc/vcscore/vcs-summary-as (assoc m :project-trust :always) key)
+          (is (file/exists? marker))))))
+
+  (test "C-x p f lists the files without running the repo's fsmonitor until it is trusted"
+    (let ([root marker] (fsmonitor-repository))
+      (binding (trust/*trust-file* (path/join root "trusted.blsp"))
+        (let (m (ed-init (make-buffer "")))
+          (is (:minibuffer (project-commands/ed-find-file-in-project m root)))
+          (refute (file/exists? marker))
+          (project-commands/ed-find-file-in-project (assoc m :project-trust :always) root)
           (is (file/exists? marker))))))
 
   (test "no background fetch: its timer does not tick and its firing runs nothing"
