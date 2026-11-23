@@ -1779,7 +1779,10 @@ src/decorations/pulse.blsp
     and the next command clears it. `:reduce-motion` (`:auto` follows the
     desktop, brood's `gui/reduce-motion?`) also snaps the scroll settle, hides
     the scrollbar without a fade and stills the spinner
-    (`model/ed-reduce-motion?`); a key settles a scroll ease at once
+    (`model/ed-reduce-motion?`); a key settles a scroll ease at once.
+    FLASHES (`flash-lines`): the same band over a run of a buffer's lines in
+    every pane showing it, fading on the same timer, whatever `:pulse` says
+    (an agent's edit, bedit-agent)
 src/decorations/rainbow.blsp
     a tree-sitter buffer's brackets coloured by depth (Emacs rainbow-delimiters,
     `:rainbow-delimiters`): delimiter tokens of the held parse, the window's top

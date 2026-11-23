@@ -14,7 +14,12 @@ the init file's `:pulse` (the model's `:pulse-on`).
 Two rules keep it calm (`model/ed-reduce-motion?`'s comment): under `:reduce-motion` the
 band is STATIC — no fade, no timer — and the next command clears it; and a key the desktop
 REPEATS (`:key-repeat`, a held C-v) starts no pulse and ends the one showing, so a held key
-never leaves a flash trailing behind the page."
+never leaves a flash trailing behind the page.
+
+FLASHES are the same band over a run of lines that something other than a jump wants seen —
+an agent's edit, a revert: `flash-lines` adds one for a buffer, shown in EVERY pane showing it
+(selected or not) and fading with the pulse's timer, whatever `:pulse` says; static under
+`:reduce-motion`, until the next command."
   (:use editor/buffer) ; buffer-current-line
   (:use editor/display :only [frect]) ; the band
   (:use model) ; ed-current-buf / ed-current-pane / register-post-step / register-timer-client
@@ -64,44 +69,98 @@ the model unchanged when nothing moved."
         (:static (:pulse m)) (dissoc noted :pulse)
         else noted))))
 
+(defn flash-lines (m name from to)
+  "`m` with lines `from`..`to` (0-based, inclusive) of the buffer called `name` flashed: a band
+over them in every pane showing it, fading as a pulse does (static under `:reduce-motion`, until
+the next command). A flash already on those lines starts again."
+  (let (flash {:name name
+               :from (math/min from to)
+               :to (math/max from to)
+               :level (if (ed-reduce-motion? m) *pulse-static-level* 1.0)
+               :static (ed-reduce-motion? m)
+               :count (:command-count m)}
+        others (seq/reject (or (:flashes m) [])
+                 (fn (old)
+                   (and (= (:name old) name)
+                     (= (:from old) (:from flash))
+                     (= (:to old) (:to flash))))))
+    (assoc m :flashes (conj (vec others) flash))))
+
 (defn timer-spec (m)
-  "The fade's timer while a fading pulse is showing, else none — a static one has no timer."
-  (let (pulse (:pulse m))
-    (when (and pulse (not (:static pulse))) {:every *pulse-tick-ms*})))
+  "The fade's timer while a fading pulse or flash is showing, else none — a static one has no
+timer."
+  (when (or (and (:pulse m) (not (:static (:pulse m))))
+          (any? (or (:flashes m) []) (fn (flash) (not (:static flash)))))
+    {:every *pulse-tick-ms*}))
+
+(defn- faded (shown)
+  ;; `shown` (a pulse or a flash) a tick dimmer, nil once it is gone; a static one unchanged
+  (cond
+    (or (nil? shown) (:static shown)) shown
+    else
+      (let (level (- (:level shown) (/ (* 1.0 *pulse-tick-ms*) *pulse-ms*)))
+        (if (<= level 0.0) nil (assoc shown :level level)))))
 
 (defn fade (m)
-  "One step of the fade: the level down by a tick's share, the pulse gone at nothing. A
-static pulse does not fade."
-  (let (pulse (:pulse m))
-    (if (or (nil? pulse) (:static pulse))
-      m
-      (let (level (- (:level pulse) (/ (* 1.0 *pulse-tick-ms*) *pulse-ms*)))
-        (if (<= level 0.0) (dissoc m :pulse) (assoc m :pulse (assoc pulse :level level)))))))
+  "One step of the fade: each pulse and flash's level down by a tick's share, gone at nothing.
+A static one does not fade."
+  (let (pulse (faded (:pulse m))
+        flashes (vec (seq/keep (or (:flashes m) []) faded))
+        dimmed (if pulse (assoc m :pulse pulse) (dissoc m :pulse)))
+    (if (empty? flashes) (dissoc dimmed :flashes) (assoc dimmed :flashes flashes))))
 
-(defn ed-pulse-layer (m pane buf geometry)
-  "The pulse on the selected pane's line after a jump: a translucent band over the rows the line
-takes, as opaque as the pulse's fading `:level`. `()` with no pulse, for another buffer, in a
-zoomed pane (its rows are the region's), or in a terminal."
-  (let (pulse (:pulse m))
-    (if (or (nil? pulse)
-          (nil? geometry)
-          (not (:selected pane))
-          (not (:gui m))
-          (not (nil? (get (:payload pane) :zoom)))
-          (not (= (:buffer pulse) (:buffer (:payload pane)))))
-      '()
-      (let (body (panegeometry/geometry-span geometry :body))
-        (map (panegeometry/ed-line-screen-rows geometry (:line pulse) (:text-height geometry))
+(defn- band (geometry from to level)
+  ;; the translucent band over the screen rows lines `from`..`to` take, at `level`
+  (let (body (panegeometry/geometry-span geometry :body))
+    (mapcat (range from (inc to))
+      (fn (line)
+        (map (panegeometry/ed-line-screen-rows geometry line (:text-height geometry))
           (fn ([row _from _to _entry])
             (frect (+ (first body) 0.0)
               (+ (:y geometry) row 0.0)
               (+ (second body) 0.0)
               1.0
               face-pulse
-              (* 0.45 (:level pulse)))))))))
+              (* 0.45 level))))))))
+
+(defn ed-pulse-layer (m pane buf geometry)
+  "The pulse on the selected pane's line after a jump, and every flash on this pane's buffer: a
+translucent band over the rows each line takes, as opaque as its fading `:level`. `()` with
+neither, in a zoomed pane (its rows are the region's), or in a terminal."
+  (let (pulse (:pulse m)
+        flashes (or (:flashes m) []))
+    (if (or (and (nil? pulse) (empty? flashes))
+          (nil? geometry)
+          (not (:gui m))
+          (not (nil? (get (:payload pane) :zoom))))
+      '()
+      (let (name (buffer-name buf)
+            last-line (dec (buffer-line-count buf))
+            pulsed (if (and pulse (:selected pane) (= (:buffer pulse) (:buffer (:payload pane))))
+                     (band geometry (:line pulse) (:line pulse) (:level pulse))
+                     '()))
+        (append pulsed
+          (mapcat (seq/filter flashes (fn (flash) (= (:name flash) name)))
+            (fn (flash)
+              (band geometry
+                (math/min (:from flash) last-line)
+                (math/min (:to flash) last-line)
+                (:level flash)))))))))
+
+(defn clear-static-flashes (m)
+  "The post-step row for flashes: a static flash (`:reduce-motion`'s, which does not fade) goes at
+the first key command after it was made. O(1) when there is none."
+  (let (flashes (:flashes m))
+    (if (or (nil? flashes) (not (any? flashes :static)))
+      m
+      (let (kept (vec (seq/reject flashes
+                        (fn (flash)
+                          (and (:static flash) (not (= (:count flash) (:command-count m))))))))
+        (if (empty? kept) (dissoc m :flashes) (assoc m :flashes kept))))))
 
 (register-pane-layer :pulse {:rank 10 :slot :over-text :run 'decorations/pulse/ed-pulse-layer})
 (register-post-step :pulse {:rank 90 :run 'decorations/pulse/note-jump})
+(register-post-step :flashes {:rank 91 :run 'decorations/pulse/clear-static-flashes})
 (register-timer-client :pulse 'decorations/pulse/timer-spec 'decorations/pulse/fade)
 
 ;; the init file's setting for this feature, declared beside it (config's registry)
