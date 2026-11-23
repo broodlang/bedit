@@ -2113,7 +2113,8 @@ src/org/mode.blsp
     / move a heading or item, M-S- with what is under it (folds carried);
     S-arrows the keyword and priority (shift-select off a heading);
     C-c C-c a checkbox and every `[2/3]` cookie above it; C-c C-t,
-    C-c C-n / p / f / b / u; breadcrumbs. Each change is one rewrite of
+    C-c C-n / p / f / b / u; C-c C-o follows the link at point (a file at
+    its `::line` or `::search`, a `*heading`, a web address); breadcrumbs. Each change is one rewrite of
     a run of lines (`org-rewrite`), so one undo step
 ```
 
