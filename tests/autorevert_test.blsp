@@ -1,0 +1,83 @@
+;; Auto-revert on the OS's word (src/autorevert.blsp, brood's `file/watch`): a visited file is
+;; watched from the loop, and a change the OS reports reverts a clean buffer at once, by the
+;; same rules as the idle beat. The test process stands in for the loop: it is the process that
+;; opened the file, so the watch's messages come to it, and it folds them in as the loop does.
+(defmodule autorevert-test
+  (:use testkit :only [press m-of cur type-str])
+  (:use autorevert)
+  (:use model)
+  (:use pool :only [ed-find-file ed-kill-buffer-at])
+  (:use editor/buffer)
+  (:use test))
+
+(defn- scratch-file (text)
+  "A fresh file holding `text`, in a directory of its own."
+  (let (dir (path/join (or (test/scratch-dir) (path/temp "bedit-autorevert-"))
+              (str "w" (rand/token 6)))
+        file (path/join dir "notes.txt"))
+    (file/mkdir dir)
+    (file/spit file text)
+    file))
+
+(defn- reported (m)
+  "`m` with the next `[:file-watch …]` message folded in as the loop folds it; the message is
+the barrier, so nothing here guesses at a delay."
+  (receive
+    ([:file-watch handle path kind] (ed-ev-file-watch m [:file-watch handle path kind] nil 80 24))
+    (after 5000 (error "no :file-watch message arrived"))))
+
+(defn- behind (m)
+  "`m` with its current buffer stamped as read before the file's last write: an external write
+in the same millisecond as the read would otherwise look unchanged."
+  (ed-set-buf m (assoc (cur m) :file-mtime (dec (:file-mtime (cur m))))))
+
+(describe "a visited file is watched"
+  (test "opening a file watches it from the loop"
+    (let (file (scratch-file "one\n")
+          m (ed-find-file (m-of "x") file))
+      (is (ref? (:file-watch (cur m))))
+      (assert= (%file-watch-count (path/dirname file)) 1)))
+  (test "another program's write reverts the clean buffer the moment the OS reports it"
+    (let (file (scratch-file "one\n")
+          m (behind (ed-find-file (m-of "x") file)))
+      (file/spit file "two\n")
+      (let (reverted (reported m))
+        (assert= (buffer-text (cur reverted)) "two\n")
+        (is (includes? (:echo reverted) "reverted")))))
+  (test "a buffer with unsaved changes is warned about, never reverted"
+    (let (file (scratch-file "one\n")
+          m (behind (type-str (ed-find-file (m-of "x") file) "mine ")))
+      (file/spit file "theirs\n")
+      (let (warned (reported m))
+        (assert= (buffer-text (cur warned)) "mine one\n")
+        (is (includes? (:echo warned) "changed on disk")))))
+  (test "our own save is not taken for another writer's"
+    (let (file (scratch-file "one\n")
+          saved (press (type-str (ed-find-file (m-of "x") file) "mine ") [:ctrl-x :ctrl-s])
+          after (reported saved))
+      (assert= (buffer-text (cur after)) "mine one\n")
+      (is (not (includes? (or (:echo after) "") "reverted")))))
+  (test "killing the buffer stops watching its file"
+    (let (file (scratch-file "one\n")
+          m (ed-find-file (m-of "x") file)
+          index (ed-buffer-index-by-name! m (buffer-name (cur m))))
+      (ed-kill-buffer-at m index)
+      (assert= (%file-watch-count (path/dirname file)) 0)))
+  (test "a file that came in with no visit steps (the launch file) is watched on the next key"
+    (let (file (scratch-file "one\n")
+          launched (ed-init (make-buffer "one\n" "notes.txt" file)))
+      (is (nil? (:file-watch (cur launched))))
+      (is (ref? (:file-watch (cur (press launched [:right])))))))
+  (test "a directory that cannot be watched is tried once, not on every key"
+    (let (gone (path/join (or (test/scratch-dir) "/tmp")
+                 (str "no-such-dir-" (rand/token 6))
+                 "x.txt")
+          m (press (ed-init (make-buffer "" "x.txt" gone)) [:right]))
+      (is (nil? (:file-watch (cur m))))
+      (assert= (:file-watch-owner (cur m)) (self))))
+  (test "a watch no buffer holds any more is ended when it reports"
+    (let (file (scratch-file "one\n")
+          handle (file/watch file))
+      (file/spit file "two\n")
+      (reported (m-of "x"))
+      (refute (file/unwatch (if (ref? handle) handle (error "the watch did not start")))))))

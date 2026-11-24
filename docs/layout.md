@@ -186,8 +186,11 @@ src/sidecar.blsp            where a sidecar lives and the note a visit shows whe
                             its TRAMP path (the user in it) percent-encoded, a long one hashed with
                             the path in `NAME.spec` beside it; never beside the file
 src/autorevert.blsp         auto-revert of files changed on disk (one undoable edit, std's
-                            `revert-buffer`; idle beat, order 120, after the sidecars). A file
-                            edited as root is left alone
+                            `revert-buffer`). A visited file is WATCHED (brood `file/watch`, the
+                            handle on the buffer as `:file-watch`): a change the OS reports reverts
+                            a clean buffer at once (`:file-watch` event, visit step, slot keeper
+                            unwatching on kill); the idle beat (order 120, after the sidecars) stays
+                            the backstop. A file edited as root is left alone
 src/sshpath.blsp            the TRAMP `/ssh:[user@]host[#port]:path` syntax in ONE place, pure: `parse`,
                             `spec`, `canonical` (a buffer's key), `dirname`, `join`, `remote-start` (a
                             `/ssh:` typed over a path), and `remote?` — what every local tool asks

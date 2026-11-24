@@ -2,8 +2,9 @@
   "Files that change under the editor (Emacs's auto-revert): a buffer whose file another writer
 changed is reloaded when it has no unsaved changes, and warned about once when it does
 (a save then asks before overwriting, `lifecycle/cmd-save`). The re-read keeps every window's point on its
-logical line. Policy over the pool on the idle beat, so it costs a keystroke nothing; the
-knowledge of \"changed since we last agreed\" lives in `std/editor/buffer`."
+logical line. A visited file is watched (brood's `file/watch`), so a change the OS reports is
+reverted at once; the idle beat is the backstop, and costs a keystroke nothing. The knowledge of
+\"changed since we last agreed\" lives in `std/editor/buffer`."
   (:use editor/buffer) ; buffer-file / buffer-modified?
   (:use editor/buffer-file) ; revert-buffer / buffer-file-changed?
   (:use editor/pane) ; pane-leaf-paths / pane-payload-at — which buffers are on screen
@@ -164,3 +165,81 @@ unreadable now) is logged and skipped. Runs on the idle beat."
 ;; It does not arm the beat (no `:stale?`) — an edit does, and the disk check follows it once
 ;; typing settles: order 120, after autosave's sidecar round at 110.
 (register-idle-job :auto-revert {:rank 120 :run 'autorevert/ed-revert-changed-files})
+
+;; ---- the OS says a file changed (brood's `file/watch`, ADR-782) ------------------------------
+;; A file visited from disk is watched from the editor's loop, the handle kept on its buffer
+;; (`:file-watch`), so a file another program writes — an agent in a terminal, a formatter, a
+;; `git checkout` — is reverted the moment it lands, not on the next idle beat or round. The
+;; same rules decide it as on the beat (`ed-revert-if-changed`): only a clean buffer is reverted,
+;; one with unsaved changes is warned about once, and our own save moves the buffer's stamp with
+;; the file so it reads as unchanged. The beat stays as the backstop for a change the OS did not
+;; report. A watch ends with its buffer (the slot keeper below) or when the buffer now names
+;; another file.
+
+(defn- needs-watch? (buf)
+  ;; a file buffer this process has not tried to watch: one with no handler (sudo, ssh), and no
+  ;; attempt by this process — a loop since restarted tries again from its own
+  (and (not (nil? (buffer-file buf)))
+    (not (= (:file-watch-owner buf) (self)))
+    (nil? (ed-buffer-handler buf))))
+
+(defn watched (buf)
+  "`buf` with its file watched by this process (`:file-watch`, a `file/watch` handle;
+`:file-watch-owner`, the process its messages come to), unless it is already, names no file, or
+a handler owns the file (sudo, ssh). A directory that cannot be watched leaves `:file-watch` nil,
+the attempt still recorded, so it is not tried again on every step."
+  (let (file (buffer-file buf))
+    (if (or (nil? file) (not (needs-watch? buf)))
+      buf
+      ;; a directory that cannot be watched answers a failure, not a raise
+      (let (handle (file/watch file))
+        (assoc buf :file-watch (if (failure? handle) nil handle) :file-watch-owner (self))))))
+
+(defn watch-visited (m buf)
+  "The visit step: `buf`, just made from a file, with that file [[watched]]."
+  [(watched buf) nil])
+
+(defn ed-watch-current (m)
+  "The post-step: the selected buffer [[watched]] when this process has not tried yet — a file
+that came in by a path with no visit steps (the one named on the command line). O(1) once it
+has."
+  (let (buf (ed-current-buf m))
+    (if (needs-watch? buf) (ed-set-buf m (watched buf)) m)))
+
+(register-post-step :auto-revert-watch {:rank 60 :run 'autorevert/ed-watch-current})
+
+(register-visit-step :auto-revert-watch {:rank 900 :run 'autorevert/watch-visited :passing true})
+
+(defn- watched-index (m handle)
+  ;; the pool index of the buffer holding watch `handle`, or nil
+  (let (buffers (:buffers m)
+        index (index-of (vec (map buffers (fn (buffer) (:file-watch buffer)))) handle))
+    (if (< index 0) nil index)))
+
+(defn ed-ev-file-watch (m input _textrows _cols _rows)
+  "A watched file changed (`[:file-watch handle path kind]`): its buffer reverted when it is clean
+and the file is newer than it, warned about when it has unsaved changes, as the idle beat would.
+A handle no buffer holds any more, or whose buffer now names another file, is unwatched."
+  (let ([_ handle path kind] input
+        index (watched-index m handle))
+    (if (nil? index)
+      (do (file/unwatch handle) m)
+      (let (buffer (ed-buf-at m index)
+            file (buffer-file buffer))
+        (cond
+          (or (nil? file)
+            (not (= (path/normalize (path/absolute file)) (path/normalize (path/absolute path)))))
+            (do (file/unwatch handle) (ed-set-buf-at m index (dissoc buffer :file-watch)))
+          (= kind :removed) m
+          (not (ed-file-buffer? m index)) m
+          else (ed-revert-if-changed m index))))))
+
+(register-event-handler :file-watch 'autorevert/ed-ev-file-watch)
+
+(defn ed-unwatch-killed (m killed)
+  "The slot keeper's `:drop`: a buffer being killed stops watching its file."
+  (let (handle (:file-watch (ed-buf-at m killed)))
+    (when handle (file/unwatch handle))
+    m))
+
+(register-slot-keeper :auto-revert-watch {:rank 50 :drop 'autorevert/ed-unwatch-killed})
